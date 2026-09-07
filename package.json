@@ -1,0 +1,14 @@
+{
+  "name": "auto-promotion",
+  "private": true,
+  "scripts": {
+    "test:ui": "node scripts/ui_test.cjs",
+    "format": "prettier --write src/auto_promotion/web scripts/ui_test.cjs",
+    "format:check": "prettier --check src/auto_promotion/web scripts/ui_test.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1",
+    "prettier": "3.6.2"
+  },
+  "engines": { "node": ">=20" }
+}

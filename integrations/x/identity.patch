@@ -1,0 +1,21 @@
+--- a/services/x-action-service/src/mcp.ts
++++ b/services/x-action-service/src/mcp.ts
+@@ -1388,6 +1388,18 @@
+     // browser page or performs an X action.
+     app.get("/health", (_req, res) => {
+       res.json({ healthy: true, service: "x-action-service" });
++    });
++
++    // Separate account identity probe. No post, like, reply or follow is performed.
++    app.get("/identity", async (_req, res) => {
++      try {
++        const page = await this.ensureAuthenticated();
++        const label = await page.locator('[data-testid="SideNav_AccountSwitcher_Button"]').innerText({ timeout: 5000 });
++        const handles = label.match(/@[A-Za-z0-9_]{1,15}\b/g) || [];
++        res.json({ identity_verified: handles.length === 1, handle: handles.length === 1 ? handles[0].slice(1) : null });
++      } catch {
++        res.json({ identity_verified: false, reason: "account_identity_unavailable" });
++      }
+     });
+ 
+     // Small authenticated HTTP facade used by the approval-first orchestrator.

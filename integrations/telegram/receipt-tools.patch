@@ -1,0 +1,74 @@
+--- a/telegram_mcp/tools/messages.py
++++ b/telegram_mcp/tools/messages.py
+@@ -443,6 +443,7 @@
+     message: str,
+     parse_mode: Optional[str] = None,
+     account: str = None,
++    verify_receipt: bool = False,
+ ) -> str:
+     """
+     Send a message to a specific chat.
+@@ -464,7 +465,10 @@
+         entity = await resolve_entity(chat_id, cl)
+         if parse_mode and parse_mode.lower() in RICH_PARSE_MODES:
+             return await _send_rich(cl, entity, message, parse_mode.lower())
+-        await cl.send_message(entity, message, parse_mode=parse_mode)
++        sent = await cl.send_message(entity, message, parse_mode=parse_mode)
++        if verify_receipt:
++            from telegram_mcp.message_receipt import verify_message_receipt
++            return json.dumps(await verify_message_receipt(cl, entity, sent.id, message))
+         return "Message sent successfully."
+     except Exception as e:
+         return log_and_format_error("send_message", e, chat_id=chat_id)
+@@ -1659,6 +1663,7 @@
+     text: str,
+     parse_mode: Optional[str] = None,
+     account: str = None,
++    verify_receipt: bool = False,
+ ) -> str:
+     """
+     Reply to a specific message in a chat.
+@@ -1676,7 +1681,10 @@
+         entity = await resolve_entity(chat_id, cl)
+         if parse_mode and parse_mode.lower() in RICH_PARSE_MODES:
+             return await _send_rich(cl, entity, text, parse_mode.lower(), reply_to=message_id)
+-        await cl.send_message(entity, text, reply_to=message_id, parse_mode=parse_mode)
++        sent = await cl.send_message(entity, text, reply_to=message_id, parse_mode=parse_mode)
++        if verify_receipt:
++            from telegram_mcp.message_receipt import verify_message_receipt
++            return json.dumps(await verify_message_receipt(cl, entity, sent.id, text, reply_to=message_id))
+         return f"Replied to message {message_id} in chat {chat_id}."
+     except Exception as e:
+         return log_and_format_error(
+--- a/telegram_mcp/tools/media.py
++++ b/telegram_mcp/tools/media.py
+@@ -219,6 +219,7 @@
+     topic_id: Optional[int] = None,
+     ctx: Optional[Context] = None,
+     account: str = None,
++    verify_receipt: bool = False,
+ ) -> str:
+     """
+     Send a file to a chat.
+@@ -250,7 +251,11 @@
+         if path_error:
+             return path_error
+         entity = await resolve_entity(chat_id, cl)
+-        await cl.send_file(entity, str(safe_path), caption=caption, reply_to=topic_id)
++        options = {"parse_mode": None} if verify_receipt else {}
++        sent = await cl.send_file(entity, str(safe_path), caption=caption, reply_to=topic_id, **options)
++        if verify_receipt:
++            from telegram_mcp.message_receipt import verify_message_receipt
++            return json.dumps(await verify_message_receipt(cl, entity, sent.id, caption, reply_to=topic_id, media=True))
+         return f"File sent to chat {chat_id} from {safe_path}."
+     except Exception as e:
+         return log_and_format_error(
+--- a/telegram_mcp/tools/__init__.py
++++ b/telegram_mcp/tools/__init__.py
+@@ -13,5 +13,6 @@
+ from telegram_mcp.tools.tasks import *
+ from telegram_mcp.tools.automation import *
+ from telegram_mcp.tools.growth import *
++from telegram_mcp.tools.receipts import *
+ 
+ __all__ = [name for name in globals() if not name.startswith("_")]
