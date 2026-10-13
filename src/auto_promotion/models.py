@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-PLATFORMS = ("telegram", "reddit", "instagram", "x")
+PLATFORMS = ("telegram", "reddit", "instagram", "x", "discord")
 CAPABILITIES = {
     "telegram": {
         "discover",
@@ -22,6 +22,7 @@ CAPABILITIES = {
     "reddit": {"discover", "reply", "post"},
     "instagram": {"publish", "manual_comment"},
     "x": {"discover", "like", "reply", "repost", "quote"},
+    "discord": {"send_message", "reply", "send_file"},
 }
 
 
@@ -47,7 +48,7 @@ class Model(BaseModel):
 
 
 class AccountInput(Model):
-    platform: Literal["telegram", "reddit", "instagram", "x"]
+    platform: Literal["telegram", "reddit", "instagram", "x", "discord"]
     label: str = Field(min_length=1, max_length=80)
     backend_label: str = Field(min_length=1, max_length=100)
     mode: Literal["live", "simulation"] = "live"
@@ -61,6 +62,18 @@ class AccountInput(Model):
         if not value.strip() or any(c in value for c in "\r\n\x00"):
             raise ValueError("账号标签不能为空或包含控制字符")
         return value.strip()
+
+
+class AccountUpdate(Model):
+    label: str = Field(min_length=1, max_length=80)
+    daily_limit: int = Field(ge=1, le=100)
+    hourly_limit: int = Field(ge=1, le=20)
+    min_interval: int = Field(ge=0, le=86400)
+
+    @field_validator("label")
+    @classmethod
+    def safe_label(cls, value):
+        return AccountInput.safe_label(value)
 
 
 class Policy(Model):
@@ -78,6 +91,7 @@ class Policy(Model):
     starts_at: str
     ends_at: str
     min_interval: int = Field(default=120, ge=0, le=86400)
+    ordering_mode: Literal["strict", "independent_accounts"] = "strict"
     daily_limit: int = Field(default=5, ge=1, le=100)
     target_daily_limit: int = Field(default=3, ge=1, le=3)
     user_daily_limit: int = Field(default=2, ge=1, le=2)
@@ -118,6 +132,7 @@ class ItemInput(Model):
     media: list[Media] = Field(default_factory=list, max_length=10)
     scheduled_at: str
     reply_to: int | None = Field(default=None, gt=0)
+    discord_reply_to: str = Field(default="", pattern=r"^(?:|[1-9][0-9]{0,19})$")
     recipient_id: str = Field(default="", max_length=160)
     target_owned: bool = False
 

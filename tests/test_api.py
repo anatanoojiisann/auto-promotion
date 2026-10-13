@@ -96,6 +96,27 @@ class APITests(unittest.TestCase):
             422,
         )
 
+    def test_account_settings_can_be_edited_without_changing_identity(self):
+        status, account, _ = self.call(
+            "/api/accounts",
+            "POST",
+            {
+                "platform": "telegram",
+                "label": "Original",
+                "backend_label": "fixed",
+                "mode": "simulation",
+            },
+        )
+        self.assertEqual(status, 201)
+        status, updated, _ = self.call(
+            f"/api/accounts/{account['id']}",
+            "PATCH",
+            {"label": "Edited", "daily_limit": 7, "hourly_limit": 4, "min_interval": 0},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["label"], "Edited")
+        self.assertEqual(updated["backend_label"], "fixed")
+
     def test_complete_api_flow(self):
         status, a, _ = self.call(
             "/api/accounts",
@@ -156,7 +177,7 @@ class APITests(unittest.TestCase):
         r = self.call(f"/api/tasks/{id}/run", "POST")[1]
         self.assertEqual(r["processed"][0]["status"], "confirmed")
         self.assertEqual(self.call(f"/api/tasks/{id}/run", "POST")[1]["processed"], [])
-        self.assertEqual(len(self.call("/api/services")[1]), 4)
+        self.assertEqual(len(self.call("/api/services")[1]), 5)
         self.assertGreater(len(self.call("/api/calls")[1]), 0)
         self.assertGreater(len(self.call("/api/audit")[1]), 0)
 

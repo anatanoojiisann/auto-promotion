@@ -334,6 +334,7 @@ def reddit(operation, account, payload, root):
             "healthy": verified,
             "service_ready": True,
             "identity_verified": verified,
+            "account_identity": handles[0].casefold() if verified else None,
             "reason": "account_read_verified"
             if verified
             else "browser_identity_requires_verification",
@@ -420,6 +421,7 @@ def x_platform(operation, account, payload, root):
             "healthy": verified,
             "service_ready": health.healthy,
             "identity_verified": verified,
+            "account_identity": str(identity.get("handle", "")).casefold() if verified else None,
             "reason": "account_read_verified"
             if verified
             else "browser_identity_requires_verification",
@@ -520,6 +522,7 @@ def instagram(operation, account, payload, root):
             "healthy": healthy,
             "service_ready": True,
             "identity_verified": healthy,
+            "account_identity": str(key) if healthy else None,
             "reason": "meta_health_checked",
         }
     if operation == "execute":

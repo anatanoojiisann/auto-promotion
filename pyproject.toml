@@ -5,16 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "auto-promotion"
 version = "0.1.0"
-description = "Local account, task and API control plane for four social platforms"
+description = "Local account, task and API control plane for five social platforms"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115,<1", "pydantic>=2.10,<3", "uvicorn>=0.34,<1", "tzdata>=2025.1"]
 
 [project.optional-dependencies]
 dev = ["ruff>=0.12,<1", "build>=1.2,<2"]
+telegram = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3"]
+browser = ["playwright>=1.55,<2"]
+mcp = ["mcp>=1.30,<2"]
+all = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3", "playwright>=1.55,<2", "mcp>=1.30,<2"]
 
 [project.scripts]
 auto-promotion = "auto_promotion.cli:main"
+auto-promotion-mcp = "auto_promotion.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

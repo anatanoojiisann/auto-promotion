@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 import uuid
@@ -12,6 +11,7 @@ from urllib.parse import urlparse
 from .models import (
     CAPABILITIES,
     AccountInput,
+    AccountUpdate,
     CandidateInput,
     ItemInput,
     TaskInput,
@@ -51,6 +51,7 @@ class Engine:
     ):
         self.store = store
         self.adapters = adapters
+        self.adapters.database = store.path
         self.clock = clock
         self.live_enabled = live_enabled
         self.media_root = Path(media_root or Path(store.path).parent / "media").resolve()
@@ -106,6 +107,32 @@ class Engine:
             )
         return self.account(account_id)
 
+    def update_account(self, account_id, value: AccountUpdate):
+        account = self.account(account_id)
+        if account["mode"] == "live" and value.min_interval < 120:
+            raise Conflict("真实账号最小发送间隔为 120 秒")
+        changes = value.model_dump()
+        if all(account[key] == val for key, val in changes.items()):
+            return account
+        with self.store.connect(write=True) as db:
+            for task in db.execute(
+                "SELECT id,account_ids FROM tasks WHERE state NOT IN ('cancelled','completed')"
+            ):
+                if account_id in json.loads(task["account_ids"]):
+                    raise Conflict("账号已被未结束任务使用；请先结束该任务并创建新任务")
+            db.execute(
+                "UPDATE accounts SET label=?,daily_limit=?,hourly_limit=?,min_interval=? WHERE id=?",
+                (
+                    value.label,
+                    value.daily_limit,
+                    value.hourly_limit,
+                    value.min_interval,
+                    account_id,
+                ),
+            )
+            Store.audit(db, "account.updated", {"account_id": account_id})
+        return self.account(account_id)
+
     def call(self, account, operation, payload=None, task_id=None):
         started = time.monotonic()
         try:
@@ -126,6 +153,8 @@ class Engine:
 
     def check_account(self, account_id):
         account = self.account(account_id)
+        if account["platform"] == "discord" and account["cooldown_until"] > self.clock():
+            return account
         try:
             result = self.call(account, "health")
         except Conflict:
@@ -136,16 +165,53 @@ class Engine:
             for key in ("healthy", "service_ready", "identity_verified", "permissions", "reason")
             if key in result
         }
-        status = (
-            "healthy"
-            if health.get("healthy") and health.get("identity_verified")
-            else "unavailable"
-        )
+        observed_identity = result.get("account_identity")
         with self.store.connect(write=True) as db:
-            db.execute(
-                "UPDATE accounts SET status=?,health=?,checked_at=? WHERE id=?",
-                (status, canonical(health), self.clock(), account_id),
+            current = db.execute(
+                "SELECT identity_hash FROM accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            identity_hash = current["identity_hash"]
+            if health.get("identity_verified") and observed_identity:
+                observed_hash = digest([account["platform"], str(observed_identity)])
+                if identity_hash and identity_hash != observed_hash:
+                    health.update(
+                        healthy=False, identity_verified=False, reason="AccountIdentityChanged"
+                    )
+                elif not identity_hash:
+                    other = db.execute(
+                        "SELECT id FROM accounts WHERE platform=? AND mode=? AND identity_hash=? AND id<>?",
+                        (account["platform"], account["mode"], observed_hash, account_id),
+                    ).fetchone()
+                    if other:
+                        health.update(
+                            healthy=False,
+                            identity_verified=False,
+                            reason="DuplicatePlatformIdentity",
+                        )
+                    else:
+                        identity_hash = observed_hash
+            elif identity_hash and health.get("identity_verified"):
+                health.update(
+                    healthy=False, identity_verified=False, reason="AccountIdentityUnavailable"
+                )
+            status = (
+                "healthy"
+                if health.get("healthy") and health.get("identity_verified")
+                else "unavailable"
             )
+            db.execute(
+                "UPDATE accounts SET status=?,health=?,checked_at=?,identity_hash=? WHERE id=?",
+                (status, canonical(health), self.clock(), identity_hash, account_id),
+            )
+            if result.get("rate_limited") or result.get("risk_warning"):
+                db.execute(
+                    "UPDATE accounts SET cooldown_until=max(cooldown_until,?),disabled=max(disabled,?) WHERE id=?",
+                    (
+                        self.clock() + max(1, int(result.get("retry_after_seconds") or 3600)),
+                        int(bool(result.get("risk_warning"))),
+                        account_id,
+                    ),
+                )
             Store.audit(db, "account.checked", {"account_id": account_id, "status": status})
         return self.account(account_id)
 
@@ -156,10 +222,34 @@ class Engine:
             Store.audit(db, "account.disabled", {"account_id": account_id, "disabled": disabled})
         return self.account(account_id)
 
+    def account_targets(self, account_id):
+        account = self.account(account_id)
+        if account["platform"] != "discord":
+            raise Conflict("此平台暂不提供频道目录")
+        if account["cooldown_until"] > self.clock():
+            raise Conflict("账号仍在冷却，请稍后读取频道")
+        result = self.call(account, "targets")
+        self.apply_cooldown(account_id, result)
+        if result.get("rate_limited"):
+            raise Conflict("Discord 请求受到限流，已记录冷却时间")
+        return {"targets": result.get("targets", []), "truncated": bool(result.get("truncated"))}
+
+    def apply_cooldown(self, account_id, result):
+        if result.get("rate_limited"):
+            until = self.clock() + max(1, int(result.get("retry_after_seconds") or 60))
+            with self.store.connect(write=True) as db:
+                db.execute(
+                    "UPDATE accounts SET cooldown_until=max(cooldown_until,?) WHERE id=?",
+                    (until, account_id),
+                )
+                Store.audit(db, "account.cooldown", {"account_id": account_id, "until": until})
+
     def create_task(self, value: TaskInput):
         if len(set(value.account_ids)) != len(value.account_ids):
             raise Conflict("任务账号不能重复")
         accounts = [self.account(a) for a in value.account_ids]
+        if any(a["health"].get("reason") == "DuplicatePlatformIdentity" for a in accounts):
+            raise Conflict("任务包含重复绑定的平台身份，请使用已核验的原账号")
         if len({a["mode"] for a in accounts}) != 1:
             raise Conflict("模拟账号和真实账号必须分开创建任务")
         if accounts[0]["mode"] == "live" and value.policy.min_interval < 120:
@@ -332,6 +422,37 @@ class Engine:
         if value.action in {"like", "repost"} and (value.text or value.media or value.title):
             raise Conflict("点赞和转发不能附带正文或媒体")
         platform = account["platform"]
+        if platform != "discord" and value.discord_reply_to:
+            raise Conflict("Discord 原消息 ID 仅用于 Discord")
+        if platform == "discord":
+            from .backends.common import BackendError
+            from .backends.discord import MAX_FILE_BYTES, MAX_TOTAL_BYTES, snowflake
+
+            try:
+                snowflake(value.target)
+                if value.action == "reply":
+                    snowflake(value.discord_reply_to)
+            except BackendError:
+                raise Conflict("Discord 需要有效的频道 ID；回复还需要原消息 ID") from None
+            if value.reply_to or value.title or value.recipient_id:
+                raise Conflict("Discord 请使用频道 ID 和 Discord 原消息 ID，不支持标题或私信")
+            if len(value.text) > 2000:
+                raise Conflict("Discord 正文最多 2000 字符")
+            if value.action == "send_file" and not value.media:
+                raise Conflict("Discord 发送文件需要媒体")
+            if value.action == "send_message" and value.media:
+                raise Conflict("请使用 Discord 发送文件或回复动作上传媒体")
+            if value.action != "reply" and value.discord_reply_to:
+                raise Conflict("Discord 原消息 ID 仅用于回复")
+            total = 0
+            for media in value.media:
+                self.verify_media(media.model_dump())
+                size = Path(media.path).stat().st_size
+                total += size
+                if size > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
+                    raise Conflict("Discord 单文件最多 10 MiB，一条消息附件合计最多 25 MiB")
+                if any(c in media.filename for c in '\r\n"\\'):
+                    raise Conflict("Discord 文件名不能包含换行、引号或反斜杠")
         if platform == "x":
             parsed = urlparse(value.target)
             if (
@@ -365,12 +486,6 @@ class Engine:
         if platform == "instagram":
             if value.action == "publish" and (not value.target_owned or not value.media):
                 raise Conflict("Instagram 发布必须使用自有账号并提供媒体")
-            if (
-                value.action == "publish"
-                and account["mode"] == "live"
-                and account["backend_label"] != os.getenv("AP_INSTAGRAM_ACCOUNT")
-            ):
-                raise Conflict("Instagram 发布账号未在 AP_INSTAGRAM_ACCOUNT 中配置")
             if value.action == "manual_comment" and (value.media or not value.text.strip()):
                 raise Conflict("人工评论需要精确正文，不支持媒体")
             if (
@@ -417,6 +532,8 @@ class Engine:
             due = epoch(value.scheduled_at)
             if due < previous_due:
                 raise Conflict("执行项必须按计划时间排序")
+            if index and due - previous_due < task["policy"]["min_interval"]:
+                raise Conflict("执行项之间短于任务最小间隔")
             gap = max(task["policy"]["min_interval"], account["min_interval"])
             if (
                 value.account_id in last_by_account
@@ -596,6 +713,7 @@ class Engine:
                 or account["status"] != "healthy"
                 or account["cooldown_until"] > now
                 or account["next_at"] > now
+                or task["next_at"] > now
             ):
                 return None
             if account["mode"] == "live" and (
@@ -619,10 +737,16 @@ class Engine:
                     (canonical({"reason": "delivery_window_elapsed"}), item_id),
                 )
                 return None
-            earlier = db.execute(
-                "SELECT status FROM items WHERE task_id=? AND position<?",
-                (task["id"], row["position"]),
-            ).fetchall()
+            if policy.get("ordering_mode", "strict") == "independent_accounts":
+                earlier = db.execute(
+                    "SELECT status FROM items WHERE task_id=? AND account_id=? AND position<?",
+                    (task["id"], account["id"], row["position"]),
+                ).fetchall()
+            else:
+                earlier = db.execute(
+                    "SELECT status FROM items WHERE task_id=? AND position<?",
+                    (task["id"], row["position"]),
+                ).fetchall()
             if any(r["status"] not in TERMINAL for r in earlier):
                 return None
             target_key = digest([account["platform"], payload["target"].casefold()])
@@ -726,6 +850,10 @@ class Engine:
                 "UPDATE accounts SET next_at=? WHERE id=?",
                 (now + max(account["min_interval"], policy["min_interval"]), account["id"]),
             )
+            db.execute(
+                "UPDATE tasks SET next_at=? WHERE id=?",
+                (now + policy["min_interval"], task["id"]),
+            )
             Store.audit(
                 db, "attempt.claimed", {"item_id": item_id, "attempt_id": attempt}, task["id"], now
             )
@@ -743,7 +871,7 @@ class Engine:
             self.task(task_id)
         if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
             return {"processed": []}
-        sql = "SELECT i.id,i.account_id,i.task_id,i.payload,i.due_at,t.policy,t.mode FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.status='not_attempted' AND t.state='active' AND t.phase='ready'"
+        sql = "SELECT i.id,i.account_id,i.task_id,i.payload,i.due_at,t.policy,t.mode,t.next_at FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.status='not_attempted' AND t.state='active' AND t.phase='ready'"
         params = ()
         if task_id:
             sql += " AND i.task_id=?"
@@ -753,6 +881,8 @@ class Engine:
         checked = set()
         for row in rows:
             if row["mode"] == "live" and not self.live_enabled:
+                continue
+            if row["next_at"] > self.clock():
                 continue
             policy = json.loads(row["policy"])
             native = json.loads(row["payload"])["action"] in {"schedule_message", "schedule_file"}
@@ -774,10 +904,15 @@ class Engine:
             account = self.account(row["account_id"])
             if not self.adapters.commissioned(account):
                 continue
+            if account["disabled"] or account["cooldown_until"] > self.clock():
+                continue
             if account["id"] not in checked:
                 # A fresh read-only health check before a live claim; simulation needs one too.
                 self.check_account(account["id"])
                 checked.add(account["id"])
+            account = self.account(row["account_id"])
+            if account["status"] != "healthy" or account["cooldown_until"] > self.clock():
+                continue
             try:
                 gate = (
                     self.call(
@@ -789,6 +924,8 @@ class Engine:
                     if account["mode"] == "live"
                     else None
                 )
+                if gate:
+                    self.apply_cooldown(account["id"], gate)
                 if gate and gate.get("allowed") is not True:
                     processed.append(
                         {
@@ -926,7 +1063,11 @@ class Engine:
             "external_reference": row["external_reference"],
             "result": json.loads(row["result"]),
         }
-        result = self.call(self.account(row["account_id"]), "verify", payload, row["task_id"])
+        account = self.account(row["account_id"])
+        if account["platform"] == "discord" and account["cooldown_until"] > self.clock():
+            raise Conflict("Discord 账号仍在冷却，请稍后核对")
+        result = self.call(account, "verify", payload, row["task_id"])
+        self.apply_cooldown(account["id"], result)
         if not result.get("verified"):
             return {"status": row["status"], "reason": "not_conclusively_verified"}
         # Reconciliation never turns an item back into a retryable state.
@@ -1073,6 +1214,14 @@ class Engine:
                 or (account["mode"] == "live" and not self.live_enabled)
             ):
                 continue
+            # Avoid an unnecessary live identity check while this task is waiting
+            # for its persisted per-account interval or platform cooldown.
+            if (
+                account["next_at"] > self.clock()
+                or task["next_at"] > self.clock()
+                or account["cooldown_until"] > self.clock()
+            ):
+                continue
             self.check_account(account["id"])
             now = self.clock()
             with self.store.connect(write=True) as db:
@@ -1098,6 +1247,7 @@ class Engine:
                     or a["status"] != "healthy"
                     or a["cooldown_until"] > now
                     or a["next_at"] > now
+                    or row["next_at"] > now
                 ):
                     continue
                 if (
@@ -1172,6 +1322,10 @@ class Engine:
                         ),
                         a["id"],
                     ),
+                )
+                db.execute(
+                    "UPDATE tasks SET next_at=? WHERE id=?",
+                    (now + policy["min_interval"], task_id),
                 )
                 Store.audit(db, "join.claimed", {"candidate_id": c["id"]}, task_id, now)
             try:

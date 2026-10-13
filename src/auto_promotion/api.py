@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
@@ -18,10 +20,12 @@ from pydantic import BaseModel, ConfigDict
 from . import __version__
 from .adapters import AdapterRegistry
 from .config import database_path, workspace_path
+from .connections import ConnectionInput, ConnectionManager
 from .core import Conflict, Engine, NotFound
 from .legacy import inventory
 from .models import (
     AccountInput,
+    AccountUpdate,
     ApprovalInput,
     CandidateInput,
     ItemInput,
@@ -49,6 +53,7 @@ def create_app(*, db_path=None, registry=None, clock=time.time, worker=False, to
     engine = Engine(
         store, registry, clock=clock, live_enabled=os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1"
     )
+    connections = ConnectionManager(engine)
     operator_token = token or os.getenv("AP_API_TOKEN")
     if not operator_token:
         secret_path = Path(store.path).parent / "operator.key"
@@ -79,6 +84,7 @@ def create_app(*, db_path=None, registry=None, clock=time.time, worker=False, to
     async def lifespan(app):
         job = asyncio.create_task(work_loop()) if worker else None
         yield
+        connections.close()
         stop.set()
         if job:
             job.cancel()
@@ -96,6 +102,7 @@ def create_app(*, db_path=None, registry=None, clock=time.time, worker=False, to
     )
     app.state.engine = engine
     app.state.store = store
+    app.state.connections = connections
 
     @app.middleware("http")
     async def boundary(request: Request, call_next):
@@ -143,6 +150,13 @@ def create_app(*, db_path=None, registry=None, clock=time.time, worker=False, to
             {"error": str(exc)}, status_code=404 if isinstance(exc, NotFound) else 409
         )
 
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        if request.url.path == "/api/connections":
+            # Pydantic errors can echo the full submitted token or extra sensitive fields.
+            return JSONResponse({"error": "连接信息不完整或格式错误，请核对表单"}, status_code=422)
+        return await request_validation_exception_handler(request, exc)
+
     @app.get("/health")
     def health():
         return {
@@ -182,9 +196,33 @@ def create_app(*, db_path=None, registry=None, clock=time.time, worker=False, to
     def add_account(value: AccountInput):
         return engine.add_account(value)
 
+    @app.patch("/api/accounts/{account_id}")
+    def update_account(account_id: str, value: AccountUpdate):
+        return engine.update_account(account_id, value)
+
+    @app.get("/api/connections")
+    def connection_list():
+        return connections.list()
+
+    @app.post("/api/connections", status_code=202)
+    def connect(value: ConnectionInput):
+        return connections.start(value)
+
+    @app.get("/api/connections/{connection_id}")
+    def connection_status(connection_id: str):
+        return connections.get(connection_id)
+
+    @app.post("/api/connections/{connection_id}/cancel")
+    def cancel_connection(connection_id: str):
+        return connections.cancel(connection_id)
+
     @app.post("/api/accounts/{account_id}/check")
     def check(account_id: str):
         return engine.check_account(account_id)
+
+    @app.get("/api/accounts/{account_id}/targets")
+    def account_targets(account_id: str):
+        return engine.account_targets(account_id)
 
     @app.post("/api/accounts/{account_id}/enabled")
     def account_enabled(account_id: str, value: Toggle):

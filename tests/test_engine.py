@@ -1,17 +1,26 @@
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from auto_promotion.adapters import AdapterRegistry, SimulationAdapter
 from auto_promotion.core import Conflict, Engine
-from auto_promotion.models import AccountInput, CandidateInput, ItemInput, ManualOutcome, TaskInput
+from auto_promotion.models import (
+    AccountInput,
+    AccountUpdate,
+    CandidateInput,
+    ItemInput,
+    ManualOutcome,
+    TaskInput,
+)
 from auto_promotion.store import Store
 
 
@@ -185,6 +194,105 @@ class EngineTests(unittest.TestCase):
             )
         self.engine.run_once(t["id"])
         self.assertEqual(self.provider.sends, 0)
+
+    def test_verified_identity_cannot_be_registered_twice(self):
+        class SharedIdentity(SimulationAdapter):
+            def call(self, account, operation, payload):
+                result = super().call(account, operation, payload)
+                if operation == "health":
+                    result["account_identity"] = "same-platform-user"
+                return result
+
+        self.registry.overrides["telegram"] = SharedIdentity()
+        first = self.engine.add_account(
+            AccountInput(platform="telegram", label="First", backend_label="first-live")
+        )
+        second = self.engine.add_account(
+            AccountInput(platform="telegram", label="Second", backend_label="second-live")
+        )
+        self.assertEqual(self.engine.check_account(first["id"])["status"], "healthy")
+        checked = self.engine.check_account(second["id"])
+        self.assertEqual(checked["status"], "unavailable")
+        self.assertEqual(checked["health"]["reason"], "DuplicatePlatformIdentity")
+
+    def test_task_interval_applies_across_accounts(self):
+        second = self.engine.add_account(
+            AccountInput(
+                platform="telegram", label="Second", backend_label="second", mode="simulation"
+            )
+        )
+        task = self.engine.create_task(
+            TaskInput(
+                name="Alternating accounts",
+                account_ids=[self.accounts["telegram"]["id"], second["id"]],
+                policy={
+                    "starts_at": iso(self.now - 100),
+                    "ends_at": iso(self.now + 3600),
+                    "min_interval": 120,
+                    "ordering_mode": "independent_accounts",
+                },
+            )
+        )
+        task = self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        first_item = self.item(target="@one")
+        second_item = self.item(account_id=second["id"], target="@two")
+        with self.assertRaisesRegex(Conflict, "任务最小间隔"):
+            self.engine.set_items(task["id"], [first_item, second_item])
+        second_item.scheduled_at = iso(self.now + 120)
+        self.engine.set_items(task["id"], [first_item, second_item])
+
+    def test_independent_account_continues_when_another_is_disabled(self):
+        second = self.engine.add_account(
+            AccountInput(
+                platform="telegram",
+                label="Second",
+                backend_label="second",
+                mode="simulation",
+                min_interval=0,
+            )
+        )
+        self.engine.check_account(second["id"])
+        task = self.engine.create_task(
+            TaskInput(
+                name="Independent accounts",
+                account_ids=[self.accounts["telegram"]["id"], second["id"]],
+                policy={
+                    "starts_at": iso(self.now - 100),
+                    "ends_at": iso(self.now + 3600),
+                    "min_interval": 0,
+                    "ordering_mode": "independent_accounts",
+                },
+            )
+        )
+        task = self.approve(
+            task,
+            [self.item(target="@one"), self.item(account_id=second["id"], target="@two")],
+        )
+        self.engine.disable_account(self.accounts["telegram"]["id"], True)
+        self.engine.run_once(task["id"])
+        statuses = [item["status"] for item in self.engine.task(task["id"])["items"]]
+        self.assertEqual(statuses, ["not_attempted", "confirmed"])
+
+    def test_account_settings_edit_requires_ending_active_task(self):
+        account_id = self.accounts["telegram"]["id"]
+        task = self.task()
+        update = AccountUpdate(label="New label", daily_limit=7, hourly_limit=3, min_interval=0)
+        with self.assertRaisesRegex(Conflict, "未结束任务"):
+            self.engine.update_account(account_id, update)
+        self.engine.change_state(task["id"], "cancelled")
+        self.assertEqual(self.engine.update_account(account_id, update)["label"], "New label")
+
+    def test_existing_database_adds_account_identity_and_task_pacing_columns(self):
+        old_path = Path(self.tmp.name) / "old.db"
+        with closing(sqlite3.connect(old_path)) as db:
+            db.execute("CREATE TABLE accounts(id TEXT PRIMARY KEY,platform TEXT,mode TEXT)")
+            db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY)")
+        migrated = Store(old_path)
+        with migrated.connect() as db:
+            accounts = {row[1] for row in db.execute("PRAGMA table_info(accounts)")}
+            tasks = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+        self.assertIn("identity_hash", accounts)
+        self.assertIn("next_at", tasks)
 
     def test_concurrent_workers_one_submission(self):
         t = self.approve(self.task())
@@ -561,10 +669,7 @@ class EngineTests(unittest.TestCase):
             "mime_type": "image/png",
             "media_type": "IMAGE",
         }
-        with (
-            patch.dict(os.environ, {"AP_INSTAGRAM_ACCOUNT": "test_creator"}),
-            self.assertRaisesRegex(Conflict, "HTTPS"),
-        ):
+        with self.assertRaisesRegex(Conflict, "HTTPS"):
             self.engine.set_items(
                 t["id"],
                 [
@@ -577,6 +682,51 @@ class EngineTests(unittest.TestCase):
                     )
                 ],
             )
+
+    def test_two_instagram_accounts_can_prepare_publish_without_global_account_setting(self):
+        accounts = [
+            self.engine.add_account(
+                AccountInput(platform="instagram", label=f"IG {n}", backend_label=f"ig-{n}")
+            )
+            for n in (1, 2)
+        ]
+        task = self.engine.create_task(
+            TaskInput(
+                name="Two Instagram accounts",
+                account_ids=[account["id"] for account in accounts],
+                policy={
+                    "starts_at": iso(self.now - 100),
+                    "ends_at": iso(self.now + 3600),
+                    "min_interval": 120,
+                },
+            )
+        )
+        task = self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        media_path = self.engine.media_root / "post.png"
+        media_path.write_bytes(b"test image")
+        media = {
+            "filename": "post.png",
+            "path": str(media_path),
+            "sha256": hashlib.sha256(media_path.read_bytes()).hexdigest(),
+            "mime_type": "image/png",
+            "media_type": "IMAGE",
+            "source_url": "https://example.com/post.png",
+        }
+        items = [
+            self.item(
+                "instagram",
+                account_id=account["id"],
+                action="publish",
+                target=str(index),
+                target_owned=True,
+                media=[media],
+                scheduled_at=iso(self.now + index * 120),
+            )
+            for index, account in enumerate(accounts, 1)
+        ]
+        with patch.dict(os.environ, {}, clear=True):
+            saved = self.engine.set_items(task["id"], items)
+        self.assertEqual(len(saved["items"]), 2)
 
     def test_all_mvp_outbound_actions_in_simulation(self):
         from auto_promotion.models import CAPABILITIES

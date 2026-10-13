@@ -24,10 +24,12 @@ async def verify_sent_message(
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Promotion Account Health", readOnlyHint=True))
+@with_account(readonly=True)
 async def promotion_account_health(account: str = None) -> str:
     from telegram_mcp.task_executor import inspect_account_capabilities
 
     result = await inspect_account_capabilities(account or "default", "outbound")
+    me = await get_client(account).get_me()
     return json.dumps(
         {
             "identity_verified": bool(result["account_status"].get("ready")),
@@ -35,6 +37,7 @@ async def promotion_account_health(account: str = None) -> str:
                 result["account_status"].get("ready") and result["send_content"].get("available")
             ),
             "service_ready": True,
+            "account_identity": str(me.id) if me else None,
             "reason": result["send_content"].get("reason", "checked"),
         }
     )

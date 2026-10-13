@@ -1,6 +1,7 @@
 """Command-line entry point shared by source checkouts and installed wheels."""
 
 import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,45 @@ def main():
     checks.add_argument("--live-only", action="store_true")
     sub.add_parser("seed-simulation")
     sub.add_parser("import-workspace-accounts")
+    login = sub.add_parser("login", help="Configure a private local platform account")
+    login.add_argument("platform", choices=PLATFORMS)
+    login.add_argument("--account", required=True, help="Stable local account label")
+    sub.add_parser("doctor", help="Check this interpreter and the bundled backends")
     args = parser.parse_args()
+    os.environ["AP_DB"] = str(Path(args.db).resolve())
+    if args.command == "doctor":
+        from .diagnostics import diagnose
+
+        print(json.dumps(diagnose(), ensure_ascii=False, indent=2))
+        return
+    if args.command == "login":
+        from .backends.common import BackendError, account_lock
+
+        try:
+            with account_lock(args.platform, args.account):
+                if args.platform == "telegram":
+                    from .backends.telegram import login as login_telegram
+
+                    result = asyncio.run(login_telegram(args.account))
+                elif args.platform == "instagram":
+                    from .backends.instagram import configure
+
+                    result = configure(args.account)
+                elif args.platform == "discord":
+                    from .backends.discord import configure
+
+                    result = configure(args.account)
+                else:
+                    from .backends.browser import login as login_browser
+
+                    result = login_browser(args.platform, args.account)
+        except (Exception, KeyboardInterrupt) as exc:
+            # Login errors may contain phone numbers, codes, cookies or tokens.
+            code = exc.safe_code if isinstance(exc, BackendError) else type(exc).__name__
+            print(json.dumps({"authenticated": False, "error": code}))
+            raise SystemExit(1) from None
+        print(json.dumps(result, ensure_ascii=False))
+        return
     if args.command == "serve":
         import uvicorn
 

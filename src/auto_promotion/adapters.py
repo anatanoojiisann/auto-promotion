@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+from importlib.util import find_spec
 from pathlib import Path
 
+from .backends import BACKENDS
 from .config import PROJECTS
 from .models import CAPABILITIES
 
@@ -13,6 +16,20 @@ class SimulationAdapter:
     """Explicitly synthetic external service, including a durable result reference."""
 
     def call(self, account, operation, payload):
+        if operation == "targets" and account["platform"] == "discord":
+            return {
+                "targets": [
+                    {
+                        "id": "123456789012345678",
+                        "guild_id": "234567890123456789",
+                        "name": "ap-simulation",
+                        "guild_name": "模拟服务器",
+                        "can_attach": True,
+                        "can_reply": True,
+                    }
+                ],
+                "truncated": False,
+            }
         if operation == "health":
             return {
                 "healthy": True,
@@ -67,11 +84,12 @@ class SimulationAdapter:
 
 
 class AdapterRegistry:
-    def __init__(self, workspace: Path, *, overrides=None, timeout=50):
+    def __init__(self, workspace: Path, *, overrides=None, timeout=180):
         self.workspace = Path(workspace).resolve()
         self.overrides = overrides or {}
         self.timeout = timeout
         self.simulation = SimulationAdapter()
+        self.database = None
 
     def commissioned(self, account):
         return account["mode"] == "simulation" or (
@@ -84,31 +102,45 @@ class AdapterRegistry:
             return self.overrides[account["platform"]].call(account, operation, payload)
         if account["mode"] == "simulation":
             return self.simulation.call(account, operation, payload)
-        root = self.workspace / PROJECTS[account["platform"]]
-        python = Path(
-            os.getenv(
-                "AP_" + account["platform"].upper() + "_PYTHON", str(root / ".venv/bin/python")
-            )
-        ).resolve()
+        legacy = os.getenv("AP_" + account["platform"].upper() + "_BACKEND", "builtin") == "legacy"
+        if legacy and account["platform"] == "discord":
+            raise RuntimeError("discord_legacy_backend_unsupported")
+        root = self.workspace / PROJECTS[account["platform"]] if legacy else Path.cwd()
+        python = Path(sys.executable)
+        if legacy:
+            runtime = ".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python"
+            python = Path(
+                os.getenv("AP_" + account["platform"].upper() + "_PYTHON", str(root / runtime))
+            ).resolve()
         if not python.exists():
             raise RuntimeError("backend_runtime_unavailable")
         env = os.environ.copy()
         env["AUTO_PROMOTION_WORKSPACE"] = str(self.workspace)
+        if self.database:
+            env["AP_DB"] = str(self.database)
+        env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONPATH"] = (
             str(Path(__file__).resolve().parent.parent) + os.pathsep + env.get("PYTHONPATH", "")
         )
         # Fixed executable and script; no caller-supplied shell or arbitrary tool name.
         completed = subprocess.run(
-            [str(python), "-m", "auto_promotion.provider_bridge"],
+            [
+                str(python),
+                "-m",
+                "auto_promotion.provider_bridge" if legacy else "auto_promotion.native_bridge",
+            ],
             input=json.dumps(
                 {
                     "platform": account["platform"],
                     "account": account["backend_label"],
+                    "account_id": account["id"],
+                    "database": self.database,
                     "operation": operation,
                     "payload": payload,
                 }
             ),
             text=True,
+            encoding="utf-8",
             capture_output=True,
             cwd=root,
             env=env,
@@ -133,13 +165,17 @@ class AdapterRegistry:
         return [
             {
                 "platform": p,
-                "project": name,
-                "installed": (self.workspace / name).is_dir(),
-                "transport": "MCP HTTP"
-                if p == "telegram"
-                else "Meta API"
-                if p == "instagram"
-                else "Browser + read provider",
+                "project": name
+                if os.getenv("AP_" + p.upper() + "_BACKEND") == "legacy"
+                else "auto_promotion.backends." + ("browser" if p in {"reddit", "x"} else p),
+                "installed": (self.workspace / name).is_dir()
+                if os.getenv("AP_" + p.upper() + "_BACKEND") == "legacy"
+                else True,
+                "transport": BACKENDS[p][0],
+                "dependencies_ready": not BACKENDS[p][1] or find_spec(BACKENDS[p][1]) is not None,
+                "backend": "legacy"
+                if os.getenv("AP_" + p.upper() + "_BACKEND") == "legacy"
+                else "builtin",
                 "capabilities": sorted(CAPABILITIES[p]),
                 "live_configured": bool(
                     os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1"

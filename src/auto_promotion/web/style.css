@@ -425,6 +425,10 @@ td strong {
   background: #fff0e8;
   color: #984624;
 }
+.platform-mark.discord {
+  background: #5865f2;
+  color: white;
+}
 .platform-mark.instagram {
   background: #f3eaf0;
   color: #864366;

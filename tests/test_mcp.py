@@ -1,0 +1,216 @@
+import asyncio
+import json
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from importlib.util import find_spec
+from pathlib import Path
+from unittest.mock import patch
+
+from auto_promotion.adapters import AdapterRegistry, SimulationAdapter
+from auto_promotion.core import Engine
+from auto_promotion.models import PLATFORMS, AccountInput, ItemInput, TaskInput
+from auto_promotion.store import Store
+
+MCP_AVAILABLE = find_spec("mcp") is not None
+if MCP_AVAILABLE:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    from auto_promotion.mcp_server import client_config, create_server
+
+
+def iso(value):
+    return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+
+class CountingAdapter(SimulationAdapter):
+    def __init__(self):
+        self.sends = 0
+        self.reads = 0
+
+    def call(self, account, operation, payload):
+        if operation == "execute":
+            self.sends += 1
+        elif operation == "discover":
+            self.reads += 1
+        return super().call(account, operation, payload)
+
+
+@unittest.skipUnless(MCP_AVAILABLE, "MCP extra is not installed")
+class MCPTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = 1800000000.0
+        self.provider = CountingAdapter()
+        self.registry = AdapterRegistry(
+            Path(self.tmp.name), overrides={p: self.provider for p in PLATFORMS}
+        )
+        self.engine = Engine(
+            Store(Path(self.tmp.name) / "mcp.db"), self.registry, clock=lambda: self.now
+        )
+        self.accounts = {}
+        for platform in PLATFORMS:
+            account = self.engine.add_account(
+                AccountInput(
+                    platform=platform,
+                    label=platform,
+                    backend_label=platform,
+                    mode="simulation",
+                    min_interval=0,
+                )
+            )
+            self.engine.check_account(account["id"])
+            self.accounts[platform] = account
+        self.server = create_server(self.engine)
+
+    async def call(self, tool_name, **arguments):
+        result = await self.server.call_tool(tool_name, arguments)
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, tuple):
+            return result[1]
+        return json.loads(result[0].text)
+
+    def task(self):
+        return self.engine.create_task(
+            TaskInput(
+                name="MCP contract",
+                account_ids=[self.accounts["telegram"]["id"]],
+                policy={
+                    "starts_at": iso(self.now - 60),
+                    "ends_at": iso(self.now + 3600),
+                    "min_interval": 0,
+                    "queries": ["AI video"],
+                },
+            )
+        )
+
+    def approved_task(self):
+        task = self.task()
+        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.set_items(
+            task["id"],
+            [
+                ItemInput(
+                    account_id=self.accounts["telegram"]["id"],
+                    action="send_message",
+                    target="@ai_group",
+                    text="AI video example",
+                    scheduled_at=iso(self.now),
+                )
+            ],
+        )
+        task = self.engine.prepare(task["id"])
+        return self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+
+    async def test_catalog_and_accounts_cover_all_five_platforms(self):
+        tools = {t.name: t for t in await self.server.list_tools()}
+        self.assertEqual(len(tools), 16)
+        self.assertTrue(tools["system_status"].annotations.readOnlyHint)
+        self.assertFalse(tools["run_approved_task"].annotations.readOnlyHint)
+        self.assertFalse({"approve", "set_stop", "login", "send_message"} & tools.keys())
+        status = await self.call("system_status")
+        self.assertEqual({p["platform"] for p in status["platforms"]}, set(PLATFORMS))
+        self.assertTrue(status["global_stop"])
+        for platform in PLATFORMS:
+            accounts = await self.call("list_accounts", platform=platform)
+            self.assertEqual([a["platform"] for a in accounts["accounts"]], [platform])
+        self.assertEqual(self.provider.sends, 0)
+
+    async def test_draft_creation_does_not_grant_approval_or_publish(self):
+        task = await self.call(
+            "create_task",
+            name="Draft",
+            account_ids=[self.accounts["x"]["id"]],
+            policy={"starts_at": iso(self.now), "ends_at": iso(self.now + 3600), "min_interval": 0},
+        )
+        self.assertEqual(task["approvals"], [])
+        self.assertEqual(self.provider.sends, 0)
+        with self.assertRaises(ToolError):
+            await self.call("run_approved_task", task_id=task["id"])
+        with self.assertRaises(ToolError):
+            await self.call("run_approved_joins", task_id=task["id"])
+        self.assertEqual(self.provider.sends, 0)
+
+    async def test_discovery_requires_human_policy_approval(self):
+        task = self.task()
+        with self.assertRaises(ToolError):
+            await self.call(
+                "discover_candidates",
+                task_id=task["id"],
+                account_id=self.accounts["telegram"]["id"],
+            )
+        self.assertEqual(self.provider.reads, 0)
+        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        result = await self.call(
+            "discover_candidates", task_id=task["id"], account_id=self.accounts["telegram"]["id"]
+        )
+        self.assertEqual(len(result["decisions"]), 1)
+        self.assertEqual(self.provider.reads, 1)
+        self.assertEqual(self.provider.sends, 0)
+
+    async def test_approved_execution_honors_stop_and_attempts_once(self):
+        task = self.approved_task()
+        self.assertEqual(
+            (await self.call("run_approved_task", task_id=task["id"]))["processed"], []
+        )
+        self.assertEqual(self.provider.sends, 0)
+        self.engine.set_stop(False)
+        result = await self.call("run_approved_task", task_id=task["id"])
+        self.assertEqual(result["processed"][0]["status"], "confirmed")
+        self.assertEqual(self.provider.sends, 1)
+        with self.assertRaises(ToolError):
+            await self.call("run_approved_task", task_id=task["id"])
+        self.assertEqual(self.provider.sends, 1)
+
+    async def test_platform_errors_never_expose_private_values(self):
+        with patch.object(self.engine, "account_targets", side_effect=RuntimeError("secret-token")):
+            with self.assertRaises(ToolError) as error:
+                await self.call("discord_list_channels", account_id="one")
+        self.assertNotIn("secret-token", str(error.exception))
+        self.assertIn("RuntimeError", str(error.exception))
+
+    async def test_discord_channel_read_has_no_outbound_action(self):
+        result = await self.call("discord_list_channels", account_id=self.accounts["discord"]["id"])
+        self.assertEqual(len(result["targets"]), 1)
+        self.assertEqual(self.provider.sends, 0)
+
+    async def test_stdio_handshake_is_independent_of_client_directory(self):
+        project = Path(__file__).resolve().parents[1]
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m",
+                "auto_promotion.mcp_server",
+                "--project-dir",
+                str(project),
+                "--db",
+                str(Path(self.tmp.name) / "stdio.db"),
+                "--no-env",
+            ],
+            env={"PYTHONIOENCODING": "utf-8", "AUTO_PROMOTION_LIVE_WRITES": "0"},
+            cwd=self.tmp.name,
+        )
+        async with asyncio.timeout(30):
+            async with stdio_client(parameters) as (read, write):
+                async with ClientSession(read, write) as client:
+                    initialized = await client.initialize()
+                    self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
+                    self.assertEqual(len((await client.list_tools()).tools), 16)
+                    status = await client.call_tool("system_status", {})
+                    self.assertFalse(status.isError)
+                    value = status.structuredContent or json.loads(status.content[0].text)
+                    self.assertTrue(value["global_stop"])
+                    result = await client.call_tool("get_task", {"task_id": "absent"})
+                    self.assertTrue(result.isError)
+
+    async def test_generated_config_has_no_credentials(self):
+        config = client_config(self.tmp.name)
+        settings = config["mcpServers"]["auto-promotion"]
+        self.assertEqual(settings["command"], sys.executable)
+        self.assertIn(str(Path(self.tmp.name).resolve()), settings["args"])
+        self.assertNotIn("env", settings)

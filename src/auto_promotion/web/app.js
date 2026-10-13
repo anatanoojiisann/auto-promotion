@@ -10,6 +10,7 @@ const esc = (v) =>
   );
 const state = {
   accounts: [],
+  connections: [],
   overview: {},
   tasks: [],
   current: null,
@@ -20,6 +21,7 @@ const names = {
   reddit: "Reddit",
   instagram: "Instagram",
   x: "X",
+  discord: "Discord",
 };
 const actions = {
   discover: "搜索发现",
@@ -61,6 +63,35 @@ const phases = {
   discovered: "准备外发清单",
   review: "等待外发审批",
   ready: "执行与核验",
+};
+const connectionStages = {
+  connecting: "正在连接",
+  awaiting_login: "等待浏览器登录",
+  checking: "正在核验连接",
+  connected: "已连接 · 身份已核验",
+  needs_check: "登录已保存 · 需检查连接",
+  cancelled: "已取消连接",
+  interrupted: "连接被工作台重启中断",
+  error: "连接未完成",
+};
+const connectionErrors = {
+  InstagramIdentityMismatch: "令牌所属账号与填写的用户名不一致。",
+  InstagramRequestRejected:
+    "Instagram 拒绝了验证请求，请核对令牌、API 版本及应用权限。",
+  InstagramRateLimited: "Instagram 请求受到限流，请稍后再试。",
+  BrowserIdentityMismatch: "浏览器登录账号与填写的用户名不一致。",
+  ChangedIdentityRequiresNewAccountLabel:
+    "此本机标签已绑定另一身份，请使用新的账号标签。",
+  LoginWaitingTimedOut: "等待登录超时，请重新连接。",
+  LoginBrowserClosed: "登录浏览器已关闭，请重新连接。",
+  AccountBusy: "账号正被其他操作使用，请稍后再连接。",
+  DiscordInvalidToken:
+    "Bot Token 无效或已过期，请从 Discord 开发者后台重新获取。",
+  DiscordBotAccountRequired: "请使用官方 Bot Token。",
+  DiscordIdentityMismatch: "此标签绑定的 Bot 与当前 Token 不一致。",
+  DiscordRateLimited: "Discord 请求受到限流，请在冷却结束后重试。",
+  DiscordMissingPermissions: "Bot 缺少频道访问、发送或读取历史权限。",
+  DiscordTransportUnavailable: "无法连接 Discord，请检查本机网络。",
 };
 const fmt = (v) =>
   v
@@ -118,7 +149,7 @@ function badge(value) {
   return `<span class="badge ${color}">${esc(statuses[value] || value)}</span>`;
 }
 function platform(p) {
-  return `<span class="platform"><span class="platform-mark ${esc(p)}">${esc({ telegram: "TG", reddit: "R", instagram: "IG", x: "X" }[p])}</span>${esc(names[p])}</span>`;
+  return `<span class="platform"><span class="platform-mark ${esc(p)}">${esc({ telegram: "TG", reddit: "R", instagram: "IG", x: "X", discord: "DC" }[p])}</span>${esc(names[p])}</span>`;
 }
 function heading(title, desc, button = "") {
   return `<div class="page-heading"><div><h1>${title}</h1><p>${desc}</p></div>${button}</div>`;
@@ -146,11 +177,13 @@ function busy(button, fn) {
     });
 }
 async function refresh() {
-  [state.accounts, state.overview, state.tasks] = await Promise.all([
-    api("/accounts"),
-    api("/overview"),
-    api("/tasks"),
-  ]);
+  [state.accounts, state.overview, state.tasks, state.connections] =
+    await Promise.all([
+      api("/accounts"),
+      api("/overview"),
+      api("/tasks"),
+      api("/connections"),
+    ]);
   $("#write-mode").textContent = state.overview.live_writes
     ? "真实连接已启用"
     : "真实发布关闭";
@@ -199,9 +232,12 @@ function renderAccounts() {
     heading(
       "账号中心",
       "连接账号，确认能力，让每一次执行都有明确的身份。",
-      '<button id="new-account">添加账号</button>',
+      '<div class="actions"><button class="secondary" id="connect-discord">连接 Discord</button><button class="secondary" id="connect-instagram">连接 IG</button><button class="secondary" id="connect-x">连接 X</button><button id="new-account">添加账号</button></div>',
     ) +
-    `<div class="stats"><span class="stat"><strong>${state.accounts.length}</strong>已登记账号</span><span class="stat"><strong>${checked}</strong>通过身份核验</span><span class="stat"><strong>${state.accounts.filter((a) => a.mode === "live").length}</strong>真实账号</span></div><div class="toolbar"><div class="filter-tabs"><button class="selected" data-mode="all">全部账号</button><button data-mode="live">真实账号</button><button data-mode="simulation">模拟账号</button></div><span class="spacer"></span><button class="secondary compact" id="check-all">检查全部连接</button></div><div class="surface" id="account-list"></div><p class="connect-note">账号中心保留平台标签和健康状态。现有登录会话与凭据由各平台服务管理；模拟账号不会触达外部平台。</p>`;
+    `<div class="stats"><span class="stat"><strong>${state.accounts.length}</strong>已登记账号</span><span class="stat"><strong>${checked}</strong>通过身份核验</span><span class="stat"><strong>${state.accounts.filter((a) => a.mode === "live").length}</strong>真实账号</span></div><div id="connection-list"></div><div class="toolbar"><div class="filter-tabs"><button class="selected" data-mode="all">全部账号</button><button data-mode="live">真实账号</button><button data-mode="simulation">模拟账号</button></div><span class="spacer"></span><button class="secondary compact" id="check-all">检查全部连接</button></div><div class="surface" id="account-list"></div><p class="connect-note">Discord、IG 和 X 可在这里完成本机连接，身份核验后自动登记。登录不启用推广发布；外发仍按任务审批执行。</p>`;
+  $("#connect-instagram").onclick = () => connectionForm("instagram");
+  $("#connect-x").onclick = () => connectionForm("x");
+  $("#connect-discord").onclick = discordConnectionForm;
   $("#new-account").onclick = accountForm;
   $("#check-all").onclick = (e) =>
     busy(e.target, async () => {
@@ -221,12 +257,180 @@ function renderAccounts() {
       }),
   );
   accountRows("all");
+  connectionRows();
 }
+function connectionRows() {
+  const list = $("#connection-list");
+  if (!list) return;
+  list.innerHTML = state.connections
+    .slice(-4)
+    .reverse()
+    .map((job) => {
+      const account = state.accounts.find(
+        (a) =>
+          a.mode === "live" &&
+          a.platform === job.platform &&
+          a.backend_label === job.backend_label,
+      );
+      const recovered =
+        ["error", "cancelled", "needs_check", "interrupted"].includes(
+          job.stage,
+        ) &&
+        account?.status === "healthy" &&
+        account.checked_at >= job.created_at;
+      const stage = recovered ? "connected" : job.stage;
+      const active = ["connecting", "awaiting_login", "checking"].includes(
+        job.stage,
+      );
+      const help = recovered
+        ? "此前的登录流程已结束；该账号现已通过身份与连接核验。"
+        : job.stage === "awaiting_login"
+          ? "请在打开的独立浏览器中完成登录和验证，工作台会自动核验身份。"
+          : job.stage === "connected"
+            ? "账号已加入账号中心，可以创建任务。"
+            : job.stage === "needs_check"
+              ? "本机登录已保存，请使用账号行中的“检查”再次核验。"
+              : job.stage === "interrupted"
+                ? "工作台重启中断了连接，请检查账号或重新连接。"
+                : job.stage === "error"
+                  ? connectionErrors[job.reason] ||
+                    "连接未完成：" + (job.reason || "ConnectionFailed")
+                  : "";
+      return `<div class="banner ${stage === "error" || stage === "needs_check" ? "warning" : ""}"><div><strong>${esc(names[job.platform])} · @${esc(job.username)} — ${esc(connectionStages[stage] || stage)}</strong>${help ? `<p>${esc(help)}</p>` : ""}${job.instagram_user_id ? `<p>自有发布目标 ID：${esc(job.instagram_user_id)}</p>` : ""}</div>${active ? `<button class="secondary compact" data-cancel-connection="${esc(job.id)}">取消连接</button>` : ""}</div>`;
+    })
+    .join("");
+  document.querySelectorAll("[data-cancel-connection]").forEach((button) => {
+    button.onclick = () =>
+      busy(button, async () => {
+        await api(
+          `/connections/${button.dataset.cancelConnection}/cancel`,
+          "POST",
+        );
+        toast("正在取消连接");
+      });
+  });
+}
+function discordConnectionForm() {
+  openPanel(
+    "连接 Discord Bot",
+    `<form id="discord-connection-form"><p class="help">在 <a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">Discord 开发者后台</a> 创建 Bot，并由服务器管理员安装。授予查看频道、发送消息和读取消息历史权限；上传媒体还需附件权限。</p><div class="field-grid"><div class="full"><label for="discord-token">Discord Bot Token</label><input id="discord-token" name="bot_token" type="password" required autocomplete="off"><span class="help">只在本机保存；身份会自动核验。</span></div><div class="full"><label for="discord-label">本机账号标签</label><input id="discord-label" name="backend_label" value="discord-bot" required autocomplete="off"><span class="help">多个 Bot 使用不同标签；更新 Token 时填写原标签。</span></div></div><p class="help">发布范围为 Bot 已获授权的服务器内普通文字和公告频道，频道需对服务器成员公开。定时发送由工作台执行，届时电脑和服务需要运行。</p><div class="form-actions"><button type="submit">验证并连接 Discord</button></div></form>`,
+  );
+  $("#discord-connection-form").onsubmit = (event) => {
+    event.preventDefault();
+    const form = event.target;
+    const payload = {
+      platform: "discord",
+      bot_token: form.elements.bot_token.value,
+      backend_label: form.elements.backend_label.value.trim(),
+    };
+    form.elements.bot_token.value = "";
+    busy(event.submitter, async () => {
+      try {
+        await api("/connections", "POST", payload);
+        $("#panel").close();
+        await refresh();
+        renderAccounts();
+        toast("正在验证 Discord Bot 身份");
+      } finally {
+        delete payload.bot_token;
+      }
+    });
+  };
+}
+function connectionForm(selectedPlatform) {
+  const isInstagram = selectedPlatform === "instagram";
+  openPanel(
+    "连接 " + names[selectedPlatform],
+    `<form id="connection-form"><p class="help">${isInstagram ? '使用商业或创作者账号的 Instagram 用户访问令牌。可在 <a href="https://developers.facebook.com/apps/" target="_blank" rel="noreferrer">Meta 应用控制台</a> 的 Instagram API 设置中获取。个人账号需先由你在 Instagram 中切换为专业账号。' : "会打开本机独立浏览器，请在该窗口完成 X 登录。工作台自动核验用户名并保存登录。"}</p><div class="field-grid"><div class="full"><label for="connection-username">平台用户名</label><input id="connection-username" name="username" required autocomplete="off" placeholder="用户名，不含 @"></div>${isInstagram ? '<div class="full"><label for="connection-token">Instagram 用户访问令牌</label><input type="password" id="connection-token" name="access_token" required autocomplete="off"><span class="help">只在本机输入；令牌不会显示在连接状态或操作日志中。</span></div><div class="full"><label for="connection-version">Meta 应用 API 版本</label><input id="connection-version" name="api_version" placeholder="例如 v25.0，以应用控制台为准" pattern="v[0-9]+\\.[0-9]+" required></div>' : '<div class="full"><label for="connection-browser">登录浏览器</label><select id="connection-browser" name="browser_channel"><option value="chromium">Chromium</option><option value="msedge">Microsoft Edge</option></select><span class="help">使用独立登录窗口；Microsoft Edge 需已安装。</span></div>'}<div class="full"><label for="connection-label">本机账号标签（可选）</label><input id="connection-label" name="backend_label" autocomplete="off" placeholder="留空自动生成；已有账号填原标签"><span class="help">重新登录已有账号时填写账号原标签。</span></div></div><div class="form-actions"><button type="submit">${isInstagram ? "验证并连接 IG" : "打开 X 登录"}</button></div></form>`,
+  );
+  $("#connection-form").onsubmit = (event) => {
+    event.preventDefault();
+    const form = event.target;
+    const payload = {
+      platform: selectedPlatform,
+      username: form.elements.username.value.trim(),
+      ...(form.elements.backend_label.value.trim()
+        ? { backend_label: form.elements.backend_label.value.trim() }
+        : {}),
+      ...(isInstagram
+        ? {
+            access_token: form.elements.access_token.value,
+            api_version: form.elements.api_version.value.trim(),
+          }
+        : { browser_channel: form.elements.browser_channel.value }),
+    };
+    if (isInstagram) form.elements.access_token.value = "";
+    busy(event.submitter, async () => {
+      try {
+        await api("/connections", "POST", payload);
+        $("#panel").close();
+        await refresh();
+        renderAccounts();
+        toast(
+          isInstagram ? "正在验证 Instagram 身份" : "正在打开 X 登录浏览器",
+        );
+      } finally {
+        delete payload.access_token;
+      }
+    });
+  };
+}
+let connectionPolling = false;
+setInterval(async () => {
+  if (connectionPolling || !location.hash.startsWith("#accounts")) return;
+  if (
+    !state.connections.some((j) =>
+      ["connecting", "awaiting_login", "checking"].includes(j.stage),
+    )
+  )
+    return;
+  connectionPolling = true;
+  try {
+    const previous = state.connections.map((j) => j.stage).join(",");
+    state.connections = await api("/connections");
+    connectionRows();
+    if (state.connections.map((j) => j.stage).join(",") !== previous) {
+      await refresh();
+      if (location.hash.startsWith("#accounts") && $("#account-list")) {
+        accountRows(
+          document.querySelector("[data-mode].selected")?.dataset.mode || "all",
+        );
+      }
+    }
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    connectionPolling = false;
+  }
+}, 2000);
 function accountRows(mode) {
   const rows = state.accounts.filter((a) => mode === "all" || a.mode === mode);
   $("#account-list").innerHTML = rows.length
     ? `<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>账号 / 平台</th><th>连接状态</th><th>可接入能力</th><th>执行边界</th><th>操作</th></tr></thead><tbody>${rows.map((a) => `<tr><td>${platform(a.platform)}<span class="sub">${esc(a.label)} · ${a.mode === "simulation" ? "模拟" : "真实"}</span></td><td>${badge(a.status)}${a.disabled ? ' <span class="badge amber">已停用</span>' : ""}<span class="sub">${a.checked_at ? fmt(a.checked_at) : "尚未检查"}${a.cooldown_until > Date.now() / 1000 ? "<br>冷却至 " + fmt(a.cooldown_until) : ""}</span></td><td><div class="chips">${a.capabilities.map((c) => `<span class="chip">${actions[c] || c}</span>`).join("")}</div></td><td>${a.daily_limit} 条 / 日<span class="sub">间隔 ${a.min_interval} 秒</span></td><td><div class="actions"><button class="secondary compact" data-check="${a.id}">检查</button><button class="text-button" data-disable="${a.id}" data-value="${!a.disabled}">${a.disabled ? "启用" : "停用"}</button></div></td></tr>`).join("")}</tbody></table></div>`
     : empty("暂无账号", "添加现有平台账号，或创建模拟账号测试完整流程。");
+  for (const account of rows) {
+    const control = document.querySelector(`[data-disable="${account.id}"]`);
+    const hourly = document.createElement("span");
+    hourly.className = "sub";
+    hourly.textContent = `${account.hourly_limit} 条 / 小时`;
+    control.closest("tr").cells[3].append(hourly);
+    if (account.status === "unavailable" && account.health?.reason) {
+      const reason = document.createElement("span");
+      reason.className = "sub";
+      reason.textContent =
+        {
+          DuplicatePlatformIdentity: "同一平台身份已由另一账号标签绑定",
+          AccountIdentityChanged: "登录身份发生变化，请核对账号",
+          AccountIdentityUnavailable: "无法核对原绑定身份",
+        }[account.health.reason] || account.health.reason;
+      control.closest("tr").cells[1].append(reason);
+    }
+    const button = document.createElement("button");
+    button.className = "text-button";
+    button.textContent = "编辑";
+    button.onclick = () => editAccountForm(account);
+    control.insertAdjacentElement("beforebegin", button);
+  }
   document.querySelectorAll("[data-check]").forEach(
     (b) =>
       (b.onclick = () =>
@@ -254,6 +458,27 @@ function accountRows(mode) {
         })),
   );
 }
+function editAccountForm(account) {
+  openPanel(
+    "编辑账号",
+    `<form id="edit-account-form"><p class="help">平台与本机账号标签保持不变。已被未结束任务使用的账号需先结束旧任务。</p><div class="field-grid"><div class="full"><label>显示名称<input name="label" value="${esc(account.label)}" required maxlength="80"></label></div><div><label>每日限额<input name="daily_limit" type="number" value="${account.daily_limit}" min="1" max="100" required></label></div><div><label>每小时限额<input name="hourly_limit" type="number" value="${account.hourly_limit}" min="1" max="20" required></label></div><div><label>最小间隔（秒）<input name="min_interval" type="number" value="${account.min_interval}" min="${account.mode === "live" ? 120 : 0}" max="86400" required></label></div></div><div class="form-actions"><button type="submit">保存账号</button></div></form>`,
+  );
+  $("#edit-account-form").onsubmit = (event) => {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    busy(event.submitter, async () => {
+      await api(`/accounts/${account.id}`, "PATCH", {
+        label: form.get("label"),
+        daily_limit: Number(form.get("daily_limit")),
+        hourly_limit: Number(form.get("hourly_limit")),
+        min_interval: Number(form.get("min_interval")),
+      });
+      $("#panel").close();
+      await refresh();
+      renderAccounts();
+    });
+  };
+}
 function accountForm() {
   openPanel(
     "添加平台账号",
@@ -263,7 +488,7 @@ function accountForm() {
       .map(([k, v]) => `<option value="${k}">${v}</option>`)
       .join(
         "",
-      )}</select></div><div><label for="mode">连接方式</label><select name="mode" id="mode"><option value="live">现有真实账号</option><option value="simulation">模拟账号 · 无外部操作</option></select></div><div><label for="label">显示名称</label><input name="label" id="label" required placeholder="例如：品牌运营账号"></div><div><label for="backend-label">平台账号标签</label><input name="backend_label" id="backend-label" required placeholder="现有服务的账号标签或用户名"><span class="help">Telegram 使用服务标签；Instagram 使用用户名。</span></div><div><label for="daily">每日限额</label><input name="daily_limit" id="daily" type="number" value="5" min="1" max="100" required></div><div><label for="interval">最小间隔（秒）</label><input name="min_interval" id="interval" type="number" value="120" min="0" required></div></div><div class="form-error" id="account-error" role="alert"></div><div class="form-actions"><button type="submit">保存账号</button></div></form>`,
+      )}</select></div><div><label for="mode">连接方式</label><select name="mode" id="mode"><option value="live">本机真实账号</option><option value="simulation">模拟账号 · 无外部操作</option></select></div><div><label for="label">显示名称</label><input name="label" id="label" required placeholder="例如：品牌运营账号"></div><div><label for="backend-label">平台账号标签</label><input name="backend_label" id="backend-label" required placeholder="例如：brand-telegram"><span class="help">先在本机完成账号登录，再填写登录时使用的相同标签。</span></div><div><label for="daily">每日限额</label><input name="daily_limit" id="daily" type="number" value="5" min="1" max="100" required></div><div><label for="interval">最小间隔（秒）</label><input name="min_interval" id="interval" type="number" value="120" min="0" required></div></div><div class="form-error" id="account-error" role="alert"></div><div class="form-actions"><button type="submit">保存账号</button></div></form>`,
   );
   $("#account-form").onsubmit = (e) => {
     e.preventDefault();
@@ -340,6 +565,10 @@ function taskForm() {
     "创建推广任务",
     `<form id="task-form"><div class="field-grid"><div class="full"><label for="task-name">任务名称</label><input id="task-name" name="name" required placeholder="例如：AI 视频创作者互动 · 第一批"></div><fieldset class="full"><legend>选择执行账号</legend>${state.accounts.map((a) => `<label class="checkbox-label"><input type="checkbox" name="accounts" value="${a.id}">${esc(a.label)} · ${names[a.platform]} · ${a.mode === "simulation" ? "模拟" : "真实"}</label>`).join("")}</fieldset><div class="full"><label for="queries">发现主题（每行一个）</label><textarea id="queries" name="queries" placeholder="AI video creation" rows="2"></textarea></div><div><label for="required">必需关键词（逗号分隔）</label><input id="required" name="required" placeholder="AI, video"></div><div><label for="blocked">排除关键词（逗号分隔）</label><input id="blocked" name="blocked" placeholder="airdrop, giveaway"></div><div><label for="starts">执行开始时间</label><input id="starts" name="starts" type="datetime-local" value="${isoLocal(now)}" required></div><div><label for="ends">执行结束时间</label><input id="ends" name="ends" type="datetime-local" value="${isoLocal(now + 86400000)}" required></div><div><label for="languages">允许语言</label><input id="languages" name="languages" value="en, zh" required></div><div><label for="candidates">最多候选数</label><input id="candidates" name="candidates" type="number" min="1" max="200" value="20" required></div><div><label for="task-daily">每日外发限额</label><input id="task-daily" name="daily" type="number" value="5" min="1" max="100" required></div><div><label for="task-interval">最小间隔（秒）</label><input id="task-interval" name="interval" type="number" value="120" min="0" required></div></div><details><summary>更多发现边界</summary><div class="field-grid"><div><label>最低成员数<input name="min_members" type="number" value="0" min="0"></label></div><div><label>最低活跃度<input name="min_activity" type="number" value="0" min="0"></label></div><div><label>最低置信度<input name="confidence" type="number" value="0.8" min="0.5" max="1" step="0.05"></label></div><div><label>最多 Telegram 入群数<input name="max_joins" type="number" value="0" min="0" max="20"></label></div><div class="full"><label>目标白名单（每行一个，空白表示使用发现政策）<textarea name="targets" rows="2"></textarea></label></div></div></details><p class="help">仅公开目标。输入时间使用浏览器本地时区，保存时转换为明确的 UTC 时间；任务详情统一显示北京时间。</p><div class="form-actions"><button type="submit">创建并预览发现政策</button></div></form>`,
   );
+  $("#task-form fieldset").insertAdjacentHTML(
+    "afterend",
+    '<div class="full"><label for="ordering-mode">多账号执行方式</label><select id="ordering-mode" name="ordering_mode"><option value="independent_accounts">各账号独立执行</option><option value="strict">严格按清单顺序</option></select><span class="help">独立执行时，一个账号冷却不会挡住其他账号；同一账号仍按清单顺序执行。</span></div>',
+  );
   $("#task-form").onsubmit = (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -367,6 +596,7 @@ function taskForm() {
           starts_at: new Date(f.get("starts")).toISOString(),
           ends_at: new Date(f.get("ends")).toISOString(),
           min_interval: Number(f.get("interval")),
+          ordering_mode: f.get("ordering_mode"),
           daily_limit: Number(f.get("daily")),
           target_allowlist: split("targets"),
         },
@@ -519,7 +749,7 @@ function approvalForm(t, stage, phrase) {
 }
 function itemPreview(i) {
   const p = i.payload;
-  return `<article class="item-preview"><div class="item-head"><strong>${i.position + 1}. ${esc(p.account_label)} · ${actions[p.action] || esc(p.action)}</strong>${badge(i.status)}</div><div class="item-meta"><span>目标：${esc(p.target)}</span><span>${fmt(p.scheduled_at)} UTC+08:00</span></div>${p.title ? `<h3>${esc(p.title)}</h3>` : ""}${p.text ? `<div class="item-text">${esc(p.text)}</div>` : ""}${p.media.length ? '<p class="help">媒体：' + p.media.map((m) => esc(m.filename) + " · " + esc(m.sha256.slice(0, 12))).join("，") + "</p>" : ""}${i.external_reference ? '<p class="help">回执：<code>' + esc(i.external_reference) + "</code></p>" : ""}${i.result.reason ? '<p class="help">' + esc(i.result.reason) + "</p>" : ""}<div class="actions">${["unknown", "scheduled"].includes(i.status) ? `<button class="text-button" data-reconcile="${i.id}">只读核对结果</button>` : ""}${i.status === "manual_attention" ? `<button class="text-button" data-manual="${i.id}">登记人工发布结果</button>` : ""}</div></article>`;
+  return `<article class="item-preview"><div class="item-head"><strong>${i.position + 1}. ${esc(p.account_label)} · ${actions[p.action] || esc(p.action)}</strong>${badge(i.status)}</div><div class="item-meta"><span>目标：${esc(p.target)}</span>${p.discord_reply_to ? `<span>回复消息 ID：${esc(p.discord_reply_to)}</span>` : ""}<span>${fmt(p.scheduled_at)} UTC+08:00</span></div>${p.title ? `<h3>${esc(p.title)}</h3>` : ""}${p.text ? `<div class="item-text">${esc(p.text)}</div>` : ""}${p.media.length ? '<p class="help">媒体：' + p.media.map((m) => esc(m.filename) + " · " + esc(m.sha256.slice(0, 12))).join("，") + "</p>" : ""}${i.external_reference ? '<p class="help">回执：<code>' + esc(i.external_reference) + "</code></p>" : ""}${i.result.reason ? '<p class="help">' + esc(i.result.reason) + "</p>" : ""}<div class="actions">${["unknown", "scheduled"].includes(i.status) ? `<button class="text-button" data-reconcile="${i.id}">只读核对结果</button>` : ""}${i.status === "manual_attention" ? `<button class="text-button" data-manual="${i.id}">登记人工发布结果</button>` : ""}</div></article>`;
 }
 function itemEditor(t) {
   let items = t.items.map((i) => {
@@ -544,12 +774,26 @@ function itemEditor(t) {
         Math.max(Date.now() + 60000, new Date(t.policy.starts_at).getTime()),
       ).toISOString(),
       reply_to: null,
+      discord_reply_to: "",
       recipient_id: "",
       target_owned: false,
     };
   }
   if (!items.length) items.push(blank());
   openPanel("编辑执行清单", "");
+  function targetField(p, n) {
+    if (
+      state.accounts.find((a) => a.id === p.account_id).platform !== "discord"
+    )
+      return `<label>目标<input name="target" value="${esc(p.target)}" placeholder="群组 @username、帖子链接、社区名称或自有账号 ID" required></label>`;
+    return `<label for="discord-channel-${n}">Discord 频道</label><select id="discord-channel-${n}" name="target" required><option value="">请读取并选择已授权频道</option>${p.target ? `<option selected value="${esc(p.target)}">频道 ${esc(p.target)}</option>` : ""}</select><button class="secondary compact" type="button" data-discord-targets="${n}">读取已授权频道</button><p class="help" data-target-note="${n}">仅列出服务器成员可见且 Bot 可发送的频道。计划时间由本机调度。</p>`;
+  }
+  function replyField(p) {
+    return state.accounts.find((a) => a.id === p.account_id).platform ===
+      "discord"
+      ? `<label>Discord 原消息 ID（回复时）<input name="discord_reply_to" type="text" inputmode="numeric" pattern="[1-9][0-9]{0,19}" value="${esc(p.discord_reply_to || "")}" placeholder="完整消息 ID"></label>`
+      : `<label>Telegram 原消息 ID（回复时）<input name="reply_to" type="number" min="1" value="${p.reply_to || ""}"></label>`;
+  }
   function draw() {
     const container = $("#panel-content");
     container.innerHTML = `<form id="items-form"><p class="help">保存后仍可编辑；冻结清单后，任何修改都需要新任务。</p>${items
@@ -564,7 +808,7 @@ function itemEditor(t) {
             )
             .join(
               "",
-            )}</select></label></div><div class="full"><label>目标<input name="target" value="${esc(p.target)}" placeholder="群组 @username、帖子链接、社区名称或自有账号 ID" required></label></div><div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div><label>Telegram 原消息 ID（回复时）<input name="reply_to" type="number" min="1" value="${p.reply_to || ""}"></label></div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 发布必须勾选）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · 最大 50 MB</p>${p.media.map((m, j) => `<label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
+            )}</select></label></div><div class="full">${targetField(p, n)}</div><div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div>${replyField(p)}</div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 发布必须勾选）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · ${state.accounts.find((a) => a.id === p.account_id).platform === "discord" ? "单文件最多 10 MiB，合计最多 25 MiB" : "最大 50 MB"}</p>${p.media.map((m, j) => `<label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
       )
       .join(
         "",
@@ -578,7 +822,10 @@ function itemEditor(t) {
         p.scheduled_at = new Date(
           row.querySelector("[name=scheduled_at]").value,
         ).toISOString();
-        p.reply_to = Number(row.querySelector("[name=reply_to]").value) || null;
+        p.reply_to =
+          Number(row.querySelector("[name=reply_to]")?.value) || null;
+        p.discord_reply_to =
+          row.querySelector("[name=discord_reply_to]")?.value.trim() || "";
         p.target_owned = row.querySelector("[name=target_owned]").checked;
         row
           .querySelectorAll("[data-source]")
@@ -601,9 +848,41 @@ function itemEditor(t) {
           items[index].action = state.accounts
             .find((a) => a.id === el.value)
             .capabilities.find((c) => !["discover", "join"].includes(c));
+          items[index].target = "";
+          items[index].reply_to = null;
+          items[index].discord_reply_to = "";
           draw();
         }),
     );
+    container.querySelectorAll("[data-discord-targets]").forEach((button) => {
+      button.onclick = () =>
+        busy(button, async () => {
+          collect();
+          const n = Number(button.dataset.discordTargets),
+            p = items[n];
+          const result = await api(`/accounts/${p.account_id}/targets`);
+          const targets = result.targets.filter(
+            (c) =>
+              !t.policy.target_allowlist.length ||
+              t.policy.target_allowlist.includes(c.id),
+          );
+          const select = button
+            .closest("[data-index]")
+            .querySelector("[name=target]");
+          select.innerHTML =
+            '<option value="">请选择频道</option>' +
+            targets
+              .map(
+                (c) =>
+                  `<option value="${esc(c.id)}" ${c.id === p.target ? "selected" : ""}>${esc(c.guild_name)} / #${esc(c.name)}${c.can_attach ? "" : "（无附件权限）"}${c.can_reply ? "" : "（公告频道，不能回复）"}</option>`,
+              )
+              .join("");
+          container.querySelector(`[data-target-note="${n}"]`).textContent =
+            targets.length
+              ? `已读取 ${targets.length} 个批准范围内频道。${result.truncated ? "目录未全部读取；请缩小服务器规模后重试。" : ""}`
+              : "暂无可用频道。请确认管理员已安装 Bot 并授予查看、发送和历史权限，且频道在任务白名单内。";
+        });
+    });
     container.querySelectorAll("[data-remove]").forEach(
       (b) =>
         (b.onclick = () => {
@@ -623,6 +902,76 @@ function itemEditor(t) {
       items.push(p);
       draw();
     };
+    if (t.account_snapshot.length > 1) {
+      $("#append-item").insertAdjacentHTML(
+        "afterend",
+        '<button class="secondary" type="button" id="rotate-accounts">同平台账号轮流分配</button><button class="secondary" type="button" id="match-accounts">按已筛选目标匹配账号</button>',
+      );
+      const eligible = (item) => {
+        const current = state.accounts.find(
+          (account) => account.id === item.account_id,
+        );
+        return t.account_snapshot.filter((snapshot) => {
+          const account = state.accounts.find(
+            (entry) => entry.id === snapshot.id,
+          );
+          return (
+            account?.platform === current?.platform &&
+            account.status === "healthy" &&
+            !account.disabled &&
+            account.capabilities.includes(item.action)
+          );
+        });
+      };
+      $("#rotate-accounts").onclick = () => {
+        collect();
+        const cursors = new Map();
+        let assigned = 0;
+        for (const item of items) {
+          const accounts = eligible(item);
+          if (!accounts.length) continue;
+          const key = `${accounts[0].platform}:${item.action}`;
+          const index = cursors.get(key) || 0;
+          item.account_id = accounts[index % accounts.length].id;
+          cursors.set(key, index + 1);
+          assigned += 1;
+        }
+        draw();
+        toast(`已轮流分配 ${assigned} 个执行项，请核对账号与目标。`);
+      };
+      $("#match-accounts").onclick = () => {
+        collect();
+        const counts = new Map();
+        let assigned = 0;
+        for (const item of items) {
+          const candidates = new Set(
+            t.candidates
+              .filter(
+                (candidate) =>
+                  candidate.decision === "qualified" &&
+                  !["unknown", "pending_admin_approval", "executing"].includes(
+                    candidate.state,
+                  ) &&
+                  candidate.target.toLowerCase() === item.target.toLowerCase(),
+              )
+              .map((candidate) => candidate.account_id),
+          );
+          const accounts = eligible(item).filter((account) =>
+            candidates.has(account.id),
+          );
+          if (!accounts.length) continue;
+          accounts.sort(
+            (left, right) =>
+              (counts.get(left.id) || 0) - (counts.get(right.id) || 0),
+          );
+          item.account_id = accounts[0].id;
+          counts.set(item.account_id, (counts.get(item.account_id) || 0) + 1);
+          assigned += 1;
+        }
+        draw();
+        toast(`已按目标匹配 ${assigned} 个执行项；未匹配的项目保留原账号。`);
+      };
+    }
     container.querySelectorAll("[data-upload]").forEach(
       (el) =>
         (el.onchange = async () => {
@@ -712,10 +1061,10 @@ async function renderAPI() {
   $("#main").innerHTML =
     heading(
       "API 中心",
-      "统一平台能力与调用记录，连接现有服务和新的任务流程。",
+      "五个平台后端随项目安装，统一查看本机能力与调用记录。",
       '<a href="/docs" target="_blank" rel="noopener">OpenAPI 文档 ↗</a>',
     ) +
-    `<div class="surface"><div class="section-header"><h2>平台适配器</h2><span class="badge">${services.filter((s) => s.installed).length} / 4 已发现源码</span></div>${services.map((s) => `<div class="service-row"><div>${platform(s.platform)}<p>${esc(s.transport)}</p></div><div><div class="chips">${s.capabilities.map((c) => `<span class="chip">${actions[c]}</span>`).join("")}</div><p>${esc(s.project)}</p></div><div class="service-status">${s.installed ? '<span class="badge green">已接入实现</span>' : '<span class="badge red">项目缺失</span>'}<p>${s.live_configured ? "真实执行配置就绪" : "真实执行尚未接管"}</p></div></div>`).join("")}</div><div class="two-col"><div class="surface padded"><h2>统一接口</h2><div class="log-row"><span><span class="method">GET</span><code>/api/accounts</code></span><span>账号与能力</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks</code></span><span>创建任务</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/approve/{stage}</code></span><span>精确审批</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/run</code></span><span>执行一轮</span></div><div class="log-row"><span><span class="method">GET</span><code>/api/audit</code></span><span>审计记录</span></div><p class="help mt-16">写入只能通过批准的任务路径。API 凭据由本机配置管理，不在页面展示。</p></div><div class="surface padded"><h2>运行边界</h2><div class="log-row"><span>存储</span><span>${esc(state.overview.storage)}</span></div><div class="log-row"><span>调度</span><span>${state.overview.worker ? "后台 worker" : "手动触发"}</span></div><div class="log-row"><span>未知结果</span><span>只读核对，不自动重发</span></div><div class="log-row"><span>外部发布</span><span>${state.overview.live_writes ? "按账号和任务权限执行" : "关闭；模拟流程可执行"}</span></div></div></div><div class="surface mt-24"><div class="section-header"><h2>最近平台调用</h2><button class="secondary compact" id="refresh-api">刷新</button></div>${
+    `<div class="surface"><div class="section-header"><h2>平台适配器</h2><span class="badge">${services.filter((s) => s.installed).length} / ${services.length} 已集成后端</span></div>${services.map((s) => `<div class="service-row"><div>${platform(s.platform)}<p>${esc(s.transport)}</p></div><div><div class="chips">${s.capabilities.map((c) => `<span class="chip">${actions[c]}</span>`).join("")}</div><p>${esc(s.project)}</p></div><div class="service-status">${s.installed ? '<span class="badge green">后端已安装</span>' : '<span class="badge red">后端缺失</span>'}<p>${s.dependencies_ready === false ? "依赖未安装，请运行 install.ps1" : s.live_configured ? "已启用；账号需通过连接检查" : "依赖就绪；真实执行未启用"}</p></div></div>`).join("")}</div><div class="two-col"><div class="surface padded"><h2>统一接口</h2><div class="log-row"><span><span class="method">GET</span><code>/api/accounts</code></span><span>账号与能力</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks</code></span><span>创建任务</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/approve/{stage}</code></span><span>精确审批</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/run</code></span><span>执行一轮</span></div><div class="log-row"><span><span class="method">GET</span><code>/api/audit</code></span><span>审计记录</span></div><p class="help mt-16">写入只能通过批准的任务路径。API 凭据由本机配置管理，不在页面展示。</p></div><div class="surface padded"><h2>运行边界</h2><div class="log-row"><span>存储</span><span>${esc(state.overview.storage)}</span></div><div class="log-row"><span>调度</span><span>${state.overview.worker ? "后台 worker" : "手动触发"}</span></div><div class="log-row"><span>未知结果</span><span>只读核对，不自动重发</span></div><div class="log-row"><span>外部发布</span><span>${state.overview.live_writes ? "按账号和任务权限执行" : "关闭；模拟流程可执行"}</span></div></div></div><div class="surface mt-24"><div class="section-header"><h2>最近平台调用</h2><button class="secondary compact" id="refresh-api">刷新</button></div>${
       calls.length
         ? `<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>时间</th><th>平台</th><th>操作</th><th>结果</th><th>耗时</th><th>错误类型</th></tr></thead><tbody>${calls
             .slice(0, 40)

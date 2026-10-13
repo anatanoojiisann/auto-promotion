@@ -17,12 +17,14 @@ CREATE TABLE IF NOT EXISTS accounts(
  mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'unchecked', health TEXT NOT NULL DEFAULT '{}',
  checked_at REAL, cooldown_until REAL NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
  daily_limit INTEGER NOT NULL, hourly_limit INTEGER NOT NULL, min_interval INTEGER NOT NULL,
- disabled INTEGER NOT NULL DEFAULT 0, UNIQUE(platform,backend_label,mode)
+ disabled INTEGER NOT NULL DEFAULT 0, identity_hash TEXT,
+ UNIQUE(platform,backend_label,mode)
 );
 CREATE TABLE IF NOT EXISTS tasks(
  id TEXT PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL, account_ids TEXT NOT NULL,
  account_snapshot TEXT NOT NULL, policy TEXT NOT NULL, policy_hash TEXT NOT NULL,
  state TEXT NOT NULL DEFAULT 'draft', phase TEXT NOT NULL DEFAULT 'discovery',
+ next_at REAL NOT NULL DEFAULT 0,
  manifest TEXT, manifest_hash TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS approvals(
@@ -57,6 +59,11 @@ CREATE TABLE IF NOT EXISTS calls(
 );
 CREATE INDEX IF NOT EXISTS items_due ON items(status,due_at);
 CREATE INDEX IF NOT EXISTS attempts_limits ON attempts(account_id,started_at);
+CREATE TABLE IF NOT EXISTS connection_jobs(
+ id TEXT PRIMARY KEY, platform TEXT NOT NULL, username TEXT NOT NULL,
+ backend_label TEXT NOT NULL, stage TEXT NOT NULL, created_at REAL NOT NULL,
+ details TEXT NOT NULL DEFAULT '{}'
+);
 CREATE TABLE IF NOT EXISTS join_attempts(
  id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(id),
  account_id TEXT NOT NULL, task_id TEXT NOT NULL, target_key TEXT NOT NULL,
@@ -76,6 +83,15 @@ class Store:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            # Existing workspaces predate identity binding and task-wide pacing.
+            if "identity_hash" not in {r[1] for r in db.execute("PRAGMA table_info(accounts)")}:
+                db.execute("ALTER TABLE accounts ADD COLUMN identity_hash TEXT")
+            if "next_at" not in {r[1] for r in db.execute("PRAGMA table_info(tasks)")}:
+                db.execute("ALTER TABLE tasks ADD COLUMN next_at REAL NOT NULL DEFAULT 0")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS accounts_identity_unique "
+                "ON accounts(platform,identity_hash,mode) WHERE identity_hash IS NOT NULL"
+            )
         Path(self.path).chmod(0o600)
 
     @contextmanager

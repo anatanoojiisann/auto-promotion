@@ -10,7 +10,7 @@ def load_environment(path):
     path = Path(path)
     if not path.is_file():
         return
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         key, separator, value = line.strip().removeprefix("export ").partition("=")
         if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
             continue
@@ -26,6 +26,7 @@ PROJECTS = {
     "reddit": "reddit-engagement-workflow",
     "instagram": "meta-social-engagement",
     "x": "x-engagement",
+    "discord": "discord-bot",
 }
 
 
