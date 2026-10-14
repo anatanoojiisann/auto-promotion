@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..models import epoch
-from .common import BackendError, read_profile, save_profile
+from .common import BackendError, observed_timestamp, read_profile, save_profile
 
 VIEW = 1 << 10
 SEND = 1 << 11
@@ -388,7 +388,12 @@ class DiscordBackend:
             and str(observed.get("message_reference", {}).get("message_id", ""))
             == item.get("discord_reply_to", "")
         )
-        return {**receipt, "status": "confirmed" if verified else "unknown", "verified": verified}
+        return {
+            **receipt,
+            "status": "confirmed" if verified else "unknown",
+            "verified": verified,
+            "published_at": observed_timestamp(observed.get("timestamp")) if verified else None,
+        }
 
 
 def call(label, operation, payload, checkpoint, authorize):

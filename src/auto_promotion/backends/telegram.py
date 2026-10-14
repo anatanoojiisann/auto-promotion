@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import time
 from datetime import datetime, timedelta, timezone
 
 from .common import (
     BackendError,
     language_evidence,
+    observed_timestamp,
     profile_path,
     read_profile,
     save_profile,
@@ -129,6 +131,10 @@ class TelegramBackend:
                 return await self.discover(client, payload["policy"])
             if operation in {"join", "verify_join"}:
                 return await self.membership(client, operation, payload, checkpoint, authorize)
+            if operation == "feedback":
+                return await self.feedback(client, payload)
+            if operation == "content":
+                return await self.content(client, payload)
             return await self.outbound(client, operation, payload, checkpoint, authorize)
         except Exception as exc:
             from telethon import errors
@@ -217,6 +223,44 @@ class TelegramBackend:
             "candidates": list(rows.values()),
             "source_note": "公开群资料及最近24小时样本；语言证据不足的候选保守拒绝",
         }
+
+    async def content(self, client, payload):
+        from telethon import utils
+
+        entity = await client.get_entity(self.target(payload["target"]))
+        if not getattr(entity, "username", None) or not getattr(entity, "megagroup", False):
+            raise BackendError("PublicTelegramGroupRequired")
+        limit = int(payload.get("limit", 200))
+        if not 1 <= limit <= 1000:
+            raise BackendError("InvalidContentLimit")
+        messages = await client.get_messages(entity, limit=limit + 1)
+        items = []
+        for message in messages[:limit]:
+            text = getattr(message, "message", "") or ""
+            if not text.strip() or getattr(message, "out", False):
+                continue
+            language, confidence = language_evidence(text)
+            items.append(
+                {
+                    "platform": "telegram",
+                    "external_id": str(message.id),
+                    "native_target_id": str(utils.get_peer_id(entity)),
+                    "target": "@" + entity.username,
+                    "action": "reply",
+                    "reply_to": message.id,
+                    "author_id": str(getattr(message, "sender_id", "") or ""),
+                    "title": text[:100],
+                    "context": text[:40000],
+                    "language": language,
+                    "confidence": confidence,
+                    "is_public": True,
+                    "permission": "unknown",
+                    "published_at": message.date.isoformat()
+                    if getattr(message, "date", None)
+                    else None,
+                }
+            )
+        return {"content_items": items, "truncated": len(messages) > limit}
 
     async def membership(self, client, operation, payload, checkpoint, authorize):
         from telethon import errors, functions
@@ -337,6 +381,9 @@ class TelegramBackend:
             second = await client(functions.messages.GetScheduledHistoryRequest(entity, 0))
             lookup = [m.id for m in second.messages if message_matches(m, item, scheduled=True)]
             active = matched and set(ids) <= set(lookup)
+            expected = datetime.fromisoformat(item["scheduled_at"].replace("Z", "+00:00"))
+            if operation == "verify" and not active and expected <= datetime.now(timezone.utc):
+                return await self.scheduled_delivery(client, entity, item, result, expected)
             return {
                 **result,
                 "status": "scheduled" if active else "unknown",
@@ -353,7 +400,116 @@ class TelegramBackend:
             observed = [observed]
         by_id = {m.id: m for m in observed if m}
         verified = all(i in by_id and message_matches(by_id[i], item) for i in ids)
-        return {**result, "status": "confirmed" if verified else "unknown", "verified": verified}
+        dates = [observed_timestamp(getattr(m, "date", None)) for m in by_id.values()]
+        published = min(dates) if dates and all(d is not None for d in dates) else None
+        return {
+            **result,
+            "status": "confirmed" if verified else "unknown",
+            "verified": verified,
+            "published_at": published if verified else None,
+        }
+
+    async def scheduled_delivery(self, client, entity, item, receipt, expected):
+        # Queue IDs belong to a different ID sequence. Confirm one unique sent
+        # message, including the server's from_scheduled flag, in a bounded window.
+        if item["media"]:
+            return {
+                **receipt,
+                "status": "unknown",
+                "verified": False,
+                "reason": "scheduled_media_delivery_requires_receipt_mapping",
+            }
+        lower, upper = expected - timedelta(minutes=2), expected + timedelta(minutes=2)
+        history = await client.get_messages(entity, limit=201, offset_date=upper)
+        if len(history) >= 201 and getattr(history[-1], "date", upper) > lower:
+            return {
+                **receipt,
+                "status": "unknown",
+                "verified": False,
+                "reason": "scheduled_delivery_lookup_truncated",
+            }
+        candidates = [
+            m
+            for m in history
+            if message_matches(m, item)
+            and getattr(m, "from_scheduled", False)
+            and getattr(m, "date", None)
+            and lower <= m.date < upper
+        ]
+        if len(candidates) != 1:
+            return {
+                **receipt,
+                "status": "unknown",
+                "verified": False,
+                "reason": "scheduled_delivery_not_unique",
+            }
+        message_id = candidates[0].id
+        observed = await client.get_messages(entity, ids=[message_id])
+        matches = [
+            m
+            for m in observed
+            if m
+            and m.id == message_id
+            and message_matches(m, item)
+            and getattr(m, "from_scheduled", False)
+            and getattr(m, "date", None)
+            and lower <= m.date < upper
+        ]
+        if len(matches) != 1:
+            return {
+                **receipt,
+                "status": "unknown",
+                "verified": False,
+                "reason": "scheduled_delivery_not_verified",
+            }
+        return {
+            "status": "confirmed",
+            "verified": True,
+            "scheduled_message_ids": receipt["message_ids"],
+            "message_ids": [message_id],
+            "published_at": observed_timestamp(matches[0].date),
+            "external_reference": f"telegram:{item['target']}:{message_id}",
+            "reason": "scheduled_delivery_verified",
+        }
+
+    async def feedback(self, client, payload):
+        item, result = payload["payload"], payload["result"]
+        entity = await client.get_entity(self.target(item["target"]))
+        ids = result.get("message_ids", [])
+        if len(ids) != 1:
+            return {"verified": False, "reason": "feedback_requires_verified_message_id"}
+        parent_id = ids[0]
+        observed = await client.get_messages(entity, ids=[parent_id])
+        if len(observed) != 1 or not message_matches(observed[0], item):
+            return {"verified": False, "reason": "feedback_parent_not_verified"}
+        checked_through = time.time()
+        cursor = max(int(payload.get("feedback_cursor", 0)), parent_id)
+        messages = [
+            m async for m in client.iter_messages(entity, min_id=cursor, reverse=True, limit=1001)
+        ]
+        complete = len(messages) < 1001
+        events = []
+        for message in messages[:1000]:
+            occurred = observed_timestamp(getattr(message, "date", None))
+            if occurred is None:
+                complete = False
+                break
+            if occurred > checked_through:
+                break
+            cursor = max(cursor, message.id)
+            if (
+                getattr(message, "reply_to_msg_id", None) == parent_id
+                and not getattr(message, "out", False)
+                and str(getattr(message, "sender_id", "")) != self.settings["identity"]
+            ):
+                events.append({"event_id": f"{entity.id}:{message.id}", "occurred_at": occurred})
+        return {
+            "verified": True,
+            "feedback_events": events,
+            "feedback_checked_through": checked_through,
+            "feedback_cursor": cursor,
+            "feedback_status": "complete" if complete else "partial",
+        }
 
 
 def call(label, operation, payload, checkpoint, authorize):

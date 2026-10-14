@@ -9,10 +9,24 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 
 from ..config import database_path
 from ..models import PLATFORMS, canonical, digest, epoch
+
+
+def observed_timestamp(value):
+    if isinstance(value, datetime):
+        return value.timestamp() if value.tzinfo else None
+    if isinstance(value, str):
+        try:
+            return epoch(value)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return None
 
 
 class BackendError(RuntimeError):
@@ -176,6 +190,12 @@ def verify_claim(request):
         stop = db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()
         if not task or task["state"] != "active" or not stop or stop[0] != "0":
             raise BackendError("ExecutionStopped")
+        if "campaign_id" in task.keys() and task["campaign_id"]:
+            campaign = db.execute(
+                "SELECT state FROM campaigns WHERE id=?", (task["campaign_id"],)
+            ).fetchone()
+            if not campaign or campaign[0] in {"paused", "cancelled"}:
+                raise BackendError("ExecutionStopped")
         policy = Engine._integrity(None, db, task, "discovery_join" if join else "outbound")
         now = time.time()
         if not epoch(policy["starts_at"]) <= now < epoch(policy["ends_at"]):
@@ -192,6 +212,24 @@ def verify_claim(request):
             if row["attempt_id"] != payload.get("attempt_id"):
                 raise BackendError("InvalidExecutionClaim")
             item = json.loads(row["payload"])
+            if item.get("execution_mode") == "manual":
+                raise BackendError("ManualActionMustNotUseBackend")
+            if account["platform"] in {"x", "reddit"}:
+                raise BackendError("PlatformAutomationNotEnabled")
+            if item.get("opportunity_id"):
+                from ..planner import execution_mode
+
+                source = db.execute(
+                    "SELECT payload FROM opportunities WHERE id=?", (item["opportunity_id"],)
+                ).fetchone()
+                if (
+                    not source
+                    or execution_mode(dict(account), json.loads(source[0]))[0] != "automatic"
+                ):
+                    raise BackendError("TargetPermissionRevoked")
+                content = json.loads(source[0])
+                if content.get("expires_at") and now >= epoch(content["expires_at"]):
+                    raise BackendError("ExecutionWindowElapsed")
             if item != payload["payload"] or digest(item) != row["payload_hash"]:
                 raise BackendError("ExecutionPayloadMismatch")
             due = epoch(item["scheduled_at"])

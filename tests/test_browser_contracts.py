@@ -3,6 +3,7 @@
 import json
 import os
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlparse
 
 from auto_promotion.backends.browser import BrowserBackend
@@ -43,6 +44,12 @@ class XBrowserTests(unittest.TestCase):
         self.duplicate_reply_control = False
         self.reply_as_dialog = False
         self.post_limited = False
+        self.reply_delay_ms = 0
+        self.pending_image = False
+        self.pending_routes = []
+        self.editor_requires_keyboard = False
+        self.expected_text = "exact approved text"
+        self.post_dropped = False
         self.context.route("**/*", self.route)
         self.backend = BrowserBackend(
             "x", "local-x", self.context, self.page, {"identity": "brand"}
@@ -52,20 +59,31 @@ class XBrowserTests(unittest.TestCase):
     def authorize(self):
         self.checks += 1
 
+    def tearDown(self):
+        for route in self.pending_routes:
+            route.abort()
+
     def payload(self, action="reply"):
         return {
             "payload": {
                 "action": action,
                 "target": "https://x.com/target/status/456",
-                "text": "exact approved text",
+                "text": self.expected_text,
                 "media": [],
             }
         }
 
     def route(self, route):
         parsed = urlparse(route.request.url)
+        if parsed.path == "/pending-image":
+            # Keep an unrelated asset pending while the target DOM is usable.
+            self.pending_routes.append(route)
+            return
         if parsed.path == "/CreateTweet":
             self.posts += 1
+            if self.post_dropped:
+                route.abort()
+                return
             if self.post_limited:
                 route.fulfill(status=429, content_type="application/json", body="{}")
                 return
@@ -91,7 +109,7 @@ class XBrowserTests(unittest.TestCase):
             raise AssertionError("Unexpected request in offline fixture")
         own = parsed.path.endswith("/123")
         identifier, author = ("123", self.author) if own else ("456", "target")
-        text = "exact approved text" if own else "target post"
+        text = self.expected_text if own else "target post"
         done = "unlike" if self.already_liked else "like"
         extra_reply_control = (
             '<button data-testid="reply" onclick="throw new Error(\'wrong reply control\')">Other reply</button>'
@@ -118,16 +136,17 @@ class XBrowserTests(unittest.TestCase):
           <a href="/{author}/status/{identifier}"><time>today</time></a>
           <div data-testid="tweetText">{text}</div>
           <button data-testid="{done}" onclick="this.dataset.testid='unlike'">Like</button>
-          <button data-testid="reply" onclick="document.querySelector('{reply_destination}').hidden=false">Reply</button>
+          <button data-testid="reply" onclick="setTimeout(()=>document.querySelector('{reply_destination}').hidden=false,{self.reply_delay_ms})">Reply</button>
           {extra_reply_control}
         </article>"""
         route.fulfill(
-            content_type="text/html",
+            content_type="text/html; charset=utf-8",
             body=f"""<button data-testid="SideNav_AccountSwitcher_Button">Brand @brand</button>
             {article}{article if self.duplicate_target else ""}
+            {'<img src="/pending-image">' if self.pending_image else ""}
             <div id="reply-compose" {" " if self.reply_as_dialog else "hidden"}>
-              <div contenteditable="true" data-testid="tweetTextarea_0"></div>
-              <button data-testid="tweetButtonInline" onclick="{inline_action}">Post</button>
+              <div contenteditable="true" data-testid="tweetTextarea_0" onkeydown="document.querySelector('[data-testid=tweetButtonInline]').disabled=false"></div>
+              <button data-testid="tweetButtonInline" {"disabled" if self.editor_requires_keyboard else ""} onclick="{inline_action}">Post</button>
             </div>{dialog_compose}""",
         )
 
@@ -152,6 +171,32 @@ class XBrowserTests(unittest.TestCase):
 
     def test_visible_modal_reply_takes_priority_over_inline_composer(self):
         self.reply_as_dialog = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_delayed_reply_composer_is_ready_before_filling(self):
+        self.reply_delay_ms = 1200
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_opening_modal_is_selected_before_touching_background_inline_editor(self):
+        self.reply_as_dialog = True
+        self.reply_delay_ms = 1200
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_unrelated_pending_asset_does_not_block_target_or_receipt(self):
+        self.pending_image = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_keyboard_editor_retains_exact_approved_unicode_before_one_submission(self):
+        self.editor_requires_keyboard = True
+        self.expected_text = "图生视频 — let’s test one frame."
         result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
         self.assertEqual(result["status"], "confirmed")
         self.assertEqual((self.posts, self.checks), (1, 1))
@@ -189,3 +234,19 @@ class XBrowserTests(unittest.TestCase):
         self.assertTrue(result["rate_limited"])
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(self.posts, 1)
+
+    def test_dropped_submission_response_records_step_and_submission_boundary(self):
+        from playwright.sync_api import TimeoutError
+
+        self.post_dropped = True
+        expect_response = self.page.expect_response
+        with patch.object(
+            self.page,
+            "expect_response",
+            side_effect=lambda predicate, timeout: expect_response(predicate, timeout=500),
+        ):
+            with self.assertRaises(TimeoutError) as captured:
+                self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(self.posts, 1)
+        self.assertEqual(captured.exception.execution_step, "submission_response")
+        self.assertTrue(captured.exception.submission_started)

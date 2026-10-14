@@ -6,10 +6,13 @@ import contextlib
 import io
 import json
 import logging
+import sqlite3
 import sys
+import time
 
 from .backends.common import BackendError, Receipts, account_lock, verify_claim
-from .models import PLATFORMS
+from .execution_diagnostics import FIELDS, exception_details
+from .models import PLATFORMS, canonical
 
 OPERATIONS = {
     "health",
@@ -20,6 +23,8 @@ OPERATIONS = {
     "join",
     "verify_join",
     "targets",
+    "feedback",
+    "content",
 }
 RESULT_FIELDS = {
     "status",
@@ -48,7 +53,15 @@ RESULT_FIELDS = {
     "media_id",
     "targets",
     "truncated",
+    "published_at",
+    "scheduled_message_ids",
+    "feedback_events",
+    "feedback_checked_through",
+    "feedback_cursor",
+    "feedback_status",
+    "content_items",
 }
+RESULT_FIELDS.update(FIELDS)
 
 
 def dispatch(request):
@@ -83,7 +96,39 @@ def dispatch(request):
 
         def checkpoint(result):
             if receipt:
-                receipt.save(key, result)
+                receipt.save(key, {**(receipt.read(key) or {}), **result})
+            # Keep progress visible even if the provider is terminated before returning.
+            if write and operation == "execute" and request.get("database"):
+                details = {
+                    k: result[k] for k in FIELDS + ("external_reference", "reason") if k in result
+                }
+                with contextlib.closing(sqlite3.connect(request["database"], timeout=10)) as db:
+                    with db:
+                        row = db.execute(
+                            "SELECT result FROM items WHERE id=? AND attempt_id=? AND status='executing'",
+                            (payload.get("item_id"), payload.get("attempt_id")),
+                        ).fetchone()
+                        if row:
+                            db.execute(
+                                "UPDATE items SET result=?,external_reference=COALESCE(?,external_reference) "
+                                "WHERE id=? AND attempt_id=? AND status='executing'",
+                                (
+                                    canonical({**json.loads(row[0]), **details}),
+                                    details.get("external_reference"),
+                                    payload.get("item_id"),
+                                    payload.get("attempt_id"),
+                                ),
+                            )
+
+        def progress(step, submission_started=None):
+            details = {"execution_step": step, "step_started_at": time.time()}
+            if submission_started is not None:
+                details["submission_started"] = submission_started
+            checkpoint(details)
+
+        checkpoint.progress = progress
+        if write:
+            progress("backend_start", False)
 
         try:
             if platform == "telegram":
@@ -119,10 +164,13 @@ def dispatch(request):
                     "status": "unknown",
                     "verified": False,
                     "reason": code,
+                    **exception_details(exc),
                 }
             else:
                 raise BackendError(code) from None
         result = {key: value for key, value in result.items() if key in RESULT_FIELDS}
+        if operation == "verify" and result.get("verified") is True:
+            checkpoint(result)
         if write:
             accepted = receipt.read(key) or {}
             if (

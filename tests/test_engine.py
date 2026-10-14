@@ -141,6 +141,23 @@ class EngineTests(unittest.TestCase):
                 self.engine.approve(t["id"], "discovery_join", phrase)
         self.assertEqual(len(self.engine.task(t["id"])["approvals"]), 0)
 
+    def test_platform_publication_time_persists_without_changing_approved_manifest(self):
+        task = self.approve(self.task())
+        self.provider.result = {
+            "status": "confirmed",
+            "verified": True,
+            "external_reference": "https://example.com/message",
+            "published_at": self.now - 1,
+        }
+        self.engine.run_once(task["id"])
+        item = self.engine.task(task["id"])["items"][0]
+        evidence = self.store.one(
+            "SELECT * FROM publication_evidence WHERE item_id=?", (item["id"],)
+        )
+        self.assertEqual(evidence["published_at"], self.now - 1)
+        self.assertEqual(evidence["verified_at"], self.now)
+        self.assertEqual(self.engine.task(task["id"])["manifest_hash"], task["manifest_hash"])
+
     def test_two_approvals_persist_and_are_idempotent(self):
         t = self.approve(self.task())
         new = Engine(Store(self.store.path), self.registry, clock=lambda: self.now)
@@ -467,6 +484,76 @@ class EngineTests(unittest.TestCase):
             ],
             ["rejected", "qualified", "rejected"],
         )
+
+    def test_unattempted_candidate_can_be_corrected_at_capacity(self):
+        task = self.task(queries=["AI"], max_candidates=1)
+        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        value = CandidateInput(
+            account_id=self.accounts["telegram"]["id"],
+            target="@coding_chat",
+            text="Coding discussion",
+            language="en",
+            confidence=0.95,
+        )
+        self.assertEqual(self.engine.candidate(task["id"], value)["decision"], "rejected")
+        original = self.engine.task(task["id"])
+        correction = value.model_copy(update={"text": "Coding discussion; AI source translation"})
+        self.assertEqual(self.engine.candidate(task["id"], correction)["decision"], "qualified")
+        saved = self.engine.task(task["id"])
+        self.assertEqual(len(saved["candidates"]), 1)
+        self.assertEqual(saved["candidates"][0]["id"], original["candidates"][0]["id"])
+        self.assertEqual(saved["policy_hash"], original["policy_hash"])
+        self.assertEqual(saved["approvals"], original["approvals"])
+        with self.assertRaises(Conflict):
+            self.engine.candidate(task["id"], correction.model_copy(update={"target": "@other"}))
+        self.assertEqual(self.engine.candidate(task["id"], correction)["decision"], "qualified")
+
+    def test_candidate_correction_still_applies_risk_gate(self):
+        task = self.task(queries=["AI"], max_candidates=1)
+        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        value = CandidateInput(
+            account_id=self.accounts["telegram"]["id"],
+            target="@ai_chat",
+            text="AI tools",
+            language="en",
+            confidence=0.95,
+        )
+        self.engine.candidate(task["id"], value)
+        result = self.engine.candidate(task["id"], value.model_copy(update={"text": "AI gambling"}))
+        self.assertEqual(result["decision"], "rejected")
+        self.assertIn("blocked_category", result["reasons"])
+
+    def test_attempted_candidate_cannot_be_corrected(self):
+        task = self.task(max_joins=1, max_candidates=1)
+        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        value = CandidateInput(
+            account_id=self.accounts["telegram"]["id"],
+            target="@ai_chat",
+            text="AI tools",
+            language="en",
+            confidence=0.95,
+        )
+        self.engine.candidate(task["id"], value)
+        self.engine.run_joins(task["id"])
+        with self.assertRaises(Conflict):
+            self.engine.candidate(task["id"], value.model_copy(update={"text": "AI video"}))
+
+    def test_candidate_correction_cannot_change_frozen_batch(self):
+        task = self.task(max_candidates=1)
+        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        value = CandidateInput(
+            account_id=self.accounts["telegram"]["id"],
+            target="@ai_group",
+            text="AI tools",
+            language="en",
+            confidence=0.95,
+        )
+        self.engine.candidate(task["id"], value)
+        self.engine.set_items(task["id"], [self.item()])
+        frozen = self.engine.prepare(task["id"])
+        with self.assertRaises(Conflict):
+            self.engine.candidate(task["id"], value.model_copy(update={"text": "AI video"}))
+        self.assertEqual(self.engine.task(task["id"])["manifest_hash"], frozen["manifest_hash"])
 
     def test_reconcile_does_not_resubmit(self):
         self.provider.result = ConnectionError()

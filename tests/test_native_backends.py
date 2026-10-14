@@ -97,6 +97,7 @@ class PrivateBackendTests(unittest.TestCase):
                     "external_reference": "telegram:@group:123",
                 }
             )
+            checkpoint.progress("receipt_lookup", True)
             raise RuntimeError("secret-token-must-not-leak")
 
         request = {
@@ -114,6 +115,39 @@ class PrivateBackendTests(unittest.TestCase):
         self.assertEqual(calls, ["execute"])
         self.assertEqual(first, second)
         self.assertEqual(first["message_ids"], [123])
+        self.assertEqual(first["execution_step"], "receipt_lookup")
+        self.assertTrue(first["submission_started"])
+        self.assertTrue(first["diagnostic_traceback"])
+        self.assertNotIn("secret-token", json.dumps(first))
+
+    def test_timeout_without_receipt_records_step_and_never_resends(self):
+        calls = []
+
+        def submit(platform, label, operation, payload, checkpoint, authorize):
+            calls.append(operation)
+            checkpoint.progress("submission_response", True)
+            raise TimeoutError("cookie=secret-token-must-not-leak")
+
+        request = {
+            "platform": "x",
+            "account": "local-x",
+            "operation": "execute",
+            "payload": {"item_id": "unknown", "payload": {"text": "exact"}},
+        }
+        with (
+            patch.object(native_bridge, "verify_claim"),
+            patch("auto_promotion.backends.browser.call", submit),
+        ):
+            first = native_bridge.dispatch(request)
+            second = native_bridge.dispatch(request)
+        self.assertEqual(calls, ["execute"])
+        self.assertEqual(first, second)
+        self.assertEqual(
+            (first["status"], first["reason"], first["execution_step"]),
+            ("unknown", "TimeoutError", "submission_response"),
+        )
+        self.assertTrue(first["submission_started"])
+        self.assertNotIn("external_reference", first)
         self.assertNotIn("secret-token", json.dumps(first))
 
 
@@ -176,6 +210,12 @@ class ClaimTests(unittest.TestCase):
         with self.assertRaises(Exception):
             verify_claim(self.request)
 
+    def test_existing_sender_can_verify_before_campaign_schema_migration(self):
+        with self.store.connect(write=True) as db:
+            db.execute("DROP INDEX tasks_campaign")
+            db.execute("ALTER TABLE tasks DROP COLUMN campaign_id")
+        verify_claim(self.request)
+
     def test_stop_rechecked_inside_provider(self):
         self.engine.set_stop(True)
         with self.assertRaises(BackendError):
@@ -216,6 +256,30 @@ class ClaimTests(unittest.TestCase):
             checked = self.engine.check_account(self.account["id"])
         self.assertTrue(checked["disabled"])
 
+    def test_interrupted_provider_progress_and_reference_survive_lease_recovery(self):
+        calls = []
+
+        def interrupted(label, operation, payload, checkpoint, authorize):
+            calls.append(operation)
+            checkpoint.progress("submission_response", True)
+            checkpoint({"external_reference": "telegram:@public_group:123"})
+            checkpoint.progress("receipt_lookup", True)
+            raise KeyboardInterrupt()
+
+        with patch("auto_promotion.backends.telegram.call", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                native_bridge.dispatch(self.request)
+        self.engine.clock = lambda: time.time() + 301
+        self.engine.recover()
+        item = self.engine.task(self.request["payload"]["task_id"])["items"][0]
+        self.assertEqual(
+            (item["status"], item["result"]["execution_step"]), ("unknown", "receipt_lookup")
+        )
+        self.assertTrue(item["result"]["submission_started"])
+        self.assertEqual(item["external_reference"], "telegram:@public_group:123")
+        self.assertEqual(self.engine.run_once(item["task_id"])["processed"], [])
+        self.assertEqual(calls, ["execute"])
+
 
 class FakeTelegram:
     def __init__(self):
@@ -226,6 +290,8 @@ class FakeTelegram:
         self.joined = False
         self.fail_lookup = False
         self.pending = False
+        self.history = []
+        self.scheduled_messages = None
 
     async def connect(self):
         pass
@@ -263,17 +329,26 @@ class FakeTelegram:
         sent.media = object()
         return sent
 
-    async def get_messages(self, entity, ids=None, limit=None):
+    async def get_messages(self, entity, ids=None, limit=None, offset_date=None):
         if self.fail_lookup:
             raise ConnectionError("test transport dropped after submission")
-        return [self.messages.get(i) for i in ids] if ids else []
+        return [self.messages.get(i) for i in ids] if ids else self.history[:limit]
+
+    async def iter_messages(self, entity, *, min_id, reverse, limit):
+        messages = sorted((m for m in self.history if m.id > min_id), key=lambda m: m.id)
+        for message in messages[:limit]:
+            yield message
 
     async def __call__(self, request):
         from telethon import errors, functions
 
         if isinstance(request, functions.messages.GetScheduledHistoryRequest):
             self.lookups += 1
-            return types.SimpleNamespace(messages=list(self.messages.values()))
+            return types.SimpleNamespace(
+                messages=list(self.messages.values())
+                if self.scheduled_messages is None
+                else self.scheduled_messages
+            )
         if isinstance(request, functions.channels.GetParticipantRequest):
             if not self.joined:
                 raise errors.UserNotParticipantError(request)
@@ -336,6 +411,82 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(self.client.lookups, 2)
         self.assertEqual(result["status"], "scheduled")
         self.assertEqual(result["message_ids"], result["lookup_message_ids"])
+
+    def test_scheduled_delivery_resolves_real_id_without_sending_and_rejects_ambiguity(self):
+        backend = self.backend()
+        expected = datetime.now(timezone.utc).replace(microsecond=0)
+        from datetime import timedelta
+
+        expected -= timedelta(seconds=30)
+        item = {
+            "action": "schedule_message",
+            "target": "@public_group",
+            "text": "approved",
+            "media": [],
+            "reply_to": None,
+            "scheduled_at": expected.isoformat(),
+        }
+        message = types.SimpleNamespace(
+            id=900,
+            out=True,
+            message="approved",
+            media=None,
+            date=expected,
+            from_scheduled=True,
+            reply_to_msg_id=None,
+        )
+        self.client.messages[900] = message
+        self.client.history = [message]
+        self.client.scheduled_messages = []
+        payload = {"payload": item, "result": {"message_ids": [2], "status": "scheduled"}}
+        result = asyncio.run(
+            backend.run("verify", payload, self.saved.append, lambda: self.fail("write"))
+        )
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(result["message_ids"], [900])
+        self.assertEqual(result["scheduled_message_ids"], [2])
+        self.assertEqual(result["published_at"], expected.timestamp())
+        self.assertEqual(self.client.sends, [])
+        self.client.history.append(types.SimpleNamespace(**{**vars(message), "id": 901}))
+        result = asyncio.run(
+            backend.run("verify", payload, self.saved.append, lambda: self.fail("write"))
+        )
+        self.assertEqual(result["status"], "unknown")
+
+    def test_feedback_collects_only_direct_other_user_replies_and_does_not_skip_future_messages(
+        self,
+    ):
+        backend = self.backend()
+        now = time.time()
+        parent = types.SimpleNamespace(id=123, out=True, message="approved", media=None)
+        self.client.messages[123] = parent
+        self.client.history = [
+            types.SimpleNamespace(
+                id=i,
+                out=False,
+                sender_id=sender,
+                reply_to_msg_id=reply_to,
+                date=datetime.fromtimestamp(when, timezone.utc),
+            )
+            for i, sender, reply_to, when in [
+                (124, 99, 123, now - 20),
+                (125, 42, 123, now - 10),
+                (126, 99, 555, now - 5),
+                (127, 99, 123, now + 60),
+            ]
+        ]
+        payload = {
+            "payload": {"target": "@public_group", "text": "approved", "media": []},
+            "result": {"message_ids": [123]},
+        }
+        result = asyncio.run(
+            backend.run("feedback", payload, self.saved.append, lambda: self.fail("write"))
+        )
+        self.assertEqual(len(result["feedback_events"]), 1)
+        self.assertEqual(result["feedback_events"][0]["event_id"], "10:124")
+        self.assertEqual(result["feedback_cursor"], 126)
+        self.assertEqual(result["feedback_status"], "complete")
+        self.assertEqual(self.client.sends, [])
 
     def test_read_failure_preserves_accepted_id_without_resubmitting(self):
         backend = self.backend()

@@ -76,7 +76,10 @@ async function cleanup() {
     server.kill("SIGTERM");
     await exited;
   }
-  fs.rmSync(temp, { recursive: true, force: true });
+  const cleanupTarget = fs.realpathSync(temp);
+  assert.equal(path.dirname(cleanupTarget), fs.realpathSync(os.tmpdir()));
+  assert.ok(path.basename(cleanupTarget).startsWith("auto-promotion-ui-"));
+  fs.rmSync(cleanupTarget, { recursive: true, force: true });
 }
 
 (async () => {
@@ -232,6 +235,66 @@ async function cleanup() {
   await page.locator("#task-interval").fill("0");
   await page.getByRole("button", { name: "创建并预览发现政策" }).click();
   await page.locator("#phrase-discovery_join").waitFor();
+  const originalTaskId = await page.evaluate(() =>
+    location.hash.split("/").at(-1),
+  );
+  await page.getByRole("button", { name: "保存为模板", exact: true }).click();
+  await page.getByLabel("模板名称", { exact: true }).fill("常用互动模板");
+  await page.getByLabel("用途说明", { exact: true }).fill("跨任务复用设置验收");
+  await page.getByRole("button", { name: "保存模板", exact: true }).click();
+  await page.locator("#panel").waitFor({ state: "hidden" });
+  await page.getByRole("link", { name: "任务模板", exact: true }).click();
+  await page.getByRole("heading", { name: "任务模板", exact: true }).waitFor();
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/templates-desktop.png",
+      fullPage: true,
+    });
+  await page
+    .getByRole("button", { name: "按模板创建任务", exact: true })
+    .click();
+  await page.getByLabel("新任务名称", { exact: true }).fill("模板创建的新草稿");
+  await page
+    .locator(`input[name="accounts"][value="${testAccount.id}"]`)
+    .check();
+  await page.getByRole("button", { name: "创建新草稿", exact: true }).click();
+  await page.locator("#phrase-discovery_join").waitFor();
+  const templateDraft = await page.evaluate(async () => {
+    const id = location.hash.split("/").at(-1);
+    return fetch(`/api/tasks/${id}`).then((response) => response.json());
+  });
+  assert.notEqual(templateDraft.id, originalTaskId);
+  assert.deepEqual(templateDraft.approvals, []);
+  assert.deepEqual(templateDraft.items, []);
+  assert.equal(templateDraft.state, "draft");
+  const reviewDownload = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载审阅清单", exact: true }).click();
+  const review = await reviewDownload;
+  await review.saveAs(path.join(temp, "task-review.html"));
+  assert.ok(
+    fs
+      .readFileSync(path.join(temp, "task-review.html"), "utf8")
+      .includes("模板创建的新草稿"),
+  );
+  const archiveDownload = page.waitForEvent("download");
+  await page.getByRole("button", { name: "导出任务日志", exact: true }).click();
+  const archive = await archiveDownload;
+  await archive.saveAs(path.join(temp, "task-evidence.zip"));
+  assert.equal(
+    fs
+      .readFileSync(path.join(temp, "task-evidence.zip"))
+      .subarray(0, 2)
+      .toString(),
+    "PK",
+  );
+  await page.evaluate((id) => {
+    location.hash = `tasks/${id}`;
+  }, originalTaskId);
+  await page
+    .locator(".detail-top code")
+    .filter({ hasText: originalTaskId })
+    .waitFor();
+  await page.locator("#phrase-discovery_join").waitFor();
   const discovery = await page
     .locator('form[data-approval="discovery_join"] .phrase')
     .innerText();
@@ -302,14 +365,48 @@ async function cleanup() {
   );
   await page.locator('[data-remove="1"]').click();
   await page.getByRole("button", { name: "保存清单", exact: true }).click();
+  await page
+    .locator("#task-workflow")
+    .filter({ hasText: "可以准备外发审批" })
+    .waitFor();
+  assert.equal(await page.locator("#prepare").isEnabled(), true);
   await page.getByRole("button", { name: "冻结并预览外发清单" }).click();
   await page.locator("#phrase-outbound").waitFor();
+  assert.ok(
+    (await page.locator("#task-state").innerText()).includes("等待外发审批"),
+  );
+  assert.ok(
+    (await page.locator("#task-readiness").innerText()).includes(
+      "缺少有效的最终外发审批",
+    ),
+  );
   const outbound = await page
     .locator('form[data-approval="outbound"] .phrase')
     .innerText();
   await page.locator("#phrase-outbound").fill(outbound);
   await page.getByRole("button", { name: "批准外发批次" }).click();
   await page.getByRole("button", { name: "运行一轮" }).waitFor();
+  const monitoredTaskId = await page.evaluate(() =>
+    location.hash.split("/").at(-1),
+  );
+  execFileSync(
+    python,
+    [
+      "-c",
+      "import sys; from auto_promotion.store import Store; from auto_promotion.workers import Workers; w=Workers(Store(sys.argv[1])); r=w.start(sys.argv[2]); w.finish(r,'process_exit',17)",
+      db,
+      monitoredTaskId,
+    ],
+    { env, stdio: "pipe" },
+  );
+  await page.getByRole("button", { name: "刷新", exact: true }).click();
+  await page
+    .locator("#task-execution")
+    .filter({ hasText: "发送进程已结束" })
+    .waitFor();
+  assert.ok(
+    (await page.locator("#task-execution").innerText()).includes("退出码 17"),
+  );
   const global = page.locator("#global-stop");
   if ((await global.innerText()).includes("恢复")) await global.click();
   await page.getByRole("button", { name: "运行一轮" }).click();
@@ -448,6 +545,20 @@ async function cleanup() {
     () => document.documentElement.scrollWidth > window.innerWidth,
   );
   assert.equal(overflow, false, "mobile page overflow");
+  await page.getByRole("link", { name: "任务模板", exact: true }).click();
+  await page.getByRole("heading", { name: "任务模板", exact: true }).waitFor();
+  assert.equal(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    ),
+    false,
+    "templates mobile overflow",
+  );
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/templates-mobile.png",
+      fullPage: true,
+    });
   await page.getByRole("link", { name: "账号中心", exact: true }).click();
   await page.getByRole("heading", { name: "账号中心", exact: true }).waitFor();
   if (!process.env.AP_UI_SKIP_SCREENSHOTS)
@@ -473,6 +584,219 @@ async function cleanup() {
     1,
     "exactly one intentional invalid approval response",
   );
+  await page.evaluate(() =>
+    fetch("/api/statistics/run", {
+      method: "POST",
+      headers: { "X-AP-Client": "local-ui" },
+    }).then((r) => r.json()),
+  );
+  await page.getByRole("link", { name: "互动统计", exact: true }).click();
+  await page.getByRole("heading", { name: "互动统计", exact: true }).waitFor();
+  assert.ok((await page.locator(".stats").innerText()).includes("不可统计"));
+  const statistics = await page.evaluate(() =>
+    fetch("/api/statistics").then((r) => r.json()),
+  );
+  assert.equal(
+    statistics.totals.published_success,
+    0,
+    "simulation must not inflate live publications",
+  );
+  assert.equal(statistics.totals.received_replies, null);
+  assert.equal(statistics.platforms.length, 5);
+  assert.equal(
+    await page
+      .getByRole("columnheader", { name: "当日累计发布", exact: true })
+      .count(),
+    1,
+  );
+  assert.equal(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    ),
+    false,
+  );
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/statistics-mobile.png",
+      fullPage: true,
+    });
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/statistics-desktop.png",
+      fullPage: true,
+    });
+  await page.getByRole("link", { name: "业务增长", exact: true }).click();
+  await page.getByRole("heading", { name: "业务增长", exact: true }).waitFor();
+  await page.getByRole("button", { name: "设置业务目标", exact: true }).click();
+  await page
+    .getByLabel("目标名称", { exact: true })
+    .fill("Growth UI simulation");
+  await page
+    .getByLabel("官方 App Store 应用链接", { exact: true })
+    .fill("https://apps.apple.com/app/id123456789");
+  await page
+    .locator('#growth-goal-form select[name="mode"]')
+    .selectOption("simulation");
+  const growthNow = Date.now();
+  const growthStart = new Date(growthNow - 2 * 86400000);
+  const growthLocal = new Date(
+    growthStart.getTime() - growthStart.getTimezoneOffset() * 60000,
+  )
+    .toISOString()
+    .slice(0, 16);
+  await page.getByLabel("开始时间", { exact: true }).fill(growthLocal);
+  await page.getByLabel("观察期新增下载目标", { exact: true }).fill("100");
+  await page.getByLabel("观察期付费人数目标", { exact: true }).fill("10");
+  await page.getByRole("button", { name: "保存目标", exact: true }).click();
+  await page
+    .getByRole("heading", { name: "Growth UI simulation", exact: true })
+    .waitFor();
+  assert.ok((await page.locator(".stats").innerText()).includes("未接入"));
+  const growthId = (await page.evaluate(() => location.hash)).slice(8);
+  await page.getByRole("button", { name: "添加渠道", exact: true }).click();
+  await page
+    .getByLabel("渠道名称", { exact: true })
+    .fill("Synthetic Telegram channel");
+  await page
+    .getByLabel("渠道标记（英文、数字、下划线或连字符）", { exact: true })
+    .fill("ui_test_tg");
+  await page
+    .getByLabel("提供商令牌（从 App Store Connect 获取，可稍后新建渠道）", {
+      exact: true,
+    })
+    .fill("123456");
+  await page.getByRole("button", { name: "保存渠道", exact: true }).click();
+  await page.getByRole("link", { name: /pt=123456&ct=ui_test_tg/ }).waitFor();
+  const growthReport = await page.evaluate(
+    (id) => fetch("/api/growth/goals/" + id).then((r) => r.json()),
+    growthId,
+  );
+  const growthChannelId = growthReport.channels[0].id;
+  const conversion = (kind, hours, extra = {}) => ({
+    source: "synthetic-ui",
+    event_id: "ui-" + kind,
+    subject_key: "ui-anonymous-user",
+    channel_id: growthChannelId,
+    kind,
+    occurred_at: new Date(growthNow - hours * 3600000).toISOString(),
+    evidence_reference: "synthetic-test",
+    ...extra,
+  });
+  await page.getByRole("button", { name: "导入应用事件", exact: true }).click();
+  await page.locator("#growth-import-json").fill(
+    JSON.stringify([
+      conversion("first_download", 24),
+      conversion("first_generation", 23),
+      conversion("trial_start", 22, {
+        trial_ends_at: new Date(growthNow - 3 * 3600000).toISOString(),
+      }),
+      conversion("first_charge", 2, {
+        transaction_id: "ui-tx",
+        amount_minor: 999,
+        currency: "USD",
+      }),
+      conversion("refund", 1, {
+        transaction_id: "ui-tx",
+        amount_minor: 200,
+        currency: "USD",
+      }),
+    ]),
+  );
+  await page.getByRole("button", { name: "核对并导入", exact: true }).click();
+  await page
+    .getByText("USD：扣费 999 · 退款 200 · 净收入 799（最小货币单位）", {
+      exact: true,
+    })
+    .waitFor();
+  await page
+    .getByRole("button", { name: "导入商店指标与成本", exact: true })
+    .click();
+  await page.locator("#growth-import-json").fill(
+    JSON.stringify([
+      {
+        channel_id: growthChannelId,
+        day: new Date(growthNow - 86400000).toLocaleDateString("sv-SE", {
+          timeZone: "Asia/Shanghai",
+        }),
+        source: "synthetic-ui",
+        evidence_reference: "synthetic-test",
+        first_downloads: 12,
+        spend_minor: 0,
+        currency: "USD",
+      },
+    ]),
+  );
+  await page.getByRole("button", { name: "核对并导入", exact: true }).click();
+  await page.getByText("目标完成 12.0%", { exact: true }).waitFor();
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/growth-desktop.png",
+      fullPage: true,
+    });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    ),
+    false,
+    "growth mobile overflow",
+  );
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/growth-mobile.png",
+      fullPage: true,
+    });
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  await page.getByRole("link", { name: "回复待办", exact: true }).click();
+  await page.getByRole("heading", { name: "回复待办", exact: true }).waitFor();
+  await page.evaluate(() => {
+    location.hash = "feeds";
+  });
+  await page
+    .getByRole("heading", { name: "内容采集来源", exact: true })
+    .waitFor();
+  await page.getByRole("button", { name: "添加来源", exact: true }).click();
+  await page.getByLabel("公开群", { exact: true }).fill("@ui_test_group");
+  await page.getByLabel("启用定时只读采集", { exact: true }).check();
+  await page.getByRole("button", { name: "保存来源", exact: true }).click();
+  await page
+    .locator("td")
+    .filter({ hasText: "@ui_test_group" })
+    .first()
+    .waitFor();
+  await page.getByRole("button", { name: "运行到期采集", exact: true }).click();
+  await page.locator("td").filter({ hasText: "读取完成" }).first().waitFor();
+  await page
+    .getByRole("link", { name: "共享内容池", exact: true })
+    .first()
+    .click();
+  await page
+    .getByRole("heading", { name: "共享内容池", exact: true })
+    .waitFor();
+  await page
+    .getByRole("button", { name: "核对资格与文案", exact: true })
+    .first()
+    .click();
+  const reviewPayload = JSON.parse(
+    await page.locator("#content-review-json").inputValue(),
+  );
+  reviewPayload.permission = "allowed";
+  reviewPayload.permission_evidence = "Synthetic rule for simulation";
+  reviewPayload.draft_text = "Reviewed simulation draft";
+  await page
+    .locator("#content-review-json")
+    .fill(JSON.stringify(reviewPayload));
+  await page.getByRole("button", { name: "保存核对结果", exact: true }).click();
+  await page.getByText("许可已登记", { exact: true }).waitFor();
+  assert.equal(
+    (
+      await page.evaluate(() =>
+        fetch("/api/growth/goals").then((r) => r.json()),
+      )
+    ).every((g) => g.payload.mode === "simulation"),
+    true,
+  );
   fs.writeFileSync(
     "var/ui-test-result.json",
     JSON.stringify(
@@ -490,15 +814,32 @@ async function cleanup() {
           "discord_attachment",
           "discord_simulation_execution",
           "create_task",
+          "save_task_template",
+          "template_creates_fresh_unapproved_draft",
+          "review_download",
+          "evidence_zip_download",
+          "templates_mobile_no_overflow",
           "reject_generic_approval",
           "discovery_approval",
           "edit_items",
           "freeze_manifest",
+          "execution_readiness_reasons",
           "outbound_approval",
           "execute_simulation",
+          "stopped_sender_not_active",
+          "observed_exit_code",
           "verified_reference",
           "global_stop_restore",
           "mobile_no_overflow",
+          "live_statistics_exclude_simulation",
+          "unavailable_replies_not_zero",
+          "growth_goals_and_channel_link",
+          "event_cohort_maturity_and_refund",
+          "store_metrics_separate_from_events",
+          "growth_mobile_no_overflow",
+          "reply_inbox_entry",
+          "read_only_content_feed",
+          "content_review",
         ],
       },
       null,
@@ -507,7 +848,7 @@ async function cleanup() {
   );
   assert.deepEqual(errors, [], "browser errors");
   console.log(
-    "UI workflow passed; 18 checks; screenshots " +
+    "UI workflow passed; 35 checks; screenshots " +
       (process.env.AP_UI_SKIP_SCREENSHOTS ? "skipped" : "saved") +
       ".",
   );

@@ -35,4 +35,12 @@ def workspace_path():
 
 
 def database_path():
-    return Path(os.getenv("AP_DB", "var/auto-promotion.db")).resolve()
+    explicit = os.getenv("AP_DB")
+    if explicit:
+        return Path(explicit).resolve()
+    # The parent campaign workspace also contains an old, empty var database.
+    # Starting a command there must use the same store as the workbench.
+    project = Path.cwd() / "auto-promotion"
+    if (project / "src" / "auto_promotion").is_dir() and (project / "pyproject.toml").is_file():
+        return (project / "var" / "auto-promotion.db").resolve()
+    return Path("var/auto-promotion.db").resolve()

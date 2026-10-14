@@ -607,6 +607,10 @@ def main():
     op = request["operation"]
     if op not in {"health", "preflight", "discover", "execute", "verify", "join", "verify_join"}:
         raise ValueError("operation_not_allowlisted")
+    if op in {"execute", "join"}:
+        from .backends.common import verify_claim
+
+        verify_claim(request)
     if p == "telegram":
         return asyncio.run(telegram(op, request["account"], request["payload"]))
     return {"reddit": reddit, "instagram": instagram, "x": x_platform}[p](

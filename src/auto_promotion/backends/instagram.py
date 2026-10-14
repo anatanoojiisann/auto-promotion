@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .common import BackendError, read_profile, save_profile
+from .common import BackendError, observed_timestamp, read_profile, save_profile
 
 
 class GraphError(BackendError):
@@ -193,7 +193,7 @@ class InstagramBackend:
             }
         own_media = self.graph.request(
             self.settings["identity"] + "/media",
-            fields={"fields": "id,caption,permalink", "limit": 100},
+            fields={"fields": "id,caption,permalink,timestamp", "limit": 100},
         )
         observed = next(
             (row for row in own_media.get("data", []) if str(row.get("id")) == media_id), None
@@ -209,6 +209,7 @@ class InstagramBackend:
             "status": "confirmed" if verified else "unknown",
             "verified": verified,
             "external_reference": url or result.get("external_reference"),
+            "published_at": observed_timestamp(observed.get("timestamp")) if verified else None,
         }
 
 

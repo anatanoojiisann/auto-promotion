@@ -92,6 +92,8 @@ class Policy(Model):
     ends_at: str
     min_interval: int = Field(default=120, ge=0, le=86400)
     ordering_mode: Literal["strict", "independent_accounts"] = "strict"
+    pacing_scope: Literal["task", "account"] = "task"
+    quota_snapshot: dict = Field(default_factory=dict)
     daily_limit: int = Field(default=5, ge=1, le=100)
     target_daily_limit: int = Field(default=3, ge=1, le=3)
     user_daily_limit: int = Field(default=2, ge=1, le=2)
@@ -135,6 +137,10 @@ class ItemInput(Model):
     discord_reply_to: str = Field(default="", pattern=r"^(?:|[1-9][0-9]{0,19})$")
     recipient_id: str = Field(default="", max_length=160)
     target_owned: bool = False
+    execution_mode: Literal["automatic", "manual"] = "automatic"
+    opportunity_id: str = ""
+    content_key: str = ""
+    profile_version: int = Field(default=0, ge=0)
 
     @field_validator("scheduled_at")
     @classmethod
@@ -167,3 +173,128 @@ class ManualOutcome(Model):
     observed_text: str
     external_reference: str
     verified: bool
+
+
+class QuotaLimit(Model):
+    daily: int = Field(default=100, ge=1, le=100000)
+    hourly: int = Field(default=20, ge=1, le=10000)
+
+
+class ExecutionSettings(Model):
+    global_limit: QuotaLimit = Field(default_factory=QuotaLimit)
+    platform_limits: dict[str, QuotaLimit] = Field(default_factory=dict)
+    max_workers: int = Field(default=6, ge=1, le=50)
+    platform_workers: dict[str, int] = Field(default_factory=lambda: {"x": 2, "reddit": 2})
+    quota_timezone: Literal["UTC"] = "UTC"
+
+    @model_validator(mode="after")
+    def platforms(self):
+        if any(p not in PLATFORMS for p in {*self.platform_limits, *self.platform_workers}):
+            raise ValueError("未知平台")
+        if any(not 1 <= n <= 50 for n in self.platform_workers.values()):
+            raise ValueError("平台并发数必须为 1–50")
+        return self
+
+
+class AccountProfile(Model):
+    brand: str = Field(default="", max_length=160)
+    role: str = Field(default="", max_length=160)
+    languages: list[str] = Field(default_factory=lambda: ["en", "zh"], max_length=30)
+    topics: list[str] = Field(default_factory=list, max_length=50)
+    audience: list[str] = Field(default_factory=list, max_length=50)
+    tone: str = Field(default="", max_length=1000)
+    facts: str = Field(default="", max_length=5000)
+    blocked_keywords: list[str] = Field(default_factory=list, max_length=100)
+    allowed_targets: list[str] = Field(default_factory=list, max_length=1000)
+    reply_template: str = Field(default="", max_length=40000)
+    work_start_hour: int = Field(default=0, ge=0, le=23)
+    work_end_hour: int = Field(default=24, ge=1, le=24)
+    timezone: str = "Asia/Shanghai"
+
+    @model_validator(mode="after")
+    def window(self):
+        ZoneInfo(self.timezone)
+        if not self.languages or self.work_end_hour <= self.work_start_hour:
+            raise ValueError("请指定语言和有效工作时段")
+        return self
+
+
+class PoolInput(Model):
+    name: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=2000)
+    account_ids: list[str] = Field(default_factory=list, max_length=1000)
+    limit: QuotaLimit = Field(default_factory=lambda: QuotaLimit(daily=1000, hourly=100))
+
+
+class OpportunityInput(Model):
+    platform: Literal["telegram", "reddit", "instagram", "x", "discord"]
+    external_id: str = Field(min_length=1, max_length=160)
+    native_target_id: str = Field(default="", pattern=r"^(?:|-?[1-9][0-9]{0,20})$")
+    target: str = Field(min_length=1, max_length=500)
+    action: str = "reply"
+    author_id: str = Field(default="", max_length=160)
+    title: str = Field(default="", max_length=300)
+    context: str = Field(default="", max_length=40000)
+    language: str = Field(default="unknown", max_length=30)
+    topics: list[str] = Field(default_factory=list, max_length=50)
+    audience: list[str] = Field(default_factory=list, max_length=50)
+    confidence: float = Field(default=0.8, ge=0, le=1)
+    value: float = Field(default=0.5, ge=0, le=1)
+    members: int = Field(default=0, ge=0)
+    activity: int = Field(default=0, ge=0)
+    is_public: bool = True
+    permission: Literal["unknown", "allowed", "denied"] = "unknown"
+    permission_evidence: str = Field(default="", max_length=2000)
+    permission_account_ids: list[str] = Field(default_factory=list, max_length=1000)
+    published_at: str | None = None
+    expires_at: str | None = None
+    draft_text: str = Field(default="", max_length=40000)
+    draft_title: str = Field(default="", max_length=300)
+    reply_to: int | None = Field(default=None, gt=0)
+    discord_reply_to: str = Field(default="", pattern=r"^(?:|[1-9][0-9]{0,19})$")
+    target_owned: bool = False
+    media: list[Media] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def valid(self):
+        if self.action not in CAPABILITIES[self.platform] - {"discover", "join"}:
+            raise ValueError("平台不支持该互动动作")
+        for value in (self.published_at, self.expires_at):
+            if value:
+                epoch(value)
+        if self.platform == "telegram" and self.action == "reply" and not self.reply_to:
+            raise ValueError("Telegram 回复需要原消息 ID")
+        if self.platform == "discord" and self.action == "reply" and not self.discord_reply_to:
+            raise ValueError("Discord 回复需要原消息 ID")
+        return self
+
+
+class OpportunityImport(Model):
+    items: list[OpportunityInput] = Field(min_length=1, max_length=5000)
+
+
+class CampaignInput(Model):
+    name: str = Field(min_length=1, max_length=160)
+    pool_id: str
+    opportunity_ids: list[str] = Field(min_length=1, max_length=10000)
+    policy: Policy
+    limit: QuotaLimit = Field(default_factory=QuotaLimit)
+    batch_size: int = Field(default=50, ge=1, le=100)
+
+
+class PlanInput(Model):
+    expected_revision: int | None = Field(default=None, ge=1)
+
+
+class AssignmentUpdate(Model):
+    text: str = Field(max_length=40000)
+    title: str = Field(default="", max_length=300)
+
+
+class GenerateDraftsInput(Model):
+    assignment_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class ContentCollectInput(Model):
+    target: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=200, ge=1, le=1000)

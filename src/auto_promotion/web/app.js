@@ -193,8 +193,13 @@ async function refresh() {
   $("#global-stop").className =
     "secondary compact" + (state.overview.global_stop ? "" : " danger");
   $("#worker-state").textContent =
-    (state.overview.worker ? "调度器运行中" : "手动运行模式") +
-    " · Asia/Shanghai";
+    (state.overview.worker
+      ? state.overview.sender?.status === "running"
+        ? "发送进程运行中"
+        : "发送进程未确认在线"
+      : state.overview.report_worker
+        ? "报告调度运行中 · 外发手动运行"
+        : "手动运行模式") + " · Asia/Shanghai";
 }
 $("#global-stop").onclick = (e) =>
   busy(e.target, async () => {
@@ -219,12 +224,75 @@ async function render() {
   });
   $("#breadcrumb").textContent =
     "工作区 / " +
-    ({ accounts: "账号中心", tasks: "任务中心", api: "API 中心" }[section] ||
-      "任务中心");
+    ({
+      accounts: "账号中心",
+      tasks: "任务中心",
+      api: "API 中心",
+      statistics: "互动统计",
+      pools: "号池与人设",
+      content: "共享内容池",
+      campaigns: "推广活动",
+      growth: "业务增长",
+      inbox: "回复待办",
+      feeds: "内容采集来源",
+      templates: "任务模板",
+    }[section] || "任务中心");
   if (hash.startsWith("tasks/")) return renderTask(hash.slice(6));
+  if (hash.startsWith("campaigns/")) return renderCampaign(hash.slice(10));
+  if (hash.startsWith("growth/")) return renderGrowthGoal(hash.slice(7));
+  if (section === "growth") return renderGrowth();
+  if (section === "inbox") return renderInbox();
+  if (section === "feeds") return renderFeeds();
+  if (section === "pools") return renderPools();
+  if (section === "content") return renderContent();
+  if (section === "campaigns") return renderCampaigns();
+  if (section === "templates") return renderTaskTemplates();
   if (section === "accounts") return renderAccounts();
   if (section === "api") return renderAPI();
+  if (section === "statistics") return renderStatistics();
   return renderTasks();
+}
+
+async function renderStatistics(day = "") {
+  const [snapshot, history] = await Promise.all([
+    api("/statistics" + (day ? "?day=" + encodeURIComponent(day) : "")),
+    api("/statistics/reports"),
+  ]);
+  const metric = (v) => (v === null ? "不可统计" : esc(v));
+  const labels = {
+    interval: "每三小时",
+    daily_20: "20:00 当日累计",
+    daily_final: "完整自然日",
+  };
+  const feedback = {
+    unavailable: "尚未采集",
+    partial: "采集不完整",
+    failed: "采集失败",
+    complete: "已完整采集",
+  };
+  const total = snapshot.totals;
+  const selectedDay =
+    day ||
+    new Date(snapshot.since * 1000).toLocaleDateString("sv-SE", {
+      timeZone: "Asia/Shanghai",
+    });
+  $("#main").innerHTML =
+    heading(
+      "互动统计",
+      "汇总全部真实任务，按北京时间统计已核验的实际发布。",
+      '<button id="refresh-statistics" class="secondary">刷新统计</button>',
+    ) +
+    `<div class="toolbar"><label for="statistics-day">统计日期</label><input id="statistics-day" type="date" value="${esc(selectedDay)}" max="${esc(new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" }))}"><span class="muted">截至 ${esc(fmt(snapshot.until))}</span></div>
+    <div class="stats"><span class="stat"><strong>${total.published_success}</strong>已核验发布</span><span class="stat"><strong>${metric(total.responded_interactions)}</strong>有他人回复的互动</span><span class="stat"><strong>${metric(total.received_replies)}</strong>收到回复总条数</span><span class="stat"><strong>${total.pending_verification}</strong>所有日期待核验</span></div>
+    <div class="banner warning">已排期与结果未知不计入发布成功。回复尚未采集时显示“不可统计”；已核验但缺少实际发布时间的 ${total.confirmed_without_publication_time} 条另列待补时间。</div>
+    <div class="surface"><div class="table-wrap" role="region" aria-label="各平台互动统计，可横向滚动" tabindex="0"><table><thead><tr><th>平台</th><th>发布成功</th><th>当日已排期</th><th>当日未知</th><th>有回复的互动</th><th>收到回复</th><th>回复率</th><th>数据覆盖</th></tr></thead><tbody>${snapshot.platforms.map((p) => `<tr><td>${platform(p.platform)}</td><td>${p.published_success}<span class="sub">待补发布时间 ${p.confirmed_without_publication_time}</span></td><td>${p.planned_statuses.scheduled}</td><td>${p.planned_statuses.unknown}</td><td>${metric(p.responded_interactions)}</td><td>${metric(p.received_replies)}</td><td>${p.reply_rate === null ? "—" : (p.reply_rate * 100).toFixed(1) + "%"}</td><td>${p.live_accounts ? esc(feedback[p.feedback_status]) : "未接入真实账号"}${p.observed_replies ? `<span class="sub">已观察到 ${p.observed_replies} 条回复</span>` : ""}</td></tr>`).join("")}</tbody></table></div></div>
+    <div class="surface padded mt-24"><h2>定时报告</h2><p class="help">每三小时保存一次；20:00 保存截至当时的累计，次日 00:00 补齐完整自然日。恢复运行后补跑遗漏报告，迟到核验会更新原报告版本。</p><p class="muted">${history.scheduler_running ? "报告调度运行中" : "报告调度未运行，启动工作台调度器后自动恢复"}</p>${history.reports.length ? `<div class="table-wrap" role="region" aria-label="历史统计报告，可横向滚动" tabindex="0"><table><thead><tr><th>截止时间</th><th>报告</th><th>期间发布</th><th>当日累计发布</th><th>期间收到回复</th><th>版本</th></tr></thead><tbody>${history.reports.map((r) => `<tr><td>${esc(fmt(r.cutoff))}</td><td>${esc(labels[r.kind])}</td><td>${r.content.period.totals.published_success}</td><td>${r.content.daily.totals.published_success}</td><td>${metric(r.content.period.totals.received_replies)}</td><td>${r.revision}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">尚无已保存的报告。</p>'}</div>`;
+  $("#refresh-statistics").onclick = (e) =>
+    busy(e.target, () => renderStatistics($("#statistics-day").value));
+  $("#statistics-day").onchange = (e) =>
+    renderStatistics(e.target.value).catch((error) =>
+      toast(error.message, true),
+    );
 }
 function renderAccounts() {
   const checked = state.accounts.filter((a) => a.status === "healthy").length;
@@ -430,6 +498,12 @@ function accountRows(mode) {
     button.textContent = "编辑";
     button.onclick = () => editAccountForm(account);
     control.insertAdjacentElement("beforebegin", button);
+    const profile = document.createElement("button");
+    profile.className = "text-button";
+    profile.textContent = "人设";
+    profile.onclick = () =>
+      profileForm(account.id).catch((error) => toast(error.message, true));
+    control.insertAdjacentElement("beforebegin", profile);
   }
   document.querySelectorAll("[data-check]").forEach(
     (b) =>
@@ -544,7 +618,7 @@ function taskRows() {
               Object.entries(t.summary)
                 .map(([s, n]) => `${statuses[s] || s} ${n}`)
                 .join(" · ") || "尚无执行项"
-            }</span></td><td>${badge(t.state)}</td><td class="nowrap">${fmt(t.created_at)}</td></tr>`,
+            }</span></td><td>${taskExecutionBadge(t)}</td><td class="nowrap">${fmt(t.created_at)}</td></tr>`,
         )
         .join("")}</tbody></table></div>`
     : empty(
@@ -607,6 +681,28 @@ function taskForm() {
     });
   };
 }
+function taskReadinessPanel(t) {
+  if (["completed", "cancelled"].includes(t.state)) return "";
+  const checks = t.readiness;
+  if (!checks) return "";
+  const messages = [
+    ...checks.blockers.map((b) => b.message),
+    ...checks.items.map((b) => {
+      const item = t.items.find((i) => i.id === b.item_id);
+      return `${item?.payload.target || "目标"}：${b.message}`;
+    }),
+  ];
+  const skips = [...t.items, ...t.candidates]
+    .filter((i) => i.result?.skip_message)
+    .map((i) => `${i.payload.target}：${i.result.skip_message}`);
+  if (!messages.length && !skips.length) return "";
+  return `<div class="surface padded mt-20" id="task-readiness"><h2>执行前检查</h2>${
+    messages.length
+      ? `<ul>${[...new Set(messages)].map((m) => `<li>${esc(m)}</li>`).join("")}</ul>`
+      : ""
+  }${skips.length ? `<details><summary>最近一次跳过执行的原因</summary><ul>${skips.map((m) => `<li>${esc(m)}</li>`).join("")}</ul></details>` : ""}</div>`;
+}
+
 async function renderTask(id) {
   const t = await api("/tasks/" + id);
   state.current = t;
@@ -618,9 +714,11 @@ async function renderTask(id) {
     heading(
       esc(t.name),
       "计划时间以北京时间显示；逐项保存执行结果和核验记录。",
-      `<div class="actions">${badge(t.state)}<button class="secondary compact" id="refresh-task">刷新</button></div>`,
+      `<div class="actions"><span id="task-state">${taskExecutionBadge(t)}</span><button class="secondary compact" id="refresh-task">刷新</button></div>`,
     ) +
-    `<div class="steps"><span class="${discovery ? "done" : ""}"><b>1</b>发现政策</span><span class="${t.manifest ? "done" : ""}"><b>2</b>准备清单</span><span class="${approved ? "done" : ""}"><b>3</b>外发审批</span><span class="${t.state === "completed" ? "done" : ""}"><b>4</b>执行核验</span></div><div class="detail-grid"><div class="detail-body"><div class="surface"><div class="section-header"><h2>执行清单 <span class="muted">${t.items.length}</span></h2>${discovery && !t.manifest && !ended ? '<button id="edit-items" class="secondary compact">编辑执行项</button>' : ""}</div>${t.items.length ? t.items.map((item) => itemPreview(item)).join("") : empty("尚无执行项", discovery ? "添加每项的目标、内容、媒体和时间，再冻结外发清单。" : "先检查任务审批中的发现政策并完成第一阶段审批。")}</div>${discovery && !t.manifest && t.items.length ? '<div class="form-actions"><button id="prepare">冻结并预览外发清单</button></div>' : ""}<div class="surface mt-24"><div class="section-header"><h2>发现候选 <span class="muted">${t.candidates.length}</span></h2></div><div class="padded">${
+    `<div id="task-execution">${taskExecutionPanel(t)}</div>` +
+    taskReadinessPanel(t) +
+    `<div class="steps"><span class="${discovery ? "done" : ""}"><b>1</b>发现政策</span><span class="${t.manifest ? "done" : ""}"><b>2</b>准备清单</span><span class="${approved ? "done" : ""}"><b>3</b>外发审批</span><span class="${t.state === "completed" ? "done" : ""}"><b>4</b>执行核验</span></div><div class="detail-grid"><div class="detail-body"><div class="surface"><div class="section-header"><h2>执行清单 <span class="muted">${t.items.length}</span></h2>${discovery && !t.manifest && !ended ? '<button id="edit-items" class="secondary compact">编辑执行项</button>' : ""}</div>${t.items.length ? t.items.map((item) => itemPreview(item)).join("") : empty("尚无执行项", discovery ? "添加每项的目标、内容、媒体和时间，再冻结外发清单。" : "先检查任务审批中的发现政策并完成第一阶段审批。")}</div>${discovery && !t.manifest && t.items.length ? `<div class="form-actions"><button id="prepare" ${t.readiness?.workflow?.can_prepare ? "" : "disabled"} title="${esc(t.readiness?.workflow?.message || "")}">冻结并预览外发清单</button></div>` : ""}<div class="surface mt-24"><div class="section-header"><h2>发现候选 <span class="muted">${t.candidates.length}</span></h2></div><div class="padded">${
       discovery && !ended
         ? `<div class="actions">${t.account_snapshot
             .filter((a) => a.platform !== "instagram")
@@ -633,6 +731,7 @@ async function renderTask(id) {
             )}<button class="secondary compact" id="add-candidate">录入候选</button>${t.policy.max_joins ? '<button class="secondary compact" id="join-candidates">执行已批准入群</button>' : ""}</div>`
         : ""
     }${t.candidates.length ? '<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>候选目标</th><th>资格判断</th><th>原因</th></tr></thead><tbody>' + t.candidates.map((c) => `<tr><td>${esc(c.target)}</td><td>${badge(c.decision)}</td><td>${esc(c.reasons.join(" · ") || "通过发现政策")}<span class="sub">${esc(c.state)}</span>${["unknown", "pending_admin_approval"].includes(c.state) ? `<button class="text-button" data-join-reconcile="${c.id}">只读核对入群</button>` : ""}</td></tr>`).join("") + "</tbody></table></div>" : '<p class="muted mt-14">搜索结果先经过资格筛选，低置信度候选会被记录为拒绝。</p>'}</div></div><div class="surface mt-24"><div class="section-header"><h2>任务日志</h2></div><div class="padded" id="task-audit">正在读取…</div></div></div><aside class="detail-aside"><div class="surface padded"><h2>任务审批</h2><div class="approval"><strong>发现与入群政策</strong>${discovery ? " " + badge("confirmed").replace("已发布 · 已核验", "已批准") : ""}<details ${!discovery ? "open" : ""}><summary>查看完整范围</summary><p class="help">账号：${t.account_snapshot.map((a) => esc(a.label) + " (" + names[a.platform] + ")").join("、")}</p><pre>${esc(JSON.stringify(t.policy, null, 2))}</pre></details>${!discovery && !ended ? approvalForm(t, "discovery_join", t.discovery_phrase) : ""}</div><div class="approval"><strong>最终外发批次</strong>${approved ? ' <span class="badge green">已批准</span>' : ""}${t.manifest ? `<details><summary>查看完整不可变清单</summary><pre>${esc(JSON.stringify(t.manifest, null, 2))}</pre></details><span class="help">SHA-256</span><code>${esc(t.manifest_hash)}</code>` : '<p class="help">保存执行项并冻结后，可审核第二阶段。</p>'}${t.manifest && !approved && !ended ? approvalForm(t, "outbound", t.outbound_phrase) : ""}</div></div><div class="surface padded mt-20"><h2>执行控制</h2><p class="help">${state.overview.global_stop ? "全局执行已暂停。请使用顶部开关恢复。" : "调度器按批准的时间窗口执行。"}</p><div class="actions mt-14">${approved && !ended ? '<button id="run-task" class="compact">运行一轮</button>' : ""}${!ended ? `<button class="secondary compact" id="pause-task">${t.state === "paused" ? "恢复任务" : "暂停任务"}</button><button class="danger compact" id="cancel-task">取消任务</button>` : ""}</div><p class="native-note">停止本地任务不会撤回已经提交给 Telegram 的原生排期。</p></div></aside></div>`;
+  bindTaskTools(t);
   $("#refresh-task").onclick = () => renderTask(id);
   $("#edit-items")?.addEventListener("click", () => itemEditor(t));
   $("#prepare")?.addEventListener("click", (e) =>
@@ -749,8 +848,112 @@ function approvalForm(t, stage, phrase) {
 }
 function itemPreview(i) {
   const p = i.payload;
-  return `<article class="item-preview"><div class="item-head"><strong>${i.position + 1}. ${esc(p.account_label)} · ${actions[p.action] || esc(p.action)}</strong>${badge(i.status)}</div><div class="item-meta"><span>目标：${esc(p.target)}</span>${p.discord_reply_to ? `<span>回复消息 ID：${esc(p.discord_reply_to)}</span>` : ""}<span>${fmt(p.scheduled_at)} UTC+08:00</span></div>${p.title ? `<h3>${esc(p.title)}</h3>` : ""}${p.text ? `<div class="item-text">${esc(p.text)}</div>` : ""}${p.media.length ? '<p class="help">媒体：' + p.media.map((m) => esc(m.filename) + " · " + esc(m.sha256.slice(0, 12))).join("，") + "</p>" : ""}${i.external_reference ? '<p class="help">回执：<code>' + esc(i.external_reference) + "</code></p>" : ""}${i.result.reason ? '<p class="help">' + esc(i.result.reason) + "</p>" : ""}<div class="actions">${["unknown", "scheduled"].includes(i.status) ? `<button class="text-button" data-reconcile="${i.id}">只读核对结果</button>` : ""}${i.status === "manual_attention" ? `<button class="text-button" data-manual="${i.id}">登记人工发布结果</button>` : ""}</div></article>`;
+  return `<article class="item-preview"><div class="item-head"><strong>${i.position + 1}. ${esc(p.account_label)} · ${actions[p.action] || esc(p.action)}</strong>${badge(i.status)}</div><div class="item-meta"><span>目标：${esc(p.target)}</span>${p.discord_reply_to ? `<span>回复消息 ID：${esc(p.discord_reply_to)}</span>` : ""}<span>${fmt(p.scheduled_at)} UTC+08:00</span></div>${p.title ? `<h3>${esc(p.title)}</h3>` : ""}${p.text ? `<div class="item-text">${esc(p.text)}</div>` : ""}${p.media.length ? '<p class="help">媒体：' + p.media.map((m) => esc(m.filename) + " · " + esc(m.sha256.slice(0, 12))).join("，") + "</p>" : ""}${i.external_reference ? '<p class="help">回执：<code>' + esc(i.external_reference) + "</code></p>" : ""}${i.result.execution_step ? `<p class="help">执行步骤：${esc(executionSteps[i.result.execution_step] || i.result.execution_step)} · ${i.result.submission_started ? "已开始提交，需核对结果" : "尚未开始提交"}</p>` : ""}${i.result.diagnostic_traceback?.length ? `<details><summary>诊断详情</summary><pre>${esc(JSON.stringify(i.result.diagnostic_traceback, null, 2))}</pre></details>` : ""}${i.result.reason ? '<p class="help">' + esc(i.result.reason) + "</p>" : ""}<div class="actions">${["unknown", "scheduled"].includes(i.status) ? `<button class="text-button" data-reconcile="${i.id}">只读核对结果</button>` : ""}${i.status === "manual_attention" ? `<button class="text-button" data-manual="${i.id}">登记人工发布结果</button>` : ""}</div></article>`;
 }
+
+const executionSteps = {
+  backend_start: "启动执行后端",
+  browser_start: "启动浏览器",
+  browser_ready: "浏览器就绪",
+  home_navigation: "打开平台首页",
+  identity_check: "核对账号身份",
+  target_navigation: "打开目标帖子",
+  target_lookup: "定位目标帖子",
+  reply_control: "打开回复入口",
+  reply_composer: "定位回复输入框",
+  fill_reply: "填写回复",
+  attach_media: "添加媒体",
+  submission_authorization: "检查提交权限",
+  submit_click: "点击发布",
+  submission_response: "等待发布回执",
+  parse_receipt: "读取发布回执",
+  receipt_saved: "保存发布回执",
+  receipt_navigation: "打开回复核验",
+  receipt_lookup: "定位已发布回复",
+  receipt_validation: "核验回复内容",
+  completed: "核验完成",
+};
+function taskExecutionBadge(t) {
+  const flow = t.readiness?.workflow;
+  if (
+    flow &&
+    !["ready", "verifying", "completed", "cancelled"].includes(flow.status)
+  )
+    return `<span class="badge amber">${esc(flow.label)}</span>`;
+  if (t.state !== "active" || t.phase !== "ready") return badge(t.state);
+  const labels = {
+    running: "发送进程运行中",
+    stale: "发送心跳超时",
+    stopped: "发送已停止",
+    unmonitored: "已批准 · 待执行",
+  };
+  const status = t.execution?.status || "unmonitored";
+  return `<span class="badge ${status === "running" ? "green" : "amber"}">${labels[status]}</span>`;
+}
+function taskExecutionPanel(t) {
+  const flow = t.readiness?.workflow;
+  const progress = flow?.counts;
+  const workflow = flow
+    ? `<div class="banner" id="task-workflow"><div><strong>${esc(flow.label)}</strong><p>${esc(flow.message)}</p>${flow.next_at ? `<p>下一计划时间：${fmt(flow.next_at)} UTC+08:00</p>` : ""}${progress ? `<p>已核验发布 ${progress.verified_sent} / ${progress.planned} · 未尝试 ${progress.not_attempted} · 已核验入群 ${progress.membership_verified}</p>` : ""}</div></div>`
+    : "";
+  if (!t.manifest) return workflow;
+  const e = t.execution || { status: "unmonitored" };
+  const messages = {
+    running: "发送进程心跳正常，按已批准的窗口和限额执行。",
+    stale: "超过 60 秒未收到发送心跳，无法确认进程仍在运行。请检查执行服务。",
+    stopped: "发送进程已结束，剩余项目不会由该进程继续执行。",
+    unmonitored: "尚无发送进程监测记录；任务审批状态不能证明发送正在运行。",
+  };
+  return (
+    workflow +
+    `<div class="banner ${e.status === "running" ? "" : "warning"}"><div><strong>后台进程状态</strong><p>${messages[e.status] || messages.unmonitored}</p>${e.last_heartbeat ? `<p>最后心跳：${fmt(e.last_heartbeat)} UTC+08:00</p>` : ""}${e.finished_at ? `<p>退出记录时间：${fmt(e.finished_at)} UTC+08:00</p>` : ""}${e.reason ? `<p>退出或监测原因：${esc(e.reason === "process_exit_reason_unavailable" ? "历史记录未保存退出原因" : e.reason)}${e.exit_code != null ? ` · 退出码 ${esc(e.exit_code)}` : ""}</p>` : ""}</div></div>`
+  );
+}
+
+let executionPolling = false;
+setInterval(async () => {
+  if (
+    executionPolling ||
+    $("#panel")?.open ||
+    !location.hash.startsWith("#tasks/")
+  )
+    return;
+  executionPolling = true;
+  const id = location.hash.slice(7);
+  try {
+    const task = await api("/tasks/" + id);
+    if (location.hash === "#tasks/" + id && $("#task-execution")) {
+      const previous = state.current;
+      const changed =
+        previous?.phase !== task.phase ||
+        previous?.readiness?.workflow?.can_prepare !==
+          task.readiness?.workflow?.can_prepare ||
+        JSON.stringify(previous?.candidates.map((c) => [c.state, c.result])) !==
+          JSON.stringify(task.candidates.map((c) => [c.state, c.result])) ||
+        JSON.stringify(previous?.items.map((i) => i.status)) !==
+          JSON.stringify(task.items.map((i) => i.status));
+      if (
+        changed &&
+        !document.activeElement?.matches("input, textarea, select")
+      ) {
+        await renderTask(id);
+        return;
+      }
+      $("#task-execution").innerHTML = taskExecutionPanel(task);
+      $("#task-state").innerHTML = taskExecutionBadge(task);
+      if ($("#task-readiness"))
+        $("#task-readiness").outerHTML = taskReadinessPanel(task);
+      if ($("#prepare"))
+        $("#prepare").disabled = !task.readiness.workflow.can_prepare;
+    }
+  } catch (_) {
+    if ($("#task-execution"))
+      $("#task-execution").textContent =
+        "执行状态暂时无法刷新，请检查本机服务。";
+  } finally {
+    executionPolling = false;
+  }
+}, 10000);
 function itemEditor(t) {
   let items = t.items.map((i) => {
     const p = { ...i.payload };
@@ -761,7 +964,12 @@ function itemEditor(t) {
   });
   function blank() {
     const a = t.account_snapshot[0];
+    const live = state.accounts.find((x) => x.id === a.id);
     return {
+      execution_mode:
+        live.mode === "live" && ["x", "reddit"].includes(live.platform)
+          ? "manual"
+          : "automatic",
       account_id: a.id,
       action: state.accounts
         .find((x) => x.id === a.id)
@@ -779,7 +987,12 @@ function itemEditor(t) {
       target_owned: false,
     };
   }
-  if (!items.length) items.push(blank());
+  if (!items.length)
+    items.push(
+      t.reply_context
+        ? { ...blank(), ...t.reply_context, action: "reply" }
+        : blank(),
+    );
   openPanel("编辑执行清单", "");
   function targetField(p, n) {
     if (
@@ -808,7 +1021,7 @@ function itemEditor(t) {
             )
             .join(
               "",
-            )}</select></label></div><div class="full">${targetField(p, n)}</div><div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div>${replyField(p)}</div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 发布必须勾选）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · ${state.accounts.find((a) => a.id === p.account_id).platform === "discord" ? "单文件最多 10 MiB，合计最多 25 MiB" : "最大 50 MB"}</p>${p.media.map((m, j) => `<label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
+            )}</select></label></div><div class="full"><label>执行方式<select name="execution_mode"><option value="automatic" ${p.execution_mode !== "manual" ? "selected" : ""}>自动执行</option><option value="manual" ${p.execution_mode === "manual" ? "selected" : ""}>人工执行与结果登记</option></select></label></div><div class="full">${targetField(p, n)}</div><div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div>${replyField(p)}</div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 发布必须勾选）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · ${state.accounts.find((a) => a.id === p.account_id).platform === "discord" ? "单文件最多 10 MiB，合计最多 25 MiB" : "最大 50 MB"}</p>${p.media.map((m, j) => `<label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
       )
       .join(
         "",
@@ -817,7 +1030,14 @@ function itemEditor(t) {
       container.querySelectorAll("[data-index]").forEach((row) => {
         const n = Number(row.dataset.index),
           p = items[n];
-        for (const name of ["account_id", "action", "target", "title", "text"])
+        for (const name of [
+          "account_id",
+          "action",
+          "target",
+          "title",
+          "text",
+          "execution_mode",
+        ])
           p[name] = row.querySelector(`[name=${name}]`).value;
         p.scheduled_at = new Date(
           row.querySelector("[name=scheduled_at]").value,
@@ -848,6 +1068,12 @@ function itemEditor(t) {
           items[index].action = state.accounts
             .find((a) => a.id === el.value)
             .capabilities.find((c) => !["discover", "join"].includes(c));
+          const account = state.accounts.find((a) => a.id === el.value);
+          items[index].execution_mode =
+            account.mode === "live" &&
+            ["x", "reddit"].includes(account.platform)
+              ? "manual"
+              : "automatic";
           items[index].target = "";
           items[index].reply_to = null;
           items[index].discord_reply_to = "";
@@ -1066,11 +1292,11 @@ async function renderAPI() {
     ) +
     `<div class="surface"><div class="section-header"><h2>平台适配器</h2><span class="badge">${services.filter((s) => s.installed).length} / ${services.length} 已集成后端</span></div>${services.map((s) => `<div class="service-row"><div>${platform(s.platform)}<p>${esc(s.transport)}</p></div><div><div class="chips">${s.capabilities.map((c) => `<span class="chip">${actions[c]}</span>`).join("")}</div><p>${esc(s.project)}</p></div><div class="service-status">${s.installed ? '<span class="badge green">后端已安装</span>' : '<span class="badge red">后端缺失</span>'}<p>${s.dependencies_ready === false ? "依赖未安装，请运行 install.ps1" : s.live_configured ? "已启用；账号需通过连接检查" : "依赖就绪；真实执行未启用"}</p></div></div>`).join("")}</div><div class="two-col"><div class="surface padded"><h2>统一接口</h2><div class="log-row"><span><span class="method">GET</span><code>/api/accounts</code></span><span>账号与能力</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks</code></span><span>创建任务</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/approve/{stage}</code></span><span>精确审批</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/run</code></span><span>执行一轮</span></div><div class="log-row"><span><span class="method">GET</span><code>/api/audit</code></span><span>审计记录</span></div><p class="help mt-16">写入只能通过批准的任务路径。API 凭据由本机配置管理，不在页面展示。</p></div><div class="surface padded"><h2>运行边界</h2><div class="log-row"><span>存储</span><span>${esc(state.overview.storage)}</span></div><div class="log-row"><span>调度</span><span>${state.overview.worker ? "后台 worker" : "手动触发"}</span></div><div class="log-row"><span>未知结果</span><span>只读核对，不自动重发</span></div><div class="log-row"><span>外部发布</span><span>${state.overview.live_writes ? "按账号和任务权限执行" : "关闭；模拟流程可执行"}</span></div></div></div><div class="surface mt-24"><div class="section-header"><h2>最近平台调用</h2><button class="secondary compact" id="refresh-api">刷新</button></div>${
       calls.length
-        ? `<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>时间</th><th>平台</th><th>操作</th><th>结果</th><th>耗时</th><th>错误类型</th></tr></thead><tbody>${calls
+        ? `<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>时间</th><th>平台</th><th>操作</th><th>结果</th><th>耗时</th><th>错误类型</th><th>执行步骤</th></tr></thead><tbody>${calls
             .slice(0, 40)
             .map(
               (c) =>
-                `<tr><td class="nowrap">${fmt(c.at)}</td><td>${names[c.platform]}</td><td><code>${esc(c.operation)}</code></td><td>${badge(c.status === "ok" ? "healthy" : "unavailable")}</td><td>${c.duration_ms} ms</td><td><code>${esc(c.error_code || "—")}</code></td></tr>`,
+                `<tr><td class="nowrap">${fmt(c.at)}</td><td>${names[c.platform]}</td><td><code>${esc(c.operation)}</code></td><td>${badge(c.status === "ok" ? "healthy" : c.status === "error" ? "unavailable" : c.status)}</td><td>${c.duration_ms} ms</td><td><code>${esc(c.error_code || "—")}</code></td><td>${esc(executionSteps[c.execution_step] || c.execution_step || "—")}</td></tr>`,
             )
             .join("")}</tbody></table></div>`
         : empty(

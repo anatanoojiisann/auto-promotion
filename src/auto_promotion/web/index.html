@@ -11,6 +11,9 @@
     />
     <link rel="stylesheet" href="/assets/style.css" />
     <script src="/assets/app.js" defer></script>
+    <script src="/assets/campaigns.js" defer></script>
+    <script src="/assets/growth.js" defer></script>
+    <script src="/assets/task-tools.js" defer></script>
   </head>
   <body>
     <a class="skip" href="#main">跳到主要内容</a>
@@ -22,6 +25,33 @@
         ><span>Auto Promotion<small>多平台运营工作台</small></span></a
       >
       <nav aria-label="主导航">
+        <a href="#growth" data-nav="growth"
+          ><svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 20h16M5 15l5-5 4 3 6-9M15 4h5v5" /></svg
+          >业务增长</a
+        >
+        <a href="#inbox" data-nav="inbox"
+          ><svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 4h18v13H9l-6 4zM7 8h10M7 12h6" /></svg
+          >回复待办 <span id="reply-count"></span
+        ></a>
+        <a href="#pools" data-nav="pools"
+          ><svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="8" cy="8" r="3" />
+            <circle cx="17" cy="9" r="2" />
+            <path d="M2 21v-3a6 6 0 0 1 12 0v3m1-6a4 4 0 0 1 7 3v3" /></svg
+          >号池与人设</a
+        >
+        <a href="#content" data-nav="content"
+          ><svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 4h16v16H4zM8 8h8M8 12h8M8 16h4" /></svg
+          >共享内容池</a
+        >
+        <a href="#campaigns" data-nav="campaigns"
+          ><svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 12h6l10-7v14L9 12m-3 0 2 8" /></svg
+          >推广活动</a
+        >
         <a href="#accounts" data-nav="accounts"
           ><svg viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="12" cy="8" r="4" />
@@ -34,10 +64,21 @@
             <path d="M8 9h8M8 13h8M8 17h5M9 4V2m6 2V2" /></svg
           >任务中心</a
         >
+        <a href="#templates" data-nav="templates"
+          ><svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M7 3h13v15H7zM4 7v14h12M10 7h7M10 11h7" />
+          </svg>
+          任务模板</a
+        >
         <a href="#api" data-nav="api"
           ><svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18" /></svg
           >API 中心</a
+        >
+        <a href="#statistics" data-nav="statistics"
+          ><svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 20h16M7 16V9m5 7V4m5 12v-6" /></svg
+          >互动统计</a
         >
       </nav>
       <div class="sidebar-note">

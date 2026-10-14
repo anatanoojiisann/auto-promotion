@@ -67,6 +67,22 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.call("/health", auth=False)[0], 200)
         self.assertEqual(self.call("/api/accounts", auth=False)[0], 401)
 
+    def test_statistics_are_private_and_missing_reply_data_is_explicit(self):
+        self.assertEqual(self.call("/api/statistics", auth=False)[0], 401)
+        status, snapshot, _ = self.call("/api/statistics")
+        self.assertEqual(status, 200)
+        self.assertEqual(snapshot["scope"], "all_live_tasks")
+        self.assertEqual(snapshot["totals"]["published_success"], 0)
+        self.assertIsNone(snapshot["totals"]["received_replies"])
+        self.assertEqual(self.call("/api/statistics/run", "POST")[0], 200)
+        self.assertEqual(self.call("/api/statistics/reports")[1]["reports"][0]["revision"], 1)
+        self.assertTrue(
+            self.app.state.engine.store.one("SELECT value FROM meta WHERE key='global_stop'")[
+                "value"
+            ]
+            == "1"
+        )
+
     def test_session_httponly_and_csrf(self):
         self.assertEqual(self.call("/api/session", "POST", auth=False)[0], 403)
         status, _, headers = self.call(

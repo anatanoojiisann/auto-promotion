@@ -480,6 +480,9 @@ td strong {
   gap: 8px;
   flex-wrap: wrap;
 }
+.task-toolbar {
+  margin-bottom: 24px;
+}
 .banner {
   padding: 13px 16px;
   background: #edf3eb;
@@ -891,12 +894,17 @@ dialog::backdrop {
     margin-top: 14px;
     display: flex;
     gap: 8px;
-    justify-content: space-between;
+    justify-content: flex-start;
+    overflow-x: auto;
+    flex-shrink: 0;
+    scrollbar-width: thin;
   }
   .sidebar nav a {
     font-size: 12px;
     padding: 8px 10px;
     gap: 7px;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
   .sidebar nav svg {
     width: 16px;
@@ -929,6 +937,19 @@ dialog::backdrop {
   }
   .page-heading {
     gap: 12px;
+    align-items: flex-start;
+  }
+  .page-heading > div:first-child {
+    min-width: 0;
+  }
+  .page-heading h1 {
+    overflow-wrap: anywhere;
+  }
+  .page-heading .actions {
+    flex-shrink: 0;
+  }
+  .page-heading .actions a {
+    white-space: nowrap;
   }
   .page-heading p {
     font-size: 12px;
@@ -1109,4 +1130,43 @@ td code {
   #task-audit {
     max-height: 300px;
   }
+}
+
+.content-wrap {
+  overflow-wrap: anywhere;
+  max-width: 28rem;
+}
+#execution-form input[type="number"] {
+  min-width: 5rem;
+  width: 100%;
+}
+
+.growth-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  border: 0;
+  padding: 0;
+  margin: 24px 0;
+}
+.growth-stats .stat {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+  font-size: 13px;
+}
+.growth-stats .stat strong {
+  display: block;
+  margin: 0;
+  font-size: 25px;
+}
+.growth-stats .sub {
+  color: var(--muted);
+  font-size: 11px;
 }

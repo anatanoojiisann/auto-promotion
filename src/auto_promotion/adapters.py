@@ -16,6 +16,26 @@ class SimulationAdapter:
     """Explicitly synthetic external service, including a durable result reference."""
 
     def call(self, account, operation, payload):
+        if operation == "content" and account["platform"] == "telegram":
+            return {
+                "content_items": [
+                    {
+                        "platform": "telegram",
+                        "external_id": "simulation-message-1",
+                        "target": payload["target"],
+                        "action": "reply",
+                        "reply_to": 1,
+                        "author_id": "simulation-author",
+                        "title": "模拟公开群消息",
+                        "context": "AI video export question",
+                        "language": "en",
+                        "confidence": 0.95,
+                        "is_public": True,
+                        "permission": "unknown",
+                    }
+                ],
+                "truncated": False,
+            }
         if operation == "targets" and account["platform"] == "discord":
             return {
                 "targets": [
@@ -65,6 +85,7 @@ class SimulationAdapter:
             return {
                 "status": "joined",
                 "verified": True,
+                "can_send": True,
                 "external_reference": "simulation://membership/" + payload["candidate_id"],
             }
         if operation in {"execute", "verify"}:

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 from .adapters import AdapterRegistry
@@ -11,7 +12,11 @@ from .config import database_path, load_environment, workspace_path
 from .core import Engine
 from .legacy import import_accounts
 from .models import PLATFORMS, AccountInput
+from .statistics import ZONE, Statistics
 from .store import Store
+from .task_tool_models import TemplateSave, TemplateTask
+from .task_tools import TaskTools
+from .workers import WorkerRun
 
 
 def main():
@@ -22,8 +27,34 @@ def main():
     serve = sub.add_parser("serve")
     serve.add_argument("--port", type=int, default=8780)
     serve.add_argument("--no-worker", action="store_true")
+    serve.add_argument(
+        "--reports-only", action="store_true", help="Run local reporting without outbound execution"
+    )
     sub.add_parser("init")
     sub.add_parser("worker-once")
+    sub.add_parser("template-list", help="List reusable task settings")
+    template = sub.add_parser("template-save", help="Save a task's reusable settings")
+    template.add_argument("--task", required=True)
+    template.add_argument("--name", required=True)
+    template.add_argument("--description", default="")
+    reuse = sub.add_parser("task-from-template", help="Create a fresh, unapproved draft")
+    reuse.add_argument("--template", required=True)
+    reuse.add_argument("--name", required=True)
+    reuse.add_argument("--account", action="append", required=True)
+    reuse.add_argument("--starts", required=True)
+    reuse.add_argument("--ends", required=True)
+    reuse.add_argument("--target", action="append", default=[])
+    export = sub.add_parser("task-export", help="Export task evidence without platform calls")
+    export.add_argument("--task", required=True)
+    export.add_argument("--format", choices=("zip", "json", "html"), default="zip")
+    export.add_argument("--output", type=Path, required=True)
+    sub.add_parser("collect-statistics", help="Read Telegram delivery and replies; never publishes")
+    statistics = sub.add_parser("statistics", help="Read all live-task interaction statistics")
+    statistics.add_argument("--day", help="UTC+8 date, YYYY-MM-DD (defaults to today)")
+    statistics.add_argument("--all", action="store_true", help="Include all recorded dates")
+    sub.add_parser(
+        "report-once", help="Save due reports and reconcile late local evidence; no platform calls"
+    )
     checks = sub.add_parser("check-accounts")
     checks.add_argument("--live-only", action="store_true")
     sub.add_parser("seed-simulation")
@@ -73,18 +104,77 @@ def main():
         from .api import create_app
 
         uvicorn.run(
-            create_app(db_path=args.db, worker=not args.no_worker),
+            create_app(
+                db_path=args.db,
+                worker=not (args.no_worker or args.reports_only),
+                report_worker=args.reports_only or not args.no_worker,
+            ),
             host="127.0.0.1",
             port=args.port,
             access_log=False,
         )
         return
     store = Store(args.db)
+    if args.command in {"statistics", "report-once"}:
+        reporting = Statistics(store)
+        try:
+            result = (
+                reporting.run_due()
+                if args.command == "report-once"
+                else reporting.snapshot(
+                    day=None if args.all else args.day or datetime.now(ZONE).date()
+                )
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     engine = Engine(
         store,
         AdapterRegistry(workspace_path()),
         live_enabled=os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
     )
+    if args.command in {"template-list", "template-save", "task-from-template", "task-export"}:
+        from pydantic import ValidationError
+
+        from .core import Conflict
+
+        task_tools = TaskTools(engine)
+        try:
+            if args.command == "template-list":
+                result = {"templates": task_tools.templates()}
+            elif args.command == "template-save":
+                result = task_tools.save_template(
+                    TemplateSave(
+                        source_task_id=args.task, name=args.name, description=args.description
+                    )
+                )
+            elif args.command == "task-from-template":
+                result = task_tools.create_from_template(
+                    args.template,
+                    TemplateTask(
+                        name=args.name,
+                        account_ids=args.account,
+                        starts_at=args.starts,
+                        ends_at=args.ends,
+                        target_allowlist=args.target,
+                    ),
+                )
+            else:
+                data = task_tools.export(args.task, args.format)
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                with args.output.open("xb") as target:
+                    target.write(data)
+                result = {
+                    "task_id": args.task,
+                    "format": args.format,
+                    "path": str(args.output.resolve()),
+                    "bytes": len(data),
+                }
+        except (Conflict, ValidationError, ValueError, OSError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "init":
         result = {
             "initialized": True,
@@ -116,7 +206,11 @@ def main():
             "external_actions": 0,
         }
     elif args.command == "worker-once":
-        result = engine.run_cycle()
+        with WorkerRun(engine.store, live_enabled=engine.live_enabled) as sender:
+            sender.phase("executing")
+            result = engine.run_cycle()
+    elif args.command == "collect-statistics":
+        result = engine.collect_statistics()
     else:
         accounts = [a for a in engine.accounts() if not args.live_only or a["mode"] == "live"]
         result = []

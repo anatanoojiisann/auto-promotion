@@ -5,21 +5,30 @@ import json
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import quotas
+from .dispatcher import AccountBusy, AccountLanes
+from .execution_diagnostics import FIELDS, safe_code
 from .models import (
     CAPABILITIES,
     AccountInput,
     AccountUpdate,
     CandidateInput,
+    ExecutionSettings,
     ItemInput,
     TaskInput,
     canonical,
     digest,
     epoch,
 )
+from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_blocker
+from .statistics import ZONE, Statistics, publication_time, record_publication
 from .store import Store, decode
+from .workers import Workers
 
 
 class Conflict(Exception):
@@ -43,6 +52,7 @@ RISK = re.compile(
     r"\b(?:nsfw|porn|adult|escort|dating|casino|gambling|scam)\b|18\+|色情|赌博|博彩|约炮|诈骗",
     re.I,
 )
+NON_ADULT = re.compile(r"(?<![\w-])non-adult(?![\w-])", re.I)
 
 
 class Engine:
@@ -56,6 +66,20 @@ class Engine:
         self.live_enabled = live_enabled
         self.media_root = Path(media_root or Path(store.path).parent / "media").resolve()
         self.media_root.mkdir(parents=True, exist_ok=True)
+        self.lanes = AccountLanes(store)
+
+    def execution_settings(self):
+        with self.store.connect() as db:
+            return quotas.settings(db)
+
+    def configure_execution(self, value: ExecutionSettings):
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "UPDATE meta SET value=? WHERE key='execution_settings'",
+                (canonical(value.model_dump()),),
+            )
+            Store.audit(db, "execution.settings", value.model_dump(), now=self.clock())
+        return self.execution_settings()
 
     def account(self, account_id):
         row = self.store.one("SELECT * FROM accounts WHERE id=?", (account_id,))
@@ -134,6 +158,10 @@ class Engine:
         return self.account(account_id)
 
     def call(self, account, operation, payload=None, task_id=None):
+        with self.lanes.acquire(account["id"]):
+            return self._call_unlocked(account, operation, payload, task_id)
+
+    def _call_unlocked(self, account, operation, payload=None, task_id=None):
         started = time.monotonic()
         try:
             result = self.adapters.call(account, operation, payload or {})
@@ -148,7 +176,19 @@ class Engine:
                 getattr(exc, "safe_code", type(exc).__name__),
             )
             raise Conflict("平台调用未完成；请查看 API 中心的错误类型并核验连接") from None
-        self.store.log_call(account["platform"], operation, "ok", started, task_id)
+        outcome = result.get("status")
+        status = outcome if outcome in {"unknown", "failed_known", "manual_attention"} else "ok"
+        if result.get("healthy") is False or result.get("allowed") is False:
+            status = "error"
+        self.store.log_call(
+            account["platform"],
+            operation,
+            status,
+            started,
+            task_id,
+            safe_code(result.get("reason"), None) if status != "ok" else None,
+            safe_code(result.get("execution_step"), None),
+        )
         return result
 
     def check_account(self, account_id):
@@ -157,6 +197,8 @@ class Engine:
             return account
         try:
             result = self.call(account, "health")
+        except AccountBusy:
+            return self.account(account_id)
         except Conflict:
             result = {"healthy": False, "reason": "connection_unavailable"}
         # Health results are an allowlist; raw provider responses are not persisted.
@@ -235,13 +277,15 @@ class Engine:
         return {"targets": result.get("targets", []), "truncated": bool(result.get("truncated"))}
 
     def apply_cooldown(self, account_id, result):
-        if result.get("rate_limited"):
+        if result.get("rate_limited") or result.get("risk_warning"):
             until = self.clock() + max(1, int(result.get("retry_after_seconds") or 60))
             with self.store.connect(write=True) as db:
                 db.execute(
                     "UPDATE accounts SET cooldown_until=max(cooldown_until,?) WHERE id=?",
                     (until, account_id),
                 )
+                if result.get("risk_warning"):
+                    db.execute("UPDATE accounts SET disabled=1 WHERE id=?", (account_id,))
                 Store.audit(db, "account.cooldown", {"account_id": account_id, "until": until})
 
     def create_task(self, value: TaskInput):
@@ -273,6 +317,8 @@ class Engine:
             for a in accounts
         ]
         policy = value.policy.model_dump()
+        # Only the server can capture limits; callers cannot pre-authorize a future increase.
+        policy["quota_snapshot"] = {"execution": self.execution_settings()}
         envelope = {"accounts": snapshot, "policy": policy}
         task_id = "AP-" + uuid.uuid4().hex[:14].upper()
         now = self.clock()
@@ -325,7 +371,61 @@ class Engine:
             s: sum(i["status"] == s for i in result["items"])
             for s in {i["status"] for i in result["items"]}
         }
+        result["execution"] = Workers(self.store, self.clock).snapshot(
+            task_id, live=result["mode"] == "live"
+        )
+        result["readiness"] = self.readiness(result)
+        reply = self.store.one(
+            "SELECT r.event_id,r.platform,r.account_id,i.payload FROM reply_inbox r "
+            "JOIN items i ON i.id=r.item_id WHERE r.followup_task_id=? LIMIT 1",
+            (task_id,),
+        )
+        if reply:
+            message_id = reply["event_id"].rsplit(":", 1)[-1]
+            result["reply_context"] = {
+                "target": json.loads(reply["payload"])["target"],
+                "account_id": reply["account_id"],
+                "reply_to": int(message_id)
+                if reply["platform"] == "telegram" and message_id.isdigit()
+                else None,
+                "discord_reply_to": message_id if reply["platform"] == "discord" else "",
+            }
         return result
+
+    def readiness(self, task):
+        """Report every local prerequisite without checking a real account or sending."""
+        blockers = []
+        grants = {a["stage"]: a["hash"] for a in task["approvals"]}
+        if task["state"] != "active":
+            blockers.append("task_not_active")
+        if grants.get("discovery_join") != task["policy_hash"]:
+            blockers.append("discovery_approval_missing")
+        if not task["manifest_hash"] or grants.get("outbound") != task["manifest_hash"]:
+            blockers.append("outbound_approval_missing")
+        if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
+            blockers.append("global_stop")
+        if task["mode"] == "live" and not self.live_enabled:
+            blockers.append("live_writes_disabled")
+        if self.clock() >= epoch(task["policy"]["ends_at"]):
+            blockers.append("delivery_window_elapsed")
+        items = []
+        with self.store.connect() as db:
+            raw_task = db.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone()
+            for item in task["items"]:
+                if item["status"] != "not_attempted":
+                    continue
+                reason = telegram_blocker(db, raw_task, item["payload"], item["due_at"])
+                if reason:
+                    items.append(
+                        {"item_id": item["id"], "reason": reason, "message": REASONS[reason]}
+                    )
+        return {
+            "blockers": [{"reason": r, "message": REASONS[r]} for r in blockers],
+            "items": items,
+            "workflow": task_workflow(task, blockers, items, self.clock()),
+            "sender_status": task["execution"]["status"],
+            "live_writes_enabled": self.live_enabled,
+        }
 
     @staticmethod
     def phrase(task_id, stage, hash_value):
@@ -379,10 +479,13 @@ class Engine:
             if previous:
                 self._integrity(db, task, stage)
             else:
+                if self.clock() >= epoch(json.loads(task["policy"])["ends_at"]):
+                    raise Conflict("任务执行窗口已过期，请创建新任务")
                 if stage == "outbound":
                     self._integrity(db, task, "discovery_join")
                     if task["phase"] != "review":
                         raise Conflict("请先冻结并预览最终外发清单")
+                    self._validate_outbound_readiness(db, task)
                 db.execute(
                     "INSERT INTO approvals VALUES(?,?,?,?,?,?)",
                     (task_id, stage, h, phrase, actor, self.clock()),
@@ -401,10 +504,48 @@ class Engine:
                 )
         return self.task(task_id)
 
-    def validate_item(self, task, value: ItemInput):
+    def validate_item(self, task, value: ItemInput, *, account=None, opportunity=None):
         if value.account_id not in task["account_ids"]:
             raise Conflict("账号不在该任务的批准范围内")
-        account = self.account(value.account_id)
+        account = account or self.account(value.account_id)
+        if (
+            account["mode"] == "live"
+            and account["platform"] in {"x", "reddit"}
+            and value.execution_mode != "manual"
+        ):
+            raise Conflict("此平台当前仅开放人工互动清单，请选择人工执行方式")
+        if value.opportunity_id:
+            from .planner import content_key, execution_mode
+
+            source = opportunity or self.store.one(
+                "SELECT * FROM opportunities WHERE id=?", (value.opportunity_id,)
+            )
+            if not source or source["platform"] != account["platform"]:
+                raise Conflict("共享内容不存在或平台不匹配")
+            original = (
+                source["payload"]
+                if isinstance(source["payload"], dict)
+                else json.loads(source["payload"])
+            )
+            if (
+                account["platform"] in {"telegram", "discord"}
+                and value.target != original["target"]
+            ):
+                raise Conflict("执行目标与共享内容不一致")
+            observed = {
+                **original,
+                "target": value.target,
+                "reply_to": value.reply_to,
+                "discord_reply_to": value.discord_reply_to,
+            }
+            if (
+                value.content_key != source["content_key"]
+                or content_key(observed) != value.content_key
+            ):
+                raise Conflict("执行目标与共享内容不一致")
+            mode, reason = execution_mode(account, original)
+            if mode == "disabled" or value.execution_mode != mode:
+                raise Conflict(reason)
         if value.action not in CAPABILITIES[account["platform"]] or value.action in {
             "discover",
             "join",
@@ -507,6 +648,21 @@ class Engine:
             self.verify_media(media.model_dump())
         return account
 
+    def _validate_outbound_readiness(self, db, task):
+        now = self.clock()
+        if now >= epoch(json.loads(task["policy"])["ends_at"]):
+            raise Conflict("任务执行窗口已过期，请创建新任务")
+        for row in db.execute(
+            "SELECT * FROM items WHERE task_id=? ORDER BY position", (task["id"],)
+        ):
+            payload = json.loads(row["payload"])
+            native = payload["action"] in {"schedule_message", "schedule_file"}
+            if now - row["due_at"] > DELIVERY_GRACE_SECONDS or (native and row["due_at"] <= now):
+                raise Conflict("清单包含已过期的计划时间，请创建新任务")
+            reason = telegram_blocker(db, task, payload, row["due_at"])
+            if reason:
+                raise Conflict(f"{payload['target']}：{REASONS[reason]}")
+
     def verify_media(self, media):
         if Path(media["filename"]).name != media["filename"]:
             raise Conflict("媒体文件名不能包含目录")
@@ -532,7 +688,11 @@ class Engine:
             due = epoch(value.scheduled_at)
             if due < previous_due:
                 raise Conflict("执行项必须按计划时间排序")
-            if index and due - previous_due < task["policy"]["min_interval"]:
+            if (
+                index
+                and task["policy"].get("pacing_scope", "task") == "task"
+                and due - previous_due < task["policy"]["min_interval"]
+            ):
                 raise Conflict("执行项之间短于任务最小间隔")
             gap = max(task["policy"]["min_interval"], account["min_interval"])
             if (
@@ -562,6 +722,9 @@ class Engine:
             self._integrity(db, row, "discovery_join")
             if row["manifest_hash"] or row["state"] in {"cancelled", "completed"}:
                 raise Conflict("清单已经冻结；变更内容请创建新任务")
+            if row["campaign_id"] and any(not p.get("opportunity_id") for p in payloads):
+                raise Conflict("活动执行项必须关联已分配的共享内容")
+            db.execute("UPDATE campaign_assignments SET item_id=NULL WHERE task_id=?", (task_id,))
             db.execute("DELETE FROM items WHERE task_id=?", (task_id,))
             for payload in payloads:
                 db.execute(
@@ -576,6 +739,17 @@ class Engine:
                         epoch(payload["scheduled_at"]),
                     ),
                 )
+                if payload.get("opportunity_id"):
+                    assignment = db.execute(
+                        "SELECT id,account_id FROM campaign_assignments WHERE task_id=? AND opportunity_id=?",
+                        (task_id, payload["opportunity_id"]),
+                    ).fetchone()
+                    if not assignment or assignment["account_id"] != payload["account_id"]:
+                        raise Conflict("执行项与活动分配不一致")
+                    db.execute(
+                        "UPDATE campaign_assignments SET item_id=(SELECT id FROM items WHERE task_id=? AND position=?) WHERE id=?",
+                        (task_id, payload["position"], assignment["id"]),
+                    )
             Store.audit(db, "items.saved", {"count": len(payloads)}, task_id, self.clock())
         return self.task(task_id)
 
@@ -596,6 +770,8 @@ class Engine:
             if row["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
             if not row["manifest_hash"]:
+                self._validate_outbound_readiness(db, row)
+                quotas.reserve(db, row)
                 # Read items inside this transaction, so a concurrent edit cannot race the freeze.
                 items = [
                     json.loads(r["payload"])
@@ -609,6 +785,15 @@ class Engine:
                     "policy": json.loads(row["policy"]),
                     "items": items,
                 }
+                if row["campaign_id"]:
+                    manifest["campaign_id"] = row["campaign_id"]
+                    manifest["profiles"] = {
+                        r["account_id"]: json.loads(r["profile_snapshot"])
+                        for r in db.execute(
+                            "SELECT account_id,profile_snapshot FROM campaign_assignments WHERE task_id=?",
+                            (task_id,),
+                        )
+                    }
                 h = digest(manifest)
                 db.execute(
                     "UPDATE tasks SET manifest=?,manifest_hash=?,phase='review',updated_at=? WHERE id=?",
@@ -635,6 +820,14 @@ class Engine:
                     "UPDATE items SET status='cancelled' WHERE task_id=? AND status='not_attempted'",
                     (task_id,),
                 )
+                db.execute(
+                    "DELETE FROM quota_reservations WHERE task_id=? AND state='reserved'",
+                    (task_id,),
+                )
+                db.execute(
+                    "DELETE FROM content_contacts WHERE assignment_id IN (SELECT ca.id FROM campaign_assignments ca LEFT JOIN items i ON i.id=ca.item_id WHERE ca.task_id=? AND (i.id IS NULL OR i.attempt_id IS NULL))",
+                    (task_id,),
+                )
             Store.audit(
                 db,
                 "task." + state,
@@ -658,13 +851,23 @@ class Engine:
     def recover(self, lease_seconds=300):
         with self.store.connect(write=True) as db:
             rows = db.execute(
-                "SELECT id,task_id,attempt_id FROM items WHERE status='executing' AND claimed_at<?",
+                "SELECT id,task_id,attempt_id,result FROM items WHERE status='executing' AND claimed_at<?",
                 (self.clock() - lease_seconds,),
             ).fetchall()
             for row in rows:
                 db.execute(
                     "UPDATE items SET status='unknown',result=? WHERE id=?",
-                    (canonical({"reason": "worker_lease_expired"}), row["id"]),
+                    (
+                        canonical(
+                            {
+                                **json.loads(row["result"]),
+                                "reason": "worker_lease_expired",
+                                "status": "unknown",
+                                "verified": False,
+                            }
+                        ),
+                        row["id"],
+                    ),
                 )
                 db.execute(
                     "UPDATE attempts SET outcome='unknown',finished_at=? WHERE id=?",
@@ -692,6 +895,30 @@ class Engine:
                 )
         return len(rows)
 
+    def _skip(self, item_id, reason, db=None, *, candidate=False):
+        if db is None:
+            with self.store.connect(write=True) as connection:
+                return self._skip(item_id, reason, connection, candidate=candidate)
+        table, state = ("candidates", "state") if candidate else ("items", "status")
+        row = db.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
+        if not row or row[state] != "not_attempted":
+            return None
+        result = json.loads(row["result"])
+        if result.get("skip_reason") == reason:
+            return None
+        result.update(
+            skip_reason=reason, skip_message=REASONS[reason], skip_recorded_at=self.clock()
+        )
+        db.execute(f"UPDATE {table} SET result=? WHERE id=?", (canonical(result), item_id))
+        Store.audit(
+            db,
+            "candidate.skipped" if candidate else "item.skipped",
+            {"candidate_id" if candidate else "item_id": item_id, "reason": reason},
+            row["task_id"],
+            self.clock(),
+        )
+        return None
+
     def _claim(self, item_id, backend_gate=None):
         now = self.clock()
         with self.store.connect(write=True) as db:
@@ -699,37 +926,69 @@ class Engine:
             if not row or row["status"] != "not_attempted":
                 return None
             task = db.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
-            if task["state"] != "active" or task["phase"] != "ready":
-                return None
+            if task["state"] != "active":
+                return self._skip(item_id, "task_not_active", db)
+            if task["campaign_id"]:
+                campaign = db.execute(
+                    "SELECT state FROM campaigns WHERE id=?", (task["campaign_id"],)
+                ).fetchone()
+                if not campaign or campaign[0] in {"paused", "cancelled"}:
+                    return self._skip(item_id, "task_not_active", db)
+            if task["phase"] != "ready":
+                return self._skip(item_id, "outbound_approval_missing", db)
             policy = self._integrity(db, task, "outbound")
             if db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
-                return None
+                return self._skip(item_id, "global_stop", db)
             payload = json.loads(row["payload"])
             account = db.execute(
                 "SELECT * FROM accounts WHERE id=?", (row["account_id"],)
             ).fetchone()
             if (
-                account["disabled"]
-                or account["status"] != "healthy"
-                or account["cooldown_until"] > now
-                or account["next_at"] > now
-                or task["next_at"] > now
+                account["mode"] == "live"
+                and account["platform"] in {"x", "reddit"}
+                and payload.get("execution_mode", "automatic") != "manual"
             ):
-                return None
-            if account["mode"] == "live" and (
-                not self.live_enabled
-                or not self.adapters.commissioned(account)
-                or not backend_gate
-                or backend_gate.get("allowed") is not True
+                return self._skip(item_id, "platform_policy_blocked", db)
+            if payload.get("opportunity_id"):
+                from .planner import execution_mode
+
+                source = db.execute(
+                    "SELECT payload FROM opportunities WHERE id=?", (payload["opportunity_id"],)
+                ).fetchone()
+                if not source or execution_mode(dict(account), json.loads(source[0]))[
+                    0
+                ] != payload.get("execution_mode", "automatic"):
+                    return self._skip(item_id, "target_cannot_send", db)
+                content = json.loads(source[0])
+                if content.get("expires_at") and now >= epoch(content["expires_at"]):
+                    return self._skip(item_id, "delivery_window_elapsed", db)
+            if account["disabled"]:
+                return self._skip(item_id, "account_disabled", db)
+            if account["status"] != "healthy":
+                return self._skip(item_id, "account_unhealthy", db)
+            if account["cooldown_until"] > now:
+                return self._skip(item_id, "account_cooldown", db)
+            if account["next_at"] > now or (
+                policy.get("pacing_scope", "task") == "task" and task["next_at"] > now
             ):
-                return None
+                return self._skip(item_id, "pacing_wait", db)
+            if (
+                account["mode"] == "live"
+                and payload.get("execution_mode", "automatic") == "automatic"
+            ):
+                if not self.live_enabled:
+                    return self._skip(item_id, "live_writes_disabled", db)
+                if not self.adapters.commissioned(account):
+                    return self._skip(item_id, "backend_not_commissioned", db)
+                if not backend_gate or backend_gate.get("allowed") is not True:
+                    return self._skip(item_id, "backend_gate_blocked", db)
             # Native schedules are submitted ahead of delivery; other actions are claimed when due.
             native = payload["action"] in {"schedule_message", "schedule_file"}
             if now < epoch(policy["starts_at"]) or (not native and row["due_at"] > now):
-                return None
+                return self._skip(item_id, "scheduled_time_pending", db)
             if (
                 now >= epoch(policy["ends_at"])
-                or now - row["due_at"] > 900
+                or now - row["due_at"] > DELIVERY_GRACE_SECONDS
                 or (native and row["due_at"] <= now)
             ):
                 db.execute(
@@ -748,7 +1007,7 @@ class Engine:
                     (task["id"], row["position"]),
                 ).fetchall()
             if any(r["status"] not in TERMINAL for r in earlier):
-                return None
+                return self._skip(item_id, "earlier_item_pending", db)
             target_key = digest([account["platform"], payload["target"].casefold()])
             user_key = digest(
                 [account["platform"], payload["recipient_id"] or payload["target"].casefold()]
@@ -761,91 +1020,27 @@ class Engine:
                     (account["id"], day),
                 ).fetchone()[0]
                 if used >= int(backend_gate["daily_remaining"]):
-                    return None
-            limits = [
-                ("mode=? AND started_at>=?", (mode, day), 100),
-                ("mode=? AND started_at>=?", (mode, now - 3600), 20),
-                ("account_id=? AND started_at>=?", (account["id"], day), account["daily_limit"]),
-                (
-                    "account_id=? AND started_at>=?",
-                    (account["id"], now - 3600),
-                    account["hourly_limit"],
-                ),
-                ("task_id=? AND started_at>=?", (task["id"], day), policy["daily_limit"]),
-                (
-                    "mode=? AND target_key=? AND started_at>=?",
-                    (mode, target_key, day),
-                    policy["target_daily_limit"],
-                ),
-                (
-                    "mode=? AND user_key=? AND started_at>=?",
-                    (mode, user_key, day),
-                    policy["user_daily_limit"],
-                ),
-            ]
-            for clause, params, limit in limits:
-                if (
-                    db.execute("SELECT count(*) FROM activity WHERE " + clause, params).fetchone()[
-                        0
-                    ]
-                    >= limit
-                ):
-                    return None
-            # Reserve delivery-day capacity too: multiple days of native schedule
-            # submissions must not concentrate beyond one day's approved limits.
-            delivery_day = row["due_at"] - row["due_at"] % 86400
-            reserved = db.execute(
-                "SELECT i.account_id,i.task_id,i.payload FROM items i JOIN accounts a ON a.id=i.account_id WHERE i.attempt_id IS NOT NULL AND a.mode=? AND i.due_at>=? AND i.due_at<?",
-                (mode, delivery_day, delivery_day + 86400),
-            ).fetchall()
-            if (
-                len(reserved) >= 100
-                or sum(r["account_id"] == account["id"] for r in reserved) >= account["daily_limit"]
-                or sum(r["task_id"] == task["id"] for r in reserved) >= policy["daily_limit"]
-            ):
-                return None
-            reserved_payloads = (json.loads(r["payload"]) for r in reserved)
-            same_platform = [p for p in reserved_payloads if p["platform"] == account["platform"]]
-            if (
-                sum(p["target"].casefold() == payload["target"].casefold() for p in same_platform)
-                >= policy["target_daily_limit"]
-            ):
-                return None
-            recipient = payload["recipient_id"] or payload["target"].casefold()
-            if (
-                sum(
-                    (p["recipient_id"] or p["target"].casefold()) == recipient
-                    for p in same_platform
-                )
-                >= policy["user_daily_limit"]
-            ):
-                return None
+                    return self._skip(item_id, "activity_limit", db)
+            quota_reason = quotas.check_claim(
+                db, account, task, payload, row["due_at"], now, item_id
+            )
+            if quota_reason:
+                return self._skip(item_id, quota_reason, db)
             for media in payload["media"]:
                 self.verify_media(media)
-            membership = db.execute(
-                "SELECT state,result FROM candidates WHERE account_id=? AND target=? ORDER BY rowid DESC LIMIT 1",
-                (account["id"], payload["target"]),
-            ).fetchone()
-            if membership:
-                joined = json.loads(membership["result"])
-                if membership["state"] in {"pending_admin_approval", "unknown", "executing"}:
-                    return None
-                if joined.get("can_send") is False:
-                    return None
-                if (
-                    joined.get("outbound_eligible_at_utc")
-                    and epoch(joined["outbound_eligible_at_utc"]) > now
-                ):
-                    return None
+            reason = telegram_blocker(db, task, payload, now)
+            if reason:
+                return self._skip(item_id, reason, db)
             attempt = "attempt-" + uuid.uuid4().hex
             db.execute(
                 "INSERT INTO attempts(id,item_id,account_id,task_id,target_key,user_key,mode,started_at) VALUES(?,?,?,?,?,?,?,?)",
                 (attempt, item_id, account["id"], task["id"], target_key, user_key, mode, now),
             )
             db.execute(
-                "UPDATE items SET status='executing',attempt_id=?,claimed_at=? WHERE id=?",
+                "UPDATE items SET status='executing',attempt_id=?,claimed_at=?,result='{}' WHERE id=?",
                 (attempt, now, item_id),
             )
+            db.execute("UPDATE quota_reservations SET state='consumed' WHERE item_id=?", (item_id,))
             db.execute(
                 "UPDATE accounts SET next_at=? WHERE id=?",
                 (now + max(account["min_interval"], policy["min_interval"]), account["id"]),
@@ -869,26 +1064,152 @@ class Engine:
         self.recover()
         if task_id:
             self.task(task_id)
-        if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
-            return {"processed": []}
-        sql = "SELECT i.id,i.account_id,i.task_id,i.payload,i.due_at,t.policy,t.mode,t.next_at FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.status='not_attempted' AND t.state='active' AND t.phase='ready'"
+        stopped = self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0"
+        sql = "SELECT i.id,i.account_id,i.task_id,i.payload,i.due_at,t.policy,t.mode,t.next_at,t.state,t.phase FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.status='not_attempted' AND t.state NOT IN ('cancelled','completed')"
         params = ()
         if task_id:
             sql += " AND i.task_id=?"
             params = (task_id,)
-        rows = self.store.rows(sql + " ORDER BY due_at,i.position", params)
+        rows = self._dispatchable_rows(
+            self.store.rows(sql + " ORDER BY due_at,i.position", params), stopped
+        )
+        groups = {}
+        strict = {}
+        for row in rows:
+            if json.loads(row["policy"]).get("ordering_mode", "strict") == "strict":
+                strict.setdefault(row["task_id"], []).append(row)
+            else:
+                groups.setdefault(row["account_id"], []).append(row)
+        limits = self.execution_settings()
+        processed = []
+        with ThreadPoolExecutor(
+            max_workers=limits["max_workers"], thread_name_prefix="account-sender"
+        ) as executor:
+            futures = [
+                executor.submit(self._run_account_group, group, stopped, limits)
+                for group in groups.values()
+            ]
+            futures.extend(
+                executor.submit(self._run_strict_rows, group, stopped, limits)
+                for group in strict.values()
+            )
+            for future in futures:
+                processed.extend(future.result())
+        with self.store.connect(write=True) as db:
+            self._mark_completed(db)
+        return {"processed": processed}
+
+    def _run_strict_rows(self, rows, stopped, limits):
+        processed = []
+        for row in rows:
+            processed.extend(self._run_account_group([row], stopped, limits))
+        return processed
+
+    def _dispatchable_rows(self, rows, stopped):
+        """Keep local waits out of shared account lanes; claims recheck every gate."""
+        ready = []
+        for row in rows:
+            policy = json.loads(row["policy"])
+            payload = json.loads(row["payload"])
+            now = self.clock()
+            native = payload["action"] in {"schedule_message", "schedule_file"}
+            reason = None
+            if row["state"] != "active":
+                reason = "task_not_active"
+            elif (
+                now >= epoch(policy["ends_at"])
+                or now - row["due_at"] > DELIVERY_GRACE_SECONDS
+                or (native and row["due_at"] <= now)
+            ):
+                with self.store.connect(write=True) as db:
+                    db.execute(
+                        "UPDATE items SET status='missed',result=? WHERE id=? AND status='not_attempted'",
+                        (canonical({"reason": "delivery_window_elapsed"}), row["id"]),
+                    )
+                continue
+            elif row["phase"] != "ready":
+                reason = (
+                    "discovery_approval_missing"
+                    if row["phase"] == "discovery"
+                    else "outbound_approval_missing"
+                )
+            elif stopped:
+                reason = "global_stop"
+            elif (
+                row["mode"] == "live"
+                and payload.get("execution_mode", "automatic") != "manual"
+                and not self.live_enabled
+            ):
+                reason = "live_writes_disabled"
+            elif now < epoch(policy["starts_at"]) or (not native and row["due_at"] > now):
+                reason = "scheduled_time_pending"
+            elif policy.get("pacing_scope", "task") == "task" and row["next_at"] > now:
+                reason = "pacing_wait"
+            else:
+                account = self.account(row["account_id"])
+                if account["disabled"]:
+                    reason = "account_disabled"
+                elif account["cooldown_until"] > now:
+                    reason = "account_cooldown"
+                elif account["next_at"] > now:
+                    reason = "pacing_wait"
+                else:
+                    with self.store.connect() as db:
+                        task = db.execute(
+                            "SELECT * FROM tasks WHERE id=?", (row["task_id"],)
+                        ).fetchone()
+                        reason = telegram_blocker(db, task, payload, now)
+            if reason:
+                self._skip(row["id"], reason)
+            else:
+                ready.append(row)
+        return ready
+
+    def _run_account_group(self, rows, stopped, limits):
+        rows = self._dispatchable_rows(rows, stopped)
+        if not rows:
+            return []
+        try:
+            with self.lanes.acquire(rows[0]["account_id"], limits):
+                return self._run_account_rows(rows, stopped)["processed"]
+        except AccountBusy:
+            for row in rows:
+                self._skip(row["id"], "account_busy")
+            return []
+
+    def _run_account_rows(self, rows, stopped):
         processed = []
         checked = set()
         for row in rows:
-            if row["mode"] == "live" and not self.live_enabled:
+            if row["state"] != "active":
+                self._skip(row["id"], "task_not_active")
                 continue
-            if row["next_at"] > self.clock():
+            if row["phase"] != "ready":
+                self._skip(
+                    row["id"],
+                    "discovery_approval_missing"
+                    if row["phase"] == "discovery"
+                    else "outbound_approval_missing",
+                )
+                continue
+            if stopped:
+                self._skip(row["id"], "global_stop")
+                continue
+            manual = json.loads(row["payload"]).get("execution_mode", "automatic") == "manual"
+            if row["mode"] == "live" and not manual and not self.live_enabled:
+                self._skip(row["id"], "live_writes_disabled")
+                continue
+            if (
+                json.loads(row["policy"]).get("pacing_scope", "task") == "task"
+                and row["next_at"] > self.clock()
+            ):
+                self._skip(row["id"], "pacing_wait")
                 continue
             policy = json.loads(row["policy"])
             native = json.loads(row["payload"])["action"] in {"schedule_message", "schedule_file"}
             if (
                 self.clock() >= epoch(policy["ends_at"])
-                or self.clock() - row["due_at"] > 900
+                or self.clock() - row["due_at"] > DELIVERY_GRACE_SECONDS
                 or (native and row["due_at"] <= self.clock())
             ):
                 with self.store.connect(write=True) as db:
@@ -900,18 +1221,43 @@ class Engine:
             if self.clock() < epoch(policy["starts_at"]) or (
                 not native and row["due_at"] > self.clock()
             ):
+                self._skip(row["id"], "scheduled_time_pending")
+                continue
+            try:
+                with self.store.connect() as db:
+                    task = db.execute(
+                        "SELECT * FROM tasks WHERE id=?", (row["task_id"],)
+                    ).fetchone()
+                    self._integrity(db, task, "outbound")
+                    reason = telegram_blocker(db, task, json.loads(row["payload"]), self.clock())
+                if reason:
+                    self._skip(row["id"], reason)
+                    continue
+            except Conflict as exc:
+                self._skip(row["id"], "approval_integrity_failed")
+                processed.append({"item_id": row["id"], "status": "blocked", "reason": str(exc)})
                 continue
             account = self.account(row["account_id"])
-            if not self.adapters.commissioned(account):
+            if not manual and not self.adapters.commissioned(account):
+                self._skip(row["id"], "backend_not_commissioned")
                 continue
             if account["disabled"] or account["cooldown_until"] > self.clock():
+                self._skip(
+                    row["id"], "account_disabled" if account["disabled"] else "account_cooldown"
+                )
                 continue
-            if account["id"] not in checked:
+            if not manual and account["id"] not in checked:
                 # A fresh read-only health check before a live claim; simulation needs one too.
                 self.check_account(account["id"])
                 checked.add(account["id"])
             account = self.account(row["account_id"])
             if account["status"] != "healthy" or account["cooldown_until"] > self.clock():
+                self._skip(
+                    row["id"],
+                    "account_cooldown"
+                    if account["cooldown_until"] > self.clock()
+                    else "account_unhealthy",
+                )
                 continue
             try:
                 gate = (
@@ -921,12 +1267,13 @@ class Engine:
                         {"payload": json.loads(row["payload"])},
                         row["task_id"],
                     )
-                    if account["mode"] == "live"
+                    if account["mode"] == "live" and not manual
                     else None
                 )
                 if gate:
                     self.apply_cooldown(account["id"], gate)
                 if gate and gate.get("allowed") is not True:
+                    self._skip(row["id"], "backend_gate_blocked")
                     processed.append(
                         {
                             "item_id": row["id"],
@@ -937,12 +1284,13 @@ class Engine:
                     continue
                 claim = self._claim(row["id"], gate)
             except Conflict as exc:
+                self._skip(row["id"], "approval_integrity_failed")
                 processed.append({"item_id": row["id"], "status": "blocked", "reason": str(exc)})
                 continue
             if not claim:
                 continue
             account = self.account(row["account_id"])
-            if claim["payload"]["action"] == "manual_comment":
+            if manual or claim["payload"]["action"] == "manual_comment":
                 result = {"status": "manual_attention", "reason": "manual_publication_required"}
             else:
                 # Stop/pause can race a claim. Recheck before entering the adapter.
@@ -964,6 +1312,12 @@ class Engine:
         return {"processed": processed}
 
     def _mark_completed(self, db, task_id=None):
+        db.execute(
+            "DELETE FROM quota_reservations WHERE state='reserved' AND item_id IN (SELECT id FROM items WHERE status IN ('cancelled','missed') AND attempt_id IS NULL)"
+        )
+        db.execute(
+            "DELETE FROM content_contacts WHERE assignment_id IN (SELECT ca.id FROM campaign_assignments ca JOIN items i ON i.id=ca.item_id WHERE i.status IN ('cancelled','missed') AND i.attempt_id IS NULL)"
+        )
         scope = " AND id=?" if task_id else " AND state='active'"
         params = (self.clock(), task_id) if task_id else (self.clock(),)
         db.execute(
@@ -973,6 +1327,10 @@ class Engine:
             "AND NOT EXISTS(SELECT 1 FROM items WHERE task_id=tasks.id "
             "AND status NOT IN ('confirmed','failed_known','missed','cancelled'))" + scope,
             params,
+        )
+        db.execute(
+            "UPDATE campaigns SET state='completed',updated_at=? WHERE state='materialized' AND EXISTS(SELECT 1 FROM tasks WHERE campaign_id=campaigns.id) AND NOT EXISTS(SELECT 1 FROM tasks WHERE campaign_id=campaigns.id AND state NOT IN ('completed','cancelled'))",
+            (self.clock(),),
         )
 
     def finish(self, claim, result):
@@ -1002,11 +1360,16 @@ class Engine:
                 "lookup_message_ids",
                 "reason",
                 "external_reference",
+                "published_at",
+                "scheduled_message_ids",
             )
+            + FIELDS
             if k in result
         }
         safe["status"] = status
         now = self.clock()
+        if "published_at" in safe:
+            safe["published_at"] = publication_time(safe["published_at"], now)
         with self.store.connect(write=True) as db:
             row = db.execute(
                 "SELECT * FROM items WHERE id=? AND attempt_id=?",
@@ -1016,6 +1379,13 @@ class Engine:
                 raise Conflict("执行所有者不匹配")
             if row["status"] not in {"executing", "unknown"}:
                 return json.loads(row["result"])
+            previous = json.loads(row["result"])
+            for key in FIELDS:
+                if key not in safe and key in previous:
+                    safe[key] = previous[key]
+            if not reference and row["external_reference"]:
+                reference = row["external_reference"]
+                safe["external_reference"] = reference
             db.execute(
                 "UPDATE items SET status=?,external_reference=?,result=? WHERE id=?",
                 (status, reference, canonical(safe), claim["item_id"]),
@@ -1024,6 +1394,8 @@ class Engine:
                 "UPDATE attempts SET outcome=?,finished_at=? WHERE id=?",
                 (status, now, claim["attempt_id"]),
             )
+            if status == "confirmed":
+                record_publication(db, claim["item_id"], safe, now)
             if result.get("rate_limited") or result.get("risk_warning"):
                 cooldown = now + max(1, int(result.get("retry_after_seconds") or 3600))
                 db.execute(
@@ -1042,7 +1414,20 @@ class Engine:
             Store.audit(
                 db,
                 "attempt." + status,
-                {"item_id": claim["item_id"], "external_reference": reference},
+                {
+                    "item_id": claim["item_id"],
+                    "external_reference": reference,
+                    **{
+                        k: safe[k]
+                        for k in (
+                            "reason",
+                            "execution_step",
+                            "submission_started",
+                            "exception_type",
+                        )
+                        if k in safe
+                    },
+                },
                 claim["task_id"],
                 now,
             )
@@ -1077,19 +1462,111 @@ class Engine:
             )
         return self.finish(payload, result)
 
+    def collect_feedback(self, item_id):
+        row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
+        if not row or row["status"] != "confirmed":
+            raise Conflict("回复采集需要已核验的发布结果")
+        account = self.account(row["account_id"])
+        if account["mode"] != "live" or account["platform"] != "telegram":
+            raise Conflict("当前回复采集仅接入真实 Telegram 互动")
+        if account["cooldown_until"] > self.clock():
+            raise Conflict("账号仍在冷却，请稍后采集回复")
+        check = self.store.one("SELECT * FROM feedback_checks WHERE item_id=?", (item_id,))
+        statistics = Statistics(self.store, clock=self.clock)
+        try:
+            result = self.call(
+                account,
+                "feedback",
+                {
+                    "item_id": item_id,
+                    "payload": json.loads(row["payload"]),
+                    "result": json.loads(row["result"]),
+                    "feedback_cursor": check["last_message_id"] if check else 0,
+                },
+                row["task_id"],
+            )
+            self.apply_cooldown(account["id"], result)
+            if result.get("verified") is not True:
+                statistics.mark_feedback(item_id, self.clock(), "failed")
+                return {
+                    "item_id": item_id,
+                    "status": "failed",
+                    "reason": result.get("reason", "feedback_unverified"),
+                }
+            count = 0
+            for event in result.get("feedback_events", []):
+                count += statistics.record_feedback(
+                    item_id, event["event_id"], event["occurred_at"]
+                )
+            statistics.mark_feedback(
+                item_id,
+                result["feedback_checked_through"],
+                result["feedback_status"],
+                cursor=result["feedback_cursor"],
+            )
+            return {"item_id": item_id, "status": result["feedback_status"], "new_replies": count}
+        except Exception:
+            statistics.mark_feedback(item_id, self.clock(), "failed")
+            raise
+
+    def collect_statistics(self):
+        """Read existing Telegram publications and feedback once per reporting boundary."""
+        now = self.clock()
+        local = datetime.fromtimestamp(now, ZONE)
+        midnight = local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        slot = midnight + max(h for h in (0, 3, 6, 9, 12, 15, 18, 20, 21) if h <= local.hour) * 3600
+        with self.store.connect(write=True) as db:
+            previous = db.execute(
+                "SELECT value FROM meta WHERE key='statistics_collection_slot'"
+            ).fetchone()
+            if previous and float(previous[0]) >= slot:
+                return {"processed": []}
+            db.execute(
+                "INSERT INTO meta VALUES('statistics_collection_slot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(slot),),
+            )
+        processed = []
+        rows = self.store.rows(
+            "SELECT i.id,i.status,i.due_at FROM items i JOIN accounts a ON a.id=i.account_id "
+            "JOIN tasks t ON t.id=i.task_id WHERE a.platform='telegram' AND a.mode='live' AND t.mode='live' "
+            "AND i.status IN ('confirmed','scheduled','unknown') AND a.cooldown_until<=? ORDER BY i.due_at",
+            (now,),
+        )
+        for row in rows:
+            try:
+                if row["status"] in {"scheduled", "unknown"} and row["due_at"] <= now:
+                    self.reconcile(row["id"])
+                if (
+                    self.store.one("SELECT status FROM items WHERE id=?", (row["id"],))["status"]
+                    == "confirmed"
+                ):
+                    processed.append(self.collect_feedback(row["id"]))
+            except Exception:
+                processed.append({"item_id": row["id"], "status": "unavailable"})
+        return {"processed": processed}
+
     def manual_outcome(self, item_id, value):
         row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
         if not row or row["status"] != "manual_attention":
             raise Conflict("该项目不在人工处理状态")
         payload = json.loads(row["payload"])
-        if payload["action"] != "manual_comment":
+        if payload["action"] != "manual_comment" and payload.get("execution_mode") != "manual":
             raise Conflict("该动作不支持人工登记")
+        hosts = {
+            "instagram": {"www.instagram.com", "instagram.com"},
+            "x": {"x.com", "twitter.com", "www.x.com", "www.twitter.com"},
+            "reddit": {"www.reddit.com", "reddit.com", "old.reddit.com"},
+            "telegram": {"t.me"},
+            "discord": {"discord.com"},
+        }
+        reference = urlparse(value.external_reference)
         exact = value.observed_text == payload["text"]
         status = (
             "confirmed"
             if exact
             and value.verified
-            and value.external_reference.startswith("https://www.instagram.com/")
+            and reference.scheme == "https"
+            and reference.hostname in hosts[payload["platform"]]
             else "unknown"
         )
         result = {
@@ -1122,7 +1599,11 @@ class Engine:
         if value.account_id not in task["account_ids"]:
             raise Conflict("候选账号超出任务范围")
         p = task["policy"]
-        content = (value.title + " " + value.text + " " + value.target).casefold()
+        # Only the literal annotation "non-adult" is negative evidence. Titles,
+        # targets and any other adult/NSFW signals still pass through the risk gate.
+        content = (
+            value.title + " " + NON_ADULT.sub("", value.text) + " " + value.target
+        ).casefold()
         reasons = []
         if RISK.search(content):
             reasons.append("blocked_category")
@@ -1150,6 +1631,41 @@ class Engine:
             self._integrity(db, row, "discovery_join")
             if row["state"] != "active":
                 raise Conflict("任务未激活")
+            existing = db.execute(
+                "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND target=?",
+                (task_id, value.account_id, value.target),
+            ).fetchone()
+            payload = canonical(value.model_dump())
+            if existing:
+                if existing["payload"] == payload:
+                    return {
+                        "decision": existing["decision"],
+                        "reasons": json.loads(existing["reasons"]),
+                    }
+                if row["manifest_hash"] or existing["state"] != "not_attempted":
+                    raise Conflict("已冻结清单或已尝试入群的候选不可更正")
+                if db.execute(
+                    "SELECT 1 FROM join_attempts WHERE candidate_id=?", (existing["id"],)
+                ).fetchone():
+                    raise Conflict("已尝试入群的候选不可更正")
+                db.execute(
+                    "UPDATE candidates SET payload=?,decision=?,reasons=? WHERE id=?",
+                    (payload, decision, canonical(reasons), existing["id"]),
+                )
+                Store.audit(
+                    db,
+                    "candidate.corrected",
+                    {
+                        "candidate_id": existing["id"],
+                        "before_hash": digest(json.loads(existing["payload"])),
+                        "after_hash": digest(value.model_dump()),
+                        "decision": decision,
+                        "reasons": reasons,
+                    },
+                    task_id,
+                    self.clock(),
+                )
+                return {"decision": decision, "reasons": reasons}
             if (
                 db.execute(
                     "SELECT count(*) FROM candidates WHERE task_id=?", (task_id,)
@@ -1164,7 +1680,7 @@ class Engine:
                     task_id,
                     value.account_id,
                     value.target,
-                    canonical(value.model_dump()),
+                    payload,
                     decision,
                     canonical(reasons),
                 ),
@@ -1199,21 +1715,106 @@ class Engine:
         return {"decisions": decisions, "source_note": result.get("source_note", "")}
 
     def run_joins(self, task_id):
+        task = self.task(task_id)
+        processed = []
+        if not task["policy"]["max_joins"]:
+            return {"processed": processed}
+        for account_id in task["account_ids"]:
+            task = self.task(task_id)
+            # Future windows, cooldowns and completed candidates need no account lane.
+            pending = [
+                c
+                for c in task["candidates"]
+                if c["account_id"] == account_id and c["state"] == "not_attempted"
+            ]
+            account = self.account(account_id)
+            if account["platform"] != "telegram":
+                continue
+            eligible = False
+            for candidate in pending:
+                reason = self._join_blocker(task, candidate, account)
+                if reason:
+                    self._skip(candidate["id"], reason, candidate=True)
+                else:
+                    eligible = True
+            if not eligible:
+                continue
+            try:
+                with self.lanes.acquire(account_id, self.execution_settings()):
+                    processed.extend(self._run_joins(task_id, account_id)["processed"])
+            except AccountBusy:
+                continue
+        return {"processed": processed}
+
+    def _join_blocker(self, task, candidate, account):
+        if candidate["decision"] != "qualified":
+            return "candidate_rejected"
+        if task["state"] != "active":
+            return "task_not_active"
+        if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
+            return "global_stop"
+        if account["mode"] == "live" and not self.live_enabled:
+            return "live_writes_disabled"
+        if not self.adapters.commissioned(account):
+            return "backend_not_commissioned"
+        now = self.clock()
+        if now >= epoch(task["policy"]["ends_at"]):
+            return "delivery_window_elapsed"
+        if now < epoch(task["policy"]["starts_at"]):
+            return "scheduled_time_pending"
+        if account["disabled"]:
+            return "account_disabled"
+        if account["cooldown_until"] > now:
+            return "account_cooldown"
+        if account["next_at"] > now or task["next_at"] > now:
+            return "pacing_wait"
+        return None
+
+    def _run_joins(self, task_id, account_id):
         self.recover()
         task = self.task(task_id)
         processed = []
         if not task["policy"]["max_joins"]:
             return {"processed": []}
         for candidate in task["candidates"]:
-            if candidate["decision"] != "qualified" or candidate["state"] != "not_attempted":
+            if candidate["account_id"] != account_id:
+                continue
+            if candidate["state"] != "not_attempted":
+                continue
+            if candidate["decision"] != "qualified":
+                self._skip(candidate["id"], "candidate_rejected", candidate=True)
                 continue
             account = self.account(candidate["account_id"])
-            if (
-                account["platform"] != "telegram"
-                or not self.adapters.commissioned(account)
-                or (account["mode"] == "live" and not self.live_enabled)
-            ):
+            if account["platform"] != "telegram":
                 continue
+            if account["mode"] == "live" and not self.live_enabled:
+                self._skip(candidate["id"], "live_writes_disabled", candidate=True)
+                continue
+            if not self.adapters.commissioned(account):
+                self._skip(candidate["id"], "backend_not_commissioned", candidate=True)
+                continue
+            if task["state"] != "active":
+                self._skip(candidate["id"], "task_not_active", candidate=True)
+                continue
+            if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
+                self._skip(candidate["id"], "global_stop", candidate=True)
+                continue
+            if (
+                not epoch(task["policy"]["starts_at"])
+                <= self.clock()
+                < epoch(task["policy"]["ends_at"])
+            ):
+                self._skip(
+                    candidate["id"],
+                    "scheduled_time_pending"
+                    if self.clock() < epoch(task["policy"]["starts_at"])
+                    else "delivery_window_elapsed",
+                    candidate=True,
+                )
+                continue
+            with self.store.connect() as db:
+                row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+                self._integrity(db, row, "discovery_join")
             # Avoid an unnecessary live identity check while this task is waiting
             # for its persisted per-account interval or platform cooldown.
             if (
@@ -1221,6 +1822,13 @@ class Engine:
                 or task["next_at"] > self.clock()
                 or account["cooldown_until"] > self.clock()
             ):
+                self._skip(
+                    candidate["id"],
+                    "account_cooldown"
+                    if account["cooldown_until"] > self.clock()
+                    else "pacing_wait",
+                    candidate=True,
+                )
                 continue
             self.check_account(account["id"])
             now = self.clock()
@@ -1234,13 +1842,16 @@ class Engine:
                     or c["state"] != "not_attempted"
                     or c["decision"] != "qualified"
                 ):
+                    self._skip(candidate["id"], "task_not_active", db, candidate=True)
                     continue
                 if (
                     db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0]
                     != "0"
                 ):
+                    self._skip(candidate["id"], "global_stop", db, candidate=True)
                     break
                 if not epoch(policy["starts_at"]) <= now < epoch(policy["ends_at"]):
+                    self._skip(candidate["id"], "delivery_window_elapsed", db, candidate=True)
                     continue
                 if (
                     a["disabled"]
@@ -1249,6 +1860,16 @@ class Engine:
                     or a["next_at"] > now
                     or row["next_at"] > now
                 ):
+                    reason = (
+                        "account_disabled"
+                        if a["disabled"]
+                        else "account_unhealthy"
+                        if a["status"] != "healthy"
+                        else "account_cooldown"
+                        if a["cooldown_until"] > now
+                        else "pacing_wait"
+                    )
+                    self._skip(candidate["id"], reason, db, candidate=True)
                     continue
                 if (
                     db.execute(
@@ -1256,47 +1877,13 @@ class Engine:
                     ).fetchone()[0]
                     >= policy["max_joins"]
                 ):
+                    self._skip(candidate["id"], "join_limit", db, candidate=True)
                     break
-                day = now - now % 86400
-                if (
-                    db.execute(
-                        "SELECT count(*) FROM activity WHERE account_id=? AND started_at>=?",
-                        (a["id"], day),
-                    ).fetchone()[0]
-                    >= a["daily_limit"]
-                ):
-                    continue
-                if (
-                    db.execute(
-                        "SELECT count(*) FROM activity WHERE mode=? AND started_at>=?",
-                        (a["mode"], day),
-                    ).fetchone()[0]
-                    >= 100
-                ):
-                    continue
-                if (
-                    db.execute(
-                        "SELECT count(*) FROM activity WHERE mode=? AND started_at>=?",
-                        (a["mode"], now - 3600),
-                    ).fetchone()[0]
-                    >= 20
-                ):
-                    continue
-                if (
-                    db.execute(
-                        "SELECT count(*) FROM activity WHERE account_id=? AND started_at>=?",
-                        (a["id"], now - 3600),
-                    ).fetchone()[0]
-                    >= a["hourly_limit"]
-                ):
-                    continue
-                if (
-                    db.execute(
-                        "SELECT count(*) FROM activity WHERE task_id=? AND started_at>=?",
-                        (task_id, day),
-                    ).fetchone()[0]
-                    >= policy["daily_limit"]
-                ):
+                quota_reason = quotas.check_claim(
+                    db, a, row, {"target": c["target"], "recipient_id": ""}, now, now, None
+                )
+                if quota_reason:
+                    self._skip(candidate["id"], quota_reason, db, candidate=True)
                     continue
                 attempt = "join-" + uuid.uuid4().hex
                 key = digest(["telegram", c["target"].casefold()])
@@ -1305,6 +1892,7 @@ class Engine:
                     "SELECT 1 FROM join_attempts WHERE account_id=? AND target_key=?",
                     (a["id"], key),
                 ).fetchone():
+                    self._skip(candidate["id"], "join_already_attempted", db, candidate=True)
                     continue
                 db.execute(
                     "INSERT INTO join_attempts(id,candidate_id,account_id,task_id,target_key,user_key,mode,started_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -1359,6 +1947,11 @@ class Engine:
                 status = "unknown"
             if status in {"joined", "already_joined"} and not result.get("verified"):
                 status = "unknown"
+            if status in {"joined", "already_joined"} and account["mode"] == "simulation":
+                result.setdefault(
+                    "outbound_eligible_at_utc",
+                    datetime.fromtimestamp(self.clock() + 3600, timezone.utc).isoformat(),
+                )
             with self.store.connect(write=True) as db:
                 db.execute(
                     "UPDATE candidates SET state=?,result=? WHERE id=?",
@@ -1432,7 +2025,7 @@ class Engine:
 
     def run_cycle(self):
         if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
-            return {"processed": []}
+            return self.run_once()
         for row in self.store.rows(
             "SELECT t.id FROM tasks t JOIN approvals a ON a.task_id=t.id AND a.stage='discovery_join' WHERE t.state='active'"
         ):

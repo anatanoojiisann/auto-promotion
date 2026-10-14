@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS calls(
  error_code TEXT
 );
 CREATE INDEX IF NOT EXISTS items_due ON items(status,due_at);
+CREATE TABLE IF NOT EXISTS worker_runs(
+ id TEXT PRIMARY KEY, task_id TEXT REFERENCES tasks(id), pid INTEGER NOT NULL,
+ live_enabled INTEGER NOT NULL DEFAULT 0, started_at REAL NOT NULL, heartbeat_at REAL NOT NULL,
+ finished_at REAL, state TEXT NOT NULL, phase TEXT NOT NULL, reason TEXT, exit_code INTEGER,
+ diagnostics TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS workers_task ON worker_runs(task_id,started_at);
 CREATE INDEX IF NOT EXISTS attempts_limits ON attempts(account_id,started_at);
 CREATE TABLE IF NOT EXISTS connection_jobs(
  id TEXT PRIMARY KEY, platform TEXT NOT NULL, username TEXT NOT NULL,
@@ -74,6 +81,111 @@ CREATE VIEW IF NOT EXISTS activity AS
  SELECT account_id,task_id,target_key,user_key,mode,started_at,outcome FROM attempts
  UNION ALL
  SELECT account_id,task_id,target_key,user_key,mode,started_at,outcome FROM join_attempts;
+CREATE TABLE IF NOT EXISTS publication_evidence(
+ item_id TEXT PRIMARY KEY REFERENCES items(id), published_at REAL,
+ verified_at REAL NOT NULL, timestamp_source TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback_events(
+ platform TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES accounts(id),
+ event_id TEXT NOT NULL, item_id TEXT NOT NULL REFERENCES items(id),
+ occurred_at REAL NOT NULL, observed_at REAL NOT NULL,
+ PRIMARY KEY(platform,account_id,event_id)
+);
+CREATE TABLE IF NOT EXISTS feedback_checks(
+ item_id TEXT PRIMARY KEY REFERENCES items(id), checked_through REAL NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('complete','partial','failed')), last_message_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS statistical_reports(
+ kind TEXT NOT NULL, cutoff REAL NOT NULL, starts_at REAL NOT NULL,
+ created_at REAL NOT NULL, updated_at REAL NOT NULL, revision INTEGER NOT NULL,
+ content_hash TEXT NOT NULL, content TEXT NOT NULL,
+ PRIMARY KEY(kind,cutoff)
+);
+CREATE TABLE IF NOT EXISTS reporting_state(
+ id INTEGER PRIMARY KEY CHECK(id=1), last_tick REAL NOT NULL, source_revision INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO meta VALUES('statistics_revision','0');
+CREATE INDEX IF NOT EXISTS feedback_item_time ON feedback_events(item_id,occurred_at);
+CREATE TABLE IF NOT EXISTS account_profiles(
+ account_id TEXT PRIMARY KEY REFERENCES accounts(id),version INTEGER NOT NULL,
+ payload TEXT NOT NULL,updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_pools(
+ id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL,limits TEXT NOT NULL,
+ revision INTEGER NOT NULL DEFAULT 1,created_at REAL NOT NULL,updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pool_members(
+ pool_id TEXT NOT NULL REFERENCES account_pools(id),account_id TEXT NOT NULL REFERENCES accounts(id),
+ PRIMARY KEY(pool_id,account_id)
+);
+CREATE TABLE IF NOT EXISTS opportunities(
+ id TEXT PRIMARY KEY,platform TEXT NOT NULL,content_key TEXT NOT NULL,payload TEXT NOT NULL,
+ revision INTEGER NOT NULL DEFAULT 1,created_at REAL NOT NULL,updated_at REAL NOT NULL,
+ UNIQUE(platform,content_key)
+);
+CREATE TABLE IF NOT EXISTS campaigns(
+ id TEXT PRIMARY KEY,name TEXT NOT NULL,pool_id TEXT NOT NULL REFERENCES account_pools(id),
+ config TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'draft',revision INTEGER NOT NULL DEFAULT 1,
+ plan_hash TEXT,plan_snapshot TEXT,created_at REAL NOT NULL,updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS campaign_assignments(
+ id TEXT PRIMARY KEY,campaign_id TEXT NOT NULL REFERENCES campaigns(id),opportunity_id TEXT NOT NULL REFERENCES opportunities(id),
+ account_id TEXT REFERENCES accounts(id),score REAL NOT NULL DEFAULT 0,reasons TEXT NOT NULL,
+ payload TEXT,profile_snapshot TEXT,status TEXT NOT NULL,task_id TEXT REFERENCES tasks(id),item_id TEXT REFERENCES items(id),
+ UNIQUE(campaign_id,opportunity_id)
+);
+CREATE INDEX IF NOT EXISTS assignments_campaign ON campaign_assignments(campaign_id,status);
+CREATE TABLE IF NOT EXISTS content_contacts(
+ mode TEXT NOT NULL,platform TEXT NOT NULL,content_key TEXT NOT NULL,
+ assignment_id TEXT NOT NULL UNIQUE REFERENCES campaign_assignments(id),
+ PRIMARY KEY(mode,platform,content_key)
+);
+CREATE TABLE IF NOT EXISTS quota_reservations(
+ item_id TEXT PRIMARY KEY REFERENCES items(id),account_id TEXT NOT NULL REFERENCES accounts(id),
+ task_id TEXT NOT NULL REFERENCES tasks(id),due_at REAL NOT NULL,payload TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('reserved','consumed'))
+);
+CREATE INDEX IF NOT EXISTS reservations_due ON quota_reservations(state,due_at);
+CREATE TABLE IF NOT EXISTS account_lanes(
+ account_id TEXT PRIMARY KEY REFERENCES accounts(id),owner TEXT NOT NULL,
+ expires_at REAL NOT NULL,heartbeat_at REAL NOT NULL
+);
+INSERT OR IGNORE INTO meta VALUES('execution_settings','{}');
+CREATE TABLE IF NOT EXISTS growth_goals(
+ id TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS growth_channels(
+ id TEXT PRIMARY KEY,goal_id TEXT NOT NULL REFERENCES growth_goals(id),
+ payload TEXT NOT NULL,link_key TEXT NOT NULL UNIQUE,created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversion_events(
+ goal_id TEXT NOT NULL REFERENCES growth_goals(id),source TEXT NOT NULL,event_id TEXT NOT NULL,
+ subject_hash TEXT NOT NULL,kind TEXT NOT NULL,occurred_at REAL NOT NULL,
+ channel_id TEXT REFERENCES growth_channels(id),payload TEXT NOT NULL,payload_hash TEXT NOT NULL,
+ imported_at REAL NOT NULL,PRIMARY KEY(goal_id,source,event_id)
+);
+CREATE INDEX IF NOT EXISTS conversions_cohort ON conversion_events(goal_id,subject_hash,kind);
+CREATE TABLE IF NOT EXISTS growth_store_metrics(
+ channel_id TEXT NOT NULL REFERENCES growth_channels(id),day TEXT NOT NULL,
+ country TEXT NOT NULL DEFAULT '',payload TEXT NOT NULL,updated_at REAL NOT NULL,
+ PRIMARY KEY(channel_id,day,country)
+);
+CREATE TABLE IF NOT EXISTS reply_inbox(
+ id TEXT PRIMARY KEY,platform TEXT NOT NULL,account_id TEXT NOT NULL,event_id TEXT NOT NULL,
+ item_id TEXT NOT NULL REFERENCES items(id),state TEXT NOT NULL DEFAULT 'open',
+ note TEXT NOT NULL DEFAULT '',followup_task_id TEXT REFERENCES tasks(id),updated_at REAL NOT NULL,
+ UNIQUE(platform,account_id,event_id)
+);
+CREATE TABLE IF NOT EXISTS content_feeds(
+ id TEXT PRIMARY KEY,payload TEXT NOT NULL,next_at REAL NOT NULL,last_at REAL,
+ status TEXT NOT NULL DEFAULT 'waiting',result TEXT NOT NULL DEFAULT '{}',
+ lease_until REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS task_templates(
+ id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT NOT NULL,mode TEXT NOT NULL,
+ platforms TEXT NOT NULL,settings TEXT NOT NULL,source_task_id TEXT REFERENCES tasks(id),
+ created_at REAL NOT NULL
+);
 """
 
 
@@ -88,10 +200,36 @@ class Store:
                 db.execute("ALTER TABLE accounts ADD COLUMN identity_hash TEXT")
             if "next_at" not in {r[1] for r in db.execute("PRAGMA table_info(tasks)")}:
                 db.execute("ALTER TABLE tasks ADD COLUMN next_at REAL NOT NULL DEFAULT 0")
+            if "campaign_id" not in {r[1] for r in db.execute("PRAGMA table_info(tasks)")}:
+                db.execute("ALTER TABLE tasks ADD COLUMN campaign_id TEXT REFERENCES campaigns(id)")
+            db.execute("CREATE INDEX IF NOT EXISTS tasks_campaign ON tasks(campaign_id)")
+            if "execution_step" not in {r[1] for r in db.execute("PRAGMA table_info(calls)")}:
+                db.execute("ALTER TABLE calls ADD COLUMN execution_step TEXT")
+            if "last_message_id" not in {
+                r[1] for r in db.execute("PRAGMA table_info(feedback_checks)")
+            }:
+                db.execute(
+                    "ALTER TABLE feedback_checks ADD COLUMN last_message_id INTEGER NOT NULL DEFAULT 0"
+                )
             db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS accounts_identity_unique "
                 "ON accounts(platform,identity_hash,mode) WHERE identity_hash IS NOT NULL"
             )
+            for table in ("items", "publication_evidence", "feedback_events", "feedback_checks"):
+                for event in ("INSERT", "UPDATE", "DELETE"):
+                    db.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS statistics_{table}_{event.lower()} "
+                        f"AFTER {event} ON {table} BEGIN "
+                        "UPDATE meta SET value=CAST(value AS INTEGER)+1 "
+                        "WHERE key='statistics_revision'; END"
+                    )
+            for table, columns in (("accounts", "platform,mode"), ("tasks", "mode")):
+                db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS statistics_{table}_scope "
+                    f"AFTER UPDATE OF {columns} ON {table} BEGIN "
+                    "UPDATE meta SET value=CAST(value AS INTEGER)+1 "
+                    "WHERE key='statistics_revision'; END"
+                )
         Path(self.path).chmod(0o600)
 
     @contextmanager
@@ -129,10 +267,19 @@ class Store:
             (time.time() if now is None else now, task_id, kind, canonical(details)),
         )
 
-    def log_call(self, platform, operation, status, started, task_id=None, error_code=None):
+    def log_call(
+        self,
+        platform,
+        operation,
+        status,
+        started,
+        task_id=None,
+        error_code=None,
+        execution_step=None,
+    ):
         with self.connect(write=True) as db:
             db.execute(
-                "INSERT INTO calls(at,platform,operation,status,duration_ms,task_id,error_code) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO calls(at,platform,operation,status,duration_ms,task_id,error_code,execution_step) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     time.time(),
                     platform,
@@ -141,6 +288,7 @@ class Store:
                     int((time.monotonic() - started) * 1000),
                     task_id,
                     error_code,
+                    execution_step,
                 ),
             )
 

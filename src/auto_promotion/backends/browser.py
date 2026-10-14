@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import re
+import time
 from urllib.parse import quote, urlparse
 
-from .common import BackendError, language_evidence, profile_path, read_profile, save_profile
+from .common import (
+    BackendError,
+    language_evidence,
+    observed_timestamp,
+    profile_path,
+    read_profile,
+    save_profile,
+)
 
 HOME = {"reddit": "https://www.reddit.com", "x": "https://x.com"}
 
@@ -101,6 +109,23 @@ class BrowserBackend:
     def __init__(self, platform, label, context, page, settings):
         self.platform, self.label = platform, label
         self.context, self.page, self.settings = context, page, settings
+        self.execution_step = "browser_start"
+        self.submission_started = False
+        self.progress = None
+
+    def step(self, value, submission_started=None):
+        self.execution_step, self.step_started_at = value, time.time()
+        if submission_started is not None:
+            self.submission_started = submission_started
+        if self.progress:
+            self.progress(value, self.submission_started)
+
+    def diagnostics(self):
+        return {
+            "execution_step": self.execution_step,
+            "step_started_at": self.step_started_at,
+            "submission_started": self.submission_started,
+        }
 
     def check_identity(self):
         observed = identity(self.platform, self.context, self.page)
@@ -108,21 +133,36 @@ class BrowserBackend:
             raise BackendError("BrowserIdentityMismatch")
 
     def run(self, operation, payload, checkpoint, authorize):
+        self.progress = getattr(checkpoint, "progress", None) if operation == "execute" else None
+        self.submission_started = bool(
+            (payload.get("receipt") or payload.get("result") or {}).get("submission_started")
+        )
+        self.step("browser_ready")
         try:
-            return self._run(operation, payload, checkpoint, authorize)
-        except BackendError as exc:
-            if exc.safe_code != "BrowserRateLimited":
-                raise
-            return {
-                "status": "unknown",
-                "verified": False,
-                "rate_limited": True,
-                "retry_after_seconds": 3600,
-                "reason": "BrowserRateLimited",
-            }
+            result = self._run(operation, payload, checkpoint, authorize)
+            if operation in {"execute", "verify"}:
+                if result.get("verified") is True:
+                    self.step("completed")
+                result.update(self.diagnostics())
+            return result
+        except Exception as exc:
+            exc.execution_step = self.execution_step
+            exc.submission_started = self.submission_started
+            if isinstance(exc, BackendError) and exc.safe_code == "BrowserRateLimited":
+                return {
+                    "status": "unknown",
+                    "verified": False,
+                    "rate_limited": True,
+                    "retry_after_seconds": 3600,
+                    "reason": "BrowserRateLimited",
+                    **self.diagnostics(),
+                }
+            raise
 
     def _run(self, operation, payload, checkpoint, authorize):
+        self.step("home_navigation")
         check_response(self.page.goto(HOME[self.platform], wait_until="domcontentloaded"))
+        self.step("identity_check")
         self.check_identity()
         if operation == "health":
             from ..models import CAPABILITIES
@@ -303,35 +343,44 @@ class BrowserBackend:
             "www.twitter.com",
         }:
             raise BackendError("InvalidXTarget")
-        check_response(page.goto(item["target"]))
+        self.step("target_navigation")
+        check_response(page.goto(item["target"], wait_until="domcontentloaded"))
+        self.step("target_lookup")
         article = self.tweet(item["target"])
+        self.step("identity_check")
         self.check_identity()
         action = item["action"]
         if action in {"like", "repost"}:
             done = "unlike" if action == "like" else "unretweet"
             if article.get_by_test_id(done).count() == 0:
                 authorize()
+                self.step("submit_click", True)
                 visible_one(
                     article.get_by_test_id("like" if action == "like" else "retweet")
                 ).click()
                 if action == "repost":
                     authorize()
                     visible_one(page.get_by_test_id("retweetConfirm")).click()
+            self.step("submission_response")
             article.get_by_test_id(done).wait_for(timeout=15000)
             result = {"status": "unknown", "verified": False, "external_reference": item["target"]}
             checkpoint(result)
             return self.verify({**payload, "receipt": result})
         if action == "reply":
+            self.step("reply_control")
             # X can render a second reply control far below the target tweet.
             # The first control belongs to the target article's action bar.
             reply_control = article.get_by_test_id("reply").first
             if not reply_control.is_visible():
                 raise BackendError("BrowserReplyControlUnavailable")
             reply_control.click()
+            self.step("reply_composer")
             # X uses either an inline composer or a modal, depending on the
             # current page layout. A hidden dialog shell may coexist with the
             # inline composer, so select only the active modal when present.
-            page.wait_for_timeout(700)
+            # The background inline editor can stay visible while a modal opens.
+            page.wait_for_timeout(1500)
+            page.locator('[data-testid="tweetTextarea_0"]:visible').first.wait_for(timeout=15000)
             active_dialogs = [
                 page.get_by_role("dialog").nth(i)
                 for i in range(page.get_by_role("dialog").count())
@@ -353,16 +402,28 @@ class BrowserBackend:
             submit_button = composer.get_by_test_id("tweetButton")
         else:
             raise BackendError("UnsupportedXAction")
-        visible_one(composer.get_by_test_id("tweetTextarea_0")).fill(item["text"])
+        self.step("fill_reply")
+        editor = visible_one(composer.get_by_test_id("tweetTextarea_0"))
+        editor.click()
+        editor.press("Control+A")
+        editor.press("Backspace")
+        editor.press_sequentially(item["text"])
+        if editor.inner_text() != item["text"]:
+            raise BackendError("ApprovedTextNotRetained")
         if item["media"]:
+            self.step("attach_media")
             composer.locator('input[type="file"]').set_input_files(
                 [m["path"] for m in item["media"]]
             )
+        self.step("submission_authorization")
         authorize()
         with page.expect_response(
             lambda r: r.request.method == "POST" and "/CreateTweet" in r.url, timeout=25000
         ) as accepted:
+            self.step("submit_click", True)
             visible_one(submit_button).click()
+            self.step("submission_response")
+        self.step("parse_receipt")
         data = (
             check_response(accepted.value)
             .json()
@@ -388,11 +449,13 @@ class BrowserBackend:
             "target_verified": str(relation) == target_id,
         }
         checkpoint(result)
+        self.step("receipt_saved")
         return self.verify({**payload, "receipt": result})
 
     def verify(self, payload):
         item = payload["payload"]
         result = payload.get("receipt") or payload.get("result", {})
+        published = None
         url = result.get("external_reference") or payload.get("external_reference")
         if not url:
             return {"status": "unknown", "verified": False, "reason": "no_durable_receipt"}
@@ -414,6 +477,7 @@ class BrowserBackend:
             parts = parsed.path.strip("/").split("/")
             identifier = parts[5] if len(parts) > 5 else parts[3]
             observed = reddit_record(response.json(), identifier)
+            published = observed_timestamp(observed.get("created_utc")) if observed else None
             verified = bool(
                 observed
                 and observed.get("author", "").casefold() == self.settings["identity"]
@@ -432,8 +496,11 @@ class BrowserBackend:
         else:
             if parsed.hostname not in {"x.com", "www.x.com"}:
                 raise BackendError("InvalidReceiptURL")
-            check_response(self.page.goto(url))
+            self.step("receipt_navigation")
+            check_response(self.page.goto(url, wait_until="domcontentloaded"))
+            self.step("receipt_lookup")
             article = self.tweet(url)
+            self.step("receipt_validation")
             if item["action"] in {"like", "repost"}:
                 verified = (
                     article.get_by_test_id(
@@ -460,17 +527,24 @@ class BrowserBackend:
                         > 0
                     )
                 )
+                timestamp = article.locator("time")
+                if verified and timestamp.count() == 1:
+                    published = observed_timestamp(timestamp.get_attribute("datetime"))
         return {
             **result,
             "status": "confirmed" if verified else "unknown",
             "verified": verified,
             "external_reference": url,
+            "published_at": published if verified else None,
         }
 
 
 def call(platform, label, operation, payload, checkpoint, authorize):
     from playwright.sync_api import sync_playwright
 
+    progress = getattr(checkpoint, "progress", None)
+    if operation == "execute" and progress:
+        progress("browser_start", False)
     settings = read_profile(platform, label)
     with sync_playwright() as runtime:
         context = launch_context(

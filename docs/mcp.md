@@ -5,6 +5,8 @@ Telegram、Reddit、Instagram、X、Discord 五个平台的内置后端。
 它不是旧电脑上的四个独立工程；无需寻找或安装那些旧工程。
 使用[官方 Python MCP SDK](https://github.com/modelcontextprotocol/python-sdk/tree/v1.x)。
 
+业务增长另提供目标设置、转化事件／商店指标导入、业务报告和回复待办6个工具；仍不授予外发审批或解除停止。数据契约和真实接入边界见 [业务增长](business-growth.md)。修改服务代码后需要重启 MCP 服务才能加载新增工具。
+
 ## 新电脑安装
 
 Windows 在项目目录运行：
@@ -43,8 +45,18 @@ codex mcp add auto-promotion -- "$PWD\.venv\Scripts\python.exe" -m auto_promotio
 
 ## 工具与账号
 
+任务工具另提供 `list_task_templates`、`save_task_template`、`create_task_from_template`、`task_evidence` 和 `task_review`。模板只复用设置，新任务不继承旧审批、目标或正文；证据只读取所选任务的关联记录。详情见 [固定工具](task-tools.md)。
+
+号池工具包括 `list_account_pools`、`save_account_pool`、`get_account_profile`、`save_account_profile`；内容工具包括 `list_opportunities`、`import_opportunities`、`collect_telegram_content`。活动使用 `create_campaign`、`plan_campaign`、`get_campaign`、`list_campaigns`、`edit_campaign_draft`、`create_campaign_batches`、`populate_campaign_batch`。
+
+这些工具只能规划、编辑本地草稿或只读采集，不能授予批准。`populate_campaign_batch` 必须已有人的发现审批，创建批次不会自动冻结或批准外发。旧 MCP 进程需要重新连接才能载入新工具目录。具体字段见 [号池说明](account-pools.md)。
+
 服务提供状态、五个平台账号目录与连接检查、Discord 频道目录、任务草稿、候选发现、
 候选筛选、清单编辑与冻结、批准后的入群/执行，以及回执与成员核对。
+
+新增只读 `interaction_statistics`（默认当天，可指定 UTC+8 日期或全部日期）与
+`statistical_reports`（保存的三小时、20:00 和完整自然日报告）。两者汇总全部真实任务，
+模拟数据不进入真实效果统计；没有回复采集数据时返回 `null`，不能解读为零回复。
 
 账号登录继续在[本机工作台或登录命令](platforms.md)中完成。
 MCP 安装完成不代表每个平台账号已登录，也不代表具备全部发布权限。
