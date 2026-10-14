@@ -705,6 +705,7 @@ function taskReadinessPanel(t) {
 
 async function renderTask(id) {
   const t = await api("/tasks/" + id);
+  if (location.hash !== "#tasks/" + id) return;
   state.current = t;
   const discovery = t.approvals.some((a) => a.stage === "discovery_join");
   const approved = t.approvals.some((a) => a.stage === "outbound");

@@ -365,6 +365,7 @@ async function renderCampaign(id, offset = 0) {
   const c = await api(`/campaigns/${id}?offset=${offset}&limit=50`);
   const editable = ["draft", "planned"].includes(c.state);
   const ai = await api("/drafts/status");
+  if (location.hash !== "#campaigns/" + id) return;
   $("#main").innerHTML =
     heading(
       esc(c.name),
