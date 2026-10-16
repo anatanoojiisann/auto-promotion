@@ -3,11 +3,73 @@ const { chromium } = require("playwright");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
+const { spawn, execFileSync } = require("node:child_process");
 
-const base = process.env.AP_POOL_UI_URL || "http://127.0.0.1:8795";
+let base = process.env.AP_POOL_UI_URL;
 const root = path.resolve(__dirname, "..");
 const output = path.join(root, "output", "playwright");
-let browser;
+let browser, server, temp;
+
+async function startSimulationService() {
+  temp = fs.mkdtempSync(path.join(os.tmpdir(), "auto-promotion-pool-ui-"));
+  const python =
+    process.env.AUTO_PROMOTION_PYTHON ||
+    path.join(
+      root,
+      process.platform === "win32"
+        ? ".venv/Scripts/python.exe"
+        : ".venv/bin/python",
+    );
+  const db = path.join(temp, "test.db");
+  const env = {
+    ...process.env,
+    AUTO_PROMOTION_LIVE_WRITES: "0",
+    AUTO_PROMOTION_WORKSPACE: temp,
+  };
+  execFileSync(python, ["-m", "auto_promotion.cli", "--db", db, "init"], {
+    cwd: root,
+    env,
+    stdio: "pipe",
+  });
+  return new Promise((resolve, reject) => {
+    server = spawn(
+      python,
+      [
+        "-m",
+        "auto_promotion.cli",
+        "--db",
+        db,
+        "serve",
+        "--port",
+        "0",
+        "--no-worker",
+      ],
+      { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const timer = setTimeout(
+      () => reject(new Error("Simulation service startup timed out")),
+      20000,
+    );
+    server.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    server.once("exit", () => {
+      clearTimeout(timer);
+      reject(new Error("Simulation service exited"));
+    });
+    server.stderr.on("data", (chunk) => {
+      const match = chunk
+        .toString()
+        .match(/Uvicorn running on (http:\/\/127\.0\.0\.1:\d+)/);
+      if (match) {
+        clearTimeout(timer);
+        resolve(match[1]);
+      }
+    });
+  });
+}
 
 async function screenshots(page) {
   fs.mkdirSync(output, { recursive: true });
@@ -45,7 +107,9 @@ async function screenshots(page) {
 }
 
 (async () => {
+  if (!base) base = await startSimulationService();
   browser = await chromium.launch({
+    channel: process.env.AP_UI_BROWSER_CHANNEL || undefined,
     headless: true,
     executablePath: process.env.AP_UI_CHROMIUM_PATH || undefined,
   });
@@ -172,7 +236,7 @@ async function screenshots(page) {
     .getByRole("button", { name: "创建并规划分配", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "创建审批批次", exact: true })
+    .getByRole("button", { name: "创建执行批次", exact: true })
     .waitFor();
   const campaignId = await page.evaluate(() => location.hash.split("/").at(-1));
   assert.equal((await read(`/campaigns/${campaignId}`)).summary.planned, 3);
@@ -182,48 +246,26 @@ async function screenshots(page) {
     .fill("Reviewed exact simulation reply.");
   await page.getByRole("button", { name: "保存草稿", exact: true }).click();
   await page.locator("#panel").waitFor({ state: "hidden" });
-  await page.getByRole("button", { name: "创建审批批次", exact: true }).click();
-  await page.getByRole("heading", { name: "审批批次", exact: true }).waitFor();
+  await page.getByRole("button", { name: "创建执行批次", exact: true }).click();
+  await page.getByRole("heading", { name: "执行批次", exact: true }).waitFor();
   const campaign = await read(`/campaigns/${campaignId}`);
   assert.equal(campaign.tasks.length, 2);
   let dueAt = 0;
   for (const task of campaign.tasks) {
     await page.goto(`${base}/#tasks/${task.id}`);
-    await page.locator("#phrase-discovery_join").waitFor();
-    await page
-      .locator("#phrase-discovery_join")
-      .fill(
-        await page
-          .locator('form[data-approval="discovery_join"] .phrase')
-          .innerText(),
-      );
-    await page
-      .getByRole("button", { name: "批准发现政策", exact: true })
-      .click();
-    await page
-      .getByRole("button", { name: "冻结并预览外发清单", exact: true })
-      .waitFor();
-    await page
-      .getByRole("button", { name: "冻结并预览外发清单", exact: true })
-      .click();
-    await page.locator("#phrase-outbound").waitFor();
-    await page
-      .locator("#phrase-outbound")
-      .fill(
-        await page
-          .locator('form[data-approval="outbound"] .phrase')
-          .innerText(),
-      );
-    await page
-      .getByRole("button", { name: "批准外发批次", exact: true })
-      .click();
-    await page.getByRole("button", { name: "运行一轮", exact: true }).waitFor();
+    await Promise.all([
+      page.waitForResponse(
+        (r) => r.url().endsWith("/start") && r.request().method() === "POST",
+      ),
+      page.getByRole("button", { name: "开始发送", exact: true }).click(),
+    ]);
+    await page.getByRole("button", { name: "开始发送", exact: true }).waitFor();
     const approved = await read(`/tasks/${task.id}`);
-    assert.equal(approved.approvals.length, 2);
+    assert.equal(approved.approvals.length, 0);
     dueAt = Math.max(dueAt, ...approved.items.map((i) => i.due_at * 1000));
   }
   console.log(
-    "UI: 号池、人设、导入、规划、草稿编辑与两阶段审批完成，等待模拟排期到期。",
+    "UI: 号池、人设、导入、规划、草稿编辑与直接启动完成，等待模拟排期到期。",
   );
   await page.waitForFunction((at) => Date.now() >= at, dueAt + 100, {
     timeout: 90000,
@@ -238,10 +280,15 @@ async function screenshots(page) {
     );
     const response = page.waitForResponse(
       (r) =>
-        r.url().endsWith(`/api/tasks/${task.id}/run`) &&
+        r.url().endsWith(`/api/tasks/${task.id}/start`) &&
         r.request().method() === "POST",
     );
-    await page.getByRole("button", { name: "运行一轮", exact: true }).click();
+    await Promise.all([
+      page.waitForResponse(
+        (r) => r.url().endsWith("/start") && r.request().method() === "POST",
+      ),
+      page.getByRole("button", { name: "开始发送", exact: true }).click(),
+    ]);
     assert.equal((await response).status(), 200);
     const sent = await read(`/tasks/${task.id}`);
     assert.ok(
@@ -264,17 +311,20 @@ async function screenshots(page) {
   await screenshots(page);
   await page.goto(`${base}/#campaigns`);
   await page.getByRole("button", { name: "调度与额度", exact: true }).click();
+  await page.getByRole("heading", { name: "发送通道", exact: true }).waitFor();
+  await page.getByLabel("X · Tabbit 并发", { exact: true }).fill("2");
   await page.getByLabel("同时执行的账号数", { exact: true }).fill("4");
   await page.getByRole("button", { name: "保存调度设置", exact: true }).click();
   await page.locator("#panel").waitFor({ state: "hidden" });
   assert.equal((await read("/execution/settings")).max_workers, 4);
+  assert.equal((await read("/execution/settings")).pool_workers["x.tabbit"], 2);
   assert.deepEqual(errors, []);
   console.log(
     JSON.stringify({
       ok: true,
       simulated_accounts: 2,
       imported_contents: 3,
-      approved_batches: 2,
+      started_batches: 2,
       confirmed_simulations: 3,
       screenshots: output,
     }),
@@ -286,4 +336,14 @@ async function screenshots(page) {
   })
   .finally(async () => {
     if (browser) await browser.close();
+    if (server && server.exitCode === null) {
+      const exited = new Promise((resolve) => server.once("exit", resolve));
+      server.kill("SIGTERM");
+      await exited;
+    }
+    if (temp) {
+      const target = fs.realpathSync(temp);
+      assert.equal(path.dirname(target), fs.realpathSync(os.tmpdir()));
+      fs.rmSync(target, { recursive: true, force: true });
+    }
   });

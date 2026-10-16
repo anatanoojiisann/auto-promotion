@@ -551,26 +551,6 @@ td strong {
   color: #fff;
   border-color: var(--accent);
 }
-.approval {
-  padding: 20px 0;
-}
-.approval + .approval {
-  border-top: 1px solid var(--line);
-}
-.approval label {
-  font-size: 12px;
-}
-.phrase {
-  display: block;
-  padding: 11px 12px;
-  background: #f0f4ee;
-  border-radius: 6px;
-  font-family: ui-monospace, monospace;
-  overflow-wrap: anywhere;
-  font-size: 12px;
-  margin: 12px 0;
-  user-select: all;
-}
 .item-preview {
   padding: 20px 24px;
   border-bottom: 1px solid var(--line);
@@ -938,6 +918,7 @@ dialog::backdrop {
   .page-heading {
     gap: 12px;
     align-items: flex-start;
+    flex-wrap: wrap;
   }
   .page-heading > div:first-child {
     min-width: 0;
@@ -947,6 +928,7 @@ dialog::backdrop {
   }
   .page-heading .actions {
     flex-shrink: 0;
+    max-width: 100%;
   }
   .page-heading .actions a {
     white-space: nowrap;

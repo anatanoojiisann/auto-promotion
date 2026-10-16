@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-PLATFORMS = ("telegram", "reddit", "instagram", "x", "discord")
+PLATFORMS = ("telegram", "reddit", "instagram", "x", "discord", "tiktok")
 CAPABILITIES = {
     "telegram": {
         "discover",
@@ -23,6 +23,16 @@ CAPABILITIES = {
     "instagram": {"publish", "manual_comment"},
     "x": {"discover", "like", "reply", "repost", "quote"},
     "discord": {"send_message", "reply", "send_file"},
+    "tiktok": {
+        "publish",
+        "reply",
+        "comment",
+        "like",
+        "unlike",
+        "hide_comment",
+        "unhide_comment",
+        "delete_comment",
+    },
 }
 
 
@@ -48,7 +58,7 @@ class Model(BaseModel):
 
 
 class AccountInput(Model):
-    platform: Literal["telegram", "reddit", "instagram", "x", "discord"]
+    platform: Literal["telegram", "reddit", "instagram", "x", "discord", "tiktok"]
     label: str = Field(min_length=1, max_length=80)
     backend_label: str = Field(min_length=1, max_length=100)
     mode: Literal["live", "simulation"] = "live"
@@ -125,6 +135,21 @@ class Media(Model):
     is_ai_generated: bool = False
 
 
+class TikTokPostOptions(Model):
+    privacy_level: Literal[
+        "", "PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR", "SELF_ONLY"
+    ] = ""
+    disable_comment: bool = True
+    disable_duet: bool = True
+    disable_stitch: bool = True
+    is_brand_organic: bool = False
+    is_branded_content: bool = False
+    is_ai_generated: bool = False
+    thumbnail_offset: int = Field(default=0, ge=0, le=600000)
+    photo_cover_index: int = Field(default=0, ge=0, le=9)
+    auto_add_music: bool = False
+
+
 class ItemInput(Model):
     account_id: str
     action: str
@@ -141,16 +166,15 @@ class ItemInput(Model):
     opportunity_id: str = ""
     content_key: str = ""
     profile_version: int = Field(default=0, ge=0)
+    tiktok_video_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
+    tiktok_comment_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
+    tiktok_options: TikTokPostOptions | None = None
 
     @field_validator("scheduled_at")
     @classmethod
     def valid_time(cls, value):
         epoch(value)
         return value
-
-
-class ApprovalInput(Model):
-    phrase: str
 
 
 class TaskStateInput(Model):
@@ -185,14 +209,19 @@ class ExecutionSettings(Model):
     platform_limits: dict[str, QuotaLimit] = Field(default_factory=dict)
     max_workers: int = Field(default=6, ge=1, le=50)
     platform_workers: dict[str, int] = Field(default_factory=lambda: {"x": 2, "reddit": 2})
+    pool_workers: dict[str, int] = Field(default_factory=dict)
     quota_timezone: Literal["UTC"] = "UTC"
 
     @model_validator(mode="after")
     def platforms(self):
+        from .routing import POOLS
+
         if any(p not in PLATFORMS for p in {*self.platform_limits, *self.platform_workers}):
             raise ValueError("未知平台")
         if any(not 1 <= n <= 50 for n in self.platform_workers.values()):
             raise ValueError("平台并发数必须为 1–50")
+        if any(k not in POOLS or not 1 <= v <= 50 for k, v in self.pool_workers.items()):
+            raise ValueError("工作池名称或并发数无效")
         return self
 
 
@@ -227,7 +256,7 @@ class PoolInput(Model):
 
 
 class OpportunityInput(Model):
-    platform: Literal["telegram", "reddit", "instagram", "x", "discord"]
+    platform: Literal["telegram", "reddit", "instagram", "x", "discord", "tiktok"]
     external_id: str = Field(min_length=1, max_length=160)
     native_target_id: str = Field(default="", pattern=r"^(?:|-?[1-9][0-9]{0,20})$")
     target: str = Field(min_length=1, max_length=500)
@@ -254,6 +283,9 @@ class OpportunityInput(Model):
     discord_reply_to: str = Field(default="", pattern=r"^(?:|[1-9][0-9]{0,19})$")
     target_owned: bool = False
     media: list[Media] = Field(default_factory=list, max_length=10)
+    tiktok_video_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
+    tiktok_comment_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
+    tiktok_options: TikTokPostOptions | None = None
 
     @model_validator(mode="after")
     def valid(self):
@@ -266,6 +298,8 @@ class OpportunityInput(Model):
             raise ValueError("Telegram 回复需要原消息 ID")
         if self.platform == "discord" and self.action == "reply" and not self.discord_reply_to:
             raise ValueError("Discord 回复需要原消息 ID")
+        if self.platform == "tiktok" and self.action != "publish" and not self.tiktok_video_id:
+            raise ValueError("TikTok 评论互动需要自有视频 ID")
         return self
 
 

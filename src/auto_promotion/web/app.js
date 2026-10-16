@@ -22,6 +22,7 @@ const names = {
   instagram: "Instagram",
   x: "X",
   discord: "Discord",
+  tiktok: "TikTok",
 };
 const actions = {
   discover: "搜索发现",
@@ -37,6 +38,11 @@ const actions = {
   like: "点赞",
   repost: "转发",
   quote: "引用",
+  comment: "评论自有内容",
+  unlike: "取消评论点赞",
+  hide_comment: "隐藏评论",
+  unhide_comment: "恢复评论显示",
+  delete_comment: "删除自己的评论",
 };
 const statuses = {
   draft: "草稿",
@@ -59,9 +65,10 @@ const statuses = {
   rejected: "已拒绝",
 };
 const phases = {
-  discovery: "等待发现审批",
+  discovery: "准备任务",
   discovered: "准备外发清单",
-  review: "等待外发审批",
+  review: "等待开始发送",
+  starting: "正在准备发送",
   ready: "执行与核验",
 };
 const connectionStages = {
@@ -116,6 +123,7 @@ const api = async (path, method = "GET", body) => {
   return result;
 };
 function toast(text, error = false) {
+  if (typeof tiktokErrorMessage === "function") text = tiktokErrorMessage(text);
   if (error && $("#panel").open) {
     let alert = $("#panel-content .form-error");
     if (!alert) {
@@ -149,7 +157,7 @@ function badge(value) {
   return `<span class="badge ${color}">${esc(statuses[value] || value)}</span>`;
 }
 function platform(p) {
-  return `<span class="platform"><span class="platform-mark ${esc(p)}">${esc({ telegram: "TG", reddit: "R", instagram: "IG", x: "X", discord: "DC" }[p])}</span>${esc(names[p])}</span>`;
+  return `<span class="platform"><span class="platform-mark ${esc(p)}">${esc({ telegram: "TG", reddit: "R", instagram: "IG", x: "X", discord: "DC", tiktok: "TT" }[p])}</span>${esc(names[p])}</span>`;
 }
 function heading(title, desc, button = "") {
   return `<div class="page-heading"><div><h1>${title}</h1><p>${desc}</p></div>${button}</div>`;
@@ -211,7 +219,7 @@ $("#global-stop").onclick = (e) =>
     toast(
       state.overview.global_stop
         ? "已暂停未提交任务；平台原生排期需单独核对"
-        : "已恢复已批准任务的执行",
+        : "已恢复已启动任务的执行",
     );
   });
 async function render() {
@@ -300,9 +308,11 @@ function renderAccounts() {
     heading(
       "账号中心",
       "连接账号，确认能力，让每一次执行都有明确的身份。",
-      '<div class="actions"><button class="secondary" id="connect-discord">连接 Discord</button><button class="secondary" id="connect-instagram">连接 IG</button><button class="secondary" id="connect-x">连接 X</button><button id="new-account">添加账号</button></div>',
+      '<div class="actions"><button class="secondary" id="connect-tiktok">连接 TikTok</button><button class="secondary" id="connect-discord">连接 Discord</button><button class="secondary" id="connect-instagram">连接 IG</button><button class="secondary" id="connect-x">连接 X</button><button id="new-account">添加账号</button></div>',
     ) +
-    `<div class="stats"><span class="stat"><strong>${state.accounts.length}</strong>已登记账号</span><span class="stat"><strong>${checked}</strong>通过身份核验</span><span class="stat"><strong>${state.accounts.filter((a) => a.mode === "live").length}</strong>真实账号</span></div><div id="connection-list"></div><div class="toolbar"><div class="filter-tabs"><button class="selected" data-mode="all">全部账号</button><button data-mode="live">真实账号</button><button data-mode="simulation">模拟账号</button></div><span class="spacer"></span><button class="secondary compact" id="check-all">检查全部连接</button></div><div class="surface" id="account-list"></div><p class="connect-note">Discord、IG 和 X 可在这里完成本机连接，身份核验后自动登记。登录不启用推广发布；外发仍按任务审批执行。</p>`;
+    `<div class="stats"><span class="stat"><strong>${state.accounts.length}</strong>已登记账号</span><span class="stat"><strong>${checked}</strong>通过身份核验</span><span class="stat"><strong>${state.accounts.filter((a) => a.mode === "live").length}</strong>真实账号</span></div><div id="connection-list"></div><div class="toolbar"><div class="filter-tabs"><button class="selected" data-mode="all">全部账号</button><button data-mode="live">真实账号</button><button data-mode="simulation">模拟账号</button></div><span class="spacer"></span><button class="secondary compact" id="check-all">检查全部连接</button></div><div class="surface" id="account-list"></div><p class="connect-note">TikTok、Discord、IG 和 X 可在这里完成连接，身份核验后自动登记。登录不启用推广发布；外发在明确启动任务后执行。</p>`;
+  $("#connect-tiktok").onclick = () =>
+    tiktokSetup().catch((e) => toast(e.message, true));
   $("#connect-instagram").onclick = () => connectionForm("instagram");
   $("#connect-x").onclick = () => connectionForm("x");
   $("#connect-discord").onclick = discordConnectionForm;
@@ -504,6 +514,14 @@ function accountRows(mode) {
     profile.onclick = () =>
       profileForm(account.id).catch((error) => toast(error.message, true));
     control.insertAdjacentElement("beforebegin", profile);
+    if (account.platform === "tiktok" && account.mode === "live") {
+      const content = document.createElement("button");
+      content.className = "text-button";
+      content.textContent = "内容与评论";
+      content.onclick = () =>
+        tiktokLibrary(account.id).catch((e) => toast(e.message, true));
+      control.insertAdjacentElement("beforebegin", content);
+    }
   }
   document.querySelectorAll("[data-check]").forEach(
     (b) =>
@@ -589,10 +607,10 @@ function renderTasks() {
   $("#main").innerHTML =
     heading(
       "任务中心",
-      "从发现到发布，把审批、排期与每一项结果放在一起。",
+      "从发现到发布，把任务、排期与每一项结果放在一起。",
       '<button id="new-task">创建任务</button>',
     ) +
-    `<div class="stats"><span class="stat"><strong>${state.tasks.length}</strong>全部任务</span><span class="stat"><strong>${active}</strong>进行中</span><span class="stat"><strong>${state.tasks.filter((t) => t.phase === "review").length}</strong>等待外发审批</span></div>${state.overview.global_stop ? '<div class="banner warning">任务执行当前暂停。可以继续创建、编辑和审批；恢复后才会执行已批准的项目。</div>' : ""}<div class="toolbar"><div class="filter-tabs"><button class="selected" id="current-tasks">当前项目</button><button id="legacy-tasks">历史任务 · 只读</button></div><span class="spacer"></span><input id="task-search" aria-label="搜索任务" placeholder="搜索任务名称或 ID"></div><div class="surface" id="task-list"></div>`;
+    `<div class="stats"><span class="stat"><strong>${state.tasks.length}</strong>全部任务</span><span class="stat"><strong>${active}</strong>进行中</span><span class="stat"><strong>${state.tasks.filter((t) => t.phase === "review").length}</strong>等待开始发送</span></div>${state.overview.global_stop ? '<div class="banner warning">任务执行当前暂停。可以继续创建和编辑任务；恢复后才会执行已启动的项目。</div>' : ""}<div class="toolbar"><div class="filter-tabs"><button class="selected" id="current-tasks">当前项目</button><button id="legacy-tasks">历史任务 · 只读</button></div><span class="spacer"></span><input id="task-search" aria-label="搜索任务" placeholder="搜索任务名称或 ID"></div><div class="surface" id="task-list"></div>`;
   $("#new-task").onclick = taskForm;
   $("#current-tasks").onclick = () => renderTasks();
   $("#legacy-tasks").onclick = (e) =>
@@ -623,7 +641,7 @@ function taskRows() {
         .join("")}</tbody></table></div>`
     : empty(
         "开始第一个推广任务",
-        "选择账号，定义发现范围，再准备和批准执行清单。",
+        "选择账号，定义发现范围，再准备清单并点击开始发送。",
         '<button id="empty-new-task" class="secondary">创建任务</button>',
       );
   $("#empty-new-task")?.addEventListener("click", taskForm);
@@ -637,7 +655,7 @@ function taskForm() {
   const now = Date.now();
   openPanel(
     "创建推广任务",
-    `<form id="task-form"><div class="field-grid"><div class="full"><label for="task-name">任务名称</label><input id="task-name" name="name" required placeholder="例如：AI 视频创作者互动 · 第一批"></div><fieldset class="full"><legend>选择执行账号</legend>${state.accounts.map((a) => `<label class="checkbox-label"><input type="checkbox" name="accounts" value="${a.id}">${esc(a.label)} · ${names[a.platform]} · ${a.mode === "simulation" ? "模拟" : "真实"}</label>`).join("")}</fieldset><div class="full"><label for="queries">发现主题（每行一个）</label><textarea id="queries" name="queries" placeholder="AI video creation" rows="2"></textarea></div><div><label for="required">必需关键词（逗号分隔）</label><input id="required" name="required" placeholder="AI, video"></div><div><label for="blocked">排除关键词（逗号分隔）</label><input id="blocked" name="blocked" placeholder="airdrop, giveaway"></div><div><label for="starts">执行开始时间</label><input id="starts" name="starts" type="datetime-local" value="${isoLocal(now)}" required></div><div><label for="ends">执行结束时间</label><input id="ends" name="ends" type="datetime-local" value="${isoLocal(now + 86400000)}" required></div><div><label for="languages">允许语言</label><input id="languages" name="languages" value="en, zh" required></div><div><label for="candidates">最多候选数</label><input id="candidates" name="candidates" type="number" min="1" max="200" value="20" required></div><div><label for="task-daily">每日外发限额</label><input id="task-daily" name="daily" type="number" value="5" min="1" max="100" required></div><div><label for="task-interval">最小间隔（秒）</label><input id="task-interval" name="interval" type="number" value="120" min="0" required></div></div><details><summary>更多发现边界</summary><div class="field-grid"><div><label>最低成员数<input name="min_members" type="number" value="0" min="0"></label></div><div><label>最低活跃度<input name="min_activity" type="number" value="0" min="0"></label></div><div><label>最低置信度<input name="confidence" type="number" value="0.8" min="0.5" max="1" step="0.05"></label></div><div><label>最多 Telegram 入群数<input name="max_joins" type="number" value="0" min="0" max="20"></label></div><div class="full"><label>目标白名单（每行一个，空白表示使用发现政策）<textarea name="targets" rows="2"></textarea></label></div></div></details><p class="help">仅公开目标。输入时间使用浏览器本地时区，保存时转换为明确的 UTC 时间；任务详情统一显示北京时间。</p><div class="form-actions"><button type="submit">创建并预览发现政策</button></div></form>`,
+    `<form id="task-form"><div class="field-grid"><div class="full"><label for="task-name">任务名称</label><input id="task-name" name="name" required placeholder="例如：AI 视频创作者互动 · 第一批"></div><fieldset class="full"><legend>选择执行账号</legend>${state.accounts.map((a) => `<label class="checkbox-label"><input type="checkbox" name="accounts" value="${a.id}">${esc(a.label)} · ${names[a.platform]} · ${a.mode === "simulation" ? "模拟" : "真实"}</label>`).join("")}</fieldset><div class="full"><label for="queries">发现主题（每行一个）</label><textarea id="queries" name="queries" placeholder="AI video creation" rows="2"></textarea></div><div><label for="required">必需关键词（逗号分隔）</label><input id="required" name="required" placeholder="AI, video"></div><div><label for="blocked">排除关键词（逗号分隔）</label><input id="blocked" name="blocked" placeholder="airdrop, giveaway"></div><div><label for="starts">执行开始时间</label><input id="starts" name="starts" type="datetime-local" value="${isoLocal(now)}" required></div><div><label for="ends">执行结束时间</label><input id="ends" name="ends" type="datetime-local" value="${isoLocal(now + 86400000)}" required></div><div><label for="languages">允许语言</label><input id="languages" name="languages" value="en, zh" required></div><div><label for="candidates">最多候选数</label><input id="candidates" name="candidates" type="number" min="1" max="200" value="20" required></div><div><label for="task-daily">每日外发限额</label><input id="task-daily" name="daily" type="number" value="5" min="1" max="100" required></div><div><label for="task-interval">最小间隔（秒）</label><input id="task-interval" name="interval" type="number" value="120" min="0" required></div></div><details><summary>更多发现边界</summary><div class="field-grid"><div><label>最低成员数<input name="min_members" type="number" value="0" min="0"></label></div><div><label>最低活跃度<input name="min_activity" type="number" value="0" min="0"></label></div><div><label>最低置信度<input name="confidence" type="number" value="0.8" min="0.5" max="1" step="0.05"></label></div><div><label>最多 Telegram 入群数<input name="max_joins" type="number" value="0" min="0" max="20"></label></div><div class="full"><label>目标白名单（每行一个，空白表示使用发现政策）<textarea name="targets" rows="2"></textarea></label></div></div></details><p class="help">仅公开目标。输入时间使用浏览器本地时区，保存时转换为明确的 UTC 时间；任务详情统一显示北京时间。</p><div class="form-actions"><button type="submit">创建任务</button></div></form>`,
   );
   $("#task-form fieldset").insertAdjacentHTML(
     "afterend",
@@ -707,8 +725,8 @@ async function renderTask(id) {
   const t = await api("/tasks/" + id);
   if (location.hash !== "#tasks/" + id) return;
   state.current = t;
-  const discovery = t.approvals.some((a) => a.stage === "discovery_join");
-  const approved = t.approvals.some((a) => a.stage === "outbound");
+  const discovery = true;
+  const started = ["starting", "ready"].includes(t.phase);
   const ended = ["cancelled", "completed"].includes(t.state);
   $("#main").innerHTML =
     `<div class="detail-top"><a href="#tasks">任务中心</a><span class="muted">/</span><code>${esc(t.id)}</code>${t.mode === "simulation" ? '<span class="badge amber">模拟任务 · 无外部发布</span>' : ""}</div>` +
@@ -719,51 +737,35 @@ async function renderTask(id) {
     ) +
     `<div id="task-execution">${taskExecutionPanel(t)}</div>` +
     taskReadinessPanel(t) +
-    `<div class="steps"><span class="${discovery ? "done" : ""}"><b>1</b>发现政策</span><span class="${t.manifest ? "done" : ""}"><b>2</b>准备清单</span><span class="${approved ? "done" : ""}"><b>3</b>外发审批</span><span class="${t.state === "completed" ? "done" : ""}"><b>4</b>执行核验</span></div><div class="detail-grid"><div class="detail-body"><div class="surface"><div class="section-header"><h2>执行清单 <span class="muted">${t.items.length}</span></h2>${discovery && !t.manifest && !ended ? '<button id="edit-items" class="secondary compact">编辑执行项</button>' : ""}</div>${t.items.length ? t.items.map((item) => itemPreview(item)).join("") : empty("尚无执行项", discovery ? "添加每项的目标、内容、媒体和时间，再冻结外发清单。" : "先检查任务审批中的发现政策并完成第一阶段审批。")}</div>${discovery && !t.manifest && t.items.length ? `<div class="form-actions"><button id="prepare" ${t.readiness?.workflow?.can_prepare ? "" : "disabled"} title="${esc(t.readiness?.workflow?.message || "")}">冻结并预览外发清单</button></div>` : ""}<div class="surface mt-24"><div class="section-header"><h2>发现候选 <span class="muted">${t.candidates.length}</span></h2></div><div class="padded">${
+    `<div class="steps"><span class="${discovery ? "done" : ""}"><b>1</b>发现政策</span><span class="${t.manifest ? "done" : ""}"><b>2</b>准备清单</span><span class="${started ? "done" : ""}"><b>3</b>开始发送</span><span class="${t.state === "completed" ? "done" : ""}"><b>4</b>执行核验</span></div><div class="detail-grid"><div class="detail-body"><div class="surface"><div class="section-header"><h2>执行清单 <span class="muted">${t.items.length}</span></h2>${!t.manifest && !started && !ended ? '<button id="edit-items" class="secondary compact">编辑执行项</button>' : ""}</div>${t.items.length ? t.items.map((item) => itemPreview(item)).join("") : empty("尚无执行项", "添加每项的目标、内容、媒体和时间，然后点击开始发送。")}</div><div class="surface mt-24"><div class="section-header"><h2>发现候选 <span class="muted">${t.candidates.length}</span></h2></div><div class="padded">${
       discovery && !ended
         ? `<div class="actions">${t.account_snapshot
-            .filter((a) => a.platform !== "instagram")
+            .filter((a) =>
+              state.accounts
+                .find((x) => x.id === a.id)
+                ?.capabilities.includes("discover"),
+            )
             .map(
               (a) =>
                 `<button class="secondary compact" data-discover="${a.id}">搜索 ${names[a.platform]}</button>`,
             )
             .join(
               "",
-            )}<button class="secondary compact" id="add-candidate">录入候选</button>${t.policy.max_joins ? '<button class="secondary compact" id="join-candidates">执行已批准入群</button>' : ""}</div>`
+            )}<button class="secondary compact" id="add-candidate">录入候选</button>${t.policy.max_joins ? '<button class="secondary compact" id="join-candidates">开始入群</button>' : ""}</div>`
         : ""
-    }${t.candidates.length ? '<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>候选目标</th><th>资格判断</th><th>原因</th></tr></thead><tbody>' + t.candidates.map((c) => `<tr><td>${esc(c.target)}</td><td>${badge(c.decision)}</td><td>${esc(c.reasons.join(" · ") || "通过发现政策")}<span class="sub">${esc(c.state)}</span>${["unknown", "pending_admin_approval"].includes(c.state) ? `<button class="text-button" data-join-reconcile="${c.id}">只读核对入群</button>` : ""}</td></tr>`).join("") + "</tbody></table></div>" : '<p class="muted mt-14">搜索结果先经过资格筛选，低置信度候选会被记录为拒绝。</p>'}</div></div><div class="surface mt-24"><div class="section-header"><h2>任务日志</h2></div><div class="padded" id="task-audit">正在读取…</div></div></div><aside class="detail-aside"><div class="surface padded"><h2>任务审批</h2><div class="approval"><strong>发现与入群政策</strong>${discovery ? " " + badge("confirmed").replace("已发布 · 已核验", "已批准") : ""}<details ${!discovery ? "open" : ""}><summary>查看完整范围</summary><p class="help">账号：${t.account_snapshot.map((a) => esc(a.label) + " (" + names[a.platform] + ")").join("、")}</p><pre>${esc(JSON.stringify(t.policy, null, 2))}</pre></details>${!discovery && !ended ? approvalForm(t, "discovery_join", t.discovery_phrase) : ""}</div><div class="approval"><strong>最终外发批次</strong>${approved ? ' <span class="badge green">已批准</span>' : ""}${t.manifest ? `<details><summary>查看完整不可变清单</summary><pre>${esc(JSON.stringify(t.manifest, null, 2))}</pre></details><span class="help">SHA-256</span><code>${esc(t.manifest_hash)}</code>` : '<p class="help">保存执行项并冻结后，可审核第二阶段。</p>'}${t.manifest && !approved && !ended ? approvalForm(t, "outbound", t.outbound_phrase) : ""}</div></div><div class="surface padded mt-20"><h2>执行控制</h2><p class="help">${state.overview.global_stop ? "全局执行已暂停。请使用顶部开关恢复。" : "调度器按批准的时间窗口执行。"}</p><div class="actions mt-14">${approved && !ended ? '<button id="run-task" class="compact">运行一轮</button>' : ""}${!ended ? `<button class="secondary compact" id="pause-task">${t.state === "paused" ? "恢复任务" : "暂停任务"}</button><button class="danger compact" id="cancel-task">取消任务</button>` : ""}</div><p class="native-note">停止本地任务不会撤回已经提交给 Telegram 的原生排期。</p></div></aside></div>`;
+    }${t.candidates.length ? '<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>候选目标</th><th>资格判断</th><th>原因</th></tr></thead><tbody>' + t.candidates.map((c) => `<tr><td>${esc(c.target)}</td><td>${badge(c.decision)}</td><td>${esc(c.reasons.join(" · ") || "通过发现政策")}<span class="sub">${esc(c.state)}</span>${["unknown", "pending_admin_approval"].includes(c.state) ? `<button class="text-button" data-join-reconcile="${c.id}">只读核对入群</button>` : ""}</td></tr>`).join("") + "</tbody></table></div>" : '<p class="muted mt-14">搜索结果先经过资格筛选，低置信度候选会被记录为拒绝。</p>'}</div></div><div class="surface mt-24"><div class="section-header"><h2>任务日志</h2></div><div class="padded" id="task-audit">正在读取…</div></div></div><aside class="detail-aside"><div class="surface padded"><h2>任务范围</h2><details><summary>查看完整范围</summary><p class="help">账号：${t.account_snapshot.map((a) => esc(a.label) + " (" + names[a.platform] + ")").join("、")}</p><pre>${esc(JSON.stringify(t.policy, null, 2))}</pre></details>${t.manifest ? `<details><summary>查看发送清单</summary><pre>${esc(JSON.stringify(t.manifest, null, 2))}</pre></details>` : '<p class="help">点击开始发送时自动固定清单，无需审批或确认短语。</p>'}</div><div class="surface padded mt-20"><h2>执行控制</h2><p class="help">${state.overview.global_stop ? "全局执行已暂停。请使用顶部开关恢复。" : "任务启动后按计划时间执行。"}</p><div class="actions mt-14">${!ended ? `<button id="run-task" class="compact">${t.items.length ? "开始发送" : t.policy.max_joins ? "开始入群" : "开始任务"}</button><button class="secondary compact" id="pause-task">${t.state === "paused" ? "恢复任务" : "暂停任务"}</button><button class="danger compact" id="cancel-task">取消任务</button>` : ""}</div><p class="native-note">停止本地任务不会撤回已经提交给 Telegram 的原生排期。</p></div></aside></div>`;
   bindTaskTools(t);
   $("#refresh-task").onclick = () => renderTask(id);
   $("#edit-items")?.addEventListener("click", () => itemEditor(t));
-  $("#prepare")?.addEventListener("click", (e) =>
-    busy(e.target, async () => {
-      await api(`/tasks/${id}/prepare`, "POST");
-      await renderTask(id);
-    }),
-  );
-  document.querySelectorAll("[data-approval]").forEach(
-    (form) =>
-      (form.onsubmit = (e) => {
-        e.preventDefault();
-        busy(e.submitter, async () => {
-          await api(`/tasks/${id}/approve/${form.dataset.approval}`, "POST", {
-            phrase: new FormData(form).get("phrase"),
-          });
-          await refresh();
-          await renderTask(id);
-          toast("精确授权已持久保存");
-        });
-      }),
-  );
   $("#run-task")?.addEventListener("click", (e) =>
     busy(e.target, async () => {
-      const r = await api(`/tasks/${id}/run`, "POST");
+      const r = await api(`/tasks/${id}/start`, "POST");
       await refresh();
       await renderTask(id);
       toast(
-        r.processed.length
-          ? `本轮处理 ${r.processed.length} 项`
-          : "暂无可执行项：请检查时间、审批、全局开关及账号状态",
+        r.execution_result.processed.length
+          ? `本轮处理 ${r.execution_result.processed.length} 项`
+          : r.readiness.workflow.message,
       );
     }),
   );
@@ -844,12 +846,9 @@ async function renderTask(id) {
           .join("")
       : "暂无记录";
 }
-function approvalForm(t, stage, phrase) {
-  return `<form data-approval="${stage}"><code class="phrase">${esc(phrase)}</code><label for="phrase-${stage}">核对完整范围后，输入确认短语</label><input id="phrase-${stage}" name="phrase" required autocomplete="off" placeholder="粘贴完整短语"><button class="compact mt-10" type="submit">批准${stage === "outbound" ? "外发批次" : "发现政策"}</button></form>`;
-}
 function itemPreview(i) {
   const p = i.payload;
-  return `<article class="item-preview"><div class="item-head"><strong>${i.position + 1}. ${esc(p.account_label)} · ${actions[p.action] || esc(p.action)}</strong>${badge(i.status)}</div><div class="item-meta"><span>目标：${esc(p.target)}</span>${p.discord_reply_to ? `<span>回复消息 ID：${esc(p.discord_reply_to)}</span>` : ""}<span>${fmt(p.scheduled_at)} UTC+08:00</span></div>${p.title ? `<h3>${esc(p.title)}</h3>` : ""}${p.text ? `<div class="item-text">${esc(p.text)}</div>` : ""}${p.media.length ? '<p class="help">媒体：' + p.media.map((m) => esc(m.filename) + " · " + esc(m.sha256.slice(0, 12))).join("，") + "</p>" : ""}${i.external_reference ? '<p class="help">回执：<code>' + esc(i.external_reference) + "</code></p>" : ""}${i.result.execution_step ? `<p class="help">执行步骤：${esc(executionSteps[i.result.execution_step] || i.result.execution_step)} · ${i.result.submission_started ? "已开始提交，需核对结果" : "尚未开始提交"}</p>` : ""}${i.result.diagnostic_traceback?.length ? `<details><summary>诊断详情</summary><pre>${esc(JSON.stringify(i.result.diagnostic_traceback, null, 2))}</pre></details>` : ""}${i.result.reason ? '<p class="help">' + esc(i.result.reason) + "</p>" : ""}<div class="actions">${["unknown", "scheduled"].includes(i.status) ? `<button class="text-button" data-reconcile="${i.id}">只读核对结果</button>` : ""}${i.status === "manual_attention" ? `<button class="text-button" data-manual="${i.id}">登记人工发布结果</button>` : ""}</div></article>`;
+  return `<article class="item-preview"><div class="item-head"><strong>${i.position + 1}. ${esc(p.account_label)} · ${actions[p.action] || esc(p.action)}</strong>${badge(i.status)}</div><div class="item-meta"><span>目标：${esc(p.target)}</span>${p.discord_reply_to ? `<span>回复消息 ID：${esc(p.discord_reply_to)}</span>` : ""}<span>${fmt(p.scheduled_at)} UTC+08:00</span></div>${tiktokItemSummary(p, i.result)}${p.title ? `<h3>${esc(p.title)}</h3>` : ""}${p.text ? `<div class="item-text">${esc(p.text)}</div>` : ""}${p.media.length ? '<p class="help">媒体：' + p.media.map((m) => esc(m.filename) + " · " + esc(m.sha256.slice(0, 12))).join("，") + "</p>" : ""}${i.external_reference ? '<p class="help">回执：<code>' + esc(i.external_reference) + "</code></p>" : ""}${i.result.execution_step ? `<p class="help">执行步骤：${esc(executionSteps[i.result.execution_step] || i.result.execution_step)} · ${i.result.submission_started ? "已开始提交，需核对结果" : "尚未开始提交"}</p>` : ""}${i.result.diagnostic_traceback?.length ? `<details><summary>诊断详情</summary><pre>${esc(JSON.stringify(i.result.diagnostic_traceback, null, 2))}</pre></details>` : ""}${i.result.reason ? '<p class="help">' + esc(i.result.reason) + "</p>" : ""}<div class="actions">${["unknown", "scheduled"].includes(i.status) ? `<button class="text-button" data-reconcile="${i.id}">只读核对结果</button>` : ""}${i.status === "manual_attention" ? `<button class="text-button" data-manual="${i.id}">登记人工发布结果</button>` : ""}</div></article>`;
 }
 
 const executionSteps = {
@@ -886,7 +885,7 @@ function taskExecutionBadge(t) {
     running: "发送进程运行中",
     stale: "发送心跳超时",
     stopped: "发送已停止",
-    unmonitored: "已批准 · 待执行",
+    unmonitored: "已启动 · 待执行",
   };
   const status = t.execution?.status || "unmonitored";
   return `<span class="badge ${status === "running" ? "green" : "amber"}">${labels[status]}</span>`;
@@ -900,10 +899,10 @@ function taskExecutionPanel(t) {
   if (!t.manifest) return workflow;
   const e = t.execution || { status: "unmonitored" };
   const messages = {
-    running: "发送进程心跳正常，按已批准的窗口和限额执行。",
+    running: "发送进程心跳正常，按已启动的窗口和限额执行。",
     stale: "超过 60 秒未收到发送心跳，无法确认进程仍在运行。请检查执行服务。",
     stopped: "发送进程已结束，剩余项目不会由该进程继续执行。",
-    unmonitored: "尚无发送进程监测记录；任务审批状态不能证明发送正在运行。",
+    unmonitored: "尚无发送进程监测记录；任务状态不能证明发送正在运行。",
   };
   return (
     workflow +
@@ -972,10 +971,13 @@ function itemEditor(t) {
           ? "manual"
           : "automatic",
       account_id: a.id,
-      action: state.accounts
-        .find((x) => x.id === a.id)
-        .capabilities.find((c) => !["discover", "join"].includes(c)),
-      target: "",
+      action:
+        live.platform === "tiktok"
+          ? "publish"
+          : state.accounts
+              .find((x) => x.id === a.id)
+              .capabilities.find((c) => !["discover", "join"].includes(c)),
+      target: live.platform === "tiktok" ? live.owned_target_id || "" : "",
       text: "",
       title: "",
       media: [],
@@ -985,7 +987,10 @@ function itemEditor(t) {
       reply_to: null,
       discord_reply_to: "",
       recipient_id: "",
-      target_owned: false,
+      target_owned: live.platform === "tiktok",
+      tiktok_video_id: "",
+      tiktok_comment_id: "",
+      tiktok_options: null,
     };
   }
   if (!items.length)
@@ -1003,6 +1008,8 @@ function itemEditor(t) {
     return `<label for="discord-channel-${n}">Discord 频道</label><select id="discord-channel-${n}" name="target" required><option value="">请读取并选择已授权频道</option>${p.target ? `<option selected value="${esc(p.target)}">频道 ${esc(p.target)}</option>` : ""}</select><button class="secondary compact" type="button" data-discord-targets="${n}">读取已授权频道</button><p class="help" data-target-note="${n}">仅列出服务器成员可见且 Bot 可发送的频道。计划时间由本机调度。</p>`;
   }
   function replyField(p) {
+    if (state.accounts.find((a) => a.id === p.account_id).platform === "tiktok")
+      return "";
     return state.accounts.find((a) => a.id === p.account_id).platform ===
       "discord"
       ? `<label>Discord 原消息 ID（回复时）<input name="discord_reply_to" type="text" inputmode="numeric" pattern="[1-9][0-9]{0,19}" value="${esc(p.discord_reply_to || "")}" placeholder="完整消息 ID"></label>`
@@ -1022,7 +1029,7 @@ function itemEditor(t) {
             )
             .join(
               "",
-            )}</select></label></div><div class="full"><label>执行方式<select name="execution_mode"><option value="automatic" ${p.execution_mode !== "manual" ? "selected" : ""}>自动执行</option><option value="manual" ${p.execution_mode === "manual" ? "selected" : ""}>人工执行与结果登记</option></select></label></div><div class="full">${targetField(p, n)}</div><div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div>${replyField(p)}</div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 发布必须勾选）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · ${state.accounts.find((a) => a.id === p.account_id).platform === "discord" ? "单文件最多 10 MiB，合计最多 25 MiB" : "最大 50 MB"}</p>${p.media.map((m, j) => `<label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
+            )}</select></label></div><div class="full"><label>执行方式<select name="execution_mode"><option value="automatic" ${p.execution_mode !== "manual" ? "selected" : ""}>自动执行</option><option value="manual" ${p.execution_mode === "manual" ? "selected" : ""}>人工执行与结果登记</option></select></label></div><div class="full">${targetField(p, n)}</div>${tiktokItemFields(p)}<div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div>${replyField(p)}</div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 与 TikTok 必须勾选）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · ${state.accounts.find((a) => a.id === p.account_id).platform === "discord" ? "单文件最多 10 MiB，合计最多 25 MiB" : "最大 50 MB"}</p>${p.media.map((m, j) => `<button type="button" class="text-button" data-remove-media="${n}:${j}">移除此媒体</button><label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 与 TikTok 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
       )
       .join(
         "",
@@ -1048,6 +1055,7 @@ function itemEditor(t) {
         p.discord_reply_to =
           row.querySelector("[name=discord_reply_to]")?.value.trim() || "";
         p.target_owned = row.querySelector("[name=target_owned]").checked;
+        collectTikTokFields(row, p);
         row
           .querySelectorAll("[data-source]")
           .forEach(
@@ -1078,6 +1086,21 @@ function itemEditor(t) {
           items[index].target = "";
           items[index].reply_to = null;
           items[index].discord_reply_to = "";
+          items[index].tiktok_options = null;
+          items[index].tiktok_video_id = "";
+          items[index].tiktok_comment_id = "";
+          if (account.platform === "tiktok") {
+            items[index].target = account.owned_target_id || "";
+            items[index].target_owned = true;
+            items[index].action = "publish";
+          }
+          draw();
+        }),
+    );
+    container.querySelectorAll("[name=action]").forEach(
+      (el) =>
+        (el.onchange = () => {
+          collect();
           draw();
         }),
     );
@@ -1146,7 +1169,10 @@ function itemEditor(t) {
             account?.platform === current?.platform &&
             account.status === "healthy" &&
             !account.disabled &&
-            account.capabilities.includes(item.action)
+            account.capabilities.includes(item.action) &&
+            (current.platform !== "tiktok" ||
+              item.action === "publish" ||
+              account.id === current.id)
           );
         });
       };
@@ -1160,6 +1186,11 @@ function itemEditor(t) {
           const key = `${accounts[0].platform}:${item.action}`;
           const index = cursors.get(key) || 0;
           item.account_id = accounts[index % accounts.length].id;
+          const selectedAccount = state.accounts.find(
+            (a) => a.id === item.account_id,
+          );
+          if (selectedAccount.platform === "tiktok")
+            item.target = selectedAccount.owned_target_id || item.target;
           cursors.set(key, index + 1);
           assigned += 1;
         }
@@ -1217,11 +1248,30 @@ function itemEditor(t) {
             });
             const m = await response.json();
             if (!response.ok) throw Error(m.error);
-            items[Number(el.dataset.upload)].media.push(m);
+            const currentItem = items[Number(el.dataset.upload)];
+            if (
+              state.accounts.find((a) => a.id === currentItem.account_id)
+                .platform === "tiktok"
+            )
+              m.media_type = m.mime_type.startsWith("image/")
+                ? "IMAGE"
+                : m.mime_type.startsWith("video/")
+                  ? "VIDEO"
+                  : "";
+            currentItem.media.push(m);
             draw();
           } catch (e) {
             toast(e.message, true);
           }
+        }),
+    );
+    container.querySelectorAll("[data-remove-media]").forEach(
+      (button) =>
+        (button.onclick = () => {
+          collect();
+          const [n, j] = button.dataset.removeMedia.split(":").map(Number);
+          items[n].media.splice(j, 1);
+          draw();
         }),
     );
     $("#items-form").onsubmit = (e) => {
@@ -1239,7 +1289,7 @@ function itemEditor(t) {
 function manualForm(item) {
   openPanel(
     "登记人工发布结果",
-    `<p class="help">先核对批准文本，再在平台手动发布。登记后不会自动重试。</p><div class="item-text">${esc(item.payload.text)}</div><form id="manual-form"><label>平台上实际发布的完整文本<textarea name="text" required></textarea></label><label>Instagram 公开链接<input name="url" type="url" required></label><label class="checkbox-label"><input name="verified" type="checkbox">已在平台页面核验发布结果</label><div class="form-actions"><button>保存结果</button></div></form>`,
+    `<p class="help">先核对任务文本，再在平台手动发布。登记后不会自动重试。</p><div class="item-text">${esc(item.payload.text)}</div><form id="manual-form"><label>平台上实际发布的完整文本<textarea name="text" required></textarea></label><label>Instagram 公开链接<input name="url" type="url" required></label><label class="checkbox-label"><input name="verified" type="checkbox">已在平台页面核验发布结果</label><div class="form-actions"><button>保存结果</button></div></form>`,
   );
   $("#manual-form").onsubmit = (e) => {
     e.preventDefault();
@@ -1291,7 +1341,7 @@ async function renderAPI() {
       "五个平台后端随项目安装，统一查看本机能力与调用记录。",
       '<a href="/docs" target="_blank" rel="noopener">OpenAPI 文档 ↗</a>',
     ) +
-    `<div class="surface"><div class="section-header"><h2>平台适配器</h2><span class="badge">${services.filter((s) => s.installed).length} / ${services.length} 已集成后端</span></div>${services.map((s) => `<div class="service-row"><div>${platform(s.platform)}<p>${esc(s.transport)}</p></div><div><div class="chips">${s.capabilities.map((c) => `<span class="chip">${actions[c]}</span>`).join("")}</div><p>${esc(s.project)}</p></div><div class="service-status">${s.installed ? '<span class="badge green">后端已安装</span>' : '<span class="badge red">后端缺失</span>'}<p>${s.dependencies_ready === false ? "依赖未安装，请运行 install.ps1" : s.live_configured ? "已启用；账号需通过连接检查" : "依赖就绪；真实执行未启用"}</p></div></div>`).join("")}</div><div class="two-col"><div class="surface padded"><h2>统一接口</h2><div class="log-row"><span><span class="method">GET</span><code>/api/accounts</code></span><span>账号与能力</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks</code></span><span>创建任务</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/approve/{stage}</code></span><span>精确审批</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/run</code></span><span>执行一轮</span></div><div class="log-row"><span><span class="method">GET</span><code>/api/audit</code></span><span>审计记录</span></div><p class="help mt-16">写入只能通过批准的任务路径。API 凭据由本机配置管理，不在页面展示。</p></div><div class="surface padded"><h2>运行边界</h2><div class="log-row"><span>存储</span><span>${esc(state.overview.storage)}</span></div><div class="log-row"><span>调度</span><span>${state.overview.worker ? "后台 worker" : "手动触发"}</span></div><div class="log-row"><span>未知结果</span><span>只读核对，不自动重发</span></div><div class="log-row"><span>外部发布</span><span>${state.overview.live_writes ? "按账号和任务权限执行" : "关闭；模拟流程可执行"}</span></div></div></div><div class="surface mt-24"><div class="section-header"><h2>最近平台调用</h2><button class="secondary compact" id="refresh-api">刷新</button></div>${
+    `<div class="surface"><div class="section-header"><h2>平台适配器</h2><span class="badge">${services.filter((s) => s.installed).length} / ${services.length} 已集成后端</span></div>${services.map((s) => `<div class="service-row"><div>${platform(s.platform)}<p>${esc(s.transport)}</p></div><div><div class="chips">${s.capabilities.map((c) => `<span class="chip">${actions[c]}</span>`).join("")}</div><p>${esc(s.project)}</p></div><div class="service-status">${s.installed ? '<span class="badge green">后端已安装</span>' : '<span class="badge red">后端缺失</span>'}<p>${s.dependencies_ready === false ? "依赖未安装，请运行 install.ps1" : s.live_configured ? "已启用；账号需通过连接检查" : "依赖就绪；真实执行未启用"}</p></div></div>`).join("")}</div><div class="two-col"><div class="surface padded"><h2>统一接口</h2><div class="log-row"><span><span class="method">GET</span><code>/api/accounts</code></span><span>账号与能力</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks</code></span><span>创建任务</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/start</code></span><span>开始发送</span></div><div class="log-row"><span><span class="method">POST</span><code>/api/tasks/{id}/run</code></span><span>执行一轮</span></div><div class="log-row"><span><span class="method">GET</span><code>/api/audit</code></span><span>审计记录</span></div><p class="help mt-16">写入通过明确启动的任务执行。API 凭据由本机配置管理，不在页面展示。</p></div><div class="surface padded"><h2>运行边界</h2><div class="log-row"><span>存储</span><span>${esc(state.overview.storage)}</span></div><div class="log-row"><span>调度</span><span>${state.overview.worker ? "后台 worker" : "手动触发"}</span></div><div class="log-row"><span>未知结果</span><span>只读核对，不自动重发</span></div><div class="log-row"><span>外部发布</span><span>${state.overview.live_writes ? "按账号和任务范围执行" : "关闭；模拟流程可执行"}</span></div></div></div><div class="surface mt-24"><div class="section-header"><h2>最近平台调用</h2><button class="secondary compact" id="refresh-api">刷新</button></div>${
       calls.length
         ? `<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>时间</th><th>平台</th><th>操作</th><th>结果</th><th>耗时</th><th>错误类型</th><th>执行步骤</th></tr></thead><tbody>${calls
             .slice(0, 40)

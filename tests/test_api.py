@@ -165,13 +165,8 @@ class APITests(unittest.TestCase):
         self.assertEqual(status, 201)
         id = t["id"]
         self.assertEqual(
-            self.call(f"/api/tasks/{id}/approve/discovery_join", "POST", {"phrase": "好的"})[0], 409
-        )
-        self.assertEqual(
-            self.call(
-                f"/api/tasks/{id}/approve/discovery_join", "POST", {"phrase": t["discovery_phrase"]}
-            )[0],
-            200,
+            self.call(f"/api/tasks/{id}/approve/discovery_join", "POST", {"phrase": "anything"})[0],
+            404,
         )
         item = {
             "account_id": a["id"],
@@ -181,19 +176,17 @@ class APITests(unittest.TestCase):
             "scheduled_at": now.isoformat(),
         }
         self.assertEqual(self.call(f"/api/tasks/{id}/items", "PUT", [item])[0], 200)
-        t = self.call(f"/api/tasks/{id}/prepare", "POST")[1]
-        self.assertEqual(
-            self.call(
-                f"/api/tasks/{id}/approve/outbound", "POST", {"phrase": t["outbound_phrase"]}
-            )[0],
-            200,
-        )
+        status, t, _ = self.call(f"/api/tasks/{id}/start", "POST")
+        self.assertEqual(status, 200)
+        self.assertEqual(t["phase"], "ready")
+        self.assertEqual(t["approvals"], [])
+        self.assertEqual(t["execution_result"]["processed"], [])
         self.assertEqual(self.call(f"/api/tasks/{id}/run", "POST")[1]["processed"], [])
         self.call("/api/control/stop", "POST", {"enabled": False})
         r = self.call(f"/api/tasks/{id}/run", "POST")[1]
         self.assertEqual(r["processed"][0]["status"], "confirmed")
         self.assertEqual(self.call(f"/api/tasks/{id}/run", "POST")[1]["processed"], [])
-        self.assertEqual(len(self.call("/api/services")[1]), 5)
+        self.assertEqual(len(self.call("/api/services")[1]), 6)
         self.assertGreater(len(self.call("/api/calls")[1]), 0)
         self.assertGreater(len(self.call("/api/audit")[1]), 0)
 

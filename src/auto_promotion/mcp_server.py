@@ -1,4 +1,4 @@
-"""Local stdio MCP server for the five bundled platform backends."""
+"""Local stdio MCP server for the six bundled platform backends."""
 
 from __future__ import annotations
 
@@ -36,9 +36,10 @@ from .statistics import ZONE, Statistics
 from .store import Store
 from .task_tool_models import TemplateSave, TemplateTask
 from .task_tools import TaskTools
-from .workers import WorkerRun, Workers
+from .tiktok import TikTokManager, TikTokReadInput
+from .workers import Workers
 
-Platform = Literal["telegram", "reddit", "instagram", "x", "discord"]
+Platform = Literal["telegram", "reddit", "instagram", "x", "discord", "tiktok"]
 
 
 def client_config(project_dir, python=None):
@@ -67,9 +68,11 @@ def create_server(engine=None):
     server = FastMCP(
         "Auto Promotion",
         instructions=(
-            "Manage Telegram, Reddit, Instagram, X and Discord through approved tasks. "
-            "Use the local workbench for human approvals and account login. "
-            "No tool grants approval, enables live writes or releases the global stop. "
+            "Manage Telegram, Reddit, Instagram, X, Discord and TikTok through persistent tasks. "
+            "When the user explicitly instructs you to start sending, replying or joining, "
+            "call start_task or start_joins for the specified task without asking for approval phrases. "
+            "Creating, editing, planning or previewing a task never starts execution. "
+            "Tools do not enable live writes or release the global stop. "
             "Account health and tool availability do not prove publication permission."
         ),
         log_level="WARNING",
@@ -81,10 +84,47 @@ def create_server(engine=None):
     pools, campaigns = Pools(engine), Campaigns(engine)
     growth = Growth(engine)
     task_tools = TaskTools(engine)
+    tiktok = TikTokManager(engine)
+
+    @server.tool(annotations=read)
+    def tiktok_configuration_status() -> dict:
+        """Read TikTok application setup without secrets; connect accounts in the local workbench."""
+        return invoke(tiktok.status)
+
+    @server.tool(annotations=remote_read)
+    def tiktok_list_videos(account_id: str, cursor: int = 0, limit: int = 20) -> dict:
+        """Read one page of owned TikTok posts; never publishes."""
+        return invoke(
+            lambda: tiktok.read(account_id, "videos", TikTokReadInput(cursor=cursor, limit=limit))
+        )
+
+    @server.tool(annotations=remote_read)
+    def tiktok_read_comments(
+        account_id: str,
+        video_id: str,
+        cursor: int = 0,
+        limit: int = 20,
+        import_to_pool: bool = False,
+    ) -> dict:
+        """Read owned-video comments; optionally import into the shared pool; never replies."""
+        return invoke(
+            lambda: tiktok.read(
+                account_id,
+                "comments",
+                TikTokReadInput(
+                    video_id=video_id, cursor=cursor, limit=limit, import_to_pool=import_to_pool
+                ),
+            )
+        )
+
+    @server.tool(annotations=remote_read)
+    def tiktok_account_insights(account_id: str) -> dict:
+        """Read permitted TikTok account metrics; absent values remain unknown."""
+        return invoke(lambda: tiktok.read(account_id, "insights", TikTokReadInput()))
 
     @server.tool(annotations=read)
     def list_task_templates() -> dict:
-        """List reusable discovery and pacing settings; templates never grant approval."""
+        """List reusable discovery and pacing settings; templates never start execution."""
         return invoke(lambda: {"templates": task_tools.templates()})
 
     @server.tool(annotations=local)
@@ -98,19 +138,19 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def create_task_from_template(template_id: str, task: dict) -> dict:
-        """Create a fresh draft with explicit accounts and dates; never approves or publishes."""
+        """Create a fresh draft with explicit accounts and dates; never starts execution."""
         return invoke(
             lambda: task_tools.create_from_template(template_id, TemplateTask.model_validate(task))
         )
 
     @server.tool(annotations=read)
     def task_evidence(task_id: str) -> dict:
-        """Read all task-scoped results, approvals and sanitized audit evidence in one snapshot."""
+        """Read all task-scoped results, historical approvals and sanitized audit evidence in one snapshot."""
         return invoke(task_tools.evidence, task_id)
 
     @server.tool(annotations=read)
     def task_review(task_id: str) -> dict:
-        """Read an HTML review of exact task content and timing; never grants approval."""
+        """Read an HTML review of exact task content and timing; never starts execution."""
         return invoke(lambda: {"task_id": task_id, "html": task_tools.review(task_id)})
 
     @server.tool(annotations=read)
@@ -125,7 +165,7 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def save_business_goal(goal: dict, goal_id: str | None = None) -> dict:
-        """Save a local business target; does not configure accounts or approve tasks."""
+        """Save a local business target; does not configure accounts or start tasks."""
         return invoke(lambda: growth.save_goal(GrowthGoal.model_validate(goal), goal_id))
 
     @server.tool(annotations=local)
@@ -157,19 +197,11 @@ def create_server(engine=None):
                 code = "BackendError"
             raise ToolError(code) from None
 
-    def require_approval(task_id, stage):
-        task = engine.task(task_id)
-        expected = task["policy_hash"] if stage == "discovery_join" else task["manifest_hash"]
-        if not expected or not any(
-            a["stage"] == stage and a["hash"] == expected for a in task["approvals"]
-        ):
-            raise Conflict("请先在本机工作台完成该阶段的精确审批")
-        if task["state"] != "active":
-            raise Conflict("任务未激活，请在本机工作台核对状态")
-
     @server.tool(annotations=read)
     def system_status() -> dict:
         """Read MCP/platform readiness and execution switches without contacting platforms."""
+        from .queue_store import JobQueue
+
         return invoke(
             lambda: {
                 "mcp_server": "auto-promotion",
@@ -180,7 +212,8 @@ def create_server(engine=None):
                 ]
                 != "0",
                 "live_writes_enabled": engine.live_enabled,
-                "human_approval": "local_workbench",
+                "execution_control": "explicit_chat_instruction_or_client_start",
+                "execution_pools": JobQueue(engine).pools(),
             }
         )
 
@@ -207,7 +240,7 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def save_account_profile(account_id: str, profile: dict) -> dict:
-        """Save a new persona version for future drafts; never changes approved text."""
+        """Save a new persona version for future drafts; never changes frozen text."""
         return invoke(lambda: pools.set_profile(account_id, AccountProfile.model_validate(profile)))
 
     @server.tool(annotations=local)
@@ -236,7 +269,7 @@ def create_server(engine=None):
 
     @server.tool(annotations=read)
     def list_campaigns() -> dict:
-        """Read campaign plans, approval-batch counts and verified outcome summaries."""
+        """Read campaign plans, execution-batch counts and verified outcome summaries."""
         return invoke(lambda: {"campaigns": campaigns.list()})
 
     @server.tool(annotations=read)
@@ -251,12 +284,12 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def plan_campaign(campaign_id: str) -> dict:
-        """Preview persona matching and quota-aware scheduling; never approves or publishes."""
+        """Preview persona matching and quota-aware scheduling; never starts execution."""
         return invoke(campaigns.plan, campaign_id)
 
     @server.tool(annotations=local)
     def create_campaign_batches(campaign_id: str) -> dict:
-        """Create idempotent draft Tasks for a reviewed plan; both human approvals remain required."""
+        """Create idempotent draft Tasks for a plan; execution requires an explicit start."""
         return invoke(campaigns.materialize, campaign_id)
 
     @server.tool(annotations=local)
@@ -270,7 +303,7 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def populate_campaign_batch(task_id: str) -> dict:
-        """Load planned content after the human discovery approval; cannot grant approval."""
+        """Load planned content into a draft without starting execution."""
         return invoke(campaigns.populate, task_id)
 
     @server.tool(annotations=remote_read)
@@ -308,7 +341,7 @@ def create_server(engine=None):
 
     @server.tool(annotations=read)
     def get_task(task_id: str) -> dict:
-        """Read policy, exact outbound manifest, approvals, candidates and task results."""
+        """Read policy, exact outbound manifest, historical approvals, candidates and task results."""
         return invoke(engine.task, task_id)
 
     @server.tool(annotations=read)
@@ -329,52 +362,50 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def create_task(name: str, account_ids: list[str], policy: dict) -> dict:
-        """Create a draft task. The human must approve its policy in the local workbench."""
+        """Create a draft task without starting execution. Use start_task on an explicit user instruction."""
         return invoke(
             lambda: engine.create_task(TaskInput(name=name, account_ids=account_ids, policy=policy))
         )
 
     @server.tool(annotations=remote_read)
     def discover_candidates(task_id: str, account_id: str) -> dict:
-        """Search Telegram/Reddit/X using the task's already approved discovery policy."""
+        """Search Telegram/Reddit/X within the task discovery policy; never join or send."""
         return invoke(engine.discover, task_id, account_id)
 
     @server.tool(annotations=local)
     def record_candidate(task_id: str, candidate: dict) -> dict:
-        """Apply the approved deterministic qualification rules to a candidate."""
+        """Apply deterministic task qualification rules to a candidate."""
         return invoke(lambda: engine.candidate(task_id, CandidateInput(**candidate)))
 
     @server.tool(annotations=local)
     def set_task_items(task_id: str, items: list[dict]) -> dict:
-        """Save draft outbound items after policy approval; this does not approve or send."""
+        """Save draft outbound items without starting execution."""
         return invoke(lambda: engine.set_items(task_id, [ItemInput(**i) for i in items]))
 
     @server.tool(annotations=local)
     def prepare_task(task_id: str) -> dict:
-        """Freeze and preview the exact manifest for human approval in the workbench."""
+        """Optionally freeze and preview the exact manifest without starting execution."""
         return invoke(engine.prepare, task_id)
 
     @server.tool(annotations=outbound)
-    def run_approved_joins(task_id: str) -> dict:
-        """Join only Telegram candidates allowed by an existing human discovery approval."""
+    def start_joins(task_id: str) -> dict:
+        """Start qualified Telegram joins after an explicit user instruction; honor all stops."""
 
         def run():
-            require_approval(task_id, "discovery_join")
+            engine.start_task(task_id, source="codex", sending=False)
             return engine.run_joins(task_id)
 
         return invoke(run)
 
     @server.tool(annotations=outbound)
-    def run_approved_task(task_id: str) -> dict:
-        """Execute due items from the human-approved manifest, honoring all existing stops."""
+    def start_task(task_id: str) -> dict:
+        """On an explicit user instruction, start sending/interacting with this task now.
 
-        def run():
-            require_approval(task_id, "outbound")
-            with WorkerRun(engine.store, task_id, live_enabled=engine.live_enabled) as sender:
-                sender.phase("executing")
-                return engine.run_once(task_id)
-
-        return invoke(run)
+        Automatically load campaign items and freeze the exact manifest. No approval
+        phrases are needed. Honor global stops, account cooldowns, quotas and schedules.
+        Never call merely because the user asked to draft, analyze, plan or preview.
+        """
+        return invoke(lambda: engine.start_and_run(task_id, source="codex"))
 
     @server.tool(annotations=remote_read)
     def verify_task_item(item_id: str) -> dict:
@@ -412,6 +443,8 @@ def main():
         load_environment(project / ".env")
     if args.db:
         os.environ["AP_DB"] = str(args.db.resolve())
+    if not args.no_env:
+        load_environment(database_path().parent / "cloud-node.env")
     create_server().run(transport="stdio")
 
 

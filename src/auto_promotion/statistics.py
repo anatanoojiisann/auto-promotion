@@ -22,6 +22,7 @@ REPLYABLE = {
     "publish",
     "manual_comment",
     "quote",
+    "comment",
 }
 STATUSES = (
     "confirmed",

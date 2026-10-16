@@ -39,8 +39,19 @@ async def check():
             }
             assert all(p["installed"] and p["dependencies_ready"] for p in platforms)
             names = {t.name for t in tools.tools}
-            assert {"list_accounts", "create_task", "run_approved_task"} <= names
-            assert not {"approve", "set_stop", "login", "send_message"} & names
+            assert {"list_accounts", "create_task", "start_task", "start_joins"} <= names
+            assert (
+                not {
+                    "approve",
+                    "run_approved_task",
+                    "run_approved_joins",
+                    "set_stop",
+                    "login",
+                    "send_message",
+                }
+                & names
+            )
+            assert value["execution_control"] == "explicit_chat_instruction_or_client_start"
             for platform in ("telegram", "reddit", "instagram", "x", "discord"):
                 result = await client.call_tool("list_accounts", {"platform": platform})
                 assert not result.isError
@@ -53,6 +64,7 @@ async def check():
                         "tools": len(names),
                         "platforms": [p["platform"] for p in platforms],
                         "all_backends_ready": True,
+                        "direct_start_tools": True,
                         "external_actions": 0,
                     }
                 )

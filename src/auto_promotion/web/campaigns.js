@@ -47,7 +47,7 @@ async function renderPools() {
 function poolForm(pool) {
   openPanel(
     pool ? "编辑号池" : "创建号池",
-    `<form id="pool-form"><div class="field-grid"><div class="full"><label>号池名称<input name="name" required maxlength="160" value="${esc(pool?.name || "")}"></label></div><div class="full"><label>业务说明<textarea name="description">${esc(pool?.description || "")}</textarea></label></div><div><label>号池每日额度<input name="daily" type="number" min="1" max="100000" value="${pool?.limits.daily || 1000}" required></label></div><div><label>号池每小时额度<input name="hourly" type="number" min="1" max="10000" value="${pool?.limits.hourly || 100}" required></label></div><fieldset class="full"><legend>选择账号</legend>${state.accounts.map((a) => `<label class="checkbox-label"><input type="checkbox" name="accounts" value="${a.id}" ${pool?.account_ids.includes(a.id) ? "checked" : ""}>${esc(a.label)} · ${esc(names[a.platform])} · ${a.mode === "simulation" ? "模拟" : "真实"}</label>`).join("")}</fieldset></div><p class="help">一个活动使用同一种模式的账号。修改号池后，未生成审批批次的活动需要重新规划。</p><div class="form-actions"><button>保存号池</button></div></form>`,
+    `<form id="pool-form"><div class="field-grid"><div class="full"><label>号池名称<input name="name" required maxlength="160" value="${esc(pool?.name || "")}"></label></div><div class="full"><label>业务说明<textarea name="description">${esc(pool?.description || "")}</textarea></label></div><div><label>号池每日额度<input name="daily" type="number" min="1" max="100000" value="${pool?.limits.daily || 1000}" required></label></div><div><label>号池每小时额度<input name="hourly" type="number" min="1" max="10000" value="${pool?.limits.hourly || 100}" required></label></div><fieldset class="full"><legend>选择账号</legend>${state.accounts.map((a) => `<label class="checkbox-label"><input type="checkbox" name="accounts" value="${a.id}" ${pool?.account_ids.includes(a.id) ? "checked" : ""}>${esc(a.label)} · ${esc(names[a.platform])} · ${a.mode === "simulation" ? "模拟" : "真实"}</label>`).join("")}</fieldset></div><p class="help">一个活动使用同一种模式的账号。修改号池后，未生成执行批次的活动需要重新规划。</p><div class="form-actions"><button>保存号池</button></div></form>`,
   );
   $("#pool-form").onsubmit = (e) => {
     e.preventDefault();
@@ -74,7 +74,7 @@ async function profileForm(accountId) {
   const account = state.accounts.find((a) => a.id === accountId);
   openPanel(
     "账号人设 · " + account.label,
-    `<form id="profile-form"><p class="help">当前版本 ${record.version}。已生成审批批次保留原人设快照，新版本用于后续草稿。</p><div class="field-grid"><div><label>品牌<input name="brand" value="${esc(p.brand)}"></label></div><div><label>真实业务角色<input name="role" value="${esc(p.role)}" placeholder="技术支持 / 官方产品 / 品牌创作者"></label></div>${listField("语言代码（每行一个）", "languages", p.languages)}${listField("专业领域与主题", "topics", p.topics)}${listField("受众", "audience", p.audience)}<div class="full"><label for="profile-tone">表达语气</label><textarea id="profile-tone" name="tone">${esc(p.tone)}</textarea></div><div class="full"><label for="profile-facts">可引用的产品事实</label><textarea id="profile-facts" name="facts" rows="3">${esc(p.facts)}</textarea></div><div class="full"><label for="profile-reply_template">回复草稿模板</label><textarea id="profile-reply_template" name="reply_template" rows="4">${esc(p.reply_template)}</textarea><span class="help">可使用 {title}、{context}、{topic}、{brand}、{role}、{facts}、{author}。已导入的精确正文优先；模板草稿需在批次中审核。</span></div>${listField("禁止关键词", "blocked_keywords", p.blocked_keywords)}${listField("允许目标（留空表示按活动政策筛选）", "allowed_targets", p.allowed_targets)}<div><label>工作开始小时<input name="work_start_hour" type="number" min="0" max="23" required value="${p.work_start_hour}"></label></div><div><label>工作结束小时<input name="work_end_hour" type="number" min="1" max="24" required value="${p.work_end_hour}"></label></div><div class="full"><label>工作时区<input name="timezone" required value="${esc(p.timezone)}"></label></div></div><div class="form-actions"><button>保存人设</button></div></form>`,
+    `<form id="profile-form"><p class="help">当前版本 ${record.version}。已生成执行批次保留原人设快照，新版本用于后续草稿。</p><div class="field-grid"><div><label>品牌<input name="brand" value="${esc(p.brand)}"></label></div><div><label>真实业务角色<input name="role" value="${esc(p.role)}" placeholder="技术支持 / 官方产品 / 品牌创作者"></label></div>${listField("语言代码（每行一个）", "languages", p.languages)}${listField("专业领域与主题", "topics", p.topics)}${listField("受众", "audience", p.audience)}<div class="full"><label for="profile-tone">表达语气</label><textarea id="profile-tone" name="tone">${esc(p.tone)}</textarea></div><div class="full"><label for="profile-facts">可引用的产品事实</label><textarea id="profile-facts" name="facts" rows="3">${esc(p.facts)}</textarea></div><div class="full"><label for="profile-reply_template">回复草稿模板</label><textarea id="profile-reply_template" name="reply_template" rows="4">${esc(p.reply_template)}</textarea><span class="help">可使用 {title}、{context}、{topic}、{brand}、{role}、{facts}、{author}。已导入的精确正文优先；模板草稿需在批次中审核。</span></div>${listField("禁止关键词", "blocked_keywords", p.blocked_keywords)}${listField("允许目标（留空表示按活动政策筛选）", "allowed_targets", p.allowed_targets)}<div><label>工作开始小时<input name="work_start_hour" type="number" min="0" max="23" required value="${p.work_start_hour}"></label></div><div><label>工作结束小时<input name="work_end_hour" type="number" min="1" max="24" required value="${p.work_end_hour}"></label></div><div class="full"><label>工作时区<input name="timezone" required value="${esc(p.timezone)}"></label></div></div><div class="form-actions"><button>保存人设</button></div></form>`,
   );
   $("#profile-form").onsubmit = (e) => {
     e.preventDefault();
@@ -286,11 +286,11 @@ async function renderCampaigns() {
   $("#main").innerHTML =
     heading(
       "推广活动",
-      "从共享内容池选择内容，按账号人设分配，再创建精确审批批次。",
+      "从共享内容池选择内容，按账号人设分配，再创建精确执行批次。",
       '<div class="actions"><button class="secondary" id="execution-settings">调度与额度</button><button id="new-campaign">创建活动</button></div>',
     ) +
     (campaigns.length
-      ? `<div class="surface table-wrap"><table><thead><tr><th>活动</th><th>状态</th><th>已分配 / 未分配</th><th>审批批次</th><th>执行结果</th></tr></thead><tbody>${campaigns.map((c) => `<tr><td><a href="#campaigns/${c.id}">${esc(c.name)}</a><span class="sub">${fmt(c.created_at)}</span></td><td>${esc({ draft: "待规划", planned: "待审核分配", materialized: "审批与执行", paused: "已暂停", cancelled: "已取消", completed: "已完成" }[c.state] || c.state)}</td><td>${(c.summary.planned || 0) + (c.summary.batched || 0)} / ${c.summary.unassigned || 0}</td><td>${c.tasks.length}</td><td>确认 ${c.execution_summary.confirmed || 0}<span class="sub">未知 ${c.execution_summary.unknown || 0} · 人工 ${c.execution_summary.manual_attention || 0}</span></td></tr>`).join("")}</tbody></table></div>`
+      ? `<div class="surface table-wrap"><table><thead><tr><th>活动</th><th>状态</th><th>已分配 / 未分配</th><th>执行批次</th><th>执行结果</th></tr></thead><tbody>${campaigns.map((c) => `<tr><td><a href="#campaigns/${c.id}">${esc(c.name)}</a><span class="sub">${fmt(c.created_at)}</span></td><td>${esc({ draft: "待规划", planned: "待查看分配", materialized: "发送与执行", paused: "已暂停", cancelled: "已取消", completed: "已完成" }[c.state] || c.state)}</td><td>${(c.summary.planned || 0) + (c.summary.batched || 0)} / ${c.summary.unassigned || 0}</td><td>${c.tasks.length}</td><td>确认 ${c.execution_summary.confirmed || 0}<span class="sub">未知 ${c.execution_summary.unknown || 0} · 人工 ${c.execution_summary.manual_attention || 0}</span></td></tr>`).join("")}</tbody></table></div>`
       : empty(
           "尚无活动",
           "先建立号池和人设，再从共享内容池选择待互动内容。",
@@ -369,13 +369,13 @@ async function renderCampaign(id, offset = 0) {
   $("#main").innerHTML =
     heading(
       esc(c.name),
-      "分配、草稿和排期经过精确审批后执行。",
-      `<div class="actions"><a href="#campaigns">全部活动</a>${editable ? '<button class="secondary" id="plan-campaign">重新规划</button>' : ""}${c.state === "planned" ? `<button class="secondary" id="generate-drafts" ${ai.configured ? "" : "disabled"}>AI生成本页前20条草稿</button><button id="materialize-campaign">创建审批批次</button>` : ""}</div>`,
+      "准备分配、草稿和排期，点击开始发送后执行。",
+      `<div class="actions"><a href="#campaigns">全部活动</a>${editable ? '<button class="secondary" id="plan-campaign">重新规划</button>' : ""}${c.state === "planned" ? `<button class="secondary" id="generate-drafts" ${ai.configured ? "" : "disabled"}>AI生成本页前20条草稿</button><button id="materialize-campaign">创建执行批次</button>` : ""}</div>`,
     ) +
     `<div class="stats"><span class="stat"><strong>${c.config.opportunity_ids.length}</strong>候选内容</span><span class="stat"><strong>${(c.summary.planned || 0) + (c.summary.batched || 0)}</strong>已分配</span><span class="stat"><strong>${c.summary.unassigned || 0}</strong>未分配</span><span class="stat"><strong>${c.execution_summary.confirmed || 0}</strong>确认发布</span></div><p class="help">已排期 ${c.execution_summary.scheduled || 0} · 结果未知 ${c.execution_summary.unknown || 0} · 待人工 ${c.execution_summary.manual_attention || 0} · 版本 ${c.revision}。各批按账号分组，账号之间可并发，同账号保持串行。</p>` +
     `<section class="surface padded mt-20"><h2>账号与人设效果</h2><p class="help">按活动使用的人设快照汇总。缺少完整反馈覆盖时，回复率显示不可统计。</p><div class="table-wrap"><table><thead><tr><th>账号 / 人设</th><th>计划分配</th><th>确认发布</th><th>已观察到回复</th><th>回复率</th></tr></thead><tbody>${c.accounts.map((a) => `<tr><td>${esc(a.label)}<span class="sub">${esc(a.role || "未指定角色")} · v${a.profile_version || 0}</span></td><td>${a.planned}</td><td>${a.confirmed}</td><td>${a.observed_replies || 0}</td><td>${a.reply_rate === null || a.reply_rate === undefined ? "不可统计" : (a.reply_rate * 100).toFixed(1) + "%"}</td></tr>`).join("")}</tbody></table></div><p class="help">${ai.configured ? "AI草稿服务已配置，可按页生成，生成结果仍需审核。" : "草稿使用导入正文或人设模板；配置AI草稿服务后可按页生成。"}</p></section>` +
     (c.tasks.length
-      ? `<section class="surface padded"><h2>审批批次</h2><p class="help">打开批次核对完整政策、账号、正文和时间。发现政策批准后载入计划清单，再冻结并批准外发清单。</p><div class="table-wrap"><table><thead><tr><th>批次</th><th>审批阶段</th><th>状态</th></tr></thead><tbody>${c.tasks.map((t) => `<tr><td><a href="#tasks/${t.id}">${esc(t.name)}</a><span class="sub">${esc(t.id)}</span></td><td>${esc(phases[t.phase])}</td><td>${badge(t.state)}</td></tr>`).join("")}</tbody></table></div><div class="actions mt-14"><button class="secondary compact" id="pause-campaign" ${["cancelled", "completed"].includes(c.state) ? "disabled" : ""}>${c.state === "paused" ? "恢复活动" : "暂停活动"}</button><button class="danger compact" id="cancel-campaign" ${["cancelled", "completed"].includes(c.state) ? "disabled" : ""}>取消活动</button></div></section>`
+      ? `<section class="surface padded"><h2>执行批次</h2><p class="help">打开批次查看账号、正文和时间，点击开始发送即可执行。</p><div class="table-wrap"><table><thead><tr><th>批次</th><th>任务阶段</th><th>状态</th></tr></thead><tbody>${c.tasks.map((t) => `<tr><td><a href="#tasks/${t.id}">${esc(t.name)}</a><span class="sub">${esc(t.id)}</span></td><td>${esc(phases[t.phase])}</td><td>${badge(t.state)}</td></tr>`).join("")}</tbody></table></div><div class="actions mt-14"><button class="secondary compact" id="pause-campaign" ${["cancelled", "completed"].includes(c.state) ? "disabled" : ""}>${c.state === "paused" ? "恢复活动" : "暂停活动"}</button><button class="danger compact" id="cancel-campaign" ${["cancelled", "completed"].includes(c.state) ? "disabled" : ""}>取消活动</button></div></section>`
       : "") +
     `<section class="surface mt-20"><div class="section-header"><h2>分配与草稿</h2><span>${offset + 1}–${Math.min(offset + 50, c.assignment_total)} / ${c.assignment_total}</span></div><div class="table-wrap"><table><thead><tr><th>内容 / 账号</th><th>理由</th><th>精确草稿与时间</th><th>执行</th></tr></thead><tbody>${c.assignments.map((a) => `<tr><td>${esc(a.source_payload.title || a.source_payload.external_id)}<span class="sub">${esc(c.accounts.find((x) => x.account_id === a.account_id)?.label || "未分配")}</span><span class="sub content-wrap">${esc(a.source_payload.target)}</span></td><td>${a.reasons.map((r) => `<span class="sub">${esc(r)}</span>`).join("")}</td><td>${a.payload ? `<details><summary>查看草稿 · 人设 v${a.payload.profile_version}</summary><div class="item-text">${esc(a.payload.text || "无需正文")}</div></details><span class="sub">${fmt(a.payload.scheduled_at)} UTC+08:00</span>${c.state === "planned" ? `<button class="text-button" data-edit-assignment="${a.id}">编辑草稿</button>` : ""}` : "—"}</td><td>${a.payload ? `<span class="badge ${a.payload.execution_mode === "manual" ? "amber" : "blue"}">${a.payload.execution_mode === "manual" ? "人工处理" : "自动执行"}</span>` : "—"}${a.item_status ? `<span class="sub">${badge(a.item_status)}</span>` : ""}</td></tr>`).join("")}</tbody></table></div></section><div class="form-actions"><button class="secondary" id="campaign-prev" ${offset === 0 ? "disabled" : ""}>上一页</button><button class="secondary" id="campaign-next" ${offset + 50 >= c.assignment_total ? "disabled" : ""}>下一页</button></div>`;
   $("#plan-campaign")?.addEventListener("click", (e) =>
@@ -451,10 +451,55 @@ async function renderCampaign(id, offset = 0) {
 }
 
 async function executionSettingsForm() {
-  const config = await api("/execution/settings");
+  const [config, health] = await Promise.all([
+    api("/execution/settings"),
+    api("/execution/pools"),
+  ]);
+  const channels = {
+    "telegram.mtproto": "Telegram 用户账号",
+    "x.edge": "X · Edge",
+    "x.tabbit": "X · Tabbit",
+    "x.playwright": "X · 独立浏览器",
+    "x.browser_use": "X · 浏览器助手",
+    "x.manual": "X · 人工处理",
+    "reddit.manual": "Reddit · 人工处理",
+    "instagram.graph": "Instagram · API",
+    "instagram.manual": "Instagram · 人工评论",
+    "discord.bot": "Discord · 机器人",
+    "tiktok.organic": "TikTok · API",
+  };
+  const channelKeys = [
+    ...new Set([
+      ...Object.keys(channels),
+      ...Object.keys(config.pool_workers || {}),
+      ...health.jobs.map((j) => j.pool),
+    ]),
+  ];
+  const channelRows = channelKeys
+    .map((key) => {
+      const jobs = health.jobs.filter((j) => j.pool === key);
+      const pending = jobs
+        .filter((j) => j.state === "pending")
+        .reduce((n, j) => n + j.count, 0);
+      const unknown = jobs
+        .filter((j) => j.state === "unknown")
+        .reduce((n, j) => n + j.count, 0);
+      const running = health.workers.filter(
+        (w) => w.pool === key && w.state === "running",
+      ).length;
+      return `<tr><td>${esc(channels[key] || key)}</td><td><input aria-label="${esc(channels[key] || key)} 并发" name="pool_${esc(key)}" type="number" min="1" max="50" value="${config.pool_workers?.[key] || 1}" required></td><td>${pending}</td><td>${unknown}</td><td>${running ? `${running} 个执行器在线` : "待命"}</td></tr>`;
+    })
+    .join("");
+  const cloudLabel =
+    health.cloud?.state === "connected" &&
+    Date.now() / 1000 - health.cloud.at < 60
+      ? "已连接"
+      : health.cloud?.state === "not_configured"
+        ? "尚未连接"
+        : "连接待恢复";
   openPanel(
     "调度与额度",
-    `<form id="execution-form"><div class="field-grid"><div><label>全局每日额度<input name="daily" type="number" min="1" max="100000" value="${config.global_limit.daily}" required></label></div><div><label>全局每小时额度<input name="hourly" type="number" min="1" max="10000" value="${config.global_limit.hourly}" required></label></div><div><label>同时执行的账号数<input name="max_workers" type="number" min="1" max="50" value="${config.max_workers}" required></label></div></div><p class="help">额度按UTC自然日计算。调高额度用于新任务；已批准任务继续受原额度快照约束。更严格的当前限制始终生效。</p><div class="table-wrap"><table><thead><tr><th>平台</th><th>并发账号</th><th>每日额度（可空）</th><th>每小时额度（可空）</th></tr></thead><tbody>${Object.keys(
+    `<form id="execution-form"><div class="field-grid"><div><label>全局每日额度<input name="daily" type="number" min="1" max="100000" value="${config.global_limit.daily}" required></label></div><div><label>全局每小时额度<input name="hourly" type="number" min="1" max="10000" value="${config.global_limit.hourly}" required></label></div><div><label>同时执行的账号数<input name="max_workers" type="number" min="1" max="50" value="${config.max_workers}" required></label></div></div><p class="help">额度按UTC自然日计算。调高额度用于新任务；已启动任务继续受原额度快照约束。更严格的当前限制始终生效。</p><div class="table-wrap"><table><thead><tr><th>平台</th><th>并发账号</th><th>每日额度（可空）</th><th>每小时额度（可空）</th></tr></thead><tbody>${Object.keys(
       names,
     )
       .map(
@@ -463,7 +508,7 @@ async function executionSettingsForm() {
       )
       .join(
         "",
-      )}</tbody></table></div><div class="form-actions"><button>保存调度设置</button></div></form>`,
+      )}</tbody></table></div><h3>发送通道</h3><p class="help">云端：${cloudLabel} · 待补传回执：${health.cloud_receipts_pending} · 设置${health.cloud_settings_pending ? "等待同步" : "已同步"}。同一账号始终逐条处理；各通道还受上方平台及全局限制。结果不明的内容只核验，不重发；空闲执行器按需启动。</p><div class="table-wrap"><table><thead><tr><th>通道</th><th>并发上限</th><th>待处理</th><th>待核验</th><th>运行状态</th></tr></thead><tbody>${channelRows}</tbody></table></div><div class="form-actions"><button>保存调度设置</button></div></form>`,
   );
   $("#execution-form").onsubmit = (e) => {
     e.preventDefault();
@@ -487,6 +532,9 @@ async function executionSettingsForm() {
         max_workers: Number(f.get("max_workers")),
         platform_limits,
         platform_workers,
+        pool_workers: Object.fromEntries(
+          channelKeys.map((key) => [key, Number(f.get(`pool_${key}`))]),
+        ),
         quota_timezone: "UTC",
       });
       $("#panel").close();

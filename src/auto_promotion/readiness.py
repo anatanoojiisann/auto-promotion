@@ -8,8 +8,7 @@ DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
     "task_not_active": "任务未激活或已暂停",
-    "discovery_approval_missing": "缺少有效的发现与入群审批",
-    "outbound_approval_missing": "缺少有效的最终外发审批",
+    "task_not_started": "任务尚未开始发送",
     "global_stop": "全局执行已停止",
     "live_writes_disabled": "真实发布未开启",
     "backend_not_commissioned": "平台执行器未启用",
@@ -33,7 +32,7 @@ REASONS = {
     "target_cannot_send": "群内文字发送权限尚未核实或不允许发送",
     "join_wait_unverified": "入群等待截止时间尚未核实",
     "join_wait_pending": "尚未满足入群后等待时间",
-    "approval_integrity_failed": "审批或清单完整性检查未通过",
+    "manifest_integrity_failed": "任务配置或发送清单完整性检查未通过",
 }
 
 
@@ -64,7 +63,7 @@ def task_workflow(task, blockers, item_blockers, now):
             "message": message,
             "next_action": action,
             "next_at": next_at,
-            "can_prepare": status == "prepare_manifest",
+            "can_prepare": bool(task["items"] and not item_blockers and not task["manifest_hash"]),
             "counts": counts,
         }
 
@@ -90,19 +89,19 @@ def task_workflow(task, blockers, item_blockers, now):
     )
     if expired:
         return step("expired", "执行时间已过期", REASONS["delivery_window_elapsed"])
-    if "discovery_approval_missing" in blockers:
-        return step(
-            "awaiting_discovery_approval",
-            "等待发现审批",
-            "审核发现与入群范围，完成第一阶段审批。",
-            "approve_discovery",
-        )
     if not task["items"]:
         return step(
             "prepare_items",
             "等待准备清单",
             "保存每项的账号、目标、完整正文和计划时间。",
             "edit_items",
+        )
+    if task["phase"] != "ready" and task["phase"] != "starting":
+        return step(
+            "ready_to_start",
+            "等待开始发送",
+            "点击开始发送，或在 Codex 对话中明确指令开始互动；系统自动固定清单并执行。",
+            "start_task",
         )
     if item_blockers:
         reasons = {i["reason"] for i in item_blockers}
@@ -111,7 +110,7 @@ def task_workflow(task, blockers, item_blockers, now):
             return step(
                 "waiting_join_window",
                 "等待入群时间",
-                "到达已批准的入群窗口后，调度器核验所选账号的群成员身份。",
+                "到达任务入群窗口后，调度器核验所选账号的群成员身份。",
                 next_at=epoch(task["policy"]["starts_at"]),
             )
         if membership:
@@ -123,28 +122,16 @@ def task_workflow(task, blockers, item_blockers, now):
                 "等待入群核验",
                 "逐项只读核对待确认的成员身份，不重复入群。"
                 if uncertain
-                else "调度器按已批准的窗口和间隔处理入群；核验完成后才能冻结清单。",
+                else "调度器按任务窗口和间隔处理入群；核验完成后自动继续发送。",
                 "verify_membership" if uncertain else None,
             )
         return step(
             "membership_blocked",
             "外发条件未满足",
-            "查看执行前检查中的具体目标和原因；冻结前须全部通过。",
+            "查看执行前检查中的具体目标和原因；发送前须全部通过。",
         )
     if not task["manifest_hash"]:
-        return step(
-            "prepare_manifest",
-            "可以准备外发审批",
-            "入群与计划条件已通过。冻结并预览完整清单，再完成第二阶段审批。",
-            "prepare_manifest",
-        )
-    if "outbound_approval_missing" in blockers:
-        return step(
-            "awaiting_outbound_approval",
-            "等待外发审批",
-            "清单已冻结。核对正文和北京时间，输入页面显示的最终外发确认短语。",
-            "approve_outbound",
-        )
+        return step("starting", "正在准备发送", "任务已启动，调度器将自动固定清单并继续发送。")
     for reason in ("global_stop", "live_writes_disabled"):
         if reason in blockers:
             return step(reason, REASONS[reason], REASONS[reason])
@@ -163,10 +150,10 @@ def task_workflow(task, blockers, item_blockers, now):
             return step(
                 "waiting_schedule",
                 "等待计划时间",
-                "最终外发已批准，到达计划时间并满足间隔后执行。",
+                "任务已启动，到达计划时间并满足间隔后执行。",
                 next_at=next_at,
             )
-        return step("ready", "已批准 · 待执行", "按已批准的清单执行并逐项核验回执。")
+        return step("ready", "已启动 · 待执行", "按启动时固定的清单执行并逐项核验回执。")
     return step("verifying", "等待结果核验", "核对已提交项目的投递或排期回执。")
 
 

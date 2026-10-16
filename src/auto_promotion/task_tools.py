@@ -35,6 +35,9 @@ ITEM_FIELDS = (
     "opportunity_id",
     "content_key",
     "profile_version",
+    "tiktok_video_id",
+    "tiktok_comment_id",
+    "tiktok_options",
 )
 RESULT_FIELDS = (
     "status",
@@ -53,8 +56,13 @@ RESULT_FIELDS = (
     "submission_started",
     "skipped_at",
     "skip_reason",
+    "publish_id",
+    "post_ids",
+    "comment_id",
+    "platform_status",
 )
 AUDIT_FIELDS = (
+    "source",
     "item_id",
     "attempt_id",
     "candidate_id",
@@ -375,7 +383,7 @@ class TaskTools:
         details = {
             "账号与限额": task["accounts"],
             "发现政策与执行窗口": task["policy"],
-            "已保存审批": evidence["approvals"],
+            "历史审批记录": evidence["approvals"],
             "候选与筛选依据": evidence["candidates"],
         }
         sections = "".join(
@@ -388,7 +396,7 @@ class TaskTools:
             "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">"
             "<title>任务审阅清单</title><style>body{font:16px/1.7 system-ui,sans-serif;color:#24314b;background:#f3f5fa;margin:0}main{max-width:980px;margin:auto;padding:28px}article,details{background:white;padding:18px;margin:16px 0;border:1px solid #dae1ec;border-radius:10px}pre{white-space:pre-wrap;overflow-wrap:anywhere}h1{font-size:26px}h2{font-size:20px}p{overflow-wrap:anywhere}@media(max-width:600px){main{padding:14px}}</style></head><body><main>"
             f"<h1>{esc(task['name'])}</h1><p>{esc(task['id'])} · {esc(task['mode'])} · {esc(task['state'])} / {esc(task['phase'])}</p>"
-            f"<p>导出时间：{esc(evidence['exported_at'])}（北京时间）。此文件是审阅快照，审批在工作台完成。</p>"
+            f"<p>导出时间：{esc(evidence['exported_at'])}（北京时间）。此文件是任务快照；在客户端点击开始发送或通过 Codex 明确指令启动。</p>"
             f"<p>清单：{'已冻结' if task['manifest_frozen'] else '草稿，尚未冻结'} · SHA-256：{esc(task['manifest_hash'] or '尚无')}</p>"
             + sections
             + "".join(cards)

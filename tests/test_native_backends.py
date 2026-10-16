@@ -68,7 +68,7 @@ class PrivateBackendTests(unittest.TestCase):
 
     def test_builtin_catalog_does_not_require_sibling_checkouts(self):
         registry = AdapterRegistry(Path(self.tmp.name) / "missing-workspace")
-        self.assertEqual(len(registry.services()), 5)
+        self.assertEqual(len(registry.services()), 6)
         self.assertTrue(all(service["installed"] for service in registry.services()))
 
     def test_native_health_without_configuration_is_explicitly_unavailable(self):
@@ -175,7 +175,7 @@ class ClaimTests(unittest.TestCase):
                 policy={"starts_at": iso(now - 60), "ends_at": iso(now + 3600)},
             )
         )
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         self.engine.set_items(
             task["id"],
             [
@@ -189,7 +189,7 @@ class ClaimTests(unittest.TestCase):
             ],
         )
         task = self.engine.prepare(task["id"])
-        self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        self.engine.start_task(task["id"])
         self.engine.set_stop(False)
         item = self.engine.task(task["id"])["items"][0]
         claim = self.engine._claim(item["id"], {"allowed": True})
@@ -203,11 +203,11 @@ class ClaimTests(unittest.TestCase):
             "payload": claim,
         }
 
-    def test_current_claim_and_exact_approvals_are_required(self):
+    def test_current_claim_and_explicit_start_are_required(self):
         verify_claim(self.request)
         with self.store.connect(write=True) as db:
-            db.execute("DELETE FROM approvals WHERE stage='outbound'")
-        with self.assertRaises(Exception):
+            db.execute("UPDATE tasks SET phase='review'")
+        with self.assertRaises(BackendError):
             verify_claim(self.request)
 
     def test_existing_sender_can_verify_before_campaign_schema_migration(self):

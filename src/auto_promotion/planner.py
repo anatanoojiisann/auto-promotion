@@ -26,6 +26,15 @@ def content_key(value):
         return digest(
             [platform, value["target"], value.get("discord_reply_to") or value["external_id"]]
         )
+    if platform == "tiktok":
+        return digest(
+            [
+                platform,
+                value["target"],
+                value.get("tiktok_video_id", ""),
+                value.get("tiktok_comment_id") or value["external_id"],
+            ]
+        )
     path = urlparse(value["target"]).path
     if platform == "x":
         found = re.search(r"/status/(\d+)", path)
@@ -68,6 +77,12 @@ def execution_mode(account, opportunity):
     if platform == "x":
         if opportunity["action"] == "like":
             return "disabled", "X 不开放自动点赞"
+        if (
+            opportunity["action"] == "reply"
+            and "reply" in account.get("automatic_actions", [])
+            and opportunity["is_public"]
+        ):
+            return "automatic", "账号已启用自动回复；提交前核对登录身份与目标回复权限"
         return "manual", "X 浏览器自动执行未开放，保留人工清单"
     if platform == "reddit":
         return "manual", "Reddit 首版保留人工社区互动"
@@ -196,7 +211,14 @@ def build_plan(engine, campaign, pool, opportunities, profiles):
                         "author": value["author_id"],
                     },
                 )
-            if value["action"] not in {"like", "repost"} and not (text.strip() or value["media"]):
+            no_text = {"like", "repost"}
+            if account["platform"] == "tiktok":
+                from .backends.tiktok import NO_TEXT_ACTIONS
+
+                no_text |= NO_TEXT_ACTIONS
+            if value["action"] in no_text:
+                text = ""
+            if value["action"] not in no_text and not (text.strip() or value["media"]):
                 errors.append("缺少精确正文或人设草稿模板")
             if errors:
                 rejected.append(account["label"] + "：" + "；".join(errors))
@@ -220,6 +242,9 @@ def build_plan(engine, campaign, pool, opportunities, profiles):
                 scheduled_at=iso(next_at[account["id"]]),
                 reply_to=value["reply_to"],
                 discord_reply_to=value["discord_reply_to"],
+                tiktok_video_id=value.get("tiktok_video_id", ""),
+                tiktok_comment_id=value.get("tiktok_comment_id", ""),
+                tiktok_options=value.get("tiktok_options"),
                 recipient_id=value["author_id"],
                 target_owned=value["target_owned"],
                 execution_mode=execution,

@@ -42,6 +42,8 @@ class RecordingAdapter(SimulationAdapter):
         self.lock = threading.Lock()
 
     def call(self, account, operation, payload):
+        if operation == "preflight":
+            return {"allowed": True}
         if operation == "execute":
             with self.lock:
                 self.calls.append((account["id"], payload["item_id"]))
@@ -150,10 +152,10 @@ class CampaignTests(unittest.TestCase):
         campaign = self.campaigns.materialize(campaign["id"])
         for row in campaign["tasks"]:
             task = self.engine.task(row["id"])
-            self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+            self.engine.start_task(task["id"], sending=False)
             self.campaigns.populate(task["id"])
             task = self.engine.prepare(task["id"])
-            self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+            self.engine.start_task(task["id"])
         return self.campaigns.get(campaign["id"])
 
     def test_thirty_accounts_and_thousand_contents_are_fair_and_explainable(self):
@@ -276,6 +278,17 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["processed"][0]["status"], "manual_attention")
         self.assertEqual(self.adapter.calls, [])
 
+    def test_x_automation_opt_in_still_rejects_denied_and_wrong_account(self):
+        from auto_promotion.planner import execution_mode
+
+        account = {"id": "one", "mode": "live", "platform": "x", "automatic_actions": ["reply"]}
+        value = {"action": "reply", "permission": "unknown", "permission_account_ids": [], "is_public": True}
+        self.assertEqual(execution_mode(account, value)[0], "automatic")
+        self.assertEqual(execution_mode(account, {**value, "permission": "denied"})[0], "disabled")
+        self.assertEqual(execution_mode(account, {**value, "permission_account_ids": ["two"]})[0], "disabled")
+        self.assertEqual(execution_mode(account, {**value, "action": "like"})[0], "disabled")
+        self.assertEqual(execution_mode(account, {**value, "action": "quote"})[0], "manual")
+
     def test_template_cannot_read_attributes_or_format_arbitrary_fields(self):
         with self.assertRaises(Conflict):
             render_template("{context.__class__}", {})
@@ -306,20 +319,19 @@ class CampaignTests(unittest.TestCase):
                 campaign["id"], [result["assignments"][0]["id"]], Provider()
             )
 
-    def test_campaign_pause_remains_effective_when_child_is_approved(self):
+    def test_campaign_pause_blocks_child_start(self):
         campaign = self.campaigns.materialize(
             self.campaigns.plan(self.campaign(count=2)["id"])["id"]
         )
         self.campaigns.change_state(campaign["id"], "paused")
         task = self.engine.task(campaign["tasks"][0]["id"])
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
-        self.campaigns.populate(task["id"])
-        task = self.engine.prepare(task["id"])
-        self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
-        self.now = task["items"][0]["due_at"]
+        with self.assertRaisesRegex(Conflict, "活动已暂停"):
+            self.engine.start_task(task["id"])
         self.engine.run_once()
         self.assertEqual(self.adapter.calls, [])
         self.campaigns.change_state(campaign["id"], "active")
+        task = self.engine.start_task(task["id"])
+        self.now = task["items"][0]["due_at"]
         self.engine.run_once()
         self.assertEqual(len(self.adapter.calls), 1)
 
@@ -330,7 +342,7 @@ class CampaignTests(unittest.TestCase):
         first = self.freeze(first)
         second = self.campaigns.materialize(second["id"])
         task = self.engine.task(second["tasks"][0]["id"])
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         self.campaigns.populate(task["id"])
         with self.assertRaisesRegex(Conflict, "额度"):
             self.engine.prepare(task["id"])
@@ -352,7 +364,7 @@ class CampaignTests(unittest.TestCase):
                     },
                 )
             )
-            self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+            self.engine.start_task(task["id"], sending=False)
             self.engine.set_items(
                 task["id"],
                 [
@@ -366,7 +378,7 @@ class CampaignTests(unittest.TestCase):
                 ],
             )
             task = self.engine.prepare(task["id"])
-            self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+            self.engine.start_task(task["id"])
         self.engine.run_once()
         self.assertEqual(len(self.adapter.calls), 2)
         self.assertEqual(self.adapter.peak, 1)
@@ -397,7 +409,7 @@ class CampaignTests(unittest.TestCase):
                 },
             )
         )
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         self.engine.set_items(
             task["id"],
             [
@@ -412,7 +424,7 @@ class CampaignTests(unittest.TestCase):
             ],
         )
         task = self.engine.prepare(task["id"])
-        self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        self.engine.start_task(task["id"])
         result = self.engine.run_once(task["id"])
         self.assertEqual(self.adapter.peak, 2)
         self.assertEqual([r["status"] for r in result["processed"]], ["confirmed", "confirmed"])
@@ -439,7 +451,7 @@ class CampaignTests(unittest.TestCase):
                 },
             )
         )
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         self.engine.set_items(
             task["id"],
             [
@@ -454,7 +466,7 @@ class CampaignTests(unittest.TestCase):
             ],
         )
         task = self.engine.prepare(task["id"])
-        self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        self.engine.start_task(task["id"])
         self.engine.configure_execution(
             ExecutionSettings(global_limit={"daily": 100, "hourly": 20})
         )

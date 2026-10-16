@@ -1,0 +1,398 @@
+"""Durable reference jobs; all outbound effects remain guarded by Engine and backends."""
+
+import json
+import threading
+import time
+from contextlib import contextmanager
+
+from .models import canonical, digest, epoch
+from .routing import route_for
+
+_CURRENT_JOB = threading.local()
+
+
+@contextmanager
+def job_scope(job):
+    previous = getattr(_CURRENT_JOB, "owner", None)
+    _CURRENT_JOB.owner = job["owner"]
+    try:
+        yield
+    finally:
+        _CURRENT_JOB.owner = previous
+
+
+def bind_connection(db):
+    db.create_function("ap_pool_owner", 0, lambda: getattr(_CURRENT_JOB, "owner", None))
+
+
+QUEUE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS execution_jobs(
+ id TEXT PRIMARY KEY,kind TEXT NOT NULL,reference_id TEXT NOT NULL,task_id TEXT,
+ account_id TEXT,pool TEXT NOT NULL,route TEXT NOT NULL,version TEXT NOT NULL,
+ available_at REAL NOT NULL,expires_at REAL NOT NULL,state TEXT NOT NULL DEFAULT 'pending',
+ owner TEXT,lease_until REAL NOT NULL DEFAULT 0,created_at REAL NOT NULL,updated_at REAL NOT NULL,
+ result TEXT NOT NULL DEFAULT '{}',UNIQUE(kind,reference_id)
+);
+CREATE INDEX IF NOT EXISTS execution_jobs_due ON execution_jobs(pool,state,available_at);
+CREATE INDEX IF NOT EXISTS execution_jobs_task ON execution_jobs(task_id);
+CREATE TABLE IF NOT EXISTS pool_workers(
+ id TEXT PRIMARY KEY,pool TEXT NOT NULL,node_id TEXT NOT NULL,pid INTEGER NOT NULL,
+ started_at REAL NOT NULL,heartbeat_at REAL NOT NULL,state TEXT NOT NULL,reason TEXT
+);
+CREATE TABLE IF NOT EXISTS execution_resources(
+ resource TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cloud_receipt_outbox(
+ job_id TEXT PRIMARY KEY,lease TEXT NOT NULL,outcome TEXT,
+ updated_at REAL NOT NULL,retry_at REAL NOT NULL DEFAULT 0,error TEXT
+);
+CREATE TABLE IF NOT EXISTS cloud_receipt_history(
+ job_id TEXT PRIMARY KEY,lease TEXT NOT NULL,outcome TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_job_routes(
+ job_id TEXT PRIMARY KEY,route TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS pooled_send_attempt BEFORE INSERT ON attempts
+ WHEN (SELECT value FROM meta WHERE key='execution_runtime')='pooled'
+ BEGIN
+ SELECT CASE WHEN NOT EXISTS(
+ SELECT 1 FROM execution_jobs j WHERE j.kind='send' AND j.reference_id=NEW.item_id
+ AND j.account_id=NEW.account_id AND j.state='leased' AND j.owner=ap_pool_owner()
+ AND j.lease_until>unixepoch('now')) THEN RAISE(ABORT,'PersistentJobLeaseRequired') END;
+ END;
+CREATE TRIGGER IF NOT EXISTS pooled_join_attempt BEFORE INSERT ON join_attempts
+ WHEN (SELECT value FROM meta WHERE key='execution_runtime')='pooled'
+ BEGIN
+ SELECT CASE WHEN NOT EXISTS(
+ SELECT 1 FROM execution_jobs j WHERE j.kind='join' AND j.reference_id=NEW.candidate_id
+ AND j.account_id=NEW.account_id AND j.state='leased' AND j.owner=ap_pool_owner()
+ AND j.lease_until>unixepoch('now')) THEN RAISE(ABORT,'PersistentJobLeaseRequired') END;
+ END;
+"""
+
+WRITE_TERMINAL = {
+    "confirmed",
+    "scheduled",
+    "failed_known",
+    "unknown",
+    "manual_attention",
+    "missed",
+    "cancelled",
+    "joined",
+    "already_joined",
+    "pending_admin_approval",
+}
+
+
+class JobQueue:
+    def __init__(self, engine):
+        self.engine, self.store, self.clock = engine, engine.store, engine.clock
+
+    def sync(self, task_id=None):
+        """Idempotently reference only explicitly active tasks; never modify their manifests."""
+        sql = "SELECT * FROM tasks WHERE state='active'"
+        params = ()
+        if task_id:
+            sql += " AND id=?"
+            params = (task_id,)
+        added = 0
+        for task in self.store.rows(sql, params):
+            policy = json.loads(task["policy"])
+            if self.clock() >= epoch(policy["ends_at"]):
+                with self.store.connect(write=True) as db:
+                    db.execute(
+                        "UPDATE items SET status='missed',result=? WHERE task_id=? AND status='not_attempted' AND attempt_id IS NULL",
+                        (canonical({"reason": "delivery_window_elapsed"}), task["id"]),
+                    )
+                    self.engine._mark_completed(db, task["id"])
+                continue
+            if task["phase"] == "ready":
+                rows = self.store.rows(
+                    "SELECT * FROM items WHERE task_id=? AND status='not_attempted' AND attempt_id IS NULL ORDER BY position",
+                    (task["id"],),
+                )
+                for row in rows:
+                    payload = json.loads(row["payload"])
+                    account = self.engine.account(row["account_id"])
+                    route = route_for(account, payload)
+                    native = payload["action"] in {"schedule_message", "schedule_file"}
+                    due = epoch(policy["starts_at"]) if native else row["due_at"]
+                    expires = min(
+                        epoch(policy["ends_at"]), row["due_at"] if native else row["due_at"] + 900
+                    )
+                    added += self._put(
+                        "send", row["id"], task, account, route, row["payload_hash"], due, expires
+                    )
+            if policy["max_joins"] and task["phase"] in {"discovered", "starting", "ready"}:
+                for row in self.store.rows(
+                    "SELECT * FROM candidates WHERE task_id=? AND decision='qualified' AND state='not_attempted' AND NOT EXISTS(SELECT 1 FROM join_attempts a WHERE a.candidate_id=candidates.id)",
+                    (task["id"],),
+                ):
+                    account = self.engine.account(row["account_id"])
+                    if account["platform"] != "telegram":
+                        continue
+                    added += self._put(
+                        "join",
+                        row["id"],
+                        task,
+                        account,
+                        route_for(account),
+                        digest(json.loads(row["payload"])),
+                        epoch(policy["starts_at"]),
+                        epoch(policy["ends_at"]),
+                    )
+        self.recover()
+        return added
+
+    def _put(self, kind, reference, task, account, route, version, due, expires):
+        now = self.clock()
+        with self.store.connect(write=True) as db:
+            before = db.total_changes
+            db.execute(
+                "INSERT OR IGNORE INTO execution_jobs(id,kind,reference_id,task_id,account_id,pool,route,version,available_at,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    kind + ":" + reference,
+                    kind,
+                    reference,
+                    task["id"],
+                    account["id"],
+                    route.pool,
+                    canonical(route.public()),
+                    version,
+                    due,
+                    expires,
+                    now,
+                    now,
+                ),
+            )
+            return int(db.total_changes != before)
+
+    def recover(self):
+        now = self.clock()
+        with self.store.connect(write=True) as db:
+            for row in db.execute(
+                "SELECT * FROM execution_jobs WHERE state IN ('pending','leased')"
+            ).fetchall():
+                source = self._source(db, row)
+                if source is None:
+                    state = "cancelled"
+                elif source["status"] in WRITE_TERMINAL:
+                    state = source["status"]
+                elif (
+                    row["state"] == "pending"
+                    and row["expires_at"] <= now
+                    and not source["attempted"]
+                ):
+                    state = "missed"
+                    if row["kind"] == "send":
+                        db.execute(
+                            "UPDATE items SET status='missed',result=? WHERE id=? AND status='not_attempted' AND attempt_id IS NULL",
+                            (canonical({"reason": "delivery_window_elapsed"}), row["reference_id"]),
+                        )
+                elif row["state"] == "leased" and row["lease_until"] <= now:
+                    # A recorded attempt is never made pending again after losing a lease.
+                    state = "unknown" if source["attempted"] else "pending"
+                else:
+                    continue
+                db.execute(
+                    "UPDATE execution_jobs SET state=?,owner=NULL,lease_until=0,updated_at=? WHERE id=?",
+                    (state, now, row["id"]),
+                )
+
+    @staticmethod
+    def _source(db, row):
+        if row["kind"] == "send":
+            item = db.execute(
+                "SELECT status,attempt_id FROM items WHERE id=?", (row["reference_id"],)
+            ).fetchone()
+            return (
+                {"status": item["status"], "attempted": bool(item["attempt_id"])} if item else None
+            )
+        candidate = db.execute(
+            "SELECT state FROM candidates WHERE id=?", (row["reference_id"],)
+        ).fetchone()
+        attempted = db.execute(
+            "SELECT 1 FROM join_attempts WHERE candidate_id=?", (row["reference_id"],)
+        ).fetchone()
+        return {"status": candidate["state"], "attempted": bool(attempted)} if candidate else None
+
+    def claim(self, pool, owner, lease_seconds=90):
+        self.recover()
+        now = self.clock()
+        limits = self.engine.execution_settings()
+        with self.store.connect(write=True) as db:
+            if db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
+                return None
+            if db.execute(
+                "SELECT COUNT(*) FROM execution_jobs WHERE state='leased' AND lease_until>? AND pool=?",
+                (now, pool),
+            ).fetchone()[0] >= limits.get("pool_workers", {}).get(pool, 1):
+                return None
+            rows = db.execute(
+                "SELECT j.* FROM execution_jobs j JOIN tasks t ON t.id=j.task_id JOIN accounts a ON a.id=j.account_id LEFT JOIN items i ON j.kind='send' AND i.id=j.reference_id WHERE j.pool=? AND j.state='pending' AND j.available_at<=? AND t.state='active' AND a.disabled=0 AND a.cooldown_until<=? AND a.next_at<=? AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' AND busy.lease_until>? AND busy.account_id=j.account_id) AND NOT EXISTS(SELECT 1 FROM account_lanes lane WHERE lane.account_id=j.account_id AND lane.expires_at>?) ORDER BY a.next_at,j.available_at,COALESCE(i.position,0),j.id LIMIT 64",
+                (pool, now, now, now, now, now),
+            ).fetchall()
+            for row in rows:
+                source = self._source(db, row)
+                if not source or source["attempted"] or source["status"] != "not_attempted":
+                    continue
+                task = db.execute(
+                    "SELECT phase,policy FROM tasks WHERE id=?", (row["task_id"],)
+                ).fetchone()
+                if (row["kind"] == "send" and task["phase"] != "ready") or now >= row["expires_at"]:
+                    continue
+                route = json.loads(row["route"])
+                account = db.execute(
+                    "SELECT * FROM account_lanes WHERE account_id=? AND expires_at>?",
+                    (row["account_id"], now),
+                ).fetchone()
+                resource = route.get("resource")
+                resource_row = (
+                    db.execute(
+                        "SELECT * FROM execution_resources WHERE resource=? AND expires_at>?",
+                        (resource, now),
+                    ).fetchone()
+                    if resource
+                    else None
+                )
+                if account or resource_row:
+                    continue
+                if db.execute(
+                    "SELECT 1 FROM execution_jobs WHERE state='leased' AND lease_until>? AND account_id=?",
+                    (now, row["account_id"]),
+                ).fetchone():
+                    continue
+                if (
+                    resource
+                    and db.execute(
+                        "SELECT 1 FROM execution_jobs WHERE state='leased' AND lease_until>? AND json_extract(route,'$.resource')=?",
+                        (now, resource),
+                    ).fetchone()
+                ):
+                    continue
+                db.execute(
+                    "UPDATE execution_jobs SET state='leased',owner=?,lease_until=?,updated_at=? WHERE id=? AND state='pending'",
+                    (owner, now + lease_seconds, now, row["id"]),
+                )
+                return {
+                    **dict(row),
+                    "owner": owner,
+                    "state": "leased",
+                    "lease_until": now + lease_seconds,
+                }
+        return None
+
+    def renew(self, job, seconds=90):
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "UPDATE pool_workers SET heartbeat_at=? WHERE id=? AND state='running'",
+                (self.clock(), job["owner"]),
+            )
+            return (
+                db.execute(
+                    "UPDATE execution_jobs SET lease_until=?,updated_at=? WHERE id=? AND owner=? AND state='leased' AND lease_until>?",
+                    (self.clock() + seconds, self.clock(), job["id"], job["owner"], self.clock()),
+                ).rowcount
+                == 1
+            )
+
+    @contextmanager
+    def heartbeat(self, job, remote_renew=None):
+        stop = threading.Event()
+
+        def pulse():
+            while not stop.wait(10):
+                try:
+                    if (remote_renew and not remote_renew()) or not self.renew(job):
+                        return
+                except Exception:
+                    return
+
+        thread = threading.Thread(target=pulse, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+
+    def settle(self, job, error=None):
+        now = self.clock()
+        with self.store.connect(write=True) as db:
+            source = self._source(db, job)
+            state = source["status"] if source else "cancelled"
+            if state == "executing":
+                state = "unknown"
+            delay = now + (30 if error else 5)
+            if state == "not_attempted":
+                account = db.execute(
+                    "SELECT next_at,cooldown_until,status FROM accounts WHERE id=?",
+                    (job["account_id"],),
+                ).fetchone()
+                delay = max(delay, account["next_at"], account["cooldown_until"])
+                if account["status"] != "healthy":
+                    delay = max(delay, now + 300)
+                state = "pending"
+            db.execute(
+                "UPDATE execution_jobs SET state=?,available_at=?,owner=NULL,lease_until=0,updated_at=?,result=? WHERE id=? AND owner=?",
+                (
+                    state,
+                    delay,
+                    now,
+                    canonical({"error_type": type(error).__name__} if error else {}),
+                    job["id"],
+                    job["owner"],
+                ),
+            )
+        return state
+
+    def pools(self, task_id=None):
+        now = self.clock()
+        rows = self.store.rows(
+            "SELECT pool,state,count(*) count,MIN(available_at) oldest FROM execution_jobs "
+            + ("WHERE task_id=? " if task_id else "")
+            + "GROUP BY pool,state",
+            (task_id,) if task_id else (),
+        )
+        cloud = self.store.one("SELECT value FROM meta WHERE key='cloud_control_health'")
+        return {
+            "jobs": rows,
+            "cloud_receipts_pending": self.store.one("SELECT COUNT(*) n FROM cloud_receipt_outbox")[
+                "n"
+            ],
+            "cloud": json.loads(cloud["value"]) if cloud else {"state": "not_configured"},
+            "cloud_settings_pending": bool(
+                self.store.one("SELECT value FROM meta WHERE key='cloud_pending_settings'")
+            ),
+            "workers": self.store.rows(
+                "SELECT id,pool,node_id,pid,heartbeat_at,state FROM pool_workers WHERE heartbeat_at>?",
+                (now - 60,),
+            ),
+        }
+
+
+def verify_job_claim(db, request):
+    context = request.get("execution_job")
+    enabled = db.execute("SELECT value FROM meta WHERE key='execution_runtime'").fetchone()
+    required = db.execute("SELECT value FROM meta WHERE key='cloud_control_required'").fetchone()
+    if required and required[0] == "1" and (not context or not context.get("cloud")):
+        raise ValueError("CloudExecutionClaimRequired")
+    if not context:
+        if enabled and enabled[0] == "pooled":
+            raise ValueError("PersistentJobClaimRequired")
+        return
+    row = db.execute("SELECT * FROM execution_jobs WHERE id=?", (context.get("id"),)).fetchone()
+    reference = (
+        request["payload"].get("candidate_id")
+        if request["operation"] == "join"
+        else request["payload"].get("item_id")
+    )
+    if (
+        not row
+        or row["owner"] != context.get("owner")
+        or row["state"] != "leased"
+        or row["lease_until"] <= time.time()
+        or row["reference_id"] != reference
+        or row["account_id"] != request["account_id"]
+    ):
+        raise ValueError("PersistentJobClaimExpired")

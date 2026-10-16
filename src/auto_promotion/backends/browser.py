@@ -540,12 +540,21 @@ class BrowserBackend:
 
 
 def call(platform, label, operation, payload, checkpoint, authorize):
+    settings = read_profile(platform, label)
+    if settings.get("browser_channel") == "browser_use":
+        from .browser_use import call as browser_use_call
+
+        return browser_use_call(platform, settings, operation)
+    if settings.get("browser_channel") == "tabbit":
+        from .tabbit import call as tabbit_call
+
+        return tabbit_call(platform, settings, operation, payload, checkpoint, authorize)
+
     from playwright.sync_api import sync_playwright
 
     progress = getattr(checkpoint, "progress", None)
     if operation == "execute" and progress:
         progress("browser_start", False)
-    settings = read_profile(platform, label)
     with sync_playwright() as runtime:
         context = launch_context(
             runtime,

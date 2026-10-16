@@ -1,0 +1,14 @@
+{
+  "name": "auto-promotion-control",
+  "main": "worker.mjs",
+  "compatibility_date": "2025-09-01",
+  "workers_dev": true,
+  "vars": { "WORKSPACE_ID": "auto-promotion" },
+  "durable_objects": {
+    "bindings": [{ "name": "CONTROL", "class_name": "WorkspaceCoordinator" }],
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["WorkspaceCoordinator"] },
+  ],
+  "observability": { "enabled": true, "head_sampling_rate": 0.1 },
+}

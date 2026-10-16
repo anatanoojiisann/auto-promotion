@@ -74,7 +74,7 @@ class TaskToolTests(unittest.TestCase):
             )
         )
         if items:
-            task = self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+            task = self.engine.start_task(task["id"], sending=False)
             task = self.engine.set_items(
                 task["id"],
                 [
@@ -88,7 +88,7 @@ class TaskToolTests(unittest.TestCase):
                 ],
             )
             task = self.engine.prepare(task["id"])
-            task = self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+            task = self.engine.start_task(task["id"])
         return task
 
     def template(self, source):

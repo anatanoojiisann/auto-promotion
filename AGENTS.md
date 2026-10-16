@@ -1,73 +1,59 @@
-# Social automation task authorization rules
+# Explicit task execution
 
-Every Telegram, Reddit, or X campaign is one persistent task identified by a
-`task_id`. A task may request human authorization at most twice:
+A user may start Telegram, Reddit, Instagram, X or Discord work by giving Codex
+an explicit instruction to send, reply, interact or join for a specified task,
+or by clicking the corresponding Start button in the local client. Do not ask
+for approval phrases or route the user through discovery/outbound approval stages.
+This replaces the former two-stage approval workflow at the user's request.
 
-1. `discovery_join`: approve the discovery policy and, for Telegram only,
-   automatic joining of groups that pass that policy.
-2. `outbound`: approve the final, exact batch of messages, replies, posts, media,
-   and scheduled delivery times.
+Drafting, editing, importing, planning and previewing are local preparation and
+must never start external writes. Use the MCP `start_task` or `start_joins` tools
+only when the human explicitly requests that execution. Generic acknowledgments
+without a clear execution instruction do not start a task.
 
-Generic replies such as "好的", "继续", or "可以" are not authorization. The
-user must repeat the stage's exact confirmation phrase. Store both approvals
-with the task so a process restart or internal retry does not request them
-again.
+## Task scope and execution
 
-Changing an approved stage's account, policy, target boundary, content, media,
-time, timezone, action type, or rate limit invalidates that stage. Do not ask
-for a third authorization inside the same task: close or cancel the task and
-create a new task with a new `task_id`.
+- Keep a persistent `task_id`, account/policy snapshot and exact immutable outbound
+  manifest with hashes. Starting sending automatically freezes the manifest.
+- Record each explicit start, its source, task phase and manifest hash in the audit
+  log. Keep historical approval records as read-only evidence; never create new ones.
+- Candidate discovery and local item editing need no approval. Only explicitly
+  started tasks may join or send. Qualified Telegram joins may run within the task
+  policy; tasks waiting for membership automatically continue after verification.
+- Preserve candidate qualification, target boundaries, media verification, account
+  health, cooldowns, global stops, quotas, pacing and delivery windows.
+- Do not enable live writes or release a global stop merely to start a task.
+- Keep platform execution support unchanged. A start instruction does not bypass
+  platform permissions or turn a manual action into browser automation.
+- Each outbound item and Telegram target may be attempted once. Resume only durable
+  `not_attempted` items. An outcome after uncertain submission is `unknown`; do not
+  retry it. Reconcile through read-only lookups.
+- Record Telegram administrator review as `pending_admin_approval`, not joined;
+  do not retry it. FloodWait, risk warnings and restrictions persist cooldowns.
+- Verify platform results and save external references. Telegram schedules require
+  `scheduled: true`, `active: true`, `verified: true` and a lookup containing every
+  returned message ID. Local pause/cancel does not retract accepted schedules.
+- Changes to frozen content, accounts, targets, media, ordering or schedule require
+  a new task. No new approval process is introduced.
 
-## Stage 1: discovery and Telegram joining
+## Feedback and privacy
 
-- Before requesting `discovery_join` authorization, show the task ID, platforms,
-  account labels, search queries/topics, required and blocked keywords, allowed
-  languages, public/private boundary, minimum activity/size, maximum candidates,
-  maximum Telegram joins, execution window, and pacing limits.
-- Stage 1 may authorize unknown future Telegram targets only inside that exact
-  policy. Raw search results must pass the deterministic qualification gate
-  before joining.
-- Always reject targets with adult/18+/NSFW/pornographic, dating/escort,
-  gambling, scam, or unrelated-topic signals unless the approved task policy
-  explicitly names that category. Low-confidence candidates are recorded as
-  rejected and are never joined automatically.
-- Persist every candidate and decision. Each Telegram target may be attempted
-  once. A restart may resume only items whose durable state is `not_attempted`.
-- If Telegram accepts a join request but requires administrator approval, record
-  `pending_admin_approval`, do not retry it, do not count it as joined, and
-  continue with other qualified task items.
-- If an outcome is unknown, record `unknown`, do not retry that target, reconcile
-  with a read-only membership lookup, and continue only items that are still
-  unattempted.
-- If Telegram reports FloodWait, a risk warning, or an account restriction, stop
-  new writes for that account and persist the cooldown. The same Stage 1 grant
-  remains valid for unchanged, unattempted items after the cooldown; never
-  switch accounts or retry an unknown target to bypass the restriction.
+Feedback and receipt verification are read-only. New reply content enters a new
+prepared task and needs an explicit start instruction or client button click.
+Never expose API hashes, Session Strings, phone numbers, login codes, bearer
+tokens, cookies or credential database contents.
 
-## Stage 2: messages and publication
+## Persistent execution pools
 
-- Before requesting `outbound` authorization, show the exact account and target
-  for every item, complete text/caption/title, action type, every media filename,
-  scheduled date/time with explicit timezone, ordering, pacing, and daily limits.
-- Persist the exact outbound manifest and its hash. Each item may be sent once;
-  a process restart may resume only durable `not_attempted` items whose payload
-  hash still matches the approved manifest.
-- Never send from a draft-only or stale approval. Any content, target, media,
-  schedule, or ordering change requires a new task rather than a third approval.
-- Verify the platform result and store its external reference. A transport
-  failure after submission is `unknown`, not a retryable failure.
-- For Telegram schedules, report success only after the tool returns
-  `scheduled: true`, `active: true`, and `verified: true`, followed by a
-  read-only scheduled-message lookup that contains every returned message ID.
+The production sender uses persistent jobs and Cloudflare authorization. Explicit
+starts queue work; account and platform processes execute it asynchronously. Do
+not bypass the queue with direct adapter calls. Read `/api/execution/pools` for
+pool health and pending receipts; a parent heartbeat alone does not prove a pool
+is working. See `docs/cloudflare-execution.md`.
 
-## Feedback and safety
-
-- Feedback listening is read-only and needs no additional authorization. Link
-  replies, mentions, reactions, deletions, moderator/admin actions, bans, and
-  conversions to the originating task and outbound item.
-- Automatic replies may use only deterministic Stage 2-approved text and the
-  approved target/time/rate boundaries. Do not generate new promotional claims
-  from untrusted messages.
-- Keep cooldowns, per-user limits, task limits, and global stops enabled.
-- Never expose API hashes, Session Strings, phone numbers, login codes, bearer
-  tokens, cookies, or credential database contents.
+An MCP connection opened before an upgrade may still have older code in memory.
+The database blocks attempts without the owning pool lease. If that older client
+reports `PersistentJobLeaseRequired` or a missing pool function after a start,
+read the task and queue status before doing anything else; the explicitly started
+task can already be queued. Refresh that MCP connection, and never create a new
+item or repeat an uncertain send to work around the error.

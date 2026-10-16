@@ -115,14 +115,14 @@ class EngineTests(unittest.TestCase):
             fields.update(action="manual_comment", target="https://www.instagram.com/p/example/")
         return ItemInput(**{**fields, **changes})
 
-    def approve(self, t, items=None):
-        t = self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+    def start(self, t, items=None):
+        t = self.engine.start_task(t["id"], sending=False)
         self.engine.set_items(t["id"], items or [self.item()])
         t = self.engine.prepare(t["id"])
-        return self.engine.approve(t["id"], "outbound", t["outbound_phrase"])
+        return self.engine.start_task(t["id"])
 
     def test_four_platform_flow(self):
-        t = self.approve(
+        t = self.start(
             self.task(["telegram", "reddit", "x", "instagram"]),
             [self.item(), self.item("reddit"), self.item("x"), self.item("instagram")],
         )
@@ -134,15 +134,60 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(self.provider.sends, 3)
 
-    def test_exact_phrase_not_generic(self):
-        t = self.task()
-        for phrase in ["好的", "继续", "可以", t["discovery_phrase"] + " "]:
-            with self.assertRaises(Conflict):
-                self.engine.approve(t["id"], "discovery_join", phrase)
-        self.assertEqual(len(self.engine.task(t["id"])["approvals"]), 0)
+    def test_start_needs_no_phrase_and_creates_no_approval(self):
+        task = self.task()
+        self.engine.set_items(task["id"], [self.item()])
+        task = self.engine.start_task(task["id"], source="codex")
+        self.assertEqual(task["phase"], "ready")
+        self.assertEqual(task["approvals"], [])
+        self.assertNotIn("discovery_phrase", task)
+        self.assertNotIn("outbound_phrase", task)
+        self.assertEqual(self.provider.sends, 0)
+        self.engine.run_once(task["id"])
+        self.assertEqual(self.provider.sends, 1)
+
+    def test_start_and_run_honors_global_stop_and_preserves_manifest(self):
+        task = self.task()
+        self.engine.set_items(task["id"], [self.item()])
+        self.engine.set_stop(True)
+        result = self.engine.start_and_run(task["id"], source="codex")
+        frozen = result["manifest_hash"]
+        self.assertEqual(result["execution_result"]["processed"], [])
+        self.assertEqual(result["approvals"], [])
+        self.assertEqual(self.provider.sends, 0)
+        started = self.store.one("SELECT details FROM audit WHERE kind='task.started'")
+        self.assertEqual(json.loads(started["details"])["source"], "codex")
+        self.engine.set_stop(False)
+        result = self.engine.start_and_run(task["id"], source="client")
+        self.assertEqual(result["manifest_hash"], frozen)
+        self.assertEqual(result["execution_result"]["processed"][0]["status"], "confirmed")
+        self.engine.run_cycle()
+        self.assertEqual(self.provider.sends, 1)
+
+    def test_join_start_does_not_start_outbound_items(self):
+        task = self.task()
+        self.engine.set_items(task["id"], [self.item()])
+        task = self.engine.start_task(task["id"], sending=False)
+        self.assertEqual(task["phase"], "discovered")
+        self.engine.run_cycle()
+        self.assertEqual(self.provider.sends, 0)
+        self.assertFalse(self.store.rows("SELECT * FROM attempts"))
+
+    def test_pending_start_cannot_be_edited_or_resumed_by_scheduler_after_pause(self):
+        task = self.task(max_joins=1)
+        self.engine.set_items(task["id"], [self.item(scheduled_at=iso(self.now + 4000))])
+        task = self.engine.start_task(task["id"])
+        self.assertEqual(task["phase"], "starting")
+        with self.assertRaises(Conflict):
+            self.engine.set_items(task["id"], [self.item(text="changed")])
+        self.engine.change_state(task["id"], "paused")
+        with self.assertRaises(Conflict):
+            self.engine.start_task(task["id"], source="scheduler")
+        self.assertEqual(self.engine.task(task["id"])["state"], "paused")
+        self.assertEqual(self.provider.sends, 0)
 
     def test_platform_publication_time_persists_without_changing_approved_manifest(self):
-        task = self.approve(self.task())
+        task = self.start(self.task())
         self.provider.result = {
             "status": "confirmed",
             "verified": True,
@@ -158,14 +203,14 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(evidence["verified_at"], self.now)
         self.assertEqual(self.engine.task(task["id"])["manifest_hash"], task["manifest_hash"])
 
-    def test_two_approvals_persist_and_are_idempotent(self):
-        t = self.approve(self.task())
+    def test_explicit_starts_persist_and_are_idempotent(self):
+        task = self.start(self.task())
         new = Engine(Store(self.store.path), self.registry, clock=lambda: self.now)
-        for stage, key in [("discovery_join", "discovery_phrase"), ("outbound", "outbound_phrase")]:
-            new.approve(t["id"], stage, t[key])
-        self.assertEqual(len(new.task(t["id"])["approvals"]), 2)
-        new.run_once(t["id"])
-        new.run_once(t["id"])
+        for _ in range(2):
+            new.start_task(task["id"])
+        self.assertEqual(new.task(task["id"])["approvals"], [])
+        new.run_once(task["id"])
+        new.run_once(task["id"])
         self.assertEqual(self.provider.sends, 1)
 
     def test_draft_does_not_send(self):
@@ -173,18 +218,21 @@ class EngineTests(unittest.TestCase):
         self.engine.run_once(t["id"])
         self.assertEqual(self.provider.sends, 0)
 
-    def test_prepare_requires_discovery(self):
-        t = self.task()
-        with self.assertRaises(Conflict):
-            self.engine.set_items(t["id"], [self.item()])
+    def test_draft_can_be_prepared_without_starting(self):
+        task = self.task()
+        self.engine.set_items(task["id"], [self.item()])
+        task = self.engine.prepare(task["id"])
+        self.assertEqual(task["state"], "draft")
+        self.engine.run_once(task["id"])
+        self.assertEqual(self.provider.sends, 0)
 
     def test_cannot_edit_frozen_batch(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         with self.assertRaises(Conflict):
             self.engine.set_items(t["id"], [self.item(text="changed")])
 
     def test_manifest_tamper_is_blocked(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         with self.store.connect(write=True) as db:
             db.execute("UPDATE tasks SET manifest_hash='bad' WHERE id=?", (t["id"],))
         result = self.engine.run_once(t["id"])
@@ -192,7 +240,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result["processed"][0]["status"], "blocked")
 
     def test_item_tamper_is_blocked(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         p = t["items"][0]["payload"]
         p["text"] = "changed"
         with self.store.connect(write=True) as db:
@@ -203,7 +251,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.provider.sends, 0)
 
     def test_account_change_invalidates_grant(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         with self.store.connect(write=True) as db:
             db.execute(
                 "UPDATE accounts SET backend_label=? WHERE id=?",
@@ -250,7 +298,7 @@ class EngineTests(unittest.TestCase):
                 },
             )
         )
-        task = self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        task = self.engine.start_task(task["id"], sending=False)
         first_item = self.item(target="@one")
         second_item = self.item(account_id=second["id"], target="@two")
         with self.assertRaisesRegex(Conflict, "任务最小间隔"):
@@ -281,7 +329,7 @@ class EngineTests(unittest.TestCase):
                 },
             )
         )
-        task = self.approve(
+        task = self.start(
             task,
             [self.item(target="@one"), self.item(account_id=second["id"], target="@two")],
         )
@@ -312,7 +360,7 @@ class EngineTests(unittest.TestCase):
         self.assertIn("next_at", tasks)
 
     def test_concurrent_workers_one_submission(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(lambda _: self.engine.run_once(t["id"]), range(8)))
         self.assertEqual(self.provider.sends, 1)
@@ -320,7 +368,7 @@ class EngineTests(unittest.TestCase):
 
     def test_transport_unknown_never_retried(self):
         self.provider.result = ConnectionError("token=secret-not-for-output")
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine.run_once(t["id"])
         self.engine.run_once(t["id"])
         self.assertEqual(self.provider.sends, 1)
@@ -330,7 +378,7 @@ class EngineTests(unittest.TestCase):
         )
 
     def test_claimed_crash_recovered_unknown(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine._claim(t["items"][0]["id"])
         self.now += 301
         self.assertEqual(self.engine.recover(), 1)
@@ -340,13 +388,13 @@ class EngineTests(unittest.TestCase):
 
     def test_unverified_success_unknown(self):
         self.provider.result = {"status": "confirmed", "verified": False, "external_reference": "x"}
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine.run_once(t["id"])
         self.assertEqual(self.engine.task(t["id"])["items"][0]["status"], "unknown")
 
     def test_verified_without_reference_unknown(self):
         self.provider.result = {"status": "confirmed", "verified": True}
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine.run_once(t["id"])
         self.assertEqual(self.engine.task(t["id"])["items"][0]["status"], "unknown")
 
@@ -360,14 +408,14 @@ class EngineTests(unittest.TestCase):
             "lookup_message_ids": [1],
             "external_reference": "telegram:1",
         }
-        t = self.approve(
+        t = self.start(
             self.task(), [self.item(action="schedule_message", scheduled_at=iso(self.now + 3600))]
         )
         self.engine.run_once(t["id"])
         self.assertEqual(self.engine.task(t["id"])["items"][0]["status"], "unknown")
 
     def test_native_schedule_verified_before_due(self):
-        t = self.approve(
+        t = self.start(
             self.task(), [self.item(action="schedule_message", scheduled_at=iso(self.now + 3600))]
         )
         self.engine.run_once(t["id"])
@@ -376,7 +424,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.task(t["id"])["items"][0]["status"], "scheduled")
 
     def test_future_local_schedule_not_early(self):
-        t = self.approve(self.task(), [self.item(scheduled_at=iso(self.now + 3600))])
+        t = self.start(self.task(), [self.item(scheduled_at=iso(self.now + 3600))])
         self.engine.run_once(t["id"])
         self.assertEqual(self.provider.sends, 0)
         self.now += 3600
@@ -384,14 +432,14 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.provider.sends, 1)
 
     def test_missed_schedule_not_sent_late(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.now += 901
         self.engine.run_once(t["id"])
         self.assertEqual(self.engine.task(t["id"])["items"][0]["status"], "missed")
         self.assertEqual(self.provider.sends, 0)
 
     def test_global_stop_pause_and_resume(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine.set_stop(True)
         self.engine.run_once(t["id"])
         self.assertEqual(self.provider.sends, 0)
@@ -404,7 +452,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.provider.sends, 1)
 
     def test_cancel_is_terminal(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine.change_state(t["id"], "cancelled")
         with self.assertRaises(Conflict):
             self.engine.change_state(t["id"], "active")
@@ -412,7 +460,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.provider.sends, 0)
 
     def test_daily_and_cross_task_account_cooldown(self):
-        t = self.approve(
+        t = self.start(
             self.task(daily_limit=1), [self.item(target="@one"), self.item(target="@two")]
         )
         self.engine.run_once(t["id"])
@@ -422,9 +470,9 @@ class EngineTests(unittest.TestCase):
             "rate_limited": True,
             "retry_after_seconds": 3600,
         }
-        t2 = self.approve(self.task(), [self.item(target="@three")])
+        t2 = self.start(self.task(), [self.item(target="@three")])
         self.engine.run_once(t2["id"])
-        t3 = self.approve(self.task(), [self.item(target="@four")])
+        t3 = self.start(self.task(), [self.item(target="@four")])
         self.engine.run_once(t3["id"])
         self.assertEqual(self.provider.sends, 2)
         self.assertGreater(
@@ -433,13 +481,13 @@ class EngineTests(unittest.TestCase):
 
     def test_risk_warning_disables_account(self):
         self.provider.result = {"status": "unknown", "risk_warning": True}
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine.run_once(t["id"])
         self.assertTrue(self.engine.account(self.accounts["telegram"]["id"])["disabled"])
 
     def test_cross_task_per_user_limit(self):
         for i in range(3):
-            t = self.approve(self.task(), [self.item(target="@same", text=str(i))])
+            t = self.start(self.task(), [self.item(target="@same", text=str(i))])
             self.engine.run_once(t["id"])
         self.assertEqual(self.provider.sends, 2)
 
@@ -451,14 +499,14 @@ class EngineTests(unittest.TestCase):
             "path": str(path),
             "sha256": hashlib.sha256(b"fixture").hexdigest(),
         }
-        t = self.approve(self.task(), [self.item(action="send_file", media=[media])])
+        t = self.start(self.task(), [self.item(action="send_file", media=[media])])
         path.write_bytes(b"changed")
         self.engine.run_once(t["id"])
         self.assertEqual(self.provider.sends, 0)
 
     def test_unsupported_and_outside_account_rejected(self):
         t = self.task()
-        self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+        self.engine.start_task(t["id"], sending=False)
         with self.assertRaises(Conflict):
             self.engine.set_items(t["id"], [self.item("reddit")])
         with self.assertRaises(Conflict):
@@ -466,7 +514,7 @@ class EngineTests(unittest.TestCase):
 
     def test_policy_filter_persists_rejections(self):
         t = self.task(queries=["AI"], required_keywords=["AI"])
-        self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+        self.engine.start_task(t["id"], sending=False)
         values = [
             {"target": "@good", "text": "AI video", "confidence": 0.9},
             {"target": "@casino", "text": "AI gambling", "confidence": 0.99},
@@ -487,7 +535,7 @@ class EngineTests(unittest.TestCase):
 
     def test_unattempted_candidate_can_be_corrected_at_capacity(self):
         task = self.task(queries=["AI"], max_candidates=1)
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         value = CandidateInput(
             account_id=self.accounts["telegram"]["id"],
             target="@coding_chat",
@@ -510,7 +558,7 @@ class EngineTests(unittest.TestCase):
 
     def test_candidate_correction_still_applies_risk_gate(self):
         task = self.task(queries=["AI"], max_candidates=1)
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         value = CandidateInput(
             account_id=self.accounts["telegram"]["id"],
             target="@ai_chat",
@@ -525,7 +573,7 @@ class EngineTests(unittest.TestCase):
 
     def test_attempted_candidate_cannot_be_corrected(self):
         task = self.task(max_joins=1, max_candidates=1)
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         value = CandidateInput(
             account_id=self.accounts["telegram"]["id"],
             target="@ai_chat",
@@ -540,7 +588,7 @@ class EngineTests(unittest.TestCase):
 
     def test_candidate_correction_cannot_change_frozen_batch(self):
         task = self.task(max_candidates=1)
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         value = CandidateInput(
             account_id=self.accounts["telegram"]["id"],
             target="@ai_group",
@@ -557,7 +605,7 @@ class EngineTests(unittest.TestCase):
 
     def test_reconcile_does_not_resubmit(self):
         self.provider.result = ConnectionError()
-        t = self.approve(self.task())
+        t = self.start(self.task())
         self.engine.run_once(t["id"])
         self.engine.reconcile(t["items"][0]["id"])
         self.assertEqual(self.provider.sends, 1)
@@ -578,7 +626,7 @@ class EngineTests(unittest.TestCase):
 
     def test_join_gate_attempt_once_and_maximum(self):
         t = self.task(max_joins=1)
-        self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+        self.engine.start_task(t["id"], sending=False)
         for target in ["@one", "@two"]:
             self.engine.candidate(
                 t["id"],
@@ -604,7 +652,7 @@ class EngineTests(unittest.TestCase):
 
             self.registry.overrides["telegram"] = Pending()
             t = self.task(max_joins=2)
-            self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+            self.engine.start_task(t["id"], sending=False)
             self.engine.candidate(
                 t["id"],
                 CandidateInput(
@@ -624,7 +672,7 @@ class EngineTests(unittest.TestCase):
         )
         self.accounts["telegram"] = a
         self.engine.live_enabled = True
-        t = self.approve(self.task(min_interval=120))
+        t = self.start(self.task(min_interval=120))
         self.engine.check_account(a["id"])
         with patch.dict(os.environ, {"AUTO_PROMOTION_LIVE_WRITES": "1", "AP_TELEGRAM_OWNER": ""}):
             self.assertIsNone(self.engine._claim(t["items"][0]["id"], {"allowed": True}))
@@ -652,7 +700,7 @@ class EngineTests(unittest.TestCase):
 
         self.registry.overrides["telegram"] = Uncertain()
         t = self.task(max_joins=2)
-        self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+        self.engine.start_task(t["id"], sending=False)
         self.engine.candidate(
             t["id"],
             CandidateInput(
@@ -671,7 +719,7 @@ class EngineTests(unittest.TestCase):
 
     def test_worker_runs_only_approved_qualified_joins(self):
         t = self.task(max_joins=2)
-        self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+        self.engine.start_task(t["id"], sending=False)
         self.engine.candidate(
             t["id"],
             CandidateInput(
@@ -700,13 +748,13 @@ class EngineTests(unittest.TestCase):
                 "UPDATE accounts SET daily_limit=1 WHERE id=?", (self.accounts["telegram"]["id"],)
             )
         due = self.now + 3 * 86400
-        one = self.approve(
+        one = self.start(
             self.task(ends_at=iso(due + 3600)),
             [self.item(action="schedule_message", target="@one", scheduled_at=iso(due))],
         )
         self.engine.run_once(one["id"])
         self.now += 86400
-        two = self.approve(
+        two = self.start(
             self.task(ends_at=iso(due + 3600)),
             [self.item(action="schedule_message", target="@two", scheduled_at=iso(due + 120))],
         )
@@ -715,7 +763,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.task(two["id"])["items"][0]["status"], "not_attempted")
 
     def test_manual_result_finishes_four_platform_task(self):
-        t = self.approve(
+        t = self.start(
             self.task(["telegram", "reddit", "x", "instagram"]),
             [self.item(), self.item("reddit"), self.item("x"), self.item("instagram")],
         )
@@ -733,7 +781,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.task(t["id"])["state"], "completed")
 
     def test_late_receipt_does_not_reopen_cancelled_task(self):
-        t = self.approve(self.task())
+        t = self.start(self.task())
         claim = self.engine._claim(t["items"][0]["id"])
         self.engine.change_state(t["id"], "cancelled")
         self.engine.finish(
@@ -748,7 +796,7 @@ class EngineTests(unittest.TestCase):
         )
         self.accounts["instagram"] = a
         t = self.task("instagram", min_interval=120)
-        self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+        self.engine.start_task(t["id"], sending=False)
         media = {
             "filename": "test.png",
             "path": "missing",
@@ -788,7 +836,7 @@ class EngineTests(unittest.TestCase):
                 },
             )
         )
-        task = self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        task = self.engine.start_task(task["id"], sending=False)
         media_path = self.engine.media_root / "post.png"
         media_path.write_bytes(b"test image")
         media = {
@@ -854,7 +902,7 @@ class EngineTests(unittest.TestCase):
                     changes["target"] = "https://x.com/example/status/" + str(number)
                     if action in {"like", "repost"}:
                         changes["text"] = ""
-                t = self.approve(self.task(platform), [self.item(platform, **changes)])
+                t = self.start(self.task(platform), [self.item(platform, **changes)])
                 self.engine.run_once(t["id"])
                 item = self.engine.task(t["id"])["items"][0]
                 expected = (
@@ -873,7 +921,7 @@ class EngineTests(unittest.TestCase):
     def test_simulated_discovery_flows_through_qualification(self):
         for platform in ["telegram", "reddit", "x"]:
             t = self.task(platform, queries=["AI video"])
-            self.engine.approve(t["id"], "discovery_join", t["discovery_phrase"])
+            self.engine.start_task(t["id"], sending=False)
             result = self.engine.discover(t["id"], self.accounts[platform]["id"])
             self.assertEqual(result["decisions"][0]["decision"], "qualified")
             self.assertEqual(len(self.engine.task(t["id"])["candidates"]), 1)

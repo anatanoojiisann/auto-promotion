@@ -17,7 +17,7 @@ class AccountLanes:
         self.local = threading.local()
 
     @contextmanager
-    def acquire(self, account_id, limits=None):
+    def acquire(self, account_id, limits=None, resource=None):
         held = getattr(self.local, "held", {})
         if account_id in held:
             yield held[account_id]
@@ -29,6 +29,17 @@ class AccountLanes:
             ).fetchone()
             if row and row["expires_at"] > now:
                 raise AccountBusy()
+            if resource:
+                occupied = db.execute(
+                    "SELECT owner FROM execution_resources WHERE resource=? AND expires_at>?",
+                    (resource, now),
+                ).fetchone()
+                if occupied:
+                    raise AccountBusy()
+                db.execute(
+                    "INSERT INTO execution_resources VALUES(?,?,?) ON CONFLICT(resource) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at",
+                    (resource, owner, now + self.lease_seconds),
+                )
             if limits:
                 platform = db.execute(
                     "SELECT platform FROM accounts WHERE id=?", (account_id,)
@@ -58,6 +69,11 @@ class AccountLanes:
                             "UPDATE account_lanes SET expires_at=?,heartbeat_at=? WHERE account_id=? AND owner=?",
                             (at + self.lease_seconds, at, account_id, owner),
                         )
+                        if resource:
+                            db.execute(
+                                "UPDATE execution_resources SET expires_at=? WHERE resource=? AND owner=?",
+                                (at + self.lease_seconds, resource, owner),
+                            )
                 except Exception:
                     # Losing the lane cannot authorize replay of a claimed write.
                     pass
@@ -74,3 +90,8 @@ class AccountLanes:
                 db.execute(
                     "DELETE FROM account_lanes WHERE account_id=? AND owner=?", (account_id, owner)
                 )
+                if resource:
+                    db.execute(
+                        "DELETE FROM execution_resources WHERE resource=? AND owner=?",
+                        (resource, owner),
+                    )

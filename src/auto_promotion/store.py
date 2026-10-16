@@ -10,6 +10,13 @@ from .models import canonical
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tiktok_oauth(
+ id TEXT PRIMARY KEY, expires_at REAL NOT NULL, client_id TEXT NOT NULL,
+ redirect_uri TEXT NOT NULL, details TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tiktok_events(
+ id TEXT PRIMARY KEY, received_at REAL NOT NULL, event TEXT NOT NULL, details TEXT NOT NULL
+);
 INSERT OR IGNORE INTO meta VALUES('schema_version','1');
 INSERT OR IGNORE INTO meta VALUES('global_stop','1');
 CREATE TABLE IF NOT EXISTS accounts(
@@ -195,6 +202,9 @@ class Store:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            from .queue_store import QUEUE_SCHEMA
+
+            db.executescript(QUEUE_SCHEMA)
             # Existing workspaces predate identity binding and task-wide pacing.
             if "identity_hash" not in {r[1] for r in db.execute("PRAGMA table_info(accounts)")}:
                 db.execute("ALTER TABLE accounts ADD COLUMN identity_hash TEXT")
@@ -236,6 +246,9 @@ class Store:
     def connect(self, write=False):
         db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
         db.row_factory = sqlite3.Row
+        from .queue_store import bind_connection
+
+        bind_connection(db)
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")

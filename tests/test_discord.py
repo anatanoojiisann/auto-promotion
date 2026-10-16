@@ -364,15 +364,12 @@ class DiscordWorkflowTests(unittest.TestCase):
             **changes,
         )
 
-    def test_future_delivery_waits_for_both_exact_approvals_and_due_time(self):
+    def test_future_delivery_waits_for_explicit_start_and_due_time(self):
         self.engine.set_stop(False)
-        with self.assertRaises(Conflict):
-            self.engine.set_items(self.task["id"], [self.item()])
-        self.engine.approve(self.task["id"], "discovery_join", self.task["discovery_phrase"])
         self.engine.set_items(self.task["id"], [self.item()])
         frozen = self.engine.prepare(self.task["id"])
         self.assertEqual(self.engine.run_once()["processed"], [])
-        self.engine.approve(frozen["id"], "outbound", frozen["outbound_phrase"])
+        self.engine.start_task(frozen["id"])
         self.assertEqual(self.engine.run_once()["processed"], [])
         self.now += 11
         self.assertEqual(self.engine.run_once()["processed"][0]["status"], "confirmed")
@@ -443,7 +440,7 @@ class DiscordWorkflowTests(unittest.TestCase):
                 policy={"starts_at": self.iso(self.now - 60), "ends_at": self.iso(self.now + 3600)},
             )
         )
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         self.engine.set_items(
             task["id"],
             [
@@ -457,7 +454,7 @@ class DiscordWorkflowTests(unittest.TestCase):
             ],
         )
         task = self.engine.prepare(task["id"])
-        self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        self.engine.start_task(task["id"])
         self.engine.live_enabled = True
         self.engine.set_stop(False)
 

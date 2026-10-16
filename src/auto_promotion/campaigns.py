@@ -1,4 +1,4 @@
-"""Shared opportunities and campaign plans. Planning never approves or publishes."""
+"""Shared opportunities and campaign plans. Planning never starts execution."""
 
 import json
 import sqlite3
@@ -298,7 +298,7 @@ class Campaigns:
     def plan(self, campaign_id, expected_revision=None):
         campaign = self.raw(campaign_id)
         if campaign["state"] not in {"draft", "planned"}:
-            raise Conflict("活动已生成审批任务，不能重新分配；变更请创建新活动")
+            raise Conflict("活动已生成执行任务，不能重新分配；变更请创建新活动")
         if expected_revision is not None and expected_revision != campaign["revision"]:
             raise Conflict("活动已变化，请刷新")
         pool = self.pools.get(campaign["pool_id"])
@@ -374,7 +374,7 @@ class Campaigns:
                 ]
                 != "planned"
             ):
-                raise Conflict("已生成审批批次，草稿不可修改")
+                raise Conflict("已生成执行批次，草稿不可修改")
             db.execute(
                 "UPDATE campaign_assignments SET payload=? WHERE id=?",
                 (canonical(payload), assignment_id),
@@ -391,7 +391,7 @@ class Campaigns:
 
         campaign = self.raw(campaign_id)
         if campaign["state"] != "planned":
-            raise Conflict("AI 草稿只能在生成审批批次前更新")
+            raise Conflict("AI 草稿只能在生成执行批次前更新")
         if len(set(assignment_ids)) != len(assignment_ids):
             raise Conflict("草稿项目不能重复")
         provider = provider or DraftService()
@@ -600,6 +600,8 @@ class Campaigns:
                 Store.audit(
                     db, "campaign.materialized", {"campaign_id": campaign_id}, now=self.clock()
                 )
+        for task in self.store.rows("SELECT id FROM tasks WHERE campaign_id=?", (campaign_id,)):
+            self.populate(task["id"])
         return self.get(campaign_id)
 
     def populate(self, task_id):
@@ -638,7 +640,7 @@ class Campaigns:
         campaign = self.raw(campaign_id)
         tasks = self.store.rows("SELECT id,state FROM tasks WHERE campaign_id=?", (campaign_id,))
         if state == "active" and not tasks:
-            raise Conflict("请先生成审批批次")
+            raise Conflict("请先生成执行批次")
         if campaign["state"] in {"cancelled", "completed"}:
             raise Conflict("已结束活动不能恢复")
         with self.store.connect(write=True) as db:
@@ -653,20 +655,14 @@ class Campaigns:
             for child in children:
                 if child["state"] in {"cancelled", "completed"}:
                     continue
-                approved = db.execute(
-                    "SELECT 1 FROM approvals WHERE task_id=? AND stage='discovery_join'",
-                    (child["id"],),
-                ).fetchone()
-                if state == "active" and approved:
+                started = child["phase"] in {"discovered", "starting", "ready"}
+                if state == "active" and started:
                     self.engine._integrity(db, child, "discovery_join")
             for child in children:
                 if child["state"] in {"cancelled", "completed"}:
                     continue
-                approved = db.execute(
-                    "SELECT 1 FROM approvals WHERE task_id=? AND stage='discovery_join'",
-                    (child["id"],),
-                ).fetchone()
-                target_state = "draft" if state == "active" and not approved else state
+                started = child["phase"] in {"discovered", "starting", "ready"}
+                target_state = "draft" if state == "active" and not started else state
                 db.execute(
                     "UPDATE tasks SET state=?,updated_at=? WHERE id=?",
                     (target_state, self.clock(), child["id"]),

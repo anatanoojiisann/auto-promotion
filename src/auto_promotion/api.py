@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import __version__
 from .adapters import AdapterRegistry
+from .backends.common import BackendError
 from .campaigns import Campaigns
 from .config import database_path, workspace_path
 from .connections import ConnectionInput, ConnectionManager
@@ -41,7 +42,6 @@ from .models import (
     AccountInput,
     AccountProfile,
     AccountUpdate,
-    ApprovalInput,
     AssignmentUpdate,
     CampaignInput,
     CandidateInput,
@@ -61,6 +61,14 @@ from .statistics import ZONE, Statistics
 from .store import Store, decode
 from .task_tool_models import TemplateSave, TemplateTask
 from .task_tools import TaskTools
+from .tiktok import (
+    TikTokAppInput,
+    TikTokAuthorizeInput,
+    TikTokCompleteInput,
+    TikTokManager,
+    TikTokReadInput,
+    TikTokWebhookInput,
+)
 from .workers import WorkerRun, Workers
 
 
@@ -75,7 +83,14 @@ class DiscoverInput(BaseModel):
 
 
 def create_app(
-    *, db_path=None, registry=None, clock=time.time, worker=False, report_worker=None, token=None
+    *,
+    db_path=None,
+    registry=None,
+    clock=time.time,
+    worker=False,
+    report_worker=None,
+    token=None,
+    pooled_worker=None,
 ):
     workspace = workspace_path()
     store = Store(db_path or database_path())
@@ -88,6 +103,7 @@ def create_app(
     pools, campaigns = Pools(engine), Campaigns(engine)
     growth = Growth(engine)
     task_tools = TaskTools(engine)
+    tiktok = TikTokManager(engine)
     report_worker = worker if report_worker is None else report_worker
     operator_token = token or os.getenv("AP_API_TOKEN")
     if not operator_token:
@@ -103,12 +119,21 @@ def create_app(
     session_token = secrets.token_urlsafe(32)
     stop = asyncio.Event()
     sender = None
+    from .pool_runtime import PoolScheduler
+    from .queue_store import JobQueue
+
+    pooled_worker = (
+        os.getenv("AP_EXECUTION_MODE", "legacy") == "pooled"
+        if pooled_worker is None
+        else pooled_worker
+    )
+    pool_scheduler = PoolScheduler(engine) if worker and pooled_worker else None
 
     async def work_loop():
         while not stop.is_set():
             try:
                 sender.phase("executing")
-                await asyncio.to_thread(engine.run_cycle)
+                await asyncio.to_thread(pool_scheduler.tick if pool_scheduler else engine.run_cycle)
             except Exception as exc:
                 with store.connect(write=True) as db:
                     Store.audit(
@@ -122,16 +147,15 @@ def create_app(
             except TimeoutError:
                 pass
 
-    async def report_loop():
+    async def report_loop(callback, kind):
         while not stop.is_set():
             try:
-                await asyncio.to_thread(engine.collect_statistics)
-                await asyncio.to_thread(statistics.run_due)
-                await asyncio.to_thread(growth.sync_inbox)
-                await asyncio.to_thread(growth.poll_feeds)
+                await asyncio.to_thread(callback)
             except Exception:
                 with store.connect(write=True) as db:
-                    Store.audit(db, "statistics.error", {"reason": "report_cycle_failed"})
+                    Store.audit(
+                        db, "statistics.error", {"reason": "report_cycle_failed", "kind": kind}
+                    )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=10)
             except TimeoutError:
@@ -144,10 +168,19 @@ def create_app(
         with ExitStack() as stack:
             jobs = []
             if worker:
+                if pool_scheduler:
+                    pool_scheduler.enable()
                 sender = stack.enter_context(WorkerRun(store, live_enabled=engine.live_enabled))
                 jobs.append(asyncio.create_task(work_loop()))
             if report_worker:
-                jobs.append(asyncio.create_task(report_loop()))
+                for callback, kind in (
+                    (tiktok.reconcile_due, "verify"),
+                    (engine.collect_statistics, "statistics"),
+                    (statistics.run_due, "reports"),
+                    (growth.sync_inbox, "inbox"),
+                    (growth.poll_feeds, "feeds"),
+                ):
+                    jobs.append(asyncio.create_task(report_loop(callback, kind)))
             try:
                 yield
             finally:
@@ -156,6 +189,8 @@ def create_app(
                 # Wait for a submitted operation to settle before recording sender exit.
                 for job in jobs:
                     await job
+                if pool_scheduler:
+                    await asyncio.to_thread(pool_scheduler.close)
                 if sender:
                     sender.reason = "service_shutdown"
 
@@ -171,6 +206,7 @@ def create_app(
     app.state.connections = connections
     app.state.statistics = statistics
     app.state.pools, app.state.campaigns = pools, campaigns
+    app.state.tiktok = tiktok
 
     @app.middleware("http")
     async def boundary(request: Request, call_next):
@@ -224,10 +260,40 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
-        if request.url.path == "/api/connections":
+        if request.url.path == "/api/connections" or request.url.path.startswith("/api/tiktok/"):
             # Pydantic errors can echo the full submitted token or extra sensitive fields.
             return JSONResponse({"error": "连接信息不完整或格式错误，请核对表单"}, status_code=422)
         return await request_validation_exception_handler(request, exc)
+
+    @app.exception_handler(BackendError)
+    async def backend_error(request, exc):
+        return JSONResponse({"error": exc.safe_code}, status_code=409)
+
+    @app.get("/api/tiktok/app")
+    def tiktok_app_status():
+        return tiktok.status()
+
+    @app.put("/api/tiktok/app")
+    def tiktok_app_save(value: TikTokAppInput):
+        return tiktok.save_app(value)
+
+    @app.post("/api/tiktok/authorize")
+    def tiktok_authorize(value: TikTokAuthorizeInput):
+        return tiktok.authorize(value)
+
+    @app.post("/api/tiktok/webhooks")
+    def tiktok_webhook_configure(value: TikTokWebhookInput):
+        return tiktok.configure_webhook(value)
+
+    @app.post("/api/tiktok/authorize/complete")
+    def tiktok_complete(value: TikTokCompleteInput):
+        return tiktok.complete(value.callback_url.get_secret_value())
+
+    @app.post("/api/tiktok/accounts/{account_id}/{kind}")
+    def tiktok_read(account_id: str, kind: str, value: TikTokReadInput):
+        if kind not in {"videos", "comments", "insights"}:
+            raise HTTPException(status_code=404)
+        return tiktok.read(account_id, kind, value)
 
     @app.get("/health")
     def health():
@@ -237,6 +303,7 @@ def create_app(
             "worker": worker,
             "live_writes": engine.live_enabled,
             "report_worker": report_worker,
+            "execution_mode": "pooled" if pooled_worker else "legacy",
         }
 
     @app.post("/api/session")
@@ -261,6 +328,7 @@ def create_app(
             "timezone": "Asia/Shanghai",
             "report_worker": report_worker,
             "sender": Workers(store, clock).snapshot(live=engine.live_enabled),
+            "execution_pools": JobQueue(engine).pools(),
         }
 
     @app.get("/api/accounts")
@@ -473,6 +541,10 @@ def create_app(
     def account_enabled(account_id: str, value: Toggle):
         return engine.disable_account(account_id, not value.enabled)
 
+    @app.get("/api/execution/pools")
+    def execution_pools():
+        return JobQueue(engine).pools()
+
     @app.get("/api/tasks")
     def tasks():
         return [
@@ -536,12 +608,9 @@ def create_app(
     def task(task_id: str):
         return engine.task(task_id)
 
-    @app.post("/api/tasks/{task_id}/approve/{stage}")
-    def approve(task_id: str, stage: str, value: ApprovalInput):
-        task = engine.approve(task_id, stage, value.phrase)
-        if stage == "discovery_join" and task.get("campaign_id"):
-            return campaigns.populate(task_id)
-        return task
+    @app.post("/api/tasks/{task_id}/start")
+    def start(task_id: str):
+        return engine.start_and_run(task_id, source="client")
 
     @app.put("/api/tasks/{task_id}/items")
     def items(task_id: str, values: list[ItemInput]):
@@ -572,6 +641,7 @@ def create_app(
 
     @app.post("/api/tasks/{task_id}/join")
     def join(task_id: str):
+        engine.start_task(task_id, source="client", sending=False)
         return engine.run_joins(task_id)
 
     @app.post("/api/candidates/{candidate_id}/reconcile")

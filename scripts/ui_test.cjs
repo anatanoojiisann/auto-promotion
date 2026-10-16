@@ -85,6 +85,7 @@ async function cleanup() {
 (async () => {
   const base = await startServer();
   browser = await chromium.launch({
+    channel: process.env.AP_UI_BROWSER_CHANNEL || undefined,
     headless: true,
     executablePath: process.env.AP_UI_CHROMIUM_PATH || undefined,
   });
@@ -213,7 +214,7 @@ async function cleanup() {
     });
   await page.getByRole("link", { name: "API 中心", exact: true }).click();
   await page.getByRole("heading", { name: "API 中心", exact: true }).waitFor();
-  assert.equal(await page.locator(".service-row").count(), 5);
+  assert.equal(await page.locator(".service-row").count(), 6);
   if (!process.env.AP_UI_SKIP_SCREENSHOTS)
     await page.screenshot({
       path: "output/playwright/api-desktop.png",
@@ -233,8 +234,11 @@ async function cleanup() {
     .check();
   await page.getByLabel("发现主题（每行一个）").fill("AI video");
   await page.locator("#task-interval").fill("0");
-  await page.getByRole("button", { name: "创建并预览发现政策" }).click();
-  await page.locator("#phrase-discovery_join").waitFor();
+  await page
+    .locator("#task-form")
+    .getByRole("button", { name: "创建任务", exact: true })
+    .click();
+  await page.locator("#edit-items").waitFor();
   const originalTaskId = await page.evaluate(() =>
     location.hash.split("/").at(-1),
   );
@@ -258,7 +262,7 @@ async function cleanup() {
     .locator(`input[name="accounts"][value="${testAccount.id}"]`)
     .check();
   await page.getByRole("button", { name: "创建新草稿", exact: true }).click();
-  await page.locator("#phrase-discovery_join").waitFor();
+  await page.locator("#edit-items").waitFor();
   const templateDraft = await page.evaluate(async () => {
     const id = location.hash.split("/").at(-1);
     return fetch(`/api/tasks/${id}`).then((response) => response.json());
@@ -294,15 +298,8 @@ async function cleanup() {
     .locator(".detail-top code")
     .filter({ hasText: originalTaskId })
     .waitFor();
-  await page.locator("#phrase-discovery_join").waitFor();
-  const discovery = await page
-    .locator('form[data-approval="discovery_join"] .phrase')
-    .innerText();
-  await page.locator("#phrase-discovery_join").fill("好的");
-  await page.getByRole("button", { name: "批准发现政策" }).click();
-  await page.getByRole("status").filter({ hasText: "完整确认短语" }).waitFor();
-  await page.locator("#phrase-discovery_join").fill(discovery);
-  await page.getByRole("button", { name: "批准发现政策" }).click();
+  await page.locator("#edit-items").waitFor();
+  assert.equal(await page.locator("[data-approval]").count(), 0);
   const firstTarget = "@ui_simulation_" + Date.now();
   await page.evaluate(
     async ({ accountId, target }) => {
@@ -367,25 +364,16 @@ async function cleanup() {
   await page.getByRole("button", { name: "保存清单", exact: true }).click();
   await page
     .locator("#task-workflow")
-    .filter({ hasText: "可以准备外发审批" })
+    .filter({ hasText: "等待开始发送" })
     .waitFor();
-  assert.equal(await page.locator("#prepare").isEnabled(), true);
-  await page.getByRole("button", { name: "冻结并预览外发清单" }).click();
-  await page.locator("#phrase-outbound").waitFor();
-  assert.ok(
-    (await page.locator("#task-state").innerText()).includes("等待外发审批"),
-  );
-  assert.ok(
-    (await page.locator("#task-readiness").innerText()).includes(
-      "缺少有效的最终外发审批",
+  await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().endsWith("/start") && r.request().method() === "POST",
     ),
-  );
-  const outbound = await page
-    .locator('form[data-approval="outbound"] .phrase')
-    .innerText();
-  await page.locator("#phrase-outbound").fill(outbound);
-  await page.getByRole("button", { name: "批准外发批次" }).click();
-  await page.getByRole("button", { name: "运行一轮" }).waitFor();
+    page.getByRole("button", { name: "开始发送", exact: true }).click(),
+  ]);
+  await page.getByRole("button", { name: "开始发送", exact: true }).waitFor();
+  assert.equal(await page.locator("[data-approval]").count(), 0);
   const monitoredTaskId = await page.evaluate(() =>
     location.hash.split("/").at(-1),
   );
@@ -402,14 +390,19 @@ async function cleanup() {
   await page.getByRole("button", { name: "刷新", exact: true }).click();
   await page
     .locator("#task-execution")
-    .filter({ hasText: "发送进程已结束" })
+    .filter({ hasText: "退出码 17" })
     .waitFor();
   assert.ok(
     (await page.locator("#task-execution").innerText()).includes("退出码 17"),
   );
   const global = page.locator("#global-stop");
   if ((await global.innerText()).includes("恢复")) await global.click();
-  await page.getByRole("button", { name: "运行一轮" }).click();
+  await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().endsWith("/start") && r.request().method() === "POST",
+    ),
+    page.getByRole("button", { name: "开始发送", exact: true }).click(),
+  ]);
   await page
     .locator(".item-preview .badge")
     .filter({ hasText: "已发布 · 已核验" })
@@ -459,9 +452,6 @@ async function cleanup() {
         min_interval: 0,
       },
     });
-    await call(`/tasks/${task.id}/approve/discovery_join`, {
-      phrase: task.discovery_phrase,
-    });
     return task;
   });
   await page.goto(base + "#tasks/" + discordTask.id);
@@ -498,12 +488,16 @@ async function cleanup() {
     "999999999999999999",
   );
   await page.getByRole("button", { name: "保存清单", exact: true }).click();
-  await page.getByRole("button", { name: "冻结并预览外发清单" }).click();
-  const discordOutbound = await page
-    .locator('form[data-approval="outbound"] .phrase')
-    .innerText();
-  await page.locator("#phrase-outbound").fill(discordOutbound);
-  await page.getByRole("button", { name: "批准外发批次" }).click();
+  const holdDiscord = page.locator("#global-stop");
+  if (!(await holdDiscord.innerText()).includes("恢复"))
+    await holdDiscord.click();
+  await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().endsWith("/start") && r.request().method() === "POST",
+    ),
+    page.getByRole("button", { name: "开始发送", exact: true }).click(),
+  ]);
+  await page.getByRole("button", { name: "开始发送", exact: true }).waitFor();
   const savedDiscord = await page.evaluate(
     (id) => fetch(`/api/tasks/${id}`).then((r) => r.json()),
     discordTask.id,
@@ -516,7 +510,12 @@ async function cleanup() {
   const discordStop = page.locator("#global-stop");
   if ((await discordStop.innerText()).includes("恢复"))
     await discordStop.click();
-  await page.getByRole("button", { name: "运行一轮" }).click();
+  await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().endsWith("/start") && r.request().method() === "POST",
+    ),
+    page.getByRole("button", { name: "开始发送", exact: true }).click(),
+  ]);
   await page
     .locator(".item-preview .badge")
     .filter({ hasText: "已发布 · 已核验" })
@@ -581,8 +580,8 @@ async function cleanup() {
     });
   assert.equal(
     expectedConsole.length,
-    1,
-    "exactly one intentional invalid approval response",
+    0,
+    "direct start requires no approval request",
   );
   await page.evaluate(() =>
     fetch("/api/statistics/run", {
@@ -602,7 +601,7 @@ async function cleanup() {
     "simulation must not inflate live publications",
   );
   assert.equal(statistics.totals.received_replies, null);
-  assert.equal(statistics.platforms.length, 5);
+  assert.equal(statistics.platforms.length, 6);
   assert.equal(
     await page
       .getByRole("columnheader", { name: "当日累计发布", exact: true })
@@ -803,7 +802,7 @@ async function cleanup() {
       {
         passed: errors.length === 0,
         errors,
-        expected_invalid_approval_responses: expectedConsole.length,
+        unexpected_conflict_responses: expectedConsole.length,
         checks: [
           "three_centers",
           "instagram_connection_form",
@@ -819,12 +818,12 @@ async function cleanup() {
           "review_download",
           "evidence_zip_download",
           "templates_mobile_no_overflow",
-          "reject_generic_approval",
-          "discovery_approval",
+          "no_approval_forms",
+          "draft_preparation_without_approval",
           "edit_items",
           "freeze_manifest",
           "execution_readiness_reasons",
-          "outbound_approval",
+          "direct_start",
           "execute_simulation",
           "stopped_sender_not_active",
           "observed_exit_code",

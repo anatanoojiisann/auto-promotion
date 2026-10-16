@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
@@ -11,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import quotas
+from .backends.common import BackendError, automatic_actions, read_profile
 from .dispatcher import AccountBusy, AccountLanes
 from .execution_diagnostics import FIELDS, safe_code
 from .models import (
@@ -26,6 +28,7 @@ from .models import (
     epoch,
 )
 from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_blocker
+from .routing import route_for
 from .statistics import ZONE, Statistics, publication_time, record_publication
 from .store import Store, decode
 from .workers import Workers
@@ -79,6 +82,23 @@ class Engine:
                 (canonical(value.model_dump()),),
             )
             Store.audit(db, "execution.settings", value.model_dump(), now=self.clock())
+        from .cloud_control import queue_settings
+
+        queue_settings(
+            self,
+            {
+                k: v
+                for k, v in value.model_dump().items()
+                if k
+                in {
+                    "global_limit",
+                    "max_workers",
+                    "platform_workers",
+                    "platform_limits",
+                    "pool_workers",
+                }
+            },
+        )
         return self.execution_settings()
 
     def account(self, account_id):
@@ -87,12 +107,33 @@ class Engine:
             raise NotFound("账号不存在")
         value = decode(row, "health")
         value["capabilities"] = sorted(CAPABILITIES[value["platform"]])
+        value["automatic_actions"] = automatic_actions(value)
+        if value["platform"] == "tiktok":
+            try:
+                value["owned_target_id"] = (
+                    read_profile(
+                        "tiktok",
+                        value["backend_label"],
+                        accounts_dir=os.getenv(
+                            "AP_ACCOUNTS_DIR", Path(self.store.path).parent / "accounts"
+                        ),
+                    )["identity"]
+                    if value["mode"] == "live"
+                    else "simulation-tiktok"
+                )
+            except BackendError:
+                value["owned_target_id"] = ""
         value["writable"] = bool(
             value["status"] == "healthy"
             and not value["disabled"]
             and value["cooldown_until"] <= self.clock()
             and (value["mode"] == "simulation" or self.live_enabled)
             and self.adapters.commissioned(value)
+            and (
+                value["platform"] != "tiktok"
+                or value["mode"] == "simulation"
+                or value["health"].get("permissions")
+            )
         )
         return value
 
@@ -158,12 +199,33 @@ class Engine:
         return self.account(account_id)
 
     def call(self, account, operation, payload=None, task_id=None):
-        with self.lanes.acquire(account["id"]):
+        route = route_for(account, (payload or {}).get("payload", {}))
+        with self.lanes.acquire(account["id"], resource=route.resource):
             return self._call_unlocked(account, operation, payload, task_id)
 
     def _call_unlocked(self, account, operation, payload=None, task_id=None):
         started = time.monotonic()
         try:
+            if operation in {"execute", "join"}:
+                from .cloud_control import CloudControl
+
+                cloud = CloudControl.configured()
+                required = self.store.one(
+                    "SELECT value FROM meta WHERE key='cloud_control_required'"
+                )
+                if not cloud and required and required["value"] == "1":
+                    from .cloud_control import CloudUnavailable
+
+                    raise CloudUnavailable("CloudControlConfigurationMissing")
+                if cloud:
+                    attempt_id = (payload or {}).get("attempt_id")
+                    if operation == "join":
+                        attempt = self.store.one(
+                            "SELECT id FROM join_attempts WHERE candidate_id=?",
+                            ((payload or {}).get("candidate_id"),),
+                        )
+                        attempt_id = attempt["id"] if attempt else None
+                    cloud.guard(getattr(self.adapters.context, "job", None), attempt_id)
             result = self.adapters.call(account, operation, payload or {})
         except Exception as exc:
             # Never expose provider exceptions: they may include tokens, URLs or browser state.
@@ -193,7 +255,10 @@ class Engine:
 
     def check_account(self, account_id):
         account = self.account(account_id)
-        if account["platform"] == "discord" and account["cooldown_until"] > self.clock():
+        if (
+            account["platform"] in {"discord", "tiktok"}
+            and account["cooldown_until"] > self.clock()
+        ):
             return account
         try:
             result = self.call(account, "health")
@@ -361,12 +426,6 @@ class Engine:
                 "SELECT * FROM candidates WHERE task_id=? ORDER BY id", (task_id,)
             )
         ]
-        result["discovery_phrase"] = self.phrase(task_id, "discovery_join", result["policy_hash"])
-        result["outbound_phrase"] = (
-            self.phrase(task_id, "outbound", result["manifest_hash"])
-            if result["manifest_hash"]
-            else None
-        )
         result["summary"] = {
             s: sum(i["status"] == s for i in result["items"])
             for s in {i["status"] for i in result["items"]}
@@ -374,6 +433,9 @@ class Engine:
         result["execution"] = Workers(self.store, self.clock).snapshot(
             task_id, live=result["mode"] == "live"
         )
+        from .queue_store import JobQueue
+
+        result["execution"]["pools"] = JobQueue(self).pools(task_id)
         result["readiness"] = self.readiness(result)
         reply = self.store.one(
             "SELECT r.event_id,r.platform,r.account_id,i.payload FROM reply_inbox r "
@@ -395,13 +457,10 @@ class Engine:
     def readiness(self, task):
         """Report every local prerequisite without checking a real account or sending."""
         blockers = []
-        grants = {a["stage"]: a["hash"] for a in task["approvals"]}
         if task["state"] != "active":
             blockers.append("task_not_active")
-        if grants.get("discovery_join") != task["policy_hash"]:
-            blockers.append("discovery_approval_missing")
-        if not task["manifest_hash"] or grants.get("outbound") != task["manifest_hash"]:
-            blockers.append("outbound_approval_missing")
+        if task["phase"] != "ready":
+            blockers.append("task_not_started")
         if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
             blockers.append("global_stop")
         if task["mode"] == "live" and not self.live_enabled:
@@ -427,10 +486,6 @@ class Engine:
             "live_writes_enabled": self.live_enabled,
         }
 
-    @staticmethod
-    def phrase(task_id, stage, hash_value):
-        return f"确认 {task_id} {stage} {hash_value[:12]}"
-
     def _integrity(self, db, task, stage):
         policy = json.loads(task["policy"])
         snapshot = json.loads(task["account_snapshot"])
@@ -440,13 +495,8 @@ class Engine:
             row = db.execute("SELECT * FROM accounts WHERE id=?", (saved["id"],)).fetchone()
             if row is None or any(row[k] != v for k, v in saved.items()):
                 raise Conflict("账号配置已变化，请创建新任务")
-        grant = db.execute(
-            "SELECT hash FROM approvals WHERE task_id=? AND stage=?", (task["id"], stage)
-        ).fetchone()
-        expected = task["policy_hash"] if stage == "discovery_join" else task["manifest_hash"]
-        if not grant or grant["hash"] != expected:
-            raise Conflict("缺少有效的精确审批")
         if stage == "outbound":
+            expected = task["manifest_hash"]
             if not task["manifest"] or digest(json.loads(task["manifest"])) != expected:
                 raise Conflict("外发清单哈希不匹配")
             rows = db.execute(
@@ -458,59 +508,119 @@ class Engine:
             if payloads != manifest["items"] or any(
                 digest(p) != r["payload_hash"] for p, r in zip(payloads, rows)
             ):
-                raise Conflict("执行项与已批准清单不一致")
+                raise Conflict("执行项与已启动清单不一致")
         return policy
 
-    def approve(self, task_id, stage, phrase, actor="operator"):
-        if stage not in {"discovery_join", "outbound"}:
-            raise Conflict("审批阶段无效")
+    def start_task(self, task_id, *, source="client", actor="operator", sending=True):
+        """Persist an explicit start; no approval phrases or approval rows are required."""
+        task = self.task(task_id)
+        for item in task["items"]:
+            payload = {
+                k: v
+                for k, v in item["payload"].items()
+                if k not in {"position", "platform", "account_label"}
+            }
+            self.validate_item(task, ItemInput(**payload))
         with self.store.connect(write=True) as db:
             task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if not task:
-                raise NotFound("任务不存在")
+            if source == "scheduler" and (task["state"] != "active" or task["phase"] != "starting"):
+                raise Conflict("任务已暂停或启动状态已变化")
             if task["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
-            h = task["policy_hash"] if stage == "discovery_join" else task["manifest_hash"]
-            if not h or phrase != self.phrase(task_id, stage, h):
-                raise Conflict("请输入当前阶段显示的完整确认短语")
-            previous = db.execute(
-                "SELECT * FROM approvals WHERE task_id=? AND stage=?", (task_id, stage)
-            ).fetchone()
-            if previous:
-                self._integrity(db, task, stage)
+            self._integrity(db, task, "discovery_join")
+            if task["campaign_id"]:
+                campaign = db.execute(
+                    "SELECT state FROM campaigns WHERE id=?", (task["campaign_id"],)
+                ).fetchone()
+                if not campaign or campaign[0] in {"paused", "cancelled", "completed"}:
+                    raise Conflict("活动已暂停或结束，请先恢复活动")
+            if task["state"] == "active" and (
+                task["phase"] == "ready" or (task["phase"] == "starting" and not sending)
+            ):
+                if task["phase"] == "ready":
+                    self._integrity(db, task, "outbound")
             else:
                 if self.clock() >= epoch(json.loads(task["policy"])["ends_at"]):
                     raise Conflict("任务执行窗口已过期，请创建新任务")
-                if stage == "outbound":
-                    self._integrity(db, task, "discovery_join")
-                    if task["phase"] != "review":
-                        raise Conflict("请先冻结并预览最终外发清单")
-                    self._validate_outbound_readiness(db, task)
-                db.execute(
-                    "INSERT INTO approvals VALUES(?,?,?,?,?,?)",
-                    (task_id, stage, h, phrase, actor, self.clock()),
-                )
-                self._integrity(db, task, stage)
+                rows = db.execute(
+                    "SELECT * FROM items WHERE task_id=? ORDER BY position", (task_id,)
+                ).fetchall()
+                phase = "discovered"
+                if rows and sending:
+                    self._validate_outbound_readiness(db, task, check_membership=False)
+                    waiting = any(
+                        telegram_blocker(db, task, json.loads(r["payload"]), r["due_at"])
+                        for r in rows
+                    )
+                    if waiting:
+                        phase = "starting"
+                    else:
+                        self._freeze_manifest(db, task)
+                        phase = "ready"
                 db.execute(
                     "UPDATE tasks SET state='active',phase=?,updated_at=? WHERE id=?",
-                    ("ready" if stage == "outbound" else "discovered", self.clock(), task_id),
+                    (phase, self.clock(), task_id),
                 )
-                Store.audit(
-                    db,
-                    "approval.granted",
-                    {"stage": stage, "hash": h, "actor": actor},
-                    task_id,
-                    self.clock(),
-                )
+                if task["state"] != "active" or task["phase"] != phase:
+                    current = db.execute(
+                        "SELECT manifest_hash FROM tasks WHERE id=?", (task_id,)
+                    ).fetchone()
+                    Store.audit(
+                        db,
+                        "task.started",
+                        {
+                            "source": source,
+                            "actor": actor,
+                            "phase": phase,
+                            "policy_hash": task["policy_hash"],
+                            "manifest_hash": current[0],
+                        },
+                        task_id,
+                        self.clock(),
+                    )
         return self.task(task_id)
+
+    def start_and_run(self, task_id, *, source="client"):
+        """Shared client/Codex entry point for an explicit user execution instruction."""
+        from .campaigns import Campaigns
+        from .workers import WorkerRun
+
+        task = self.task(task_id)
+        if task.get("campaign_id"):
+            Campaigns(self).populate(task_id)
+        self.start_task(task_id, source=source)
+        runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
+        if runtime and runtime["value"] == "pooled":
+            from .queue_store import JobQueue
+
+            JobQueue(self).sync(task_id)
+            task = self.task(task_id)
+            task["execution_result"] = {"joins": [], "processed": [], "queued": True}
+            return task
+        with WorkerRun(self.store, task_id, live_enabled=self.live_enabled) as sender:
+            sender.phase("executing")
+            joined = self.run_joins(task_id)
+            current = self.task(task_id)
+            if current["phase"] == "starting" and current["state"] == "active":
+                self.start_task(task_id, source="scheduler")
+            result = self.run_once(task_id)
+        task = self.task(task_id)
+        task["execution_result"] = {"joins": joined["processed"], **result}
+        return task
 
     def validate_item(self, task, value: ItemInput, *, account=None, opportunity=None):
         if value.account_id not in task["account_ids"]:
-            raise Conflict("账号不在该任务的批准范围内")
+            raise Conflict("账号不在该任务范围内")
         account = account or self.account(value.account_id)
         if (
             account["mode"] == "live"
-            and account["platform"] in {"x", "reddit"}
+            and (
+                account["platform"] == "reddit"
+                or (
+                    account["platform"] == "x"
+                    and value.action not in account.get("automatic_actions", [])
+                )
+            )
             and value.execution_mode != "manual"
         ):
             raise Conflict("此平台当前仅开放人工互动清单，请选择人工执行方式")
@@ -537,6 +647,8 @@ class Engine:
                 "target": value.target,
                 "reply_to": value.reply_to,
                 "discord_reply_to": value.discord_reply_to,
+                "tiktok_video_id": value.tiktok_video_id,
+                "tiktok_comment_id": value.tiktok_comment_id,
             }
             if (
                 value.content_key != source["content_key"]
@@ -555,14 +667,36 @@ class Engine:
         if not epoch(policy["starts_at"]) <= epoch(value.scheduled_at) < epoch(policy["ends_at"]):
             raise Conflict("计划时间超出任务执行窗口")
         if policy["target_allowlist"] and value.target not in policy["target_allowlist"]:
-            raise Conflict("目标不在批准的目标边界内")
+            raise Conflict("目标不在任务的目标边界内")
         if RISK.search(value.target):
             raise Conflict("目标包含被禁止的类别信号")
-        if value.action not in {"like", "repost"} and not (value.text.strip() or value.media):
+        no_text_actions = {"like", "repost"}
+        if account["platform"] == "tiktok":
+            from .backends.tiktok import NO_TEXT_ACTIONS
+
+            no_text_actions |= NO_TEXT_ACTIONS
+        if value.action not in no_text_actions and not (value.text.strip() or value.media):
             raise Conflict("此动作需要正文或媒体")
         if value.action in {"like", "repost"} and (value.text or value.media or value.title):
             raise Conflict("点赞和转发不能附带正文或媒体")
         platform = account["platform"]
+        if platform != "tiktok" and (
+            value.tiktok_video_id or value.tiktok_comment_id or value.tiktok_options
+        ):
+            raise Conflict("TikTok 字段仅用于 TikTok")
+        if platform == "tiktok":
+            from .backends.common import BackendError
+            from .backends.tiktok import validate_item
+
+            try:
+                validate_item(value.model_dump())
+            except (BackendError, ValueError) as exc:
+                raise Conflict(getattr(exc, "safe_code", "TikTok 发布选项无效")) from None
+            for entry in value.media:
+                self.verify_media(entry.model_dump())
+                ceiling = 20 * 1024 * 1024 if entry.media_type == "IMAGE" else 1024 * 1024 * 1024
+                if Path(entry.path).stat().st_size > ceiling:
+                    raise Conflict("TikTok 图片最多 20 MiB，视频最多 1 GiB；网页上传仍最多 50 MiB")
         if platform != "discord" and value.discord_reply_to:
             raise Conflict("Discord 原消息 ID 仅用于 Discord")
         if platform == "discord":
@@ -648,7 +782,7 @@ class Engine:
             self.verify_media(media.model_dump())
         return account
 
-    def _validate_outbound_readiness(self, db, task):
+    def _validate_outbound_readiness(self, db, task, *, check_membership=True):
         now = self.clock()
         if now >= epoch(json.loads(task["policy"])["ends_at"]):
             raise Conflict("任务执行窗口已过期，请创建新任务")
@@ -659,7 +793,9 @@ class Engine:
             native = payload["action"] in {"schedule_message", "schedule_file"}
             if now - row["due_at"] > DELIVERY_GRACE_SECONDS or (native and row["due_at"] <= now):
                 raise Conflict("清单包含已过期的计划时间，请创建新任务")
-            reason = telegram_blocker(db, task, payload, row["due_at"])
+            reason = (
+                telegram_blocker(db, task, payload, row["due_at"]) if check_membership else None
+            )
             if reason:
                 raise Conflict(f"{payload['target']}：{REASONS[reason]}")
 
@@ -720,7 +856,11 @@ class Engine:
         with self.store.connect(write=True) as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             self._integrity(db, row, "discovery_join")
-            if row["manifest_hash"] or row["state"] in {"cancelled", "completed"}:
+            if (
+                row["manifest_hash"]
+                or row["phase"] == "starting"
+                or row["state"] in {"cancelled", "completed"}
+            ):
                 raise Conflict("清单已经冻结；变更内容请创建新任务")
             if row["campaign_id"] and any(not p.get("opportunity_id") for p in payloads):
                 raise Conflict("活动执行项必须关联已分配的共享内容")
@@ -769,40 +909,44 @@ class Engine:
             self._integrity(db, row, "discovery_join")
             if row["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
-            if not row["manifest_hash"]:
-                self._validate_outbound_readiness(db, row)
-                quotas.reserve(db, row)
-                # Read items inside this transaction, so a concurrent edit cannot race the freeze.
-                items = [
-                    json.loads(r["payload"])
-                    for r in db.execute(
-                        "SELECT payload FROM items WHERE task_id=? ORDER BY position", (task_id,)
-                    )
-                ]
-                manifest = {
-                    "task_id": task_id,
-                    "accounts": json.loads(row["account_snapshot"]),
-                    "policy": json.loads(row["policy"]),
-                    "items": items,
-                }
-                if row["campaign_id"]:
-                    manifest["campaign_id"] = row["campaign_id"]
-                    manifest["profiles"] = {
-                        r["account_id"]: json.loads(r["profile_snapshot"])
-                        for r in db.execute(
-                            "SELECT account_id,profile_snapshot FROM campaign_assignments WHERE task_id=?",
-                            (task_id,),
-                        )
-                    }
-                h = digest(manifest)
-                db.execute(
-                    "UPDATE tasks SET manifest=?,manifest_hash=?,phase='review',updated_at=? WHERE id=?",
-                    (canonical(manifest), h, self.clock(), task_id),
-                )
-                Store.audit(
-                    db, "manifest.frozen", {"hash": h, "count": len(items)}, task_id, self.clock()
-                )
+            self._freeze_manifest(db, row)
         return self.task(task_id)
+
+    def _freeze_manifest(self, db, row):
+        if row["manifest_hash"]:
+            self._integrity(db, row, "outbound")
+            return
+        self._validate_outbound_readiness(db, row)
+        quotas.reserve(db, row)
+        items = [
+            json.loads(r["payload"])
+            for r in db.execute(
+                "SELECT payload FROM items WHERE task_id=? ORDER BY position", (row["id"],)
+            )
+        ]
+        manifest = {
+            "task_id": row["id"],
+            "accounts": json.loads(row["account_snapshot"]),
+            "policy": json.loads(row["policy"]),
+            "items": items,
+        }
+        if row["campaign_id"]:
+            manifest["campaign_id"] = row["campaign_id"]
+            manifest["profiles"] = {
+                r["account_id"]: json.loads(r["profile_snapshot"])
+                for r in db.execute(
+                    "SELECT account_id,profile_snapshot FROM campaign_assignments WHERE task_id=?",
+                    (row["id"],),
+                )
+            }
+        h = digest(manifest)
+        db.execute(
+            "UPDATE tasks SET manifest=?,manifest_hash=?,phase='review',updated_at=? WHERE id=?",
+            (canonical(manifest), h, self.clock(), row["id"]),
+        )
+        Store.audit(
+            db, "manifest.frozen", {"hash": h, "count": len(items)}, row["id"], self.clock()
+        )
 
     def change_state(self, task_id, state):
         self.task(task_id)
@@ -843,6 +987,9 @@ class Engine:
                 "UPDATE meta SET value=? WHERE key='global_stop'", ("1" if stopped else "0",)
             )
             Store.audit(db, "global_stop", {"stopped": stopped})
+        from .cloud_control import queue_settings
+
+        queue_settings(self, {"global_stop": stopped})
         return {
             "global_stop": stopped,
             "native_schedule_note": "已提交的平台排期不受本地停止开关撤回",
@@ -935,7 +1082,7 @@ class Engine:
                 if not campaign or campaign[0] in {"paused", "cancelled"}:
                     return self._skip(item_id, "task_not_active", db)
             if task["phase"] != "ready":
-                return self._skip(item_id, "outbound_approval_missing", db)
+                return self._skip(item_id, "task_not_started", db)
             policy = self._integrity(db, task, "outbound")
             if db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
                 return self._skip(item_id, "global_stop", db)
@@ -943,9 +1090,17 @@ class Engine:
             account = db.execute(
                 "SELECT * FROM accounts WHERE id=?", (row["account_id"],)
             ).fetchone()
+            account = dict(account)
+            account["automatic_actions"] = automatic_actions(account)
             if (
                 account["mode"] == "live"
-                and account["platform"] in {"x", "reddit"}
+                and (
+                    account["platform"] == "reddit"
+                    or (
+                        account["platform"] == "x"
+                        and payload["action"] not in account["automatic_actions"]
+                    )
+                )
                 and payload.get("execution_mode", "automatic") != "manual"
             ):
                 return self._skip(item_id, "platform_policy_blocked", db)
@@ -1061,6 +1216,16 @@ class Engine:
             }
 
     def run_once(self, task_id=None):
+        runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
+        if (
+            runtime
+            and runtime["value"] == "pooled"
+            and not getattr(self.adapters.context, "job", None)
+        ):
+            from .queue_store import JobQueue
+
+            JobQueue(self).sync(task_id)
+            return {"processed": [], "queued": True}
         self.recover()
         if task_id:
             self.task(task_id)
@@ -1128,11 +1293,7 @@ class Engine:
                     )
                 continue
             elif row["phase"] != "ready":
-                reason = (
-                    "discovery_approval_missing"
-                    if row["phase"] == "discovery"
-                    else "outbound_approval_missing"
-                )
+                reason = "task_not_started"
             elif stopped:
                 reason = "global_stop"
             elif (
@@ -1170,7 +1331,9 @@ class Engine:
         if not rows:
             return []
         try:
-            with self.lanes.acquire(rows[0]["account_id"], limits):
+            account = self.account(rows[0]["account_id"])
+            route = route_for(account, json.loads(rows[0]["payload"]))
+            with self.lanes.acquire(rows[0]["account_id"], limits, resource=route.resource):
                 return self._run_account_rows(rows, stopped)["processed"]
         except AccountBusy:
             for row in rows:
@@ -1187,9 +1350,7 @@ class Engine:
             if row["phase"] != "ready":
                 self._skip(
                     row["id"],
-                    "discovery_approval_missing"
-                    if row["phase"] == "discovery"
-                    else "outbound_approval_missing",
+                    "task_not_started",
                 )
                 continue
             if stopped:
@@ -1234,7 +1395,7 @@ class Engine:
                     self._skip(row["id"], reason)
                     continue
             except Conflict as exc:
-                self._skip(row["id"], "approval_integrity_failed")
+                self._skip(row["id"], "manifest_integrity_failed")
                 processed.append({"item_id": row["id"], "status": "blocked", "reason": str(exc)})
                 continue
             account = self.account(row["account_id"])
@@ -1284,7 +1445,7 @@ class Engine:
                     continue
                 claim = self._claim(row["id"], gate)
             except Conflict as exc:
-                self._skip(row["id"], "approval_integrity_failed")
+                self._skip(row["id"], "manifest_integrity_failed")
                 processed.append({"item_id": row["id"], "status": "blocked", "reason": str(exc)})
                 continue
             if not claim:
@@ -1362,6 +1523,10 @@ class Engine:
                 "external_reference",
                 "published_at",
                 "scheduled_message_ids",
+                "publish_id",
+                "post_ids",
+                "comment_id",
+                "platform_status",
             )
             + FIELDS
             if k in result
@@ -1449,11 +1614,26 @@ class Engine:
             "result": json.loads(row["result"]),
         }
         account = self.account(row["account_id"])
-        if account["platform"] == "discord" and account["cooldown_until"] > self.clock():
-            raise Conflict("Discord 账号仍在冷却，请稍后核对")
+        if (
+            account["platform"] in {"discord", "tiktok"}
+            and account["cooldown_until"] > self.clock()
+        ):
+            raise Conflict("账号仍在冷却，请稍后核对")
         result = self.call(account, "verify", payload, row["task_id"])
         self.apply_cooldown(account["id"], result)
         if not result.get("verified"):
+            if account["platform"] == "tiktok":
+                progress = {
+                    k: result[k]
+                    for k in ("publish_id", "post_ids", "comment_id", "platform_status", "reason")
+                    if k in result
+                }
+                with self.store.connect(write=True) as db:
+                    db.execute(
+                        "UPDATE items SET result=? WHERE id=? AND status='unknown'",
+                        (canonical({**json.loads(row["result"]), **progress}), item_id),
+                    )
+                return {"status": row["status"], **progress}
             return {"status": row["status"], "reason": "not_conclusively_verified"}
         # Reconciliation never turns an item back into a retryable state.
         with self.store.connect(write=True) as db:
@@ -1558,6 +1738,7 @@ class Engine:
             "reddit": {"www.reddit.com", "reddit.com", "old.reddit.com"},
             "telegram": {"t.me"},
             "discord": {"discord.com"},
+            "tiktok": {"www.tiktok.com", "tiktok.com"},
         }
         reference = urlparse(value.external_reference)
         exact = value.observed_text == payload["text"]
@@ -1629,8 +1810,8 @@ class Engine:
         with self.store.connect(write=True) as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             self._integrity(db, row, "discovery_join")
-            if row["state"] != "active":
-                raise Conflict("任务未激活")
+            if row["state"] in {"paused", "cancelled", "completed"}:
+                raise Conflict("任务已暂停或结束")
             existing = db.execute(
                 "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND target=?",
                 (task_id, value.account_id, value.target),
@@ -1701,8 +1882,8 @@ class Engine:
         with self.store.connect() as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             self._integrity(db, row, "discovery_join")
-            if row["state"] != "active":
-                raise Conflict("任务未激活")
+            if row["state"] in {"paused", "cancelled", "completed"}:
+                raise Conflict("任务已暂停或结束")
         account = self.account(account_id)
         if "discover" not in CAPABILITIES[account["platform"]]:
             raise Conflict("该平台请通过候选录入接入")
@@ -1716,6 +1897,16 @@ class Engine:
 
     def run_joins(self, task_id):
         task = self.task(task_id)
+        runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
+        if (
+            runtime
+            and runtime["value"] == "pooled"
+            and not getattr(self.adapters.context, "job", None)
+        ):
+            from .queue_store import JobQueue
+
+            JobQueue(self).sync(task_id)
+            return {"processed": [], "queued": True}
         processed = []
         if not task["policy"]["max_joins"]:
             return {"processed": processed}
@@ -1751,6 +1942,8 @@ class Engine:
             return "candidate_rejected"
         if task["state"] != "active":
             return "task_not_active"
+        if task["phase"] not in {"discovered", "starting", "ready"}:
+            return "task_not_started"
         if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
             return "global_stop"
         if account["mode"] == "live" and not self.live_enabled:
@@ -1770,13 +1963,15 @@ class Engine:
             return "pacing_wait"
         return None
 
-    def _run_joins(self, task_id, account_id):
+    def _run_joins(self, task_id, account_id, candidate_id=None):
         self.recover()
         task = self.task(task_id)
         processed = []
         if not task["policy"]["max_joins"]:
             return {"processed": []}
         for candidate in task["candidates"]:
+            if candidate_id and candidate["id"] != candidate_id:
+                continue
             if candidate["account_id"] != account_id:
                 continue
             if candidate["state"] != "not_attempted":
@@ -1976,6 +2171,26 @@ class Engine:
             processed.append({"candidate_id": candidate["id"], "status": status})
         return {"processed": processed}
 
+    def run_reference_job(self, job):
+        """Execute one persisted reference through the existing publication safeguards."""
+        if job["kind"] == "join":
+            account = self.account(job["account_id"])
+            with self.lanes.acquire(account["id"], self.execution_settings()):
+                result = self._run_joins(job["task_id"], account["id"], job["reference_id"])
+            task = self.task(job["task_id"])
+            if task["state"] == "active" and task["phase"] == "starting":
+                self.start_task(task["id"], source="scheduler")
+            return result
+        self.recover()
+        row = self.store.one(
+            "SELECT i.id,i.account_id,i.task_id,i.payload,i.due_at,t.policy,t.mode,t.next_at,t.state,t.phase "
+            "FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.id=? AND i.status='not_attempted' AND i.attempt_id IS NULL",
+            (job["reference_id"],),
+        )
+        if not row:
+            return {"processed": []}
+        return {"processed": self._run_account_group([row], False, self.execution_settings())}
+
     def reconcile_join(self, candidate_id):
         row = self.store.one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
         if not row:
@@ -2026,11 +2241,11 @@ class Engine:
     def run_cycle(self):
         if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
             return self.run_once()
-        for row in self.store.rows(
-            "SELECT t.id FROM tasks t JOIN approvals a ON a.task_id=t.id AND a.stage='discovery_join' WHERE t.state='active'"
-        ):
+        for row in self.store.rows("SELECT id,phase FROM tasks WHERE state='active'"):
             try:
                 self.run_joins(row["id"])
+                if row["phase"] == "starting":
+                    self.start_task(row["id"], source="scheduler")
             except Conflict:
                 pass
         return self.run_once()

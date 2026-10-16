@@ -68,7 +68,7 @@ class ReadinessTests(unittest.TestCase):
         return self.engine.task(task["id"])["candidates"][0]
 
     def discovery(self, task):
-        return self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        return self.engine.start_task(task["id"], sending=False)
 
     def items(self, task, **fields):
         return self.engine.set_items(
@@ -92,7 +92,7 @@ class ReadinessTests(unittest.TestCase):
         task = self.discovery(self.task())
         self.items(task)
         task = self.engine.prepare(task["id"])
-        return self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        return self.engine.start_task(task["id"])
 
     def membership(self, candidate, state="joined", **changes):
         result = {
@@ -189,7 +189,7 @@ class ReadinessTests(unittest.TestCase):
             task, action="schedule_message", reply_to=None, scheduled_at=iso(self.now + 4000)
         )
         task = self.engine.prepare(task["id"])
-        task = self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        task = self.engine.start_task(task["id"])
         with patch.object(self.provider, "call", wraps=self.provider.call) as calls:
             self.engine.run_once(task["id"])
         calls.assert_not_called()
@@ -209,7 +209,7 @@ class ReadinessTests(unittest.TestCase):
             self.engine.prepare(task["id"])
         self.items(task, scheduled_at=iso(self.now + 3600))
         task = self.engine.prepare(task["id"])
-        task = self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        task = self.engine.start_task(task["id"])
         frozen_hash = task["manifest_hash"]
         self.engine.run_once(task["id"])
         self.assertFalse(self.store.rows("SELECT * FROM attempts"))
@@ -249,11 +249,11 @@ class ReadinessTests(unittest.TestCase):
         self.items(task)
         task = self.engine.prepare(task["id"])
         self.membership(candidate, "unknown")
-        with self.assertRaisesRegex(Conflict, "入群回执"):
-            self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
-        self.assertEqual(len(self.engine.task(task["id"])["approvals"]), 1)
+        waiting = self.engine.start_task(task["id"])
+        self.assertEqual(waiting["phase"], "starting")
+        self.assertEqual(len(self.engine.task(task["id"])["approvals"]), 0)
         self.membership(candidate)
-        task = self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        task = self.engine.start_task(task["id"])
         self.membership(candidate, "unknown")
         with patch.object(self.provider, "call", wraps=self.provider.call) as calls:
             self.engine.run_once(task["id"])
@@ -275,8 +275,8 @@ class ReadinessTests(unittest.TestCase):
         task = self.engine.prepare(task["id"])
         self.now += 10
         with self.assertRaisesRegex(Conflict, "窗口已过期"):
-            self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
-        self.assertEqual(len(self.engine.task(task["id"])["approvals"]), 1)
+            self.engine.start_task(task["id"])
+        self.assertEqual(len(self.engine.task(task["id"])["approvals"]), 0)
 
     def test_elapsed_delivery_time_is_rejected_at_freeze_and_approval(self):
         task = self.discovery(self.task())
@@ -288,21 +288,21 @@ class ReadinessTests(unittest.TestCase):
         task = self.engine.prepare(task["id"])
         self.now += 902
         with self.assertRaisesRegex(Conflict, "计划时间"):
-            self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+            self.engine.start_task(task["id"])
 
-    def test_existing_approval_remains_idempotent_after_window_without_resuming(self):
+    def test_expired_paused_task_cannot_be_restarted(self):
         task = self.ready()
         self.engine.change_state(task["id"], "paused")
         self.now += 7200
-        task = self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
-        self.assertEqual(task["state"], "paused")
-        self.assertEqual(len(task["approvals"]), 2)
+        with self.assertRaisesRegex(Conflict, "窗口已过期"):
+            self.engine.start_task(task["id"])
+        self.assertEqual(self.engine.task(task["id"])["state"], "paused")
 
     def test_immediate_delivery_keeps_existing_grace_and_native_schedule_must_be_future(self):
         task = self.discovery(self.task())
         self.items(task, scheduled_at=iso(self.now - 5))
-        frozen = self.engine.prepare(task["id"])
-        self.engine.approve(task["id"], "outbound", frozen["outbound_phrase"])
+        self.engine.prepare(task["id"])
+        self.engine.start_task(task["id"])
         self.engine.run_once(task["id"])
         self.assertEqual(self.engine.task(task["id"])["items"][0]["status"], "confirmed")
         task = self.discovery(self.task())
@@ -320,7 +320,7 @@ class ReadinessTests(unittest.TestCase):
             self.engine.run_cycle()
         calls.assert_not_called()
         current = self.engine.task(task["id"])
-        self.assertEqual(current["items"][0]["result"]["skip_reason"], "outbound_approval_missing")
+        self.assertEqual(current["items"][0]["result"]["skip_reason"], "task_not_started")
         self.assertEqual(current["manifest_hash"], task["manifest_hash"])
         self.assertEqual(current["items"][0]["payload_hash"], task["items"][0]["payload_hash"])
         self.assertEqual(len(self.store.rows("SELECT * FROM audit WHERE kind='item.skipped'")), 1)
@@ -351,16 +351,14 @@ class ReadinessTests(unittest.TestCase):
         acquire.assert_not_called()
         calls.assert_not_called()
         audits = self.store.rows("SELECT details FROM audit WHERE kind='item.skipped'")
-        self.assertEqual(
-            [json.loads(a["details"])["reason"] for a in audits], ["outbound_approval_missing"]
-        )
+        self.assertEqual([json.loads(a["details"])["reason"] for a in audits], ["task_not_started"])
         self.assertFalse(self.store.rows("SELECT * FROM attempts"))
 
     def test_approved_future_delivery_never_acquires_account_lane(self):
         task = self.discovery(self.task())
         self.items(task, scheduled_at=iso(self.now + 100))
         task = self.engine.prepare(task["id"])
-        task = self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        task = self.engine.start_task(task["id"])
         with patch.object(self.engine.lanes, "acquire") as acquire:
             self.engine.run_once(task["id"])
         acquire.assert_not_called()
@@ -376,6 +374,7 @@ class ReadinessTests(unittest.TestCase):
         task = self.discovery(self.task(max_joins=1, starts_at=iso(self.now + 100)))
         self.candidate(task)
         self.items(task, scheduled_at=iso(self.now + 4000))
+        self.engine.start_task(task["id"])
         with patch.object(self.engine.lanes, "acquire") as acquire:
             self.engine.run_cycle()
         acquire.assert_not_called()
@@ -388,25 +387,19 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(len(self.store.rows("SELECT * FROM join_attempts")), 1)
         self.assertFalse(self.store.rows("SELECT * FROM attempts"))
 
-    def test_membership_to_approval_workflow_never_grants_outbound_itself(self):
-        task = self.discovery(self.task(max_joins=1))
+    def test_explicit_start_waits_for_membership_then_continues_automatically(self):
+        task = self.task(max_joins=1)
         self.candidate(task)
         self.items(task, scheduled_at=iso(self.now + 4000))
-        task = self.engine.task(task["id"])
+        task = self.engine.start_task(task["id"], source="codex")
+        self.assertEqual(task["phase"], "starting")
         self.assertEqual(task["readiness"]["workflow"]["status"], "waiting_membership")
-        self.assertFalse(task["readiness"]["workflow"]["can_prepare"])
         self.engine.run_cycle()
         task = self.engine.task(task["id"])
-        self.assertTrue(task["readiness"]["workflow"]["can_prepare"])
-        self.assertEqual(task["readiness"]["workflow"]["counts"]["membership_verified"], 1)
-        self.assertEqual(len(task["approvals"]), 1)
-        self.assertIsNone(task["manifest_hash"])
-        task = self.engine.prepare(task["id"])
-        self.assertEqual(task["readiness"]["workflow"]["status"], "awaiting_outbound_approval")
-        self.engine.run_cycle()
-        self.assertFalse(self.store.rows("SELECT * FROM attempts"))
-        task = self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        self.assertEqual(task["phase"], "ready")
+        self.assertEqual(task["approvals"], [])
         self.assertEqual(task["readiness"]["workflow"]["status"], "waiting_schedule")
+        self.assertFalse(self.store.rows("SELECT * FROM attempts"))
         self.now += 4000
         self.engine.run_cycle()
         self.engine.run_cycle()
@@ -425,7 +418,7 @@ class ReadinessTests(unittest.TestCase):
         task = self.engine.task(task["id"])
         self.assertEqual(task["items"][0]["status"], "missed")
         self.assertEqual(task["readiness"]["workflow"]["status"], "expired")
-        self.assertEqual(len(task["approvals"]), 1)
+        self.assertEqual(len(task["approvals"]), 0)
 
     def test_cooldown_is_filtered_without_acquiring_a_lane_or_sending(self):
         task = self.ready()

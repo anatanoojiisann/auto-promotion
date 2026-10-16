@@ -91,7 +91,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     def approved_task(self):
         task = self.task()
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
+        self.engine.start_task(task["id"], sending=False)
         self.engine.set_items(
             task["id"],
             [
@@ -105,11 +105,11 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         task = self.engine.prepare(task["id"])
-        return self.engine.approve(task["id"], "outbound", task["outbound_phrase"])
+        return self.engine.start_task(task["id"])
 
-    async def test_catalog_and_accounts_cover_all_five_platforms(self):
+    async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 43)
+        self.assertEqual(len(tools), 47)
         self.assertTrue(
             {
                 "list_task_templates",
@@ -148,7 +148,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tools["interaction_statistics"].annotations.readOnlyHint)
         self.assertTrue(tools["statistical_reports"].annotations.readOnlyHint)
         self.assertTrue(tools["system_status"].annotations.readOnlyHint)
-        self.assertFalse(tools["run_approved_task"].annotations.readOnlyHint)
+        self.assertFalse(tools["start_task"].annotations.readOnlyHint)
         self.assertFalse({"approve", "set_stop", "login", "send_message"} & tools.keys())
         status = await self.call("system_status")
         self.assertEqual({p["platform"] for p in status["platforms"]}, set(PLATFORMS))
@@ -167,10 +167,9 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(task["approvals"], [])
         self.assertEqual(self.provider.sends, 0)
-        with self.assertRaises(ToolError):
-            await self.call("run_approved_task", task_id=task["id"])
-        with self.assertRaises(ToolError):
-            await self.call("run_approved_joins", task_id=task["id"])
+        started = await self.call("start_task", task_id=task["id"])
+        self.assertEqual(started["approvals"], [])
+        self.assertEqual(started["execution_result"]["processed"], [])
         self.assertEqual(self.provider.sends, 0)
 
     async def test_reusable_template_and_task_evidence_keep_approvals_task_specific(self):
@@ -195,22 +194,13 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(source["id"], (await self.call("task_review", task_id=source["id"]))["html"])
         self.assertEqual(self.provider.sends, 0)
-        with self.assertRaises(ToolError):
-            await self.call("run_approved_task", task_id=fresh["id"])
-        with self.assertRaises(ToolError):
-            await self.call("run_approved_joins", task_id=fresh["id"])
+        self.assertEqual(fresh["state"], "draft")
+        started = await self.call("start_task", task_id=fresh["id"])
+        self.assertEqual(started["execution_result"]["processed"], [])
         self.assertEqual(self.provider.sends, 0)
 
-    async def test_discovery_requires_human_policy_approval(self):
+    async def test_discovery_is_read_only_without_approval(self):
         task = self.task()
-        with self.assertRaises(ToolError):
-            await self.call(
-                "discover_candidates",
-                task_id=task["id"],
-                account_id=self.accounts["telegram"]["id"],
-            )
-        self.assertEqual(self.provider.reads, 0)
-        self.engine.approve(task["id"], "discovery_join", task["discovery_phrase"])
         result = await self.call(
             "discover_candidates", task_id=task["id"], account_id=self.accounts["telegram"]["id"]
         )
@@ -228,15 +218,15 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
     async def test_approved_execution_honors_stop_and_attempts_once(self):
         task = self.approved_task()
         self.assertEqual(
-            (await self.call("run_approved_task", task_id=task["id"]))["processed"], []
+            (await self.call("start_task", task_id=task["id"]))["execution_result"]["processed"], []
         )
         self.assertEqual(self.provider.sends, 0)
         self.engine.set_stop(False)
-        result = await self.call("run_approved_task", task_id=task["id"])
-        self.assertEqual(result["processed"][0]["status"], "confirmed")
+        result = await self.call("start_task", task_id=task["id"])
+        self.assertEqual(result["execution_result"]["processed"][0]["status"], "confirmed")
         self.assertEqual(self.provider.sends, 1)
         with self.assertRaises(ToolError):
-            await self.call("run_approved_task", task_id=task["id"])
+            await self.call("start_task", task_id=task["id"])
         self.assertEqual(self.provider.sends, 1)
 
     async def test_platform_errors_never_expose_private_values(self):
@@ -272,7 +262,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 async with ClientSession(read, write) as client:
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
-                    self.assertEqual(len((await client.list_tools()).tools), 43)
+                    self.assertEqual(len((await client.list_tools()).tools), 47)
                     status = await client.call_tool("system_status", {})
                     self.assertFalse(status.isError)
                     value = status.structuredContent or json.loads(status.content[0].text)

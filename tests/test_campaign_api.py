@@ -60,7 +60,7 @@ class CampaignAPITests(unittest.TestCase):
         ):
             self.assertEqual(self.call(path, auth=False)[0], 401)
 
-    def test_api_plan_and_both_human_approval_stages(self):
+    def test_api_plan_and_direct_start(self):
         account, pool = self.fixture()
         status, imported, _ = self.call(
             "/api/opportunities/import",
@@ -104,21 +104,12 @@ class CampaignAPITests(unittest.TestCase):
         task_id = batched["tasks"][0]["id"]
         task = self.call(f"/api/tasks/{task_id}")[1]
         self.assertEqual(task["approvals"], [])
-        self.assertEqual(self.call(f"/api/tasks/{task_id}/populate", "POST")[0], 409)
-        status, task, _ = self.call(
-            f"/api/tasks/{task_id}/approve/discovery_join",
-            "POST",
-            {"phrase": task["discovery_phrase"]},
-        )
-        self.assertEqual((status, len(task["items"])), (200, 1))
-        self.assertEqual(task["items"][0]["payload"]["profile_version"], 1)
-        status, task, _ = self.call(f"/api/tasks/{task_id}/prepare", "POST")
+        self.assertEqual(self.call(f"/api/tasks/{task_id}/populate", "POST")[0], 200)
+        status, task, _ = self.call(f"/api/tasks/{task_id}/start", "POST")
         self.assertEqual(status, 200)
-        status, task, _ = self.call(
-            f"/api/tasks/{task_id}/approve/outbound", "POST", {"phrase": task["outbound_phrase"]}
-        )
-        self.assertEqual((status, task["phase"]), (200, "ready"))
-        self.assertEqual(len(task["approvals"]), 2)
+        self.assertEqual(task["phase"], "ready")
+        self.assertTrue(task["manifest_hash"])
+        self.assertEqual(task["approvals"], [])
         self.assertTrue(
             self.app.state.engine.store.one("SELECT value FROM meta WHERE key='global_stop'")[
                 "value"

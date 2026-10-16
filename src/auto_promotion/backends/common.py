@@ -58,6 +58,19 @@ def read_profile(platform, label, *, accounts_dir=None):
         raise BackendError("InvalidAccountConfiguration") from None
 
 
+def automatic_actions(account):
+    """Account-local opt-in; existing X connections remain read-only by default."""
+    if account["platform"] != "x" or account["mode"] != "live":
+        return []
+    try:
+        profile = read_profile("x", account["backend_label"])
+    except BackendError:
+        return []
+    if profile.get("browser_channel") == "browser_use":
+        return []
+    return ["reply"] if "reply" in profile.get("automatic_actions", []) else []
+
+
 def save_profile(platform, label, data, *, accounts_dir=None):
     root = profile_path(platform, label, accounts_dir=accounts_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -154,7 +167,7 @@ class Receipts:
 
 
 def verify_claim(request):
-    """A direct provider invocation cannot bypass durable task approvals."""
+    """A direct provider invocation must belong to an explicitly started task."""
     platform = request["platform"]
     if (
         os.getenv("AUTO_PROMOTION_LIVE_WRITES") != "1"
@@ -166,6 +179,12 @@ def verify_claim(request):
 
     with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
+        from ..queue_store import verify_job_claim
+
+        try:
+            verify_job_claim(db, request)
+        except ValueError as exc:
+            raise BackendError(str(exc)) from None
         payload = request["payload"]
         join = request["operation"] == "join"
         row = db.execute(
@@ -190,6 +209,8 @@ def verify_claim(request):
         stop = db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()
         if not task or task["state"] != "active" or not stop or stop[0] != "0":
             raise BackendError("ExecutionStopped")
+        if task["phase"] not in ({"discovered", "starting", "ready"} if join else {"ready"}):
+            raise BackendError("TaskNotStarted")
         if "campaign_id" in task.keys() and task["campaign_id"]:
             campaign = db.execute(
                 "SELECT state FROM campaigns WHERE id=?", (task["campaign_id"],)
@@ -214,7 +235,12 @@ def verify_claim(request):
             item = json.loads(row["payload"])
             if item.get("execution_mode") == "manual":
                 raise BackendError("ManualActionMustNotUseBackend")
-            if account["platform"] in {"x", "reddit"}:
+            current_account = dict(account)
+            current_account["automatic_actions"] = automatic_actions(current_account)
+            if account["platform"] == "reddit" or (
+                account["platform"] == "x"
+                and item["action"] not in current_account["automatic_actions"]
+            ):
                 raise BackendError("PlatformAutomationNotEnabled")
             if item.get("opportunity_id"):
                 from ..planner import execution_mode
@@ -224,7 +250,7 @@ def verify_claim(request):
                 ).fetchone()
                 if (
                     not source
-                    or execution_mode(dict(account), json.loads(source[0]))[0] != "automatic"
+                    or execution_mode(current_account, json.loads(source[0]))[0] != "automatic"
                 ):
                     raise BackendError("TargetPermissionRevoked")
                 content = json.loads(source[0])
@@ -242,6 +268,25 @@ def verify_claim(request):
                 actual = hashlib.sha256(Path(media["path"]).read_bytes()).hexdigest()
                 if actual != media["sha256"]:
                     raise BackendError("ApprovedMediaChanged")
+        from ..cloud_control import CloudControl, CloudUnavailable
+
+        cloud = CloudControl.configured()
+        required = db.execute(
+            "SELECT value FROM meta WHERE key='cloud_control_required'"
+        ).fetchone()
+        if not cloud and required and required[0] == "1":
+            raise BackendError("CloudAuthorizationUnavailable")
+        if cloud:
+            attempt_id = payload.get("attempt_id")
+            if join:
+                attempt = db.execute(
+                    "SELECT id FROM join_attempts WHERE candidate_id=?", (row["id"],)
+                ).fetchone()
+                attempt_id = attempt["id"] if attempt else None
+            try:
+                cloud.guard(request.get("execution_job"), attempt_id)
+            except CloudUnavailable:
+                raise BackendError("CloudAuthorizationUnavailable") from None
 
 
 def language_evidence(text):

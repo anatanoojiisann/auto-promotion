@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -111,6 +113,16 @@ class AdapterRegistry:
         self.timeout = timeout
         self.simulation = SimulationAdapter()
         self.database = None
+        self.context = threading.local()
+
+    @contextmanager
+    def execution_job(self, job):
+        previous = getattr(self.context, "job", None)
+        self.context.job = job
+        try:
+            yield
+        finally:
+            self.context.job = previous
 
     def commissioned(self, account):
         return account["mode"] == "simulation" or (
@@ -124,8 +136,8 @@ class AdapterRegistry:
         if account["mode"] == "simulation":
             return self.simulation.call(account, operation, payload)
         legacy = os.getenv("AP_" + account["platform"].upper() + "_BACKEND", "builtin") == "legacy"
-        if legacy and account["platform"] == "discord":
-            raise RuntimeError("discord_legacy_backend_unsupported")
+        if legacy and account["platform"] in {"discord", "tiktok"}:
+            raise RuntimeError(account["platform"] + "_legacy_backend_unsupported")
         root = self.workspace / PROJECTS[account["platform"]] if legacy else Path.cwd()
         python = Path(sys.executable)
         if legacy:
@@ -157,6 +169,7 @@ class AdapterRegistry:
                     "account_id": account["id"],
                     "database": self.database,
                     "operation": operation,
+                    "execution_job": getattr(self.context, "job", None),
                     "payload": payload,
                 }
             ),

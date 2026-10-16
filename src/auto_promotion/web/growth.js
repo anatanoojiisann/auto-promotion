@@ -27,7 +27,7 @@ async function renderGrowth() {
       '<button id="new-growth">设置业务目标</button>',
     ) +
     `<div class="stats growth-stats">${checks.map(([label, count, route]) => `<a class="stat" href="#${route}"><strong>${count}</strong>${label}</a>`).join("")}</div>` +
-    `<div class="surface padded"><h2>运行与数据准备</h2><p>${ready.global_stop ? "外发已停止" : "外发停止开关已解除"} · ${ready.sender_configured ? "后台发送已配置" : "后台发送未配置"} · ${ready.read_scheduler_configured ? "只读采集调度已配置" : "只读采集调度未配置"}</p><p class="help">资格证据数量不代表可直接发送，最终仍按账号、目标、额度和审批检查。X、Reddit 使用人工互动清单。</p>${ready.profiles_missing.length ? `<p>待配置角色：${esc(ready.profiles_missing.join("、"))}</p>` : ""}${
+    `<div class="surface padded"><h2>运行与数据准备</h2><p>${ready.global_stop ? "外发已停止" : "外发停止开关已解除"} · ${ready.sender_configured ? "后台发送已配置" : "后台发送未配置"} · ${ready.read_scheduler_configured ? "只读采集调度已配置" : "只读采集调度未配置"}</p><p class="help">资格证据数量不代表可直接发送，最终仍按账号、目标、额度和启动状态检查。X、Reddit 使用人工互动清单。</p>${ready.profiles_missing.length ? `<p>待配置角色：${esc(ready.profiles_missing.join("、"))}</p>` : ""}${
       Object.keys(ready.task_blockers).length
         ? `<details><summary>未结束任务的执行阻碍</summary><ul>${Object.entries(
             ready.task_blockers,
@@ -135,7 +135,7 @@ async function channelForm(report) {
   );
   openPanel(
     "添加渠道",
-    `<form id="growth-channel-form">${growthInput("渠道名称", "name", "", "text", "required")}${growthInput("渠道标记（英文、数字、下划线或连字符）", "campaign_token", "", "text", "required maxlength=30 pattern=[A-Za-z0-9_\\-]+")}${growthInput("提供商令牌（从 App Store Connect 获取，可稍后新建渠道）", "provider_token", "", "text", "pattern=[0-9]*")}<label>推广活动<select name="campaign_id"><option value="">未关联</option>${report.goal.payload.campaign_ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("")}</select></label><label>渠道账号<select name="account_id"><option value="">未关联</option>${accounts.map((a) => `<option value="${a.id}">${esc(a.label)}</option>`).join("")}</select></label><p class="help">提供商令牌须来自真实 App Store Connect 链接。渠道记录保留原始标记；它不会改写已批准的正文，也不提供逐用户安装归因。</p><div class="form-actions"><button>保存渠道</button></div></form>`,
+    `<form id="growth-channel-form">${growthInput("渠道名称", "name", "", "text", "required")}${growthInput("渠道标记（英文、数字、下划线或连字符）", "campaign_token", "", "text", "required maxlength=30 pattern=[A-Za-z0-9_\\-]+")}${growthInput("提供商令牌（从 App Store Connect 获取，可稍后新建渠道）", "provider_token", "", "text", "pattern=[0-9]*")}<label>推广活动<select name="campaign_id"><option value="">未关联</option>${report.goal.payload.campaign_ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("")}</select></label><label>渠道账号<select name="account_id"><option value="">未关联</option>${accounts.map((a) => `<option value="${a.id}">${esc(a.label)}</option>`).join("")}</select></label><p class="help">提供商令牌须来自真实 App Store Connect 链接。渠道记录保留原始标记；它不会改写已启动的正文，也不提供逐用户安装归因。</p><div class="form-actions"><button>保存渠道</button></div></form>`,
   );
   $("#growth-channel-form").onsubmit = (e) => {
     e.preventDefault();
@@ -243,7 +243,7 @@ async function renderInbox(offset = growthState.inboxOffset) {
   $("#main").innerHTML =
     heading(
       "回复待办",
-      "收到的回复关联原互动；后续回复进入新的精确审批任务。",
+      "收到的回复关联原互动；后续回复进入新任务，点击开始发送后执行。",
       '<button class="secondary" id="refresh-inbox">刷新待办</button>',
     ) +
     `<div class="stats growth-stats">${Object.entries(states)
@@ -253,7 +253,7 @@ async function renderInbox(offset = growthState.inboxOffset) {
       )
       .join("")}</div>` +
     (data.items.length
-      ? `<div class="surface table-wrap"><table><thead><tr><th>回复来源</th><th>原互动</th><th>处理状态</th><th>操作</th></tr></thead><tbody>${data.items.map((r) => `<tr><td>${esc(r.account_label)}<span class="sub">${esc(r.payload.target)} · 回复 ${esc(r.event_id.split(":").pop())}</span><span class="sub">${fmt(r.occurred_at)}</span></td><td><a href="#tasks/${r.task_id}">查看原任务</a><span class="sub content-wrap">${esc(r.payload.text.slice(0, 180))}</span></td><td>${states[r.state]}<span class="sub content-wrap">${esc(r.note)}</span>${r.followup_task_id ? `<a href="#tasks/${r.followup_task_id}">后续审批任务</a>` : ""}</td><td><button class="secondary compact" data-triage="${r.id}">处理</button><button class="text-button" data-followup="${r.id}">创建后续任务</button></td></tr>`).join("")}</tbody></table></div>`
+      ? `<div class="surface table-wrap"><table><thead><tr><th>回复来源</th><th>原互动</th><th>处理状态</th><th>操作</th></tr></thead><tbody>${data.items.map((r) => `<tr><td>${esc(r.account_label)}<span class="sub">${esc(r.payload.target)} · 回复 ${esc(r.event_id.split(":").pop())}</span><span class="sub">${fmt(r.occurred_at)}</span></td><td><a href="#tasks/${r.task_id}">查看原任务</a><span class="sub content-wrap">${esc(r.payload.text.slice(0, 180))}</span></td><td>${states[r.state]}<span class="sub content-wrap">${esc(r.note)}</span>${r.followup_task_id ? `<a href="#tasks/${r.followup_task_id}">后续执行任务</a>` : ""}</td><td><button class="secondary compact" data-triage="${r.id}">处理</button><button class="text-button" data-followup="${r.id}">创建后续任务</button></td></tr>`).join("")}</tbody></table></div>`
       : empty(
           "尚无待办",
           "只读反馈采集发现他人直接回复后，会自动进入此列表。",
@@ -319,7 +319,7 @@ async function followupForm(reply) {
   const account = state.accounts.find((a) => a.id === reply.account_id);
   openPanel(
     "创建后续回复任务",
-    `<form id="followup-form">${growthInput("任务名称", "name", "后续回复 · " + reply.payload.target, "text", "required")}${growthInput("允许语言（逗号分隔）", "languages", "en, zh", "text", "required")}${growthInput("开始时间", "starts", isoLocal(Date.now()), "datetime-local", "required")}${growthInput("结束时间", "ends", isoLocal(Date.now() + 86400000), "datetime-local", "required")}<p>${esc(account.label)} · ${esc(reply.payload.target)} · 回复消息 ${esc(reply.event_id.split(":").pop())}</p><p class="help">创建任务后先审核发现政策，再编辑完整回复正文。目标与回复编号会带入编辑器；不会自动生成或发送回复。</p><div class="form-actions"><button>创建审批草稿</button></div></form>`,
+    `<form id="followup-form">${growthInput("任务名称", "name", "后续回复 · " + reply.payload.target, "text", "required")}${growthInput("允许语言（逗号分隔）", "languages", "en, zh", "text", "required")}${growthInput("开始时间", "starts", isoLocal(Date.now()), "datetime-local", "required")}${growthInput("结束时间", "ends", isoLocal(Date.now() + 86400000), "datetime-local", "required")}<p>${esc(account.label)} · ${esc(reply.payload.target)} · 回复消息 ${esc(reply.event_id.split(":").pop())}</p><p class="help">创建任务后编辑完整回复正文，再点击开始发送。目标与回复编号会带入编辑器；不会自动生成或发送回复。</p><div class="form-actions"><button>创建任务草稿</button></div></form>`,
   );
   $("#followup-form").onsubmit = (e) => {
     e.preventDefault();
@@ -412,7 +412,7 @@ async function feedForm(feed) {
 function contentReviewForm(opportunity) {
   openPanel(
     "核对内容资格与文案",
-    `<form id="content-review-form"><label>内容、上下文、许可和正文<textarea id="content-review-json" rows="17" required>${esc(JSON.stringify(opportunity.payload, null, 2))}</textarea></label><p class="help">允许互动需要填写真实许可及证据。平台、目标与原消息标识不能更换；已生成审批批次保留原快照，更新只用于后续计划。</p><div class="form-actions"><button>保存核对结果</button></div></form>`,
+    `<form id="content-review-form"><label>内容、上下文、许可和正文<textarea id="content-review-json" rows="17" required>${esc(JSON.stringify(opportunity.payload, null, 2))}</textarea></label><p class="help">允许互动需要填写真实许可及证据。平台、目标与原消息标识不能更换；已生成执行批次保留原快照，更新只用于后续计划。</p><div class="form-actions"><button>保存核对结果</button></div></form>`,
   );
   $("#content-review-form").onsubmit = (e) => {
     e.preventDefault();

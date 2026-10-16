@@ -25,6 +25,7 @@ OPERATIONS = {
     "targets",
     "feedback",
     "content",
+    "insights",
 }
 RESULT_FIELDS = {
     "status",
@@ -60,6 +61,14 @@ RESULT_FIELDS = {
     "feedback_cursor",
     "feedback_status",
     "content_items",
+    "publish_id",
+    "post_ids",
+    "comment_id",
+    "platform_status",
+    "insights",
+    "next_cursor",
+    "has_more",
+    "mutation_accepted",
 }
 RESULT_FIELDS.update(FIELDS)
 
@@ -143,6 +152,10 @@ def dispatch(request):
                 from .backends.discord import call
 
                 result = call(label, operation, payload, checkpoint, authorize)
+            elif platform == "tiktok":
+                from .backends.tiktok import call
+
+                result = call(label, operation, payload, checkpoint, authorize)
             else:
                 from .backends.browser import call
 
@@ -177,9 +190,12 @@ def dispatch(request):
                 accepted.get("message_ids")
                 or accepted.get("media_id")
                 or accepted.get("external_reference")
+                or accepted.get("publish_id")
             ):
                 result = {**accepted, **result}
-                if result.get("status") == "failed_known":
+                if result.get("status") == "failed_known" and not (
+                    platform == "tiktok" and result.get("verified") is True
+                ):
                     result["status"] = "unknown"
             checkpoint(result)
         return result

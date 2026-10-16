@@ -27,6 +27,7 @@ PROJECTS = {
     "instagram": "meta-social-engagement",
     "x": "x-engagement",
     "discord": "discord-bot",
+    "tiktok": "tiktok-accounts",
 }
 
 

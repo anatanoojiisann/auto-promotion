@@ -631,8 +631,8 @@ class Growth:
             "feed_count": len(self.feeds()),
             "goal_count": len(self.goals()),
             "platform_execution": {
-                "telegram": "automatic_with_approval",
-                "discord": "automatic_with_approval",
+                "telegram": "automatic_after_start",
+                "discord": "automatic_after_start",
                 "instagram": "owned_media_or_manual_comment",
                 "x": "manual",
                 "reddit": "manual",

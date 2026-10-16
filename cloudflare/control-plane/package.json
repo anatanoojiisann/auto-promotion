@@ -1,0 +1,13 @@
+{
+  "name": "auto-promotion-control",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
