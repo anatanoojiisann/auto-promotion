@@ -48,3 +48,11 @@ class BrowserUseConnectionTests(unittest.TestCase):
                 automatic_actions({"platform": "x", "mode": "live", "backend_label": "local"}),
                 [],
             )
+
+    def test_native_chrome_requires_its_own_reply_opt_in(self):
+        account = {"platform": "x", "mode": "live", "backend_label": "chrome-native"}
+        settings = {"identity": "example", "browser_channel": "chrome"}
+        with patch("auto_promotion.backends.common.read_profile", return_value=settings):
+            self.assertEqual(automatic_actions(account), [])
+            settings["automatic_actions"] = ["reply", "like", "repost"]
+            self.assertEqual(automatic_actions(account), ["reply"])

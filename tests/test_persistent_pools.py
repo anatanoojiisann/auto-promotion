@@ -155,6 +155,113 @@ class PersistentPoolTests(unittest.TestCase):
         self.assertEqual(len(JobQueue(reopened).pools()["jobs"]), 1)
         self.assertIsNotNone(self.engine.task(task["id"])["manifest_hash"])
 
+    def test_cancelled_task_closes_only_unattempted_pending_join(self):
+        from datetime import datetime, timezone
+
+        from auto_promotion.models import CandidateInput
+
+        now = self.engine.clock()
+        account = self.engine.add_account(
+            AccountInput(
+                platform="telegram",
+                label="test",
+                backend_label="test-join",
+                mode="simulation",
+                min_interval=0,
+            )
+        )
+        self.engine.check_account(account["id"])
+        task = self.engine.create_task(
+            TaskInput(
+                name="cancel join",
+                account_ids=[account["id"]],
+                policy={
+                    "starts_at": datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),
+                    "ends_at": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+                    "min_interval": 0,
+                    "max_joins": 1,
+                },
+            )
+        )
+        self.engine.candidate(
+            task["id"],
+            CandidateInput(
+                account_id=account["id"], target="@test_ai", language="en", confidence=0.9
+            ),
+        )
+        self.engine.start_task(task["id"], sending=False)
+        queue = JobQueue(self.engine)
+        queue.sync()
+        self.engine.change_state(task["id"], "cancelled")
+        queue.recover()
+        self.assertEqual(self.store.one("SELECT state FROM execution_jobs")["state"], "cancelled")
+        self.assertEqual(self.store.one("SELECT state FROM candidates")["state"], "not_attempted")
+        self.assertEqual(self.store.one("SELECT count(*) n FROM join_attempts")["n"], 0)
+
+    def test_cancel_does_not_reset_unknown_attempt(self):
+        task, _ = self.ready()
+        queue = JobQueue(self.engine)
+        queue.sync()
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE items SET status='unknown',attempt_id='uncertain'")
+        self.engine.change_state(task["id"], "cancelled")
+        queue.recover()
+        self.assertEqual(self.store.one("SELECT state FROM execution_jobs")["state"], "unknown")
+        self.assertEqual(self.store.one("SELECT attempt_id FROM items")["attempt_id"], "uncertain")
+
+    def test_due_interaction_is_not_starved_by_older_join_backlog(self):
+        from datetime import datetime, timezone
+
+        from auto_promotion.models import CandidateInput
+
+        now = self.engine.clock()
+
+        def iso(at):
+            return datetime.fromtimestamp(at, timezone.utc).isoformat()
+
+        account = self.engine.add_account(
+            AccountInput(
+                platform="telegram",
+                label="test",
+                backend_label="test-priority",
+                mode="simulation",
+                min_interval=0,
+            )
+        )
+        self.engine.check_account(account["id"])
+        policy = {"starts_at": iso(now - 100), "ends_at": iso(now + 3600), "min_interval": 0}
+        join = self.engine.create_task(
+            TaskInput(
+                name="join backlog", account_ids=[account["id"]], policy={**policy, "max_joins": 1}
+            )
+        )
+        self.engine.candidate(
+            join["id"],
+            CandidateInput(
+                account_id=account["id"], target="@test_ai_join", language="en", confidence=0.9
+            ),
+        )
+        self.engine.start_task(join["id"], sending=False)
+        send = self.engine.create_task(
+            TaskInput(name="due interaction", account_ids=[account["id"]], policy=policy)
+        )
+        self.engine.set_items(
+            send["id"],
+            [
+                ItemInput(
+                    account_id=account["id"],
+                    action="send_message",
+                    target="@test_ai_send",
+                    text="specific question",
+                    scheduled_at=iso(now),
+                )
+            ],
+        )
+        self.engine.start_task(send["id"])
+        queue = JobQueue(self.engine)
+        queue.sync()
+        self.assertEqual(queue.claim("simulation.telegram", "test-worker")["kind"], "send")
+
     def test_two_consumers_claim_only_once(self):
         self.ready()
         queue = JobQueue(self.engine)

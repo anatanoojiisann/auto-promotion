@@ -1,9 +1,13 @@
 import hashlib
+import io
+import json
 import os
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 import test_persistent_pools as fixtures
 
@@ -24,6 +28,92 @@ class CloudClientTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.engine, self.store = self.fixture.engine, self.fixture.store
+
+    def test_delta_sync_sends_each_definition_once_and_skips_unchanged(self):
+        self.fixture.ready()
+        snapshot = export_snapshot(self.engine)
+        task, job = snapshot["tasks"][0], snapshot["jobs"][0]
+        snapshot["tasks"] = [{**task, "id": f"t-{i}"} for i in range(201)]
+        snapshot["jobs"] = [{**job, "id": f"j-{i}", "task_id": f"t-{i}"} for i in range(201)]
+        cloud = CloudControl("http://127.0.0.1:8791", operator_token="test")
+        with (
+            patch("auto_promotion.cloud_control.export_snapshot", return_value=snapshot),
+            patch.object(cloud, "request", return_value={}) as request,
+        ):
+            result = cloud.sync(self.engine)
+            self.assertEqual(result["changed_records"], 403)
+            self.assertEqual(sum(len(c.args[1]["tasks"]) for c in request.call_args_list), 201)
+            self.assertEqual(sum(len(c.args[1]["jobs"]) for c in request.call_args_list), 201)
+            request.reset_mock()
+            self.assertTrue(cloud.sync(self.engine)["unchanged"])
+            request.assert_not_called()
+
+    def test_failed_delta_resumes_without_replaying_acknowledged_slices(self):
+        self.fixture.ready()
+        snapshot = export_snapshot(self.engine)
+        task = snapshot["tasks"][0]
+        snapshot["tasks"] = [{**task, "id": f"t-{i}"} for i in range(201)]
+        cloud = CloudControl("http://127.0.0.1:8791", operator_token="test")
+
+        def first(path, payload, **kwargs):
+            if payload["tasks"] and payload["tasks"][0]["id"] == "t-100":
+                raise CloudUnavailable("CloudTransportUnavailable")
+            return {}
+
+        with patch("auto_promotion.cloud_control.export_snapshot", return_value=snapshot):
+            with patch.object(cloud, "request", side_effect=first):
+                with self.assertRaises(CloudUnavailable):
+                    cloud.sync(self.engine)
+            with patch.object(cloud, "request", return_value={}) as request:
+                cloud.sync(self.engine)
+                resent = [t["id"] for c in request.call_args_list for t in c.args[1]["tasks"]]
+                self.assertEqual(resent, [f"t-{i}" for i in range(100, 201)])
+
+    def test_unfrozen_outbound_is_not_exported_as_an_execution_job(self):
+        task, _ = self.fixture.ready(start=False)
+        self.assertEqual(export_snapshot(self.engine)["jobs"], [])
+        self.engine.start_task(task["id"])
+        self.assertEqual(len(export_snapshot(self.engine)["jobs"]), 1)
+
+    def test_cloud_quota_error_keeps_safe_code_and_retry_delay(self):
+        cloud = CloudControl("http://127.0.0.1:8791", operator_token="test")
+        error = HTTPError(
+            cloud.url,
+            503,
+            "Unavailable",
+            {},
+            io.BytesIO(
+                json.dumps(
+                    {"error": "CloudWriteQuotaExceeded", "retry_after_seconds": 3600}
+                ).encode()
+            ),
+        )
+        with patch("auto_promotion.cloud_control.urlopen", side_effect=error):
+            with self.assertRaises(CloudUnavailable) as raised:
+                cloud.request("/v1/status", operator=True, method="GET")
+        self.assertEqual(str(raised.exception), "CloudWriteQuotaExceeded")
+        self.assertEqual(raised.exception.retry_after_seconds, 3600)
+
+    def test_scheduler_backoff_persists_across_restart_without_platform_attempt(self):
+        from auto_promotion.pool_runtime import PoolScheduler
+
+        self.fixture.ready()
+        cloud = Mock()
+        cloud.request.side_effect = CloudUnavailable(
+            "CloudWriteQuotaExceeded", retry_after_seconds=3600
+        )
+        with patch.object(CloudControl, "configured", return_value=cloud):
+            scheduler = PoolScheduler(self.engine, popen=Mock())
+            scheduler.tick()
+            scheduler.tick()
+            PoolScheduler(self.engine, popen=Mock()).tick()
+        self.assertEqual(cloud.request.call_count, 1)
+        self.assertEqual(self.store.one("SELECT count(*) n FROM attempts")["n"], 0)
+        health = json.loads(
+            self.store.one("SELECT value FROM meta WHERE key='cloud_control_health'")["value"]
+        )
+        self.assertFalse(health["execution_ready"])
+        self.assertEqual(health["retry_at"], self.engine.clock() + 3600)
 
     def lease(self):
         self.fixture.ready()
@@ -178,10 +268,106 @@ class CloudClientTests(unittest.TestCase):
         )
         with patch.object(cloud, "request", return_value={}) as request:
             cloud.flush_settings(self.engine)
-        self.assertEqual(request.call_args.args[1], {"global_stop": True})
+        from auto_promotion.execution_channels import binding
+
+        self.assertEqual(
+            request.call_args.args[1], {"global_stop": True, "local_store_id": binding(self.engine)}
+        )
         self.assertIsNone(
             self.store.one("SELECT value FROM meta WHERE key='cloud_pending_settings'")
         )
+
+    def test_cloud_renewal_waits_for_margin_and_uses_monotonic_time(self):
+        cloud = CloudControl("http://127.0.0.1:8791", node_id="n", node_token="test")
+        now = [100.0]
+        replies = [
+            {
+                "job": {
+                    "id": "j",
+                    "lease_token": "t",
+                    "lease_until": 1000180,
+                    "renew_after_seconds": 120,
+                }
+            },
+            {"renewed": True, "lease_until": 1000300, "renew_after_seconds": 120},
+        ]
+        with (
+            patch("auto_promotion.cloud_control.time.monotonic", side_effect=lambda: now[0]),
+            patch.object(cloud, "request", side_effect=replies) as request,
+        ):
+            lease = cloud.claim("simulation.x", "j")
+            for elapsed in range(0, 120, 10):
+                now[0] = 100 + elapsed
+                self.assertTrue(cloud.renew(lease))
+            self.assertEqual(request.call_count, 1)
+            now[0] = 220
+            with patch("auto_promotion.cloud_control.time.time", return_value=-100000):
+                self.assertTrue(cloud.renew(lease))
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(lease["_renew_at_monotonic"], 340)
+            self.assertEqual(lease["lease_until"], 1000300)
+
+    def test_failed_renewal_never_extends_the_local_remote_deadline(self):
+        cloud = CloudControl("http://127.0.0.1:8791", node_id="n", node_token="test")
+        lease = {"id": "j", "lease_token": "t", "_renew_at_monotonic": 100}
+        with (
+            patch("auto_promotion.cloud_control.time.monotonic", return_value=100),
+            patch.object(cloud, "request", side_effect=CloudUnavailable("LostResponse")),
+        ):
+            with self.assertRaises(CloudUnavailable):
+                cloud.renew(lease)
+        self.assertEqual(lease["_renew_at_monotonic"], 100)
+
+    def test_old_server_without_renewal_duration_keeps_safe_frequent_checks(self):
+        cloud = CloudControl("http://127.0.0.1:8791", node_id="n", node_token="test")
+        lease = {"id": "j", "lease_token": "t"}
+        with patch.object(cloud, "request", return_value={"renewed": True}) as request:
+            self.assertTrue(cloud.renew(lease))
+            self.assertTrue(cloud.renew(lease))
+        self.assertEqual(request.call_count, 2)
+
+    def test_idle_scheduler_probes_every_five_minutes_but_flushes_stops_each_tick(self):
+        from auto_promotion.pool_runtime import PoolScheduler
+
+        now = [self.engine.clock()]
+        self.engine.clock = lambda: now[0]
+        cloud = Mock()
+        cloud.sync.return_value = {"unchanged": True}
+        with patch.object(CloudControl, "configured", return_value=cloud):
+            scheduler = PoolScheduler(self.engine, popen=Mock())
+            scheduler.tick()
+            now[0] += 299
+            scheduler.tick()
+            self.assertEqual(cloud.request.call_count, 1)
+            now[0] += 1
+            scheduler.tick()
+        self.assertEqual(cloud.request.call_count, 2)
+        self.assertEqual(cloud.flush_settings.call_count, 3)
+
+    def test_due_work_uses_active_probe_interval_and_recent_sync_can_supply_liveness(self):
+        from auto_promotion.pool_runtime import PoolScheduler
+
+        self.fixture.ready()
+        now = [self.engine.clock()]
+        self.engine.clock = lambda: now[0]
+        cloud = Mock()
+        cloud.sync.return_value = {"unchanged": True}
+        with (
+            patch.object(CloudControl, "configured", return_value=cloud),
+            patch.dict(os.environ, {"AP_EXECUTOR_POOLS": "telegram.mtproto"}),
+        ):
+            scheduler = PoolScheduler(self.engine, popen=Mock())
+            scheduler.tick()
+            now[0] += 59
+            scheduler.tick()
+            self.assertEqual(cloud.request.call_count, 1)
+            now[0] += 1
+            scheduler.tick()
+            self.assertEqual(cloud.request.call_count, 2)
+            now[0] += 60
+            cloud.last_contact_monotonic = time.monotonic()
+            scheduler.tick()
+            self.assertEqual(cloud.request.call_count, 2)
 
 
 @unittest.skipUnless(os.getenv("AP_TEST_CONTROL_URL"), "Cloudflare emulator not requested")
@@ -190,6 +376,13 @@ class CloudflareHTTPTests(unittest.TestCase):
         CloudClientTests.setUp(self)
         self.engine.clock = time.time
         self.fixture.ready(target_id=uuid.uuid4().int % 10**18)
+        # Independent test databases share one emulator workspace. Give each
+        # fixture a later cursor instead of replaying revision 1 after revision 2.
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "INSERT INTO meta VALUES('cloud_snapshot_revision',?)",
+                (str(int(time.time() * 1_000_000)),),
+            )
         self.cloud = CloudControl(
             os.environ["AP_TEST_CONTROL_URL"],
             operator_token="test-control-only",
@@ -233,6 +426,73 @@ class CloudflareHTTPTests(unittest.TestCase):
         bad = CloudControl(self.cloud.url, operator_token="wrong")
         with self.assertRaises(CloudUnavailable):
             bad.request("/v1/status", operator=True, method="GET")
+
+    def test_two_nodes_racing_for_the_same_job_get_one_lease_and_one_attempt(self):
+        other = CloudControl(
+            self.cloud.url,
+            node_id="test-" + uuid.uuid4().hex,
+            node_token=uuid.uuid4().hex,
+        )
+        self.cloud.request(
+            "/v1/nodes",
+            {
+                "id": other.node_id,
+                "token_hash": hashlib.sha256(other.node_token.encode()).hexdigest(),
+                "pools": ["simulation.x"],
+                "account_ids": [a["id"] for a in self.engine.accounts()],
+            },
+            operator=True,
+        )
+        job_id = export_snapshot(self.engine)["jobs"][0]["id"]
+        clients = [self.cloud, other]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leases = list(executor.map(lambda c: c.claim("simulation.x", job_id), clients))
+        self.assertEqual(sum(lease is not None for lease in leases), 1)
+        index = next(i for i, lease in enumerate(leases) if lease)
+        client, lease = clients[index], leases[index]
+        attempt = "attempt-" + uuid.uuid4().hex
+        self.assertTrue(client.authorize(lease, attempt))
+        self.assertTrue(client.authorize(lease, attempt))
+        with self.assertRaisesRegex(CloudUnavailable, "AttemptAlreadyRecorded"):
+            client.authorize(lease, "different")
+        client.complete(lease, "unknown", {"verified": False}, attempt)
+        with self.assertRaisesRegex(CloudUnavailable, "AlreadySettled"):
+            other.claim("simulation.x", job_id)
+        result = {"verified": True, "external_reference": "https://example.invalid/test"}
+        client.complete(lease, "confirmed", result, attempt)
+        client.complete(lease, "confirmed", result, attempt)
+
+    def test_http_cannot_claim_before_due_but_can_claim_when_due(self):
+        self.engine.clock = lambda: time.time() + 3
+        task, account = self.fixture.ready(
+            account=self.engine.accounts()[0], target_id=uuid.uuid4().int % 10**18
+        )
+        self.engine.clock = time.time
+        self.cloud.sync(self.engine)
+        self.cloud.request(
+            "/v1/nodes",
+            {
+                "id": self.cloud.node_id,
+                "token_hash": hashlib.sha256(self.cloud.node_token.encode()).hexdigest(),
+                "pools": ["simulation.x"],
+                "account_ids": [a["id"] for a in self.engine.accounts()],
+            },
+            operator=True,
+        )
+        job = next(j for j in export_snapshot(self.engine)["jobs"] if j["task_id"] == task["id"])
+        self.assertIsNone(self.cloud.claim("simulation.x", job["id"]))
+        time.sleep(max(0, job["available_at"] - time.time()) + 0.05)
+        lease = self.cloud.claim("simulation.x", job["id"])
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease["account_id"], account["id"])
+        attempt = "attempt-" + uuid.uuid4().hex
+        self.assertTrue(self.cloud.authorize(lease, attempt))
+        self.cloud.complete(
+            lease,
+            "confirmed",
+            {"verified": True, "external_reference": "https://example.invalid/timed-test"},
+            attempt,
+        )
 
 
 if __name__ == "__main__":

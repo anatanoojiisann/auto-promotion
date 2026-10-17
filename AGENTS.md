@@ -51,6 +51,17 @@ not bypass the queue with direct adapter calls. Read `/api/execution/pools` for
 pool health and pending receipts; a parent heartbeat alone does not prove a pool
 is working. See `docs/cloudflare-execution.md`.
 
+The user requested cloud-first dual-channel execution, then explicitly required
+the local channel to work independently without server initialization. A
+`cloud_then_local` policy with a durable `local_channel_authority` may consume
+the SAME local persistent queue for the explicitly scoped accounts. An explicit
+local-today handoff or `CloudWriteQuotaExceeded` can select that channel; no cloud
+checkpoint or server request is required. Keep all local stops, quotas, leases,
+manual boundaries and once-only outcomes. Do not unset `cloud_control_required`
+or use direct/legacy calls. Server-side fencing prevents parallel online claims
+during today's handoff. Reconcile local receipts and quotas before returning to
+cloud. See `docs/execution-channels.md`.
+
 An MCP connection opened before an upgrade may still have older code in memory.
 The database blocks attempts without the owning pool lease. If that older client
 reports `PersistentJobLeaseRequired` or a missing pool function after a start,

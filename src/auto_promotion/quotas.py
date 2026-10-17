@@ -6,6 +6,15 @@ from collections import defaultdict
 
 from .models import ExecutionSettings, QuotaLimit, canonical, digest
 
+# A manual handoff has not contacted the platform. Keep its audit attempt, but do
+# not charge a delivery until a manual outcome or an actual submission is recorded.
+UNSUBMITTED_MANUAL = (
+    "(i.status='manual_attention' AND json_extract(i.payload,'$.execution_mode')='manual' "
+    "AND json_extract(i.result,'$.reason')='manual_publication_required' "
+    "AND i.external_reference IS NULL "
+    "AND COALESCE(json_extract(i.result,'$.submission_started'),0)=0)"
+)
+
 
 def settings(db):
     row = db.execute("SELECT value FROM meta WHERE key='execution_settings'").fetchone()
@@ -100,7 +109,8 @@ def events(db, mode, *, delivery=False, exclude_item=None):
         rows = db.execute(
             "SELECT i.id,i.account_id,i.task_id,i.due_at at,i.payload,a.platform,a.mode,t.campaign_id,c.pool_id "
             "FROM items i JOIN accounts a ON a.id=i.account_id JOIN tasks t ON t.id=i.task_id "
-            "LEFT JOIN campaigns c ON c.id=t.campaign_id WHERE i.attempt_id IS NOT NULL AND a.mode=?",
+            "LEFT JOIN campaigns c ON c.id=t.campaign_id WHERE i.attempt_id IS NOT NULL AND a.mode=? "
+            "AND NOT " + UNSUBMITTED_MANUAL,
             (mode,),
         )
         for row in rows:
@@ -118,7 +128,10 @@ def events(db, mode, *, delivery=False, exclude_item=None):
     else:
         for row in db.execute(
             "SELECT v.*,a.platform,t.campaign_id,c.pool_id FROM activity v JOIN accounts a ON a.id=v.account_id "
-            "JOIN tasks t ON t.id=v.task_id LEFT JOIN campaigns c ON c.id=t.campaign_id WHERE v.mode=?",
+            "JOIN tasks t ON t.id=v.task_id LEFT JOIN campaigns c ON c.id=t.campaign_id WHERE v.mode=? "
+            "AND NOT EXISTS (SELECT 1 FROM attempts att JOIN items i ON i.id=att.item_id "
+            "WHERE att.task_id=v.task_id AND att.account_id=v.account_id "
+            "AND att.started_at=v.started_at AND " + UNSUBMITTED_MANUAL + ")",
             (mode,),
         ):
             result.append(

@@ -28,7 +28,7 @@ class ConnectionInput(Model):
     access_token: SecretStr | None = Field(default=None, max_length=8192)
     bot_token: SecretStr | None = Field(default=None, max_length=8192)
     api_version: str = ""
-    browser_channel: Literal["chromium", "msedge"] = "chromium"
+    browser_channel: Literal["chromium", "msedge", "chrome"] = "chromium"
 
     @model_validator(mode="after")
     def validate_login(self):

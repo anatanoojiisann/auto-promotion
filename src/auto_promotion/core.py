@@ -179,11 +179,21 @@ class Engine:
         changes = value.model_dump()
         if all(account[key] == val for key, val in changes.items()):
             return account
+        daily_only = all(
+            account[key] == val for key, val in changes.items() if key != "daily_limit"
+        )
         with self.store.connect(write=True) as db:
             for task in db.execute(
-                "SELECT id,account_ids FROM tasks WHERE state NOT IN ('cancelled','completed')"
+                "SELECT id,account_ids,state,policy FROM tasks WHERE state NOT IN ('cancelled','completed')"
             ):
                 if account_id in json.loads(task["account_ids"]):
+                    # Old snapshots stay immutable; resuming them still requires
+                    # a new task after this explicit account-budget change.
+                    if daily_only and (
+                        task["state"] == "paused"
+                        or epoch(json.loads(task["policy"])["ends_at"]) <= self.clock()
+                    ):
+                        continue
                     raise Conflict("账号已被未结束任务使用；请先结束该任务并创建新任务")
             db.execute(
                 "UPDATE accounts SET label=?,daily_limit=?,hourly_limit=?,min_interval=? WHERE id=?",
@@ -195,7 +205,15 @@ class Engine:
                     account_id,
                 ),
             )
-            Store.audit(db, "account.updated", {"account_id": account_id})
+            Store.audit(
+                db,
+                "account.updated",
+                {
+                    "account_id": account_id,
+                    "before": {k: account[k] for k in changes},
+                    "after": changes,
+                },
+            )
         return self.account(account_id)
 
     def call(self, account, operation, payload=None, task_id=None):
@@ -209,15 +227,25 @@ class Engine:
             if operation in {"execute", "join"}:
                 from .cloud_control import CloudControl
 
-                cloud = CloudControl.configured()
+                context = getattr(self.adapters.context, "job", None)
+                from .execution_channels import independent_active
+
+                local_independent = bool(
+                    context and context.get("channel") == "local" and independent_active(self)
+                )
+                cloud = None if local_independent else CloudControl.configured()
                 required = self.store.one(
                     "SELECT value FROM meta WHERE key='cloud_control_required'"
                 )
-                if not cloud and required and required["value"] == "1":
+                if not cloud and required and required["value"] == "1" and not local_independent:
                     from .cloud_control import CloudUnavailable
 
                     raise CloudUnavailable("CloudControlConfigurationMissing")
-                if cloud:
+                if context and context.get("channel") == "local":
+                    from .execution_channels import guard_local
+
+                    guard_local(self, context, cloud)
+                elif cloud:
                     attempt_id = (payload or {}).get("attempt_id")
                     if operation == "join":
                         attempt = self.store.one(
@@ -237,10 +265,18 @@ class Engine:
                 task_id,
                 getattr(exc, "safe_code", type(exc).__name__),
             )
-            raise Conflict("平台调用未完成；请查看 API 中心的错误类型并核验连接") from None
+            error = Conflict("平台调用未完成；请查看 API 中心的错误类型并核验连接")
+            error.safe_code = safe_code(
+                getattr(exc, "safe_code", type(exc).__name__), "BackendError"
+            )
+            raise error from None
         outcome = result.get("status")
         status = outcome if outcome in {"unknown", "failed_known", "manual_attention"} else "ok"
-        if result.get("healthy") is False or result.get("allowed") is False:
+        if (
+            result.get("healthy") is False
+            or result.get("allowed") is False
+            or (operation == "feedback" and result.get("verified") is not True)
+        ):
             status = "error"
         self.store.log_call(
             account["platform"],
@@ -547,16 +583,23 @@ class Engine:
                 ).fetchall()
                 phase = "discovered"
                 if rows and sending:
-                    self._validate_outbound_readiness(db, task, check_membership=False)
-                    waiting = any(
-                        telegram_blocker(db, task, json.loads(r["payload"]), r["due_at"])
-                        for r in rows
-                    )
-                    if waiting:
+                    if not self._execution_service_ready(db, task):
                         phase = "starting"
                     else:
-                        self._freeze_manifest(db, task)
-                        phase = "ready"
+                        self._resolve_membership_schedule(db, task)
+                        rows = db.execute(
+                            "SELECT * FROM items WHERE task_id=? ORDER BY position", (task_id,)
+                        ).fetchall()
+                        self._validate_outbound_readiness(db, task, check_membership=False)
+                        waiting = any(
+                            telegram_blocker(db, task, json.loads(r["payload"]), r["due_at"])
+                            for r in rows
+                        )
+                        if waiting:
+                            phase = "starting"
+                        else:
+                            self._freeze_manifest(db, task)
+                            phase = "ready"
                 db.execute(
                     "UPDATE tasks SET state='active',phase=?,updated_at=? WHERE id=?",
                     (phase, self.clock(), task_id),
@@ -579,6 +622,116 @@ class Engine:
                         self.clock(),
                     )
         return self.task(task_id)
+
+    def _execution_service_ready(self, db, task):
+        policy = json.loads(task["policy"])
+        if policy.get("outbound_after_service_recovery_seconds") is None:
+            return True
+        required = db.execute(
+            "SELECT value FROM meta WHERE key='cloud_control_required'"
+        ).fetchone()
+        if not required or required[0] != "1":
+            return True
+        health = db.execute("SELECT value FROM meta WHERE key='cloud_control_health'").fetchone()
+        return bool(health and json.loads(health[0]).get("state") == "connected")
+
+    def _resolve_membership_schedule(self, db, task):
+        """Resolve an explicitly requested relative time before freezing the manifest."""
+        policy = json.loads(task["policy"])
+        delay = policy.get("outbound_after_membership_seconds")
+        if delay is None or task["manifest_hash"]:
+            return
+        previous_due = None
+        last_by_account = {}
+        for item in db.execute(
+            "SELECT * FROM items WHERE task_id=? ORDER BY position", (task["id"],)
+        ).fetchall():
+            payload = json.loads(item["payload"])
+            if payload["platform"] != "telegram" or item["attempt_id"]:
+                continue
+            candidate = db.execute(
+                "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND lower(target)=lower(?) "
+                "ORDER BY CASE WHEN decision='qualified' THEN 1 ELSE 0 END,rowid DESC LIMIT 1",
+                (task["id"], payload["account_id"], payload["target"]),
+            ).fetchone()
+            if not candidate and not policy["max_joins"]:
+                candidate = db.execute(
+                    "SELECT * FROM candidates WHERE account_id=? AND lower(target)=lower(?) "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (payload["account_id"], payload["target"]),
+                ).fetchone()
+            if not candidate or candidate["state"] not in {"joined", "already_joined"}:
+                continue
+            receipt = json.loads(candidate["result"])
+            if (
+                receipt.get("verified") is not True
+                or not receipt.get("external_reference")
+                or receipt.get("can_send") is not True
+            ):
+                continue
+            try:
+                # Backend receipts already include the mandatory first 3600 seconds.
+                eligible = epoch(receipt["outbound_eligible_at_utc"]) + delay - 3600
+            except (KeyError, TypeError, ValueError):
+                continue
+            due = max(item["due_at"], eligible, epoch(policy["starts_at"]), self.clock() + 30)
+            account = db.execute(
+                "SELECT min_interval,cooldown_until,next_at FROM accounts WHERE id=?",
+                (item["account_id"],),
+            ).fetchone()
+            recovery_delay = policy.get("outbound_after_service_recovery_seconds")
+            if recovery_delay is not None:
+                base = max(
+                    self.clock(),
+                    epoch(policy["starts_at"]),
+                    account["cooldown_until"],
+                    account["next_at"],
+                )
+                due = max(due, base + recovery_delay)
+            gap = max(policy["min_interval"], account["min_interval"])
+            if previous_due is not None:
+                due = max(
+                    due, previous_due + (gap if policy.get("pacing_scope", "task") == "task" else 0)
+                )
+            if item["account_id"] in last_by_account:
+                due = max(due, last_by_account[item["account_id"]] + gap)
+            previous_due, last_by_account[item["account_id"]] = due, due
+            if due == item["due_at"]:
+                continue
+            payload["scheduled_at"] = datetime.fromtimestamp(due, timezone.utc).isoformat()
+            db.execute(
+                "UPDATE items SET payload=?,payload_hash=?,due_at=? WHERE id=? AND status='not_attempted' AND attempt_id IS NULL",
+                (canonical(payload), digest(payload), due, item["id"]),
+            )
+            Store.audit(
+                db,
+                "item.membership_schedule_resolved",
+                {
+                    "item_id": item["id"],
+                    "candidate_id": candidate["id"],
+                    "previous_due_at": item["due_at"],
+                    "due_at": due,
+                    "delay_seconds": delay,
+                },
+                task["id"],
+                self.clock(),
+            )
+
+    def _resume_membership_dependents(self, account_id, target):
+        """Continue separately started groups without waiting for the rest of a batch."""
+        tasks = self.store.rows(
+            "SELECT DISTINCT t.id FROM tasks t JOIN items i ON i.task_id=t.id "
+            "WHERE t.state='active' AND t.phase='starting' AND i.account_id=? "
+            "AND lower(json_extract(i.payload,'$.target'))=lower(?) "
+            "AND json_extract(t.policy,'$.outbound_after_membership_seconds') IS NOT NULL",
+            (account_id, target),
+        )
+        for task in tasks:
+            try:
+                self.start_task(task["id"], source="scheduler")
+            except Conflict:
+                # Write permissions, stop and timing gates remain in force.
+                pass
 
     def start_and_run(self, task_id, *, source="client"):
         """Shared client/Codex entry point for an explicit user execution instruction."""
@@ -1215,16 +1368,21 @@ class Engine:
                 "manifest_hash": task["manifest_hash"],
             }
 
-    def run_once(self, task_id=None):
+    def _queue_pooled_task(self, task_id):
         runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
         if (
-            runtime
-            and runtime["value"] == "pooled"
-            and not getattr(self.adapters.context, "job", None)
+            not runtime
+            or runtime["value"] != "pooled"
+            or getattr(self.adapters.context, "job", None)
         ):
-            from .queue_store import JobQueue
+            return False
+        from .queue_store import JobQueue
 
-            JobQueue(self).sync(task_id)
+        JobQueue(self).sync(task_id)
+        return True
+
+    def run_once(self, task_id=None):
+        if self._queue_pooled_task(task_id):
             return {"processed": [], "queued": True}
         self.recover()
         if task_id:
@@ -1667,11 +1825,16 @@ class Engine:
             )
             self.apply_cooldown(account["id"], result)
             if result.get("verified") is not True:
-                statistics.mark_feedback(item_id, self.clock(), "failed")
+                statistics.mark_feedback(
+                    item_id,
+                    self.clock(),
+                    "failed",
+                    error_code=result.get("reason", "feedback_unverified"),
+                )
                 return {
                     "item_id": item_id,
                     "status": "failed",
-                    "reason": result.get("reason", "feedback_unverified"),
+                    "reason": safe_code(result.get("reason"), "feedback_unverified"),
                 }
             count = 0
             for event in result.get("feedback_events", []):
@@ -1683,10 +1846,21 @@ class Engine:
                 result["feedback_checked_through"],
                 result["feedback_status"],
                 cursor=result["feedback_cursor"],
+                error_code=result.get("reason"),
             )
-            return {"item_id": item_id, "status": result["feedback_status"], "new_replies": count}
-        except Exception:
-            statistics.mark_feedback(item_id, self.clock(), "failed")
+            return {
+                "item_id": item_id,
+                "status": result["feedback_status"],
+                "new_replies": count,
+                **({"reason": safe_code(result["reason"])} if result.get("reason") else {}),
+            }
+        except Exception as exc:
+            statistics.mark_feedback(
+                item_id,
+                self.clock(),
+                "failed",
+                error_code=getattr(exc, "safe_code", type(exc).__name__),
+            )
             raise
 
     def collect_statistics(self):
@@ -1897,15 +2071,7 @@ class Engine:
 
     def run_joins(self, task_id):
         task = self.task(task_id)
-        runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
-        if (
-            runtime
-            and runtime["value"] == "pooled"
-            and not getattr(self.adapters.context, "job", None)
-        ):
-            from .queue_store import JobQueue
-
-            JobQueue(self).sync(task_id)
+        if self._queue_pooled_task(task_id):
             return {"processed": [], "queued": True}
         processed = []
         if not task["policy"]["max_joins"]:
@@ -2180,6 +2346,11 @@ class Engine:
             task = self.task(job["task_id"])
             if task["state"] == "active" and task["phase"] == "starting":
                 self.start_task(task["id"], source="scheduler")
+            candidate = self.store.one(
+                "SELECT target FROM candidates WHERE id=?", (job["reference_id"],)
+            )
+            if candidate:
+                self._resume_membership_dependents(account["id"], candidate["target"])
             return result
         self.recover()
         row = self.store.one(
@@ -2236,6 +2407,7 @@ class Engine:
                 row["task_id"],
                 self.clock(),
             )
+        self._resume_membership_dependents(row["account_id"], row["target"])
         return safe
 
     def run_cycle(self):

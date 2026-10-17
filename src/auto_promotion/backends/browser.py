@@ -19,10 +19,10 @@ HOME = {"reddit": "https://www.reddit.com", "x": "https://x.com"}
 
 
 def launch_context(runtime, root, *, browser_channel="chromium", headless):
-    if browser_channel not in {"chromium", "msedge"}:
+    if browser_channel not in {"chromium", "msedge", "chrome"}:
         raise BackendError("UnsupportedBrowserChannel")
-    options = {"channel": "msedge"} if browser_channel == "msedge" else {}
-    directory = "browser-msedge" if browser_channel == "msedge" else "browser"
+    options = {"channel": browser_channel} if browser_channel != "chromium" else {}
+    directory = "browser" if browser_channel == "chromium" else "browser-" + browser_channel
     return runtime.chromium.launch_persistent_context(
         str(root / directory),
         headless=headless,
@@ -65,9 +65,12 @@ def login(platform, label, *, browser_channel="chromium"):
         context = launch_context(runtime, root, browser_channel=browser_channel, headless=False)
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(HOME[platform] + ("/login" if platform == "reddit" else "/i/flow/login"))
+            page.goto(
+                HOME[platform] + ("/login" if platform == "reddit" else "/i/flow/login"),
+                wait_until="domcontentloaded",
+            )
             input("Finish login in the opened browser, then press Enter here: ")
-            check_response(page.goto(HOME[platform]))
+            check_response(page.goto(HOME[platform], wait_until="domcontentloaded"))
             observed = identity(platform, context, page)
             if not observed or observed != expected:
                 raise BackendError("BrowserIdentityMismatch")

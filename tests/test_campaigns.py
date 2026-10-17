@@ -25,6 +25,7 @@ from auto_promotion.models import (
 from auto_promotion.planner import content_key, render_template
 from auto_promotion.pools import Pools
 from auto_promotion.quotas import Calendar
+from auto_promotion.quotas import events as quota_events
 from auto_promotion.store import Store
 
 
@@ -278,14 +279,76 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["processed"][0]["status"], "manual_attention")
         self.assertEqual(self.adapter.calls, [])
 
+    def test_opted_in_x_reply_runs_and_manual_handoff_does_not_consume_delivery(self):
+        from unittest.mock import patch
+
+        account = self.account("live-x", "x", "live")
+        pool = self.pools.save(PoolInput(name="X", account_ids=[account["id"]]))
+        campaign = self.freeze(
+            self.campaigns.plan(
+                self.campaign(
+                    pool=pool,
+                    values=[
+                        self.opportunity(
+                            1, platform="x", target="https://x.com/test/status/123", reply_to=None
+                        )
+                    ],
+                )["id"]
+            )
+        )
+        task = self.engine.task(campaign["tasks"][0]["id"])
+        self.now = task["items"][0]["due_at"]
+        self.engine.run_once(task["id"])
+        with self.store.connect() as db:
+            self.assertEqual(quota_events(db, "live"), [])
+            self.assertEqual(quota_events(db, "live", delivery=True), [])
+        self.campaigns.change_state(campaign["id"], "cancelled")
+        self.assertEqual(self.store.one("SELECT count(*) n FROM content_contacts")["n"], 0)
+        with (
+            patch("auto_promotion.core.automatic_actions", return_value=["reply"]),
+            patch.object(self.engine.adapters, "commissioned", return_value=True),
+        ):
+            self.engine.live_enabled = True
+            campaign = self.freeze(
+                self.campaigns.plan(
+                    self.campaign(
+                        pool=pool,
+                        values=[
+                            self.opportunity(
+                                1,
+                                platform="x",
+                                target="https://x.com/test/status/123",
+                                reply_to=None,
+                            )
+                        ],
+                    )["id"]
+                )
+            )
+            task = self.engine.task(campaign["tasks"][0]["id"])
+            self.assertEqual(task["items"][0]["payload"]["execution_mode"], "automatic")
+            self.now = task["items"][0]["due_at"]
+            execution = self.engine.run_once(task["id"])
+            self.assertEqual(
+                self.engine.task(task["id"])["items"][0]["status"], "confirmed", execution
+            )
+            self.engine.run_once(task["id"])
+            self.assertEqual(len(self.adapter.calls), 1)
+
     def test_x_automation_opt_in_still_rejects_denied_and_wrong_account(self):
         from auto_promotion.planner import execution_mode
 
         account = {"id": "one", "mode": "live", "platform": "x", "automatic_actions": ["reply"]}
-        value = {"action": "reply", "permission": "unknown", "permission_account_ids": [], "is_public": True}
+        value = {
+            "action": "reply",
+            "permission": "unknown",
+            "permission_account_ids": [],
+            "is_public": True,
+        }
         self.assertEqual(execution_mode(account, value)[0], "automatic")
         self.assertEqual(execution_mode(account, {**value, "permission": "denied"})[0], "disabled")
-        self.assertEqual(execution_mode(account, {**value, "permission_account_ids": ["two"]})[0], "disabled")
+        self.assertEqual(
+            execution_mode(account, {**value, "permission_account_ids": ["two"]})[0], "disabled"
+        )
         self.assertEqual(execution_mode(account, {**value, "action": "like"})[0], "disabled")
         self.assertEqual(execution_mode(account, {**value, "action": "quote"})[0], "manual")
 

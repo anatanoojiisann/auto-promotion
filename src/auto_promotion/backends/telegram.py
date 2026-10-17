@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import math
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -480,14 +481,33 @@ class TelegramBackend:
             return {"verified": False, "reason": "feedback_requires_verified_message_id"}
         parent_id = ids[0]
         observed = await client.get_messages(entity, ids=[parent_id])
-        if len(observed) != 1 or not message_matches(observed[0], item):
+        parent = observed[0] if len(observed) == 1 else None
+        parent_missing = parent is None or type(parent).__name__ == "MessageEmpty"
+        published = observed_timestamp(result.get("published_at"))
+        # A removed parent does not erase an already verified publication. Keep
+        # observing direct replies using its exact durable receipt, while leaving
+        # coverage partial because the parent can no longer be independently read.
+        durable_parent = (
+            result.get("verified") is True
+            and result.get("status") == "confirmed"
+            and isinstance(parent_id, int)
+            and not isinstance(parent_id, bool)
+            and parent_id > 0
+            and result.get("external_reference") == f"telegram:{item['target']}:{parent_id}"
+            and isinstance(published, (int, float))
+            and math.isfinite(published)
+            and 0 < published <= time.time()
+        )
+        if parent_missing and not durable_parent:
+            return {"verified": False, "reason": "feedback_parent_unavailable"}
+        if not parent_missing and not message_matches(parent, item):
             return {"verified": False, "reason": "feedback_parent_not_verified"}
         checked_through = time.time()
         cursor = max(int(payload.get("feedback_cursor", 0)), parent_id)
         messages = [
             m async for m in client.iter_messages(entity, min_id=cursor, reverse=True, limit=1001)
         ]
-        complete = len(messages) < 1001
+        complete = len(messages) < 1001 and not parent_missing
         events = []
         for message in messages[:1000]:
             occurred = observed_timestamp(getattr(message, "date", None))
@@ -501,6 +521,7 @@ class TelegramBackend:
                 getattr(message, "reply_to_msg_id", None) == parent_id
                 and not getattr(message, "out", False)
                 and str(getattr(message, "sender_id", "")) != self.settings["identity"]
+                and occurred >= (published or 0)
             ):
                 events.append({"event_id": f"{entity.id}:{message.id}", "occurred_at": occurred})
         return {
@@ -509,6 +530,11 @@ class TelegramBackend:
             "feedback_checked_through": checked_through,
             "feedback_cursor": cursor,
             "feedback_status": "complete" if complete else "partial",
+            **(
+                {"status": "unknown", "reason": "feedback_parent_unavailable"}
+                if parent_missing
+                else {}
+            ),
         }
 
 

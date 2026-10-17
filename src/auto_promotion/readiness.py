@@ -78,7 +78,13 @@ def task_workflow(task, blockers, item_blockers, now):
     expired = now >= epoch(task["policy"]["ends_at"]) or (
         not task["manifest_hash"]
         and any(
-            now - i["due_at"] > DELIVERY_GRACE_SECONDS
+            (
+                now - i["due_at"] > DELIVERY_GRACE_SECONDS
+                and not (
+                    task["phase"] == "starting"
+                    and task["policy"].get("outbound_after_service_recovery_seconds") is not None
+                )
+            )
             or (
                 i["payload"]["action"] in {"schedule_message", "schedule_file"}
                 and i["due_at"] <= now
@@ -95,6 +101,15 @@ def task_workflow(task, blockers, item_blockers, now):
             "等待准备清单",
             "保存每项的账号、目标、完整正文和计划时间。",
             "edit_items",
+        )
+    if (
+        task["phase"] == "starting"
+        and task["policy"].get("outbound_after_service_recovery_seconds") is not None
+    ):
+        return step(
+            "waiting_execution_service",
+            "等待执行服务恢复",
+            "执行服务恢复后，按账号节奏与入群满一小时的条件安排互动。",
         )
     if task["phase"] != "ready" and task["phase"] != "starting":
         return step(
@@ -136,6 +151,30 @@ def task_workflow(task, blockers, item_blockers, now):
         if reason in blockers:
             return step(reason, REASONS[reason], REASONS[reason])
     if pending:
+        cloud = task.get("execution", {}).get("pools", {}).get("cloud", {})
+        channel = task.get("execution", {}).get("pools", {}).get("channel", {})
+        fallback = channel.get("active") == "local" and channel.get("until", 0) > now
+        if (
+            task["mode"] == "live"
+            and not fallback
+            and cloud.get("state")
+            and (cloud["state"] != "connected" or cloud.get("execution_ready") is False)
+        ):
+            if cloud["state"] == "LocalChannelCheckpointRequired":
+                return step(
+                    "waiting_execution_service",
+                    "等待备用通道初始化",
+                    "双通道已配置；首次检查需要等待服务器额度恢复，之后额度耗尽时会自动使用本地通道。",
+                    next_at=cloud.get("retry_at"),
+                )
+            return step(
+                "waiting_execution_service",
+                "等待执行服务恢复",
+                "云端数据库当日写入额度已用尽，等待额度重置后重新检查；已冻结的时间窗仍然有效。"
+                if cloud["state"] == "CloudWriteQuotaExceeded"
+                else "云端授权服务暂不可用，调度器恢复连接后检查原有时间窗与尚未尝试的项目。",
+                next_at=cloud.get("retry_at"),
+            )
         next_at = max(
             epoch(task["policy"]["starts_at"]),
             min(
@@ -153,7 +192,13 @@ def task_workflow(task, blockers, item_blockers, now):
                 "任务已启动，到达计划时间并满足间隔后执行。",
                 next_at=next_at,
             )
-        return step("ready", "已启动 · 待执行", "按启动时固定的清单执行并逐项核验回执。")
+        return step(
+            "ready",
+            "已启动 · 本地通道" if fallback else "已启动 · 待执行",
+            "服务器额度已用尽，按原有本地通道执行；去重、限速和回执核验继续生效。"
+            if fallback
+            else "按启动时固定的清单执行并逐项核验回执。",
+        )
     return step("verifying", "等待结果核验", "核对已提交项目的投递或排期回执。")
 
 
@@ -169,6 +214,9 @@ def telegram_blocker(db, task, payload, at):
     if candidate and candidate["decision"] != "qualified":
         return "candidate_rejected"
     requires_join = bool(policy["max_joins"])
+    requires_membership = (
+        requires_join or policy.get("outbound_after_membership_seconds") is not None
+    )
     if requires_join and not candidate:
         return "candidate_missing"
     if not candidate:
@@ -178,9 +226,9 @@ def telegram_blocker(db, task, payload, at):
             (payload["account_id"], payload["target"]),
         ).fetchone()
     if not candidate:
-        return None
+        return "membership_unverified" if requires_membership else None
     joined = json.loads(candidate["result"])
-    if requires_join or candidate["state"] != "not_attempted":
+    if requires_membership or candidate["state"] != "not_attempted":
         if (
             candidate["state"] not in {"joined", "already_joined"}
             or joined.get("verified") is not True

@@ -242,19 +242,25 @@ class Statistics:
                 == 1
             )
 
-    def mark_feedback(self, item_id, checked_through, status, *, cursor=0):
+    def mark_feedback(self, item_id, checked_through, status, *, cursor=0, error_code=None):
         now = self.clock()
         if (
             status not in {"complete", "partial", "failed"}
             or publication_time(checked_through, now) is None
         ):
             raise ValueError("回复采集状态无效")
+        from .execution_diagnostics import safe_code
+
+        error_code = safe_code(error_code, "feedback_unavailable") if error_code else None
+        if status == "complete":
+            error_code = None
         with self.store.connect(write=True) as db:
             db.execute(
-                "INSERT INTO feedback_checks(item_id,checked_through,status,last_message_id) VALUES(?,?,?,?) "
+                "INSERT INTO feedback_checks(item_id,checked_through,status,last_message_id,error_code) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(item_id) DO UPDATE SET checked_through=excluded.checked_through,"
-                "status=excluded.status,last_message_id=max(feedback_checks.last_message_id,excluded.last_message_id)",
-                (item_id, checked_through, status, cursor),
+                "status=excluded.status,last_message_id=max(feedback_checks.last_message_id,excluded.last_message_id),"
+                "error_code=excluded.error_code",
+                (item_id, checked_through, status, cursor, error_code),
             )
 
     def reports(self, limit=30):
@@ -267,6 +273,30 @@ class Statistics:
                 "ORDER BY cutoff DESC,kind LIMIT ?",
                 (limit,),
             )
+        ]
+
+    def feedback_issues(self):
+        from .execution_diagnostics import safe_code
+
+        rows = self.store.rows(
+            "SELECT c.item_id,a.platform,c.status,c.checked_through,"
+            "COALESCE(c.error_code,(SELECT l.error_code FROM calls l "
+            "WHERE l.task_id=i.task_id AND l.operation='feedback' AND l.error_code IS NOT NULL "
+            "AND l.at BETWEEN c.checked_through-5 AND c.checked_through+0.01 "
+            "ORDER BY l.at DESC LIMIT 1)) error_code "
+            "FROM feedback_checks c JOIN items i ON i.id=c.item_id "
+            "JOIN tasks t ON t.id=i.task_id JOIN accounts a ON a.id=i.account_id "
+            "WHERE t.mode='live' AND a.mode='live' AND c.status!='complete' "
+            "ORDER BY c.item_id"
+        )
+        return [
+            {
+                **r,
+                "error_code": safe_code(r["error_code"], "feedback_unavailable")
+                if r["error_code"]
+                else None,
+            }
+            for r in rows
         ]
 
     def _save_report(self, db, kind, start, cutoff, now):

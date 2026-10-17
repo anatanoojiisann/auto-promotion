@@ -269,14 +269,30 @@ def verify_claim(request):
                 if actual != media["sha256"]:
                     raise BackendError("ApprovedMediaChanged")
         from ..cloud_control import CloudControl, CloudUnavailable
+        from ..execution_channels import independent_scope
 
-        cloud = CloudControl.configured()
+        independent = bool(
+            independent_scope(db) and (request.get("execution_job") or {}).get("channel") == "local"
+        )
+        cloud = None if independent else CloudControl.configured()
         required = db.execute(
             "SELECT value FROM meta WHERE key='cloud_control_required'"
         ).fetchone()
-        if not cloud and required and required[0] == "1":
+        if not cloud and required and required[0] == "1" and not independent:
             raise BackendError("CloudAuthorizationUnavailable")
-        if cloud:
+        if (request.get("execution_job") or {}).get("channel") == "local":
+            from ..adapters import AdapterRegistry
+            from ..execution_channels import guard_local
+            from ..store import Store
+
+            # Recheck local ownership immediately before submission. All normal
+            # task, stop, permission and payload checks above remain mandatory.
+            local_engine = Engine(Store(path), AdapterRegistry(path.parent), live_enabled=True)
+            try:
+                guard_local(local_engine, request["execution_job"], cloud)
+            except CloudUnavailable:
+                raise BackendError("LocalChannelAuthorizationUnavailable") from None
+        elif cloud:
             attempt_id = payload.get("attempt_id")
             if join:
                 attempt = db.execute(

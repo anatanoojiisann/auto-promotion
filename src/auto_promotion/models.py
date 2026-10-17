@@ -62,7 +62,7 @@ class AccountInput(Model):
     label: str = Field(min_length=1, max_length=80)
     backend_label: str = Field(min_length=1, max_length=100)
     mode: Literal["live", "simulation"] = "live"
-    daily_limit: int = Field(default=5, ge=1, le=100)
+    daily_limit: int = Field(default=5, ge=1, le=300)
     hourly_limit: int = Field(default=3, ge=1, le=20)
     min_interval: int = Field(default=120, ge=0, le=86400)
 
@@ -76,7 +76,7 @@ class AccountInput(Model):
 
 class AccountUpdate(Model):
     label: str = Field(min_length=1, max_length=80)
-    daily_limit: int = Field(ge=1, le=100)
+    daily_limit: int = Field(ge=1, le=300)
     hourly_limit: int = Field(ge=1, le=20)
     min_interval: int = Field(ge=0, le=86400)
 
@@ -97,6 +97,8 @@ class Policy(Model):
     min_confidence: float = Field(default=0.8, ge=0.5, le=1)
     max_candidates: int = Field(default=20, ge=1, le=200)
     max_joins: int = Field(default=0, ge=0, le=20)
+    outbound_after_membership_seconds: int | None = Field(default=None, ge=3600, le=604800)
+    outbound_after_service_recovery_seconds: int | None = Field(default=None, ge=30, le=86400)
     timezone: str = "Asia/Shanghai"
     starts_at: str
     ends_at: str
@@ -104,7 +106,7 @@ class Policy(Model):
     ordering_mode: Literal["strict", "independent_accounts"] = "strict"
     pacing_scope: Literal["task", "account"] = "task"
     quota_snapshot: dict = Field(default_factory=dict)
-    daily_limit: int = Field(default=5, ge=1, le=100)
+    daily_limit: int = Field(default=5, ge=1, le=300)
     target_daily_limit: int = Field(default=3, ge=1, le=3)
     user_daily_limit: int = Field(default=2, ge=1, le=2)
     target_allowlist: list[str] = Field(default_factory=list)

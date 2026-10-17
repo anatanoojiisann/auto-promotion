@@ -9,7 +9,7 @@ from .core import Conflict, NotFound
 from .models import CandidateInput, ItemInput, OpportunityInput, TaskInput, canonical, digest
 from .planner import build_plan, content_key
 from .pools import Pools
-from .quotas import settings
+from .quotas import UNSUBMITTED_MANUAL, settings
 from .store import Store, decode
 
 
@@ -682,7 +682,9 @@ class Campaigns:
             )
             if state == "cancelled":
                 db.execute(
-                    "DELETE FROM content_contacts WHERE assignment_id IN (SELECT ca.id FROM campaign_assignments ca LEFT JOIN items i ON i.id=ca.item_id WHERE ca.campaign_id=? AND (i.id IS NULL OR i.attempt_id IS NULL))",
+                    "DELETE FROM content_contacts WHERE assignment_id IN (SELECT ca.id FROM campaign_assignments ca LEFT JOIN items i ON i.id=ca.item_id WHERE ca.campaign_id=? AND (i.id IS NULL OR i.attempt_id IS NULL OR "
+                    + UNSUBMITTED_MANUAL
+                    + "))",
                     (campaign_id,),
                 )
             Store.audit(

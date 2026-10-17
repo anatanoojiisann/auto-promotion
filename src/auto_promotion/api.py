@@ -91,12 +91,18 @@ def create_app(
     report_worker=None,
     token=None,
     pooled_worker=None,
+    statistics_only=False,
 ):
+    if statistics_only:
+        worker, report_worker = False, True
     workspace = workspace_path()
     store = Store(db_path or database_path())
     registry = registry or AdapterRegistry(workspace)
     engine = Engine(
-        store, registry, clock=clock, live_enabled=os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1"
+        store,
+        registry,
+        clock=clock,
+        live_enabled=not statistics_only and os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
     )
     connections = ConnectionManager(engine)
     statistics = Statistics(store, clock=clock)
@@ -173,13 +179,21 @@ def create_app(
                 sender = stack.enter_context(WorkerRun(store, live_enabled=engine.live_enabled))
                 jobs.append(asyncio.create_task(work_loop()))
             if report_worker:
-                for callback, kind in (
-                    (tiktok.reconcile_due, "verify"),
-                    (engine.collect_statistics, "statistics"),
-                    (statistics.run_due, "reports"),
-                    (growth.sync_inbox, "inbox"),
-                    (growth.poll_feeds, "feeds"),
-                ):
+                callbacks = (
+                    (
+                        (engine.collect_statistics, "statistics"),
+                        (statistics.run_due, "reports"),
+                    )
+                    if statistics_only
+                    else (
+                        (tiktok.reconcile_due, "verify"),
+                        (engine.collect_statistics, "statistics"),
+                        (statistics.run_due, "reports"),
+                        (growth.sync_inbox, "inbox"),
+                        (growth.poll_feeds, "feeds"),
+                    )
+                )
+                for callback, kind in callbacks:
                     jobs.append(asyncio.create_task(report_loop(callback, kind)))
             try:
                 yield
@@ -231,6 +245,12 @@ def create_app(
                     return JSONResponse({"error": "local_session_only"}, status_code=403)
             elif not authenticated:
                 return JSONResponse({"error": "authentication_required"}, status_code=401)
+            if (
+                statistics_only
+                and request.method not in {"GET", "HEAD", "OPTIONS"}
+                and not bootstrap
+            ):
+                return JSONResponse({"error": "statistics_service_read_only"}, status_code=403)
             if (
                 request.method not in {"GET", "HEAD", "OPTIONS"}
                 and not bearer
@@ -304,7 +324,12 @@ def create_app(
             "live_writes": engine.live_enabled,
             "report_worker": report_worker,
             "execution_mode": "pooled" if pooled_worker else "legacy",
+            "statistics_only": statistics_only,
         }
+
+    @app.get("/api/statistics/feedback-issues")
+    def feedback_issues():
+        return {"issues": statistics.feedback_issues()}
 
     @app.post("/api/session")
     def session():

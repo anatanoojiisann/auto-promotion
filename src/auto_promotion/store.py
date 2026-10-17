@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS feedback_events(
 );
 CREATE TABLE IF NOT EXISTS feedback_checks(
  item_id TEXT PRIMARY KEY REFERENCES items(id), checked_through REAL NOT NULL,
- status TEXT NOT NULL CHECK(status IN ('complete','partial','failed')), last_message_id INTEGER NOT NULL DEFAULT 0
+ status TEXT NOT NULL CHECK(status IN ('complete','partial','failed')), last_message_id INTEGER NOT NULL DEFAULT 0,
+ error_code TEXT
 );
 CREATE TABLE IF NOT EXISTS statistical_reports(
  kind TEXT NOT NULL, cutoff REAL NOT NULL, starts_at REAL NOT NULL,
@@ -221,6 +222,8 @@ class Store:
                 db.execute(
                     "ALTER TABLE feedback_checks ADD COLUMN last_message_id INTEGER NOT NULL DEFAULT 0"
                 )
+            if "error_code" not in {r[1] for r in db.execute("PRAGMA table_info(feedback_checks)")}:
+                db.execute("ALTER TABLE feedback_checks ADD COLUMN error_code TEXT")
             db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS accounts_identity_unique "
                 "ON accounts(platform,identity_hash,mode) WHERE identity_hash IS NOT NULL"

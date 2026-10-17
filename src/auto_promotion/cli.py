@@ -47,6 +47,21 @@ def main():
     pool.add_argument("--node-id", required=True)
     pool.add_argument("--idle-exit", type=int, default=30)
     sub.add_parser("pools-status", help="Read persistent queue and per-pool worker health")
+    channels = sub.add_parser(
+        "execution-channels", help="Configure cloud-first, quota-only local fallback"
+    )
+    channels.add_argument("--enable", action="store_true")
+    channels.add_argument(
+        "--local-today",
+        action="store_true",
+        help="Use the independent local queue until midnight in Asia/Shanghai",
+    )
+    channels.add_argument("--account", action="append", default=[])
+    channels.add_argument(
+        "--binding",
+        action="store_true",
+        help="Create/read this database's non-secret deployment binding",
+    )
     sub.add_parser("cloud-status", help="Read Cloudflare queue and executor health")
     sub.add_parser(
         "cloud-sync", help="Persist current task snapshots and quota ledger to Cloudflare"
@@ -94,6 +109,9 @@ def main():
     login = sub.add_parser("login", help="Configure a private local platform account")
     login.add_argument("platform", choices=PLATFORMS)
     login.add_argument("--account", required=True, help="Stable local account label")
+    login.add_argument(
+        "--browser-channel", choices=["chromium", "msedge", "chrome"], default="chromium"
+    )
     sub.add_parser("doctor", help="Check this interpreter and the bundled backends")
     args = parser.parse_args()
     load_environment(Path(args.db).resolve().parent / "cloud-node.env")
@@ -146,7 +164,9 @@ def main():
                 else:
                     from .backends.browser import login as login_browser
 
-                    result = login_browser(args.platform, args.account)
+                    result = login_browser(
+                        args.platform, args.account, browser_channel=args.browser_channel
+                    )
         except (Exception, KeyboardInterrupt) as exc:
             # Login errors may contain phone numbers, codes, cookies or tokens.
             code = exc.safe_code if isinstance(exc, BackendError) else type(exc).__name__
@@ -165,6 +185,7 @@ def main():
                 worker=not (args.no_worker or args.reports_only),
                 report_worker=args.reports_only or not args.no_worker,
                 pooled_worker=args.execution_mode == "pooled",
+                statistics_only=args.reports_only,
             ),
             host="127.0.0.1",
             port=args.port,
@@ -191,6 +212,67 @@ def main():
         AdapterRegistry(workspace_path()),
         live_enabled=os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
     )
+    if args.command == "execution-channels":
+        from .cloud_control import CloudControl, CloudUnavailable
+        from .execution_channels import (
+            binding,
+            check_standby,
+            configure_independent,
+            enabled,
+            read_state,
+        )
+
+        cloud = None if args.local_today else CloudControl.configured()
+        try:
+            if args.local_today:
+                from datetime import timedelta
+                from zoneinfo import ZoneInfo
+
+                now = datetime.fromtimestamp(engine.clock(), ZoneInfo("Asia/Shanghai"))
+                until = datetime.combine(
+                    now.date() + timedelta(days=1), datetime.min.time(), tzinfo=now.tzinfo
+                ).timestamp()
+                configure_independent(engine, args.account, until)
+            if args.enable:
+                try:
+                    check_standby(engine, cloud)
+                except CloudUnavailable as exc:
+                    if str(exc) not in {
+                        "CloudWriteQuotaExceeded",
+                        "LocalChannelCheckpointRequired",
+                    }:
+                        raise
+                    # Arm the policy now; the first trusted checkpoint is still
+                    # mandatory before any local write can execute.
+                    health = cloud.request("/health", None, method="GET")
+                    if health.get("fallback") != {
+                        "node_id": cloud.node_id,
+                        "store_id": binding(engine),
+                    }:
+                        raise CloudUnavailable("LocalChannelBindingMismatch") from None
+                with store.connect(write=True) as db:
+                    db.execute(
+                        "INSERT INTO meta VALUES('execution_channel_policy','cloud_then_local') "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                    )
+                    Store.audit(db, "execution.channels_enabled", {"policy": "cloud_then_local"})
+            result = {
+                "policy": "cloud_then_local" if enabled(store) else "cloud_only",
+                "channel": read_state(store),
+                "checkpoint_saved": bool(
+                    store.one("SELECT value FROM meta WHERE key='cloud_standby_permit'")
+                ),
+            }
+            if args.binding:
+                result["deployment_binding"] = {
+                    "FALLBACK_NODE_ID": cloud.node_id if cloud else None,
+                    "FALLBACK_STORE_ID": binding(engine),
+                }
+        except (CloudUnavailable, ValueError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            raise SystemExit(2) from None
+        print(json.dumps(result, ensure_ascii=False))
+        return
     if args.command in {"cloud-bootstrap", "cloud-sync", "cloud-status"}:
         from .cloud_admin import bootstrap, configured
         from .cloud_control import CloudUnavailable

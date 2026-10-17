@@ -347,6 +347,33 @@ class EngineTests(unittest.TestCase):
         self.engine.change_state(task["id"], "cancelled")
         self.assertEqual(self.engine.update_account(account_id, update)["label"], "New label")
 
+    def test_daily_budget_300_requires_pausing_and_keeps_old_snapshot_invalid(self):
+        account = self.accounts["telegram"]
+        task = self.task()
+        update = AccountUpdate(
+            label=account["label"],
+            daily_limit=300,
+            hourly_limit=account["hourly_limit"],
+            min_interval=account["min_interval"],
+        )
+        with self.assertRaisesRegex(Conflict, "未结束任务"):
+            self.engine.update_account(account["id"], update)
+        self.engine.change_state(task["id"], "paused")
+        self.assertEqual(self.engine.update_account(account["id"], update)["daily_limit"], 300)
+        self.assertEqual(self.engine.task(task["id"])["policy_hash"], task["policy_hash"])
+        with self.assertRaisesRegex(Conflict, "账号配置已变化"):
+            self.engine.start_task(task["id"], sending=False)
+
+    def test_daily_budget_above_300_is_rejected(self):
+        account = self.accounts["telegram"]
+        with self.assertRaises(ValueError):
+            AccountUpdate(
+                label=account["label"],
+                daily_limit=301,
+                hourly_limit=account["hourly_limit"],
+                min_interval=account["min_interval"],
+            )
+
     def test_existing_database_adds_account_identity_and_task_pacing_columns(self):
         old_path = Path(self.tmp.name) / "old.db"
         with closing(sqlite3.connect(old_path)) as db:

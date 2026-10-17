@@ -1,4 +1,8 @@
 // All mutations run synchronously inside one workspace's durable SQLite transaction.
+import { SCHEMA, migrate } from "./schema.mjs";
+export const LEASE_SECONDS = 180;
+export const RENEW_MARGIN_SECONDS = 60;
+export const NODE_HEARTBEAT_SECONDS = 300;
 export const PLATFORMS = new Set([
   "telegram",
   "x",
@@ -34,7 +38,8 @@ const TERMINAL = new Set([
   "already_joined",
   "pending_admin_approval",
 ]);
-const SCHEMA = `
+// Retained for migration regression fixtures; never executed for new workspaces.
+export const LEGACY_SCHEMA = `
  CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
  INSERT OR IGNORE INTO config VALUES(1,'{"global_stop":true,"live_enabled":false,"max_workers":6,"global_limit":{"daily":100,"hourly":20},"platform_workers":{},"pool_workers":{}}');
  CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,identity TEXT NOT NULL,platform TEXT NOT NULL,payload TEXT NOT NULL,next_at REAL NOT NULL DEFAULT 0,cooldown_until REAL NOT NULL DEFAULT 0,disabled INTEGER NOT NULL DEFAULT 0);
@@ -56,6 +61,13 @@ export class ControlError extends Error {
     super(code);
     this.status = status;
   }
+}
+export function cloudFailure(error, now = Date.now()) {
+  const quota = /Exceeded allowed rows written in Durable Objects free tier/i.test(String(error?.message || ""));
+  return {
+    error: quota ? "CloudWriteQuotaExceeded" : "CloudRuntimeUnavailable",
+    retry_after_seconds: quota ? Math.ceil((86400000 - (now % 86400000)) / 1000) + 30 : 60,
+  };
 }
 export function canonical(value) {
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
@@ -100,7 +112,11 @@ export class ControlKernel {
     this.sql = storage.sql;
     this.clock = clock;
     this.uuid = uuid;
-    this.sql.exec(SCHEMA);
+    // Existing workspaces do not need schema writes on every object activation.
+    if (!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='snapshot_cursor'"))
+      this.tx(() => this.sql.exec(SCHEMA));
+    else if (!this.rows("PRAGMA table_info(jobs)").some(c => c.name === "attempt_at"))
+      migrate(storage);
   }
   rows(q, ...args) {
     return this.sql.exec(q, ...args).toArray();
@@ -192,7 +208,8 @@ export class ControlKernel {
     const n = this.one("SELECT * FROM nodes WHERE id=?", id);
     if (!n || !n.enabled || n.token_hash !== tokenHash)
       throw new ControlError("NodeUnauthorized", 401);
-    this.sql.exec("UPDATE nodes SET last_seen=? WHERE id=?", this.clock(), id);
+    if (this.clock() - n.last_seen >= NODE_HEARTBEAT_SECONDS)
+      this.sql.exec("UPDATE nodes SET last_seen=? WHERE id=?", this.clock(), id);
     return {
       ...n,
       pools: JSON.parse(n.pools),
@@ -218,7 +235,7 @@ export class ControlKernel {
         if (cursor && snapshot.revision < cursor.revision)
           return { stale: true };
         this.sql.exec(
-          "INSERT INTO snapshot_cursor VALUES(1,?) ON CONFLICT(id) DO UPDATE SET revision=MAX(revision,excluded.revision)",
+          "INSERT INTO snapshot_cursor VALUES(1,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision WHERE excluded.revision>snapshot_cursor.revision",
           snapshot.revision,
         );
       } else if (cursor)
@@ -227,11 +244,12 @@ export class ControlKernel {
         if (!PLATFORMS.has(a.platform) || !a.id || !a.identity || !a.limits)
           throw new ControlError("InvalidAccount", 400);
         const prior = this.one(
-          "SELECT identity FROM accounts WHERE id=?",
+          "SELECT identity,payload FROM accounts WHERE id=?",
           a.id,
         );
         if (prior && prior.identity !== a.identity)
           throw new ControlError("AccountIdentityChanged");
+        if (prior && prior.payload === canonical(a)) continue;
         this.sql.exec(
           "INSERT INTO accounts VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,next_at=MAX(accounts.next_at,excluded.next_at),cooldown_until=MAX(accounts.cooldown_until,excluded.cooldown_until),disabled=MAX(accounts.disabled,excluded.disabled)",
           a.id,
@@ -256,6 +274,20 @@ export class ControlKernel {
           ["active", "completed"].includes(old.state)
         )
           throw new ControlError("FrozenTaskChanged");
+        // Legacy clients mirrored unfrozen membership placeholders. They were
+        // never eligible to execute. Remove only unleased, unattempted send
+        // placeholders before publishing the first immutable manifest.
+        if (old && old.phase === "starting" && !frozen && t.manifest_hash)
+          this.sql.exec(
+            "DELETE FROM jobs WHERE task_id=? AND kind='send' AND state='pending' AND attempt_id IS NULL AND lease_until<=?",
+            t.id, this.clock(),
+          );
+        if (t.state === "cancelled")
+          this.sql.exec(
+            "UPDATE jobs SET state='cancelled' WHERE task_id=? AND state='pending' AND attempt_id IS NULL AND lease_until<=?",
+            t.id, this.clock(),
+          );
+        if (old && old.payload === canonical(t)) continue;
         this.sql.exec(
           "INSERT INTO tasks VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,phase=excluded.phase,version=excluded.version,payload=excluded.payload",
           t.id,
@@ -330,14 +362,20 @@ export class ControlKernel {
             j.id,
           );
       }
-      for (const e of snapshot.quota_events || [])
+      for (const e of snapshot.quota_events || []) {
+        // The local receipt mirror echoes the same attempt. Its dimensions
+        // already live durably on the job; do not materialize nine duplicate rows.
+        const recorded = this.one("SELECT quota_scopes FROM jobs WHERE attempt_id=? AND attempt_at IS NOT NULL", e.attempt_id);
+        if (recorded && JSON.parse(recorded.quota_scopes).some(s => s.scope === e.scope && s.key === e.key))
+          continue;
         this.sql.exec(
-          "INSERT OR IGNORE INTO quota_events VALUES(?,?,?,?)",
+          "INSERT OR IGNORE INTO quota_history VALUES(?,?,?,?)",
           e.attempt_id,
           e.scope,
           e.key,
           e.at,
         );
+      }
       return { tasks: snapshot.tasks.length, jobs: snapshot.jobs.length };
     });
   }
@@ -349,18 +387,54 @@ export class ControlKernel {
         now,
       )) {
         this.sql.exec(
-          "UPDATE jobs SET state='unknown',result=? WHERE id=?",
+          "UPDATE jobs SET state='unknown',result=?,completed_at=? WHERE id=?",
           canonical({ reason: "executor_lease_expired", verified: false }),
+          now,
           j.id,
         );
-        this.event("job_unknown", j.id, { reason: "executor_lease_expired" });
       }
       this.sql.exec(
-        "UPDATE jobs SET state='missed',result=? WHERE state='pending' AND expires_at<=?",
+        "UPDATE jobs SET state='missed',result=?,completed_at=? WHERE state='pending' AND expires_at<=?",
         canonical({ reason: "delivery_window_elapsed" }),
+        now,
         now,
       );
     });
+  }
+  nextMaintenanceAt() {
+    // The executor wakes for due_at. The coordinator only needs to wake for
+    // lease expiry or a missed delivery window; waiting itself does not write.
+    return this.one("SELECT MIN(at) at FROM (SELECT MIN(lease_until) at FROM jobs WHERE state='leased' UNION ALL SELECT MIN(expires_at) at FROM jobs WHERE state='pending')")?.at ?? null;
+  }
+  accountNext(identity) {
+    return Math.max(
+      this.one("SELECT MAX(next_at) at FROM accounts WHERE identity=?", identity)?.at || 0,
+      this.one("SELECT MAX(j.account_pacing_until) at FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE a.identity=? AND j.attempt_at IS NOT NULL", identity)?.at || 0,
+    );
+  }
+  taskNext(taskId) {
+    return Math.max(
+      this.one("SELECT next_at FROM task_pacing WHERE task_id=?", taskId)?.next_at || 0,
+      this.one("SELECT MAX(task_pacing_until) at FROM jobs WHERE task_id=? AND attempt_at IS NOT NULL", taskId)?.at || 0,
+    );
+  }
+  checkQuotas(scopes, attemptId, now) {
+    const day = Math.floor(now / 86400) * 86400;
+    const since = Math.min(day, now - 3600);
+    const recent = this.rows("SELECT attempt_id,attempt_at,quota_scopes FROM jobs WHERE attempt_at>=? AND attempt_id<>?", since, attemptId);
+    for (const s of scopes) {
+      const attempts = new Map(this.rows(
+        "SELECT attempt_id,at FROM quota_history WHERE scope=? AND scope_key=? AND at>=? AND attempt_id<>?",
+        s.scope, s.key, since, attemptId,
+      ).map(e => [e.attempt_id, e.at]));
+      for (const j of recent) {
+        if (JSON.parse(j.quota_scopes).some(e => e.scope === s.scope && e.key === s.key))
+          attempts.set(j.attempt_id, Math.max(attempts.get(j.attempt_id) || 0, j.attempt_at));
+      }
+      const times = [...attempts.values()];
+      if (times.filter(at => at >= day).length >= s.limit.daily || times.filter(at => at > now - 3600).length >= s.limit.hourly)
+        throw new ControlError("QuotaExceeded");
+    }
   }
   claim(node, pool, expectedId = null) {
     if (!node.pools.includes(pool))
@@ -400,7 +474,7 @@ export class ControlKernel {
           !node.accounts.includes(j.account_id) ||
           identityState.disabled ||
           identityState.cooldown_until > now ||
-          identityState.next_at > now ||
+          this.accountNext(j.identity) > now ||
           j.attempt_id
         )
           continue;
@@ -412,10 +486,7 @@ export class ControlKernel {
         if (j.kind === "send" && task.phase !== "ready") continue;
         if (
           task.policy.pacing_scope !== "account" &&
-          (this.one(
-            "SELECT next_at FROM task_pacing WHERE task_id=?",
-            j.task_id,
-          )?.next_at || 0) > now
+          this.taskNext(j.task_id) > now
         )
           continue;
         if (j.kind === "send") {
@@ -457,16 +528,16 @@ export class ControlKernel {
         )
           continue;
         const token = this.uuid(),
-          until = now + 180;
+          until = now + LEASE_SECONDS;
         this.sql.exec(
-          "UPDATE jobs SET state='leased',owner=?,lease_token=?,lease_until=? WHERE id=?",
+          "UPDATE jobs SET state='leased',owner=?,lease_token=?,lease_until=?,claimed_at=?,completed_at=NULL WHERE id=?",
           node.id,
           token,
           until,
+          now,
           j.id,
         );
-        this.event("job_leased", j.id, { node_id: node.id, pool });
-        return { ...data, lease_token: token, lease_until: until };
+        return { ...data, lease_token: token, lease_until: until, renew_after_seconds: LEASE_SECONDS - RENEW_MARGIN_SECONDS };
       }
       return null;
     });
@@ -487,13 +558,13 @@ export class ControlKernel {
   }
   renew(node, id, token) {
     return this.tx(() => {
-      this.leased(node, id, token);
-      this.sql.exec(
-        "UPDATE jobs SET lease_until=? WHERE id=?",
-        this.clock() + 180,
-        id,
-      );
-      return { renewed: true };
+      const j = this.leased(node, id, token), now = this.clock();
+      let until = j.lease_until;
+      if (until - now <= RENEW_MARGIN_SECONDS) {
+        until = now + LEASE_SECONDS;
+        this.sql.exec("UPDATE jobs SET lease_until=? WHERE id=?", until, id);
+      }
+      return { renewed: true, lease_until: until, renew_after_seconds: Math.max(0, until - now - RENEW_MARGIN_SECONDS) };
     });
   }
   authorize(node, id, token, attemptId) {
@@ -538,10 +609,13 @@ export class ControlKernel {
           throw new ControlError("AttemptAlreadyRecorded");
         return { allowed: true };
       }
+      if (this.one("SELECT id FROM jobs WHERE attempt_id=? AND id<>? LIMIT 1", attemptId, id))
+        throw new ControlError("AttemptAlreadyRecorded");
+      if (this.accountNext(a.identity) > now)
+        throw new ControlError("PacingWait");
       if (
         task.policy.pacing_scope !== "account" &&
-        (this.one("SELECT next_at FROM task_pacing WHERE task_id=?", j.task_id)
-          ?.next_at || 0) > now
+        this.taskNext(j.task_id) > now
       )
         throw new ControlError("PacingWait");
       if (j.kind === "join") {
@@ -588,51 +662,17 @@ export class ControlKernel {
           hourly: 100000,
         },
       });
-      const day = Math.floor(now / 86400) * 86400;
-      for (const s of scopes) {
-        const daily = this.one(
-          "SELECT COUNT(*) n FROM quota_events WHERE scope=? AND scope_key=? AND at>=? AND attempt_id<>?",
-          s.scope,
-          s.key,
-          day,
-          attemptId,
-        ).n;
-        const hourly = this.one(
-          "SELECT COUNT(*) n FROM quota_events WHERE scope=? AND scope_key=? AND at>? AND attempt_id<>?",
-          s.scope,
-          s.key,
-          now - 3600,
-          attemptId,
-        ).n;
-        if (daily >= s.limit.daily || hourly >= s.limit.hourly)
-          throw new ControlError("QuotaExceeded");
-      }
+      this.checkQuotas(scopes, attemptId, now);
+      const dimensions = [...new Map(scopes.map(s => [canonical([s.scope,s.key]), {scope:s.scope,key:s.key}])).values()];
+      // Persist the attempt BEFORE any platform call. This one row is also the
+      // quota ledger, pacing reservation and durable execution audit.
       this.sql.exec(
-        "UPDATE jobs SET attempt_id=? WHERE id=? AND attempt_id IS NULL",
-        attemptId,
+        "UPDATE jobs SET attempt_id=?,attempt_at=?,quota_scopes=?,account_pacing_until=?,task_pacing_until=? WHERE id=? AND attempt_id IS NULL",
+        attemptId, now, canonical(dimensions),
+        now + Math.max(account.min_interval || 0, task.policy.min_interval || 0),
+        task.policy.pacing_scope !== "account" ? now + (task.policy.min_interval || 0) : 0,
         id,
       );
-      for (const s of scopes)
-        this.sql.exec(
-          "INSERT OR IGNORE INTO quota_events VALUES(?,?,?,?)",
-          attemptId,
-          s.scope,
-          s.key,
-          now,
-        );
-      this.sql.exec(
-        "UPDATE accounts SET next_at=MAX(next_at,?) WHERE identity=?",
-        now +
-          Math.max(account.min_interval || 0, task.policy.min_interval || 0),
-        a.identity,
-      );
-      if (task.policy.pacing_scope !== "account")
-        this.sql.exec(
-          "INSERT INTO task_pacing VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET next_at=MAX(next_at,excluded.next_at)",
-          j.task_id,
-          now + (task.policy.min_interval || 0),
-        );
-      this.event("attempt_registered", id, { attempt_id: attemptId });
       return { allowed: true };
     });
   }
@@ -683,19 +723,19 @@ export class ControlKernel {
       )
         throw new ControlError("VerifiedScheduleRequired");
       const normalized = { ...result, status: state };
+      if (j.state === state && j.result === canonical(normalized))
+        return { state };
       this.sql.exec(
-        "UPDATE jobs SET state=?,result=?,attempt_id=COALESCE(attempt_id,?),available_at=?,lease_until=0 WHERE id=?",
+        "UPDATE jobs SET state=?,result=?,attempt_id=COALESCE(attempt_id,?),available_at=?,lease_until=0,completed_at=?,owner=?,lease_token=? WHERE id=?",
         state,
         canonical(normalized),
         attempt_id,
-        Math.max(this.clock() + 5, Number(result.next_at) || 0),
+        state === "pending" ? Math.max(j.available_at, this.clock() + 5, Number(result.next_at) || 0) : j.available_at,
+        this.clock(),
+        state === "pending" ? null : j.owner,
+        state === "pending" ? null : j.lease_token,
         id,
       );
-      if (state === "pending")
-        this.sql.exec(
-          "UPDATE jobs SET owner=NULL,lease_token=NULL WHERE id=?",
-          id,
-        );
       if (result.rate_limited || result.risk_warning)
         this.sql.exec(
           "UPDATE accounts SET cooldown_until=MAX(cooldown_until,?),disabled=MAX(disabled,?) WHERE identity=(SELECT identity FROM accounts WHERE id=?)",
@@ -704,13 +744,14 @@ export class ControlKernel {
           result.risk_warning ? 1 : 0,
           j.account_id,
         );
-      this.event("job_" + state, id, { verified: !!result.verified });
       return { state };
     });
   }
   status() {
     this.sweep();
     return {
+      schema: 2,
+      node_heartbeat_seconds: NODE_HEARTBEAT_SECONDS,
       settings: this.settings(),
       jobs: this.rows(
         "SELECT pool,state,COUNT(*) count,MIN(available_at) oldest FROM jobs GROUP BY pool,state",

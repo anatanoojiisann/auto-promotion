@@ -198,6 +198,13 @@ class ConnectionsTests(unittest.TestCase):
 
     @unittest.skipUnless(find_spec("playwright"), "browser extra is not installed")
     def test_edge_login_and_subsequent_health_use_same_browser_profile(self):
+        self.check_installed_browser_login_and_health("msedge")
+
+    @unittest.skipUnless(find_spec("playwright"), "browser extra is not installed")
+    def test_chrome_login_and_subsequent_health_use_same_isolated_profile(self):
+        self.check_installed_browser_login_and_health("chrome")
+
+    def check_installed_browser_login_and_health(self, channel):
         runtime = MagicMock()
         context = runtime.chromium.launch_persistent_context.return_value
         context.pages = [MagicMock()]
@@ -205,7 +212,7 @@ class ConnectionsTests(unittest.TestCase):
         page.is_closed.return_value = False
         page.get_by_test_id.return_value.count.return_value = 1
         page.get_by_test_id.return_value.first.is_visible.return_value = True
-        value = ConnectionInput(platform="x", username="brand", browser_channel="msedge")
+        value = ConnectionInput(platform="x", username="brand", browser_channel=channel)
         job = self.manager.start(value)
         with (
             patch("playwright.sync_api.sync_playwright") as factory,
@@ -215,18 +222,18 @@ class ConnectionsTests(unittest.TestCase):
             factory.return_value.__enter__.return_value = runtime
             self.manager.x_login(job["id"], value, threading.Event())
             settings = read_profile("x", "x-brand", accounts_dir=self.manager.accounts_dir)
-            self.assertEqual(settings["browser_channel"], "msedge")
+            self.assertEqual(settings["browser_channel"], channel)
             self.assertEqual(settings["identity"], "brand")
             browser_call("x", "x-brand", "health", {}, MagicMock(), MagicMock())
             launches = runtime.chromium.launch_persistent_context.call_args_list
             self.assertEqual(len(launches), 2)
             expected_path = str(
                 profile_path("x", "x-brand", accounts_dir=self.manager.accounts_dir)
-                / "browser-msedge"
+                / ("browser-" + channel)
             )
             for index, launch in enumerate(launches):
                 self.assertEqual(launch.args[0], expected_path)
-                self.assertEqual(launch.kwargs["channel"], "msedge")
+                self.assertEqual(launch.kwargs["channel"], channel)
                 self.assertEqual(launch.kwargs["headless"], bool(index))
             self.assertEqual(backend.call_args.args[-1], settings)
 

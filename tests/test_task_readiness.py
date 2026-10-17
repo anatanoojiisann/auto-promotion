@@ -16,6 +16,115 @@ def iso(seconds):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_recovery_schedule_waits_for_cloud_and_keeps_hour_and_spacing(self):
+        task = self.task(
+            max_joins=1,
+            outbound_after_membership_seconds=3600,
+            outbound_after_service_recovery_seconds=630,
+            ends_at=iso(self.now + 86400),
+        )
+        candidate = self.candidate(task)
+        self.membership(candidate, outbound_eligible_at_utc=iso(self.now + 3600))
+        self.items(task, scheduled_at=iso(self.now + 3600))
+        with self.store.connect(write=True) as db:
+            db.execute("INSERT INTO meta VALUES('cloud_control_required','1')")
+            db.execute(
+                "INSERT INTO meta VALUES('cloud_control_health',?)",
+                (json.dumps({"state": "CloudWriteQuotaExceeded"}),),
+            )
+        task = self.engine.start_task(task["id"])
+        self.assertEqual(task["phase"], "starting")
+        self.assertIsNone(task["manifest_hash"])
+        self.now += 7200
+        self.assertEqual(
+            self.engine.start_task(task["id"])["readiness"]["workflow"]["status"],
+            "waiting_execution_service",
+        )
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "UPDATE meta SET value=? WHERE key='cloud_control_health'",
+                (json.dumps({"state": "connected"}),),
+            )
+        task = self.engine.start_task(task["id"], source="scheduler")
+        self.assertEqual(task["phase"], "ready")
+        self.assertEqual(task["items"][0]["due_at"], self.now + 630)
+        self.assertGreater(task["items"][0]["due_at"], 1800003600)
+
+    def test_join_and_one_interaction_have_budget_for_both_actions(self):
+        task = self.task(
+            max_joins=1,
+            outbound_after_membership_seconds=3600,
+            daily_limit=2,
+            target_daily_limit=2,
+            user_daily_limit=2,
+        )
+        self.candidate(task)
+        self.items(task, scheduled_at=iso(self.now + 3600))
+        self.engine.start_task(task["id"])
+        self.assertEqual(self.engine.run_joins(task["id"])["processed"][0]["status"], "joined")
+        self.engine.start_task(task["id"], source="scheduler")
+        self.now += 3600
+        sent = self.engine.run_once(task["id"])["processed"]
+        self.assertEqual(sent[0]["status"], "confirmed")
+        self.assertEqual(len(self.store.rows("SELECT * FROM join_attempts")), 1)
+        self.assertEqual(len(self.store.rows("SELECT * FROM attempts")), 1)
+
+    def test_relative_hour_resolves_from_actual_late_join_before_freezing(self):
+        task = self.task(
+            max_joins=1, outbound_after_membership_seconds=3600, ends_at=iso(self.now + 86400)
+        )
+        candidate = self.candidate(task)
+        self.items(task, scheduled_at=iso(self.now + 3600))
+        self.assertEqual(self.engine.start_task(task["id"])["phase"], "starting")
+        self.now += 7200
+        eligible = self.now + 3600
+        self.membership(candidate, outbound_eligible_at_utc=iso(eligible))
+        task = self.engine.start_task(task["id"], source="scheduler")
+        self.assertEqual(task["phase"], "ready")
+        self.assertEqual(task["items"][0]["due_at"], eligible)
+        self.assertEqual(task["items"][0]["payload"]["text"], "AI question")
+        self.now = eligible - 1
+        self.assertEqual(self.engine.run_once(task["id"])["processed"], [])
+        self.now = eligible
+        self.assertEqual(self.engine.run_once(task["id"])["processed"][0]["status"], "confirmed")
+
+    def test_relative_hour_requires_confirmed_membership_not_admin_request(self):
+        task = self.task(max_joins=1, outbound_after_membership_seconds=3600)
+        candidate = self.candidate(task)
+        self.membership(candidate, "pending_admin_approval", verified=False)
+        self.items(task, scheduled_at=iso(self.now + 3600))
+        task = self.engine.start_task(task["id"])
+        self.assertEqual(task["phase"], "starting")
+        self.assertIsNone(task["manifest_hash"])
+        self.assertEqual(task["items"][0]["due_at"], self.now + 3600)
+
+    def test_relative_hour_does_not_modify_a_frozen_manifest(self):
+        task = self.task(max_joins=1, outbound_after_membership_seconds=3600)
+        candidate = self.candidate(task)
+        self.membership(candidate, outbound_eligible_at_utc=iso(self.now + 3600))
+        self.items(task, scheduled_at=iso(self.now + 3600))
+        original = self.engine.start_task(task["id"])
+        self.now += 3600
+        restarted = self.engine.start_task(task["id"])
+        self.assertEqual(original["manifest_hash"], restarted["manifest_hash"])
+        self.assertEqual(original["items"][0]["payload"], restarted["items"][0]["payload"])
+
+    def test_relative_membership_dependents_continue_per_group(self):
+        parent = self.task(max_joins=1)
+        candidate = self.candidate(parent)
+        child = self.task(outbound_after_membership_seconds=3600)
+        self.items(child, scheduled_at=iso(self.now + 3600))
+        self.assertEqual(self.engine.start_task(child["id"])["phase"], "starting")
+        other = self.task(max_joins=1, outbound_after_membership_seconds=3600)
+        self.items(other, target="@other_ai_group", scheduled_at=iso(self.now + 3600))
+        self.assertEqual(self.engine.start_task(other["id"])["phase"], "starting")
+        self.membership(candidate, outbound_eligible_at_utc=iso(self.now + 3600))
+        from auto_promotion.queue_store import JobQueue
+
+        JobQueue(self.engine).sync(child["id"])
+        self.assertEqual(self.engine.task(child["id"])["phase"], "ready")
+        self.assertEqual(self.engine.task(other["id"])["phase"], "starting")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

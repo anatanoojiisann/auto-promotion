@@ -1,6 +1,7 @@
 """Durable reference jobs; all outbound effects remain guarded by Engine and backends."""
 
 import json
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -9,6 +10,14 @@ from .models import canonical, digest, epoch
 from .routing import route_for
 
 _CURRENT_JOB = threading.local()
+
+
+def executor_task_ids():
+    """Optional task allowlist for a deliberately scoped local executor."""
+    raw = os.getenv("AP_EXECUTOR_TASK_IDS")
+    if raw is None:
+        return None
+    return sorted({task_id.strip() for task_id in raw.split(",") if task_id.strip()})
 
 
 @contextmanager
@@ -98,6 +107,27 @@ class JobQueue:
         added = 0
         for task in self.store.rows(sql, params):
             policy = json.loads(task["policy"])
+            if (
+                task["phase"] == "starting"
+                and policy.get("outbound_after_membership_seconds") is not None
+            ):
+                # A read-only membership tracker may have completed a linked join.
+                # Only resume an explicitly started task with verified evidence.
+                verified = self.store.rows(
+                    "SELECT 1 FROM items i JOIN candidates c ON c.account_id=i.account_id "
+                    "AND lower(c.target)=lower(json_extract(i.payload,'$.target')) "
+                    "WHERE i.task_id=? AND c.state IN ('joined','already_joined') "
+                    "AND json_extract(c.result,'$.verified')=1 LIMIT 1",
+                    (task["id"],),
+                )
+                if verified:
+                    from .core import Conflict
+
+                    try:
+                        self.engine.start_task(task["id"], source="scheduler")
+                    except Conflict:
+                        pass
+                    task = self.store.one("SELECT * FROM tasks WHERE id=?", (task["id"],))
             if self.clock() >= epoch(policy["ends_at"]):
                 with self.store.connect(write=True) as db:
                     db.execute(
@@ -174,10 +204,20 @@ class JobQueue:
                 "SELECT * FROM execution_jobs WHERE state IN ('pending','leased')"
             ).fetchall():
                 source = self._source(db, row)
+                parent = db.execute(
+                    "SELECT state FROM tasks WHERE id=?", (row["task_id"],)
+                ).fetchone()
                 if source is None:
                     state = "cancelled"
                 elif source["status"] in WRITE_TERMINAL:
                     state = source["status"]
+                elif (
+                    parent
+                    and parent["state"] == "cancelled"
+                    and row["state"] == "pending"
+                    and not source["attempted"]
+                ):
+                    state = "cancelled"
                 elif (
                     row["state"] == "pending"
                     and row["expires_at"] <= now
@@ -221,6 +261,10 @@ class JobQueue:
         now = self.clock()
         limits = self.engine.execution_settings()
         with self.store.connect(write=True) as db:
+            if db.execute(
+                "SELECT 1 FROM meta WHERE key='local_fallback_expiry_requested'"
+            ).fetchone():
+                return None
             if db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
                 return None
             if db.execute(
@@ -228,10 +272,38 @@ class JobQueue:
                 (now, pool),
             ).fetchone()[0] >= limits.get("pool_workers", {}).get(pool, 1):
                 return None
-            rows = db.execute(
-                "SELECT j.* FROM execution_jobs j JOIN tasks t ON t.id=j.task_id JOIN accounts a ON a.id=j.account_id LEFT JOIN items i ON j.kind='send' AND i.id=j.reference_id WHERE j.pool=? AND j.state='pending' AND j.available_at<=? AND t.state='active' AND a.disabled=0 AND a.cooldown_until<=? AND a.next_at<=? AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' AND busy.lease_until>? AND busy.account_id=j.account_id) AND NOT EXISTS(SELECT 1 FROM account_lanes lane WHERE lane.account_id=j.account_id AND lane.expires_at>?) ORDER BY a.next_at,j.available_at,COALESCE(i.position,0),j.id LIMIT 64",
-                (pool, now, now, now, now, now),
-            ).fetchall()
+            sql = (
+                "SELECT j.* FROM execution_jobs j JOIN tasks t ON t.id=j.task_id "
+                "JOIN accounts a ON a.id=j.account_id LEFT JOIN items i "
+                "ON j.kind='send' AND i.id=j.reference_id WHERE j.pool=? "
+                "AND j.state='pending' AND j.available_at<=? AND t.state='active' "
+                "AND a.disabled=0 AND a.cooldown_until<=? AND a.next_at<=? "
+                "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' "
+                "AND busy.lease_until>? AND busy.account_id=j.account_id) "
+                "AND NOT EXISTS(SELECT 1 FROM account_lanes lane "
+                "WHERE lane.account_id=j.account_id AND lane.expires_at>?)"
+            )
+            params = [pool, now, now, now, now, now]
+            from .execution_channels import local_account_scope
+
+            accounts = local_account_scope(db, now)
+            if accounts is not None:
+                if not accounts:
+                    return None
+                sql += " AND j.account_id IN (" + ",".join("?" for _ in accounts) + ")"
+                sql += " AND NOT EXISTS(SELECT 1 FROM cloud_receipt_outbox receipt WHERE receipt.job_id=j.id)"
+                params.extend(accounts)
+            task_ids = executor_task_ids()
+            if task_ids is not None:
+                if not task_ids:
+                    return None
+                sql += " AND j.task_id IN (" + ",".join("?" for _ in task_ids) + ")"
+                params.extend(task_ids)
+            sql += (
+                " ORDER BY CASE WHEN j.kind='send' THEN 0 ELSE 1 END,a.next_at,"
+                "j.available_at,COALESCE(i.position,0),j.id LIMIT 64"
+            )
+            rows = db.execute(sql, params).fetchall()
             for row in rows:
                 source = self._source(db, row)
                 if not source or source["attempted"] or source["status"] != "not_attempted":
@@ -355,12 +427,18 @@ class JobQueue:
             (task_id,) if task_id else (),
         )
         cloud = self.store.one("SELECT value FROM meta WHERE key='cloud_control_health'")
+        from .execution_channels import enabled, read_state
+
         return {
             "jobs": rows,
             "cloud_receipts_pending": self.store.one("SELECT COUNT(*) n FROM cloud_receipt_outbox")[
                 "n"
             ],
             "cloud": json.loads(cloud["value"]) if cloud else {"state": "not_configured"},
+            "channel": {
+                "policy": "cloud_then_local" if enabled(self.store) else "cloud_only",
+                **read_state(self.store),
+            },
             "cloud_settings_pending": bool(
                 self.store.one("SELECT value FROM meta WHERE key='cloud_pending_settings'")
             ),
@@ -375,7 +453,14 @@ def verify_job_claim(db, request):
     context = request.get("execution_job")
     enabled = db.execute("SELECT value FROM meta WHERE key='execution_runtime'").fetchone()
     required = db.execute("SELECT value FROM meta WHERE key='cloud_control_required'").fetchone()
-    if required and required[0] == "1" and (not context or not context.get("cloud")):
+    from .execution_channels import local_context_valid
+
+    if (
+        required
+        and required[0] == "1"
+        and (not context or not context.get("cloud"))
+        and not local_context_valid(db, context)
+    ):
         raise ValueError("CloudExecutionClaimRequired")
     if not context:
         if enabled and enabled[0] == "pooled":

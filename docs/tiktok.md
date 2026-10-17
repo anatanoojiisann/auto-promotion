@@ -14,6 +14,42 @@
 
 陌生视频下的批量点赞、评论、关注及私信不属于此实现的支持范围。
 
+## 私信与主动互动需求
+
+2026-10-16 已确认需求同时包含自有评论／已有私信回复，以及到他人内容下互动／主动联系新用户。以下为官方文档核对后的后续范围，不表示当前已实现或已获得权限。
+
+| 需求 | 官方接入边界 | 当前状态 |
+| --- | --- | --- |
+| 自有内容下的评论与回复 | Accounts API，需应用获批并由账号授权 | 已实现本地流程；待真实授权与验收 |
+| 接收和回复已有私信 | 独立的 Business Messaging API；需安全与隐私审核，并遵守会话窗口和地区限制 | 尚未实现、未申请获批 |
+| 新关注者欢迎私信 | 官方 FOLLOW_WELCOME 自动消息；仅限符合账号条件、能力检查通过且配置审核通过的账号 | 尚未实现，不等同于任意用户私信 |
+| 任意他人视频下批量点赞／评论／关注 | 未找到覆盖这些任意目标的通用官方接口；不能把自有评论权限当成此权限 | 不计入自动执行范围 |
+| 向未建立会话的任意陌生用户主动发私信 | 常规发送接口明确禁止；企业认证不会解除此限制 | 不计入自动执行范围 |
+
+新关注者消息要求账号为 Verified Business Account，或为最近七天有 TikTok Messaging Ads 历史的 Advanced Access 账号；仍需查询 `FOLLOW_WELCOME` 能力，并确认消息配置的 `audit_status=APPROVED`、`operation_status=ENABLE`。这是用户关注触发的受限自动消息，不提供任意收件人群发。
+
+账号资格与开发者资格分别检查。账号可通过绑定 TikTok for Business 或未验证的 Business Center 获得 Advanced Access；但自建私信 API 的申请表仍要求公司法定名称、公司／产品网站、企业域名联系人邮箱和有效 App ID，且安全与隐私审核不可跳过。当前未找到纯个人免企业信息的自助申请入口。不得用 Cloudflare 回调页冒充公司官网。
+
+私信地区按账号注册地点判断。欧洲经济区、瑞士和英国注册的账号目前不支持该 API；美国注册账号还需通过美国数据安全审核并完成相应协议。非互关会话还存在消息数量及窗口限制，不能仅以通用接口限速替代会话规则。
+
+用户于 2026-10-16 确认 `@mira339019` 最初注册地区为新加坡。私信权限申请的 Managed Business Account Regions 应选择 `APAC`；仅管理该账号时，不申请美国区域。此记录来自用户说明，尚未经过真实授权核验，也不代表应用已获准使用私信 API。新加坡账号仍需开发者完成常规数据安全与隐私审核，以及账号自身满足 Advanced Access／Verified Business Account 条件。
+
+主动拓客的可选后续设计是候选整理、文案准备、打开平台和人工操作记录；这部分尚未开发，不会因准备草稿或泛化的需求确认而开始外发。任何新增执行器仍须遵守现有任务启动、单次提交和回执规则。
+
+官方依据：[私信准入](https://business-api.tiktok.com/portal/docs/access-to-business-messaging-api/v1.3)、[申请表](https://bytedance.sg.larkoffice.com/share/base/form/shrlg7vFArGhg9V20neYCEwIKrb)、[私信发送边界](https://business-api.tiktok.com/portal/docs/manage-direct-messages-for-a-business-account/v1.3)、[新关注者消息](https://business-api.tiktok.com/portal/docs/manage-the-new-follower-message-for-a-tiktok-account/v1.3)、[会话窗口限制](https://business-api.tiktok.com/portal/docs?id=1854823717597185)、[账号等级](https://ads.tiktok.com/help/article/about-tiktok-account-entitlements?lang=en)、[引导用户发起会话](https://business-api.tiktok.com/portal/docs/unlock-conversations/v1.3)。
+
+## 当前申请就绪状态
+
+2026-10-16 已逐页核对用户提供的两份 PDF。州公司设立文件与 IRS CP 575 A 通知均对应 `AlphaDecentral Inc.`，文件显示注册地为美国科罗拉多州，名称、地址对应，六页均可清晰读取。此前依据用户口述准备的中国大陆主体方案需调整；若使用本组文件，申请的法定主体应与此美国公司一致。未在仓库保存完整税号或证件副本，也未将文件可读性检查当作签发机构真实性核验。
+
+TikTok 官方美国企业验证清单列出 CP 575，因此优先使用 IRS 通知作为企业验证主材料，州公司设立文件作为补充候选。具体文件接受与权限批准仍由 TikTok 审核。[可接受证件](https://ads.tiktok.com/resources/help/article/acceptable-documents-for-business-verification?lang=en)
+
+2026-10-16 早先后台核对：`Auto Promotion` 状态为 `Rejected`，没有可用 App ID；页面提示开发者资料申请被拒。原资料的官网域名为 `aurax.one`，通信邮箱域名为 `hala.finance`。平台明确要求添加已验证、且域名与资料官网一致的公司通信邮箱，并重新提交资料。
+
+同日按用户明确指示，将 Company Name 从品牌名 `Aurax` 更正为 `AlphaDecentral Inc.`，Company Website 改为 `https://www.hala.finance/en-US/home`，核对现有通信邮箱为用户指定的 `hala.finance` 企业邮箱，并在用途说明补充 HALA 与 Aurax 是该公司不同业务线的产品。已确认重新提交，页面显示 **Your profile is currently under review**。本次未触发额外邮箱验证码，也未上传企业证件；资料进入审核不等于应用或 API 权限已获批。
+
+Primary Country of Operation 保留现有 Singapore；注册地、运营地和所管理账号的注册地是不同字段。账号注册地目前由用户确认为新加坡，私信申请服务区域仍为 `APAC`。待资料审核后核对应用状态和有效 App ID，并继续确认功能演示录屏、独立 Accounts 申请是否曾提交。私信 API 的安全与隐私审核仍需单独申请，本轮没有代为提交这两份独立权限申请。
+
 ## TikTok 后台准备
 
 1. 创建 TikTok for Business 开发者应用，申请 Accounts API / TikTok Accounts 权限并完成官方接入申请。
@@ -29,6 +65,16 @@
 输入账号用户名和固定本机标签，生成链接后在 TikTok 完成授权。部署了独立接收器时，账号自动登记；未部署接收器时，在回调页面从地址栏复制完整地址，粘贴到本机工作台的“授权完成后的完整回调地址”。代码和 state 只在这次连接中使用，不进入账号目录和审计日志。
 
 应用密钥和令牌保存在配置的私密账号目录中，不应放入共享内容、人设、任务正文或代码仓库。单个标签绑定固定平台身份；换账号使用新标签。连接账号和保存应用配置不会启用真实发布。
+
+## Cloudflare 回调页
+
+没有自有域名时，可先使用 Cloudflare Workers 提供的 HTTPS 地址完成授权联调。当前已部署的回调地址为：
+
+`https://auto-promotion-tiktok-callback.lolulu834.workers.dev/oauth/tiktok/`
+
+将它同时登记为 TikTok 应用的 TikTok account holder redirect URL 和本机应用设置中的回调地址。授权后复制浏览器地址栏的完整 URL，粘贴到本机「授权完成后的完整回调地址」；一次性 state 与令牌交换仍由本机工作台完成。
+
+此 Worker 提供手动回填页面，不提供 Webhook 或素材托管，因此不要为它注册发布／评论 Webhook，也不要把该地址当作已验证的素材前缀。R2 和 TikTok 素材 URL 前缀验证以后单独配置。源码、部署记录与日志设置见 [Cloudflare 回调页说明](../cloudflare/tiktok-callback/README.md)。
 
 ## 回调接收器
 

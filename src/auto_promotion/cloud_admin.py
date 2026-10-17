@@ -36,6 +36,7 @@ def bootstrap(engine, *, url, node_id, operator_file, account_ids=None, adopt_lo
             raise ValueError("ExistingNodeTokenMissing")
     else:
         node_token = secrets.token_urlsafe(48)
+    cloud.node_id, cloud.node_token = node_id, node_token
     cloud.request(
         "/v1/nodes",
         {
@@ -48,10 +49,13 @@ def bootstrap(engine, *, url, node_id, operator_file, account_ids=None, adopt_lo
     )
     cloud.sync(engine, force=True)
     if adopt_local:
+        from .execution_channels import binding
+
         settings = engine.execution_settings()
         cloud.request(
             "/v1/settings",
             {
+                "local_store_id": binding(engine),
                 "global_stop": engine.store.one("SELECT value FROM meta WHERE key='global_stop'")[
                     "value"
                 ]

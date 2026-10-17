@@ -496,6 +496,105 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(self.saved[0]["message_ids"], [123])
         self.assertEqual(len(self.client.sends), 1)
 
+    def test_missing_parent_keeps_tracking_verified_receipt_but_coverage_stays_partial(self):
+        backend = self.backend()
+        now = time.time()
+        self.client.history = [
+            types.SimpleNamespace(
+                id=i,
+                out=False,
+                sender_id=sender,
+                reply_to_msg_id=reply_to,
+                date=datetime.fromtimestamp(when, timezone.utc),
+            )
+            for i, sender, reply_to, when in (
+                (575, 99, 500, now - 10),
+                (576, 42, 500, now - 8),
+                (577, 99, 501, now - 5),
+            )
+        ]
+        result = asyncio.run(
+            backend.run(
+                "feedback",
+                {
+                    "payload": {"target": "@public_group", "text": "approved", "media": []},
+                    "result": {
+                        "message_ids": [500],
+                        "verified": True,
+                        "status": "confirmed",
+                        "published_at": now - 100,
+                        "external_reference": "telegram:@public_group:500",
+                    },
+                    "feedback_cursor": 574,
+                },
+                self.saved.append,
+                lambda: self.fail("write"),
+            )
+        )
+        self.assertEqual(result["feedback_status"], "partial")
+        self.assertEqual(result["reason"], "feedback_parent_unavailable")
+        self.assertEqual([e["event_id"] for e in result["feedback_events"]], ["10:575"])
+        self.assertEqual(result["feedback_cursor"], 577)
+        self.assertFalse(self.client.sends)
+        self.assertFalse(self.client.joined)
+
+    def test_missing_parent_without_exact_verified_receipt_never_scans(self):
+        from unittest.mock import Mock
+
+        backend = self.backend()
+        self.client.iter_messages = Mock(side_effect=AssertionError("unverified history scan"))
+        receipt = {
+            "message_ids": [500],
+            "verified": True,
+            "status": "confirmed",
+            "published_at": time.time() - 100,
+            "external_reference": "telegram:@public_group:500",
+        }
+        for changes in (
+            {"verified": False},
+            {"status": "unknown"},
+            {"external_reference": "telegram:@other:500"},
+            {"published_at": float("nan")},
+            {"published_at": time.time() + 100},
+        ):
+            with self.subTest(changes=changes):
+                result = asyncio.run(
+                    backend.run(
+                        "feedback",
+                        {
+                            "payload": {"target": "@public_group", "text": "approved", "media": []},
+                            "result": {**receipt, **changes},
+                        },
+                        self.saved.append,
+                        lambda: self.fail("write"),
+                    )
+                )
+                self.assertFalse(result["verified"])
+        self.client.iter_messages.assert_not_called()
+
+    def test_present_mismatched_parent_is_not_replaced_by_receipt_fallback(self):
+        backend = self.backend()
+        self.client.messages[500] = types.SimpleNamespace(id=500, out=False, message="approved")
+        result = asyncio.run(
+            backend.run(
+                "feedback",
+                {
+                    "payload": {"target": "@public_group", "text": "approved", "media": []},
+                    "result": {
+                        "message_ids": [500],
+                        "verified": True,
+                        "status": "confirmed",
+                        "published_at": time.time() - 100,
+                        "external_reference": "telegram:@public_group:500",
+                    },
+                },
+                self.saved.append,
+                lambda: self.fail("write"),
+            )
+        )
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["reason"], "feedback_parent_not_verified")
+
     def test_pending_join_is_distinct_and_not_counted_as_joined(self):
         backend = self.backend()
         self.client.pending = True

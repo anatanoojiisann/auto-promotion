@@ -1,9 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ControlKernel, POOLS, sha } from "../kernel.mjs";
+import { ControlKernel, POOLS, LEGACY_SCHEMA, cloudFailure, sha } from "../kernel.mjs";
+import { scheduleMaintenance } from "../maintenance.mjs";
 
-function fixture() {
+function fixture({ beforeOpen } = {}) {
   const db = new DatabaseSync(":memory:");
   let now = 1800000000;
   const storage = {
@@ -32,6 +33,7 @@ function fixture() {
       }
     },
   };
+  beforeOpen?.(db, storage);
   const k = new ControlKernel(storage, { clock: () => now });
   function seed({
     id = "one",
@@ -111,6 +113,68 @@ function fixture() {
   };
 }
 
+test("unchanged snapshots do not rewrite account or task rows", () => {
+  const f = fixture();
+  const s = f.seed();
+  f.k.sync({ ...s.snapshot, revision: 1 });
+  const before = f.db.prepare("SELECT total_changes() n").get().n;
+  f.k.sync({ ...s.snapshot, revision: 1 });
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n, before);
+  new ControlKernel(f.storage);
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n, before);
+});
+
+test("legacy unfrozen placeholders can freeze without changing attempted jobs", () => {
+  const f = fixture();
+  const s = f.seed();
+  s.t.phase = "starting";
+  f.k.sync(s.snapshot);
+  s.t.phase = "ready";
+  s.t.manifest_hash = "first-frozen-manifest";
+  s.j.version = "resolved-membership-time";
+  f.k.sync(s.snapshot);
+  assert.equal(f.k.one("SELECT version FROM jobs WHERE id=?", s.j.id).version, s.j.version);
+  s.j.version = "later-change";
+  assert.throws(() => f.k.sync(s.snapshot), /FrozenJobChanged/);
+});
+
+test("node heartbeat persists at most once in five minutes, including restart", () => {
+  const f = fixture();
+  f.node();
+  const before = f.db.prepare("SELECT total_changes() n").get().n;
+  f.k.node("node", "a".repeat(64));
+  f.advance(299);
+  f.k.node("node", "a".repeat(64));
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n, before);
+  new ControlKernel(f.storage, {clock: () => 1800000299}).node("node", "a".repeat(64));
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n, before);
+  f.advance(1);
+  f.k.node("node", "a".repeat(64));
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n, before + 1);
+});
+
+test("freezing a legacy placeholder never resets an unknown attempt", () => {
+  const f = fixture();
+  const s = f.seed();
+  s.t.phase = "starting";
+  f.k.sync(s.snapshot);
+  f.db.prepare("UPDATE jobs SET state='unknown',attempt_id='existing-attempt' WHERE id=?").run(s.j.id);
+  s.t.phase = "ready";
+  s.t.manifest_hash = "first-manifest";
+  s.j.version = "resolved-time";
+  assert.throws(() => f.k.sync(s.snapshot), /FrozenJobChanged/);
+  const job = f.k.one("SELECT state,attempt_id FROM jobs WHERE id=?", s.j.id);
+  assert.equal(job.state, "unknown");
+  assert.equal(job.attempt_id, "existing-attempt");
+});
+
+test("quota errors are safe and retry after UTC day reset", () => {
+  const result = cloudFailure(new Error("Exceeded allowed rows written in Durable Objects free tier."), 3600000);
+  assert.equal(result.error, "CloudWriteQuotaExceeded");
+  assert.equal(result.retry_after_seconds, 23 * 3600 + 30);
+  assert.deepEqual(cloudFailure(new Error("private provider exception")), {error: "CloudRuntimeUnavailable", retry_after_seconds: 60});
+});
+
 test("new workspace is stopped and cannot publish by default", () => {
   const f = fixture();
   const empty = new ControlKernel({
@@ -120,6 +184,7 @@ test("new workspace is stopped and cannot publish by default", () => {
   assert.equal(empty.settings().live_enabled, true);
   const db = new DatabaseSync(":memory:");
   const storage = {
+    transactionSync: fn => fn(),
     sql: {
       exec(sql) {
         db.exec(sql);
@@ -460,4 +525,199 @@ test("a delayed snapshot cannot undo a newer pause", () => {
     "paused",
   );
   f.db.close();
+});
+
+function finish(f, n, j, attempt = "a", state = "confirmed", extra = {}) {
+  return f.k.complete(n, j.id, j.lease_token, {
+    state, attempt_id: attempt,
+    result: {verified:true,external_reference:"https://example.invalid/receipt",...extra},
+  });
+}
+
+test("due time and deadline remain exact across reconstruction", () => {
+  const f = fixture(), s = f.seed(), n = f.node();
+  f.db.prepare("UPDATE jobs SET available_at=?,expires_at=? WHERE id=?").run(1800000060,1800000090,s.j.id);
+  const before = f.db.prepare("SELECT total_changes() n").get().n;
+  assert.equal(f.k.claim(n,"x.edge"),null);
+  f.advance(59.999);
+  assert.equal(f.k.claim(n,"x.edge"),null);
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,before);
+  f.advance(0.001);
+  f.k = new ControlKernel(f.storage,{clock:()=>1800000060});
+  const j=f.k.claim(n,"x.edge");
+  assert.ok(j);
+  f.k = new ControlKernel(f.storage,{clock:()=>1800000090});
+  assert.throws(()=>f.k.authorize(n,j.id,j.lease_token,"a"),/ExecutionWindowElapsed/);
+  assert.equal(f.k.one("SELECT attempt_id FROM jobs").attempt_id,null);
+  f.db.close();
+});
+
+test("never renew early or revive an expired lease", () => {
+  const f=fixture(); f.seed(); const n=f.node(),j=f.k.claim(n,"x.edge");
+  const before=f.db.prepare("SELECT total_changes() n").get().n;
+  for(let i=0;i<11;i++){f.advance(10);assert.equal(f.k.renew(n,j.id,j.lease_token).lease_until,1800000180);}
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,before);
+  f.advance(10);
+  const renewed=f.k.renew(n,j.id,j.lease_token);
+  assert.equal(renewed.lease_until,1800000300);
+  assert.equal(renewed.renew_after_seconds,120);
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,before+1);
+  f.advance(180);
+  assert.throws(()=>f.k.renew(n,j.id,j.lease_token),/LeaseExpired/);
+  f.k.sweep();
+  assert.equal(f.k.one("SELECT state FROM jobs").state,"unknown");
+  assert.equal(f.k.claim(n,"x.edge"),null);
+  f.db.close();
+});
+
+test("pacing follows account identity across aliases and survives restart", () => {
+  const f=fixture(),s=f.seed();
+  s.a.min_interval=120;s.t.policy.pacing_scope="account";f.k.sync(s.snapshot);
+  f.seed({id:"two",account:"b",identity:"x:one"});
+  const n=f.node(),j=f.k.claim(n,"x.edge",s.j.id);
+  f.k.authorize(n,j.id,j.lease_token,"a"); finish(f,n,j);
+  assert.equal(f.k.one("SELECT next_at FROM accounts WHERE id='a'").next_at,0);
+  f.k=new ControlKernel(f.storage,{clock:()=>1800000119});
+  assert.equal(f.k.claim(n,"x.edge","send:two"),null);
+  f.k=new ControlKernel(f.storage,{clock:()=>1800000120});
+  assert.ok(f.k.claim(n,"x.edge","send:two"));
+  f.db.close();
+});
+
+test("authorization response loss and duplicate uploads never create a second attempt", () => {
+  const f=fixture(),s=f.seed(),n=f.node(),j=f.k.claim(n,"x.edge");
+  f.k.authorize(n,j.id,j.lease_token,"lost-response");
+  f.k=new ControlKernel(f.storage,{clock:()=>1800000001});
+  const before=f.db.prepare("SELECT total_changes() n").get().n;
+  assert.equal(f.k.authorize(n,j.id,j.lease_token,"lost-response").allowed,true);
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,before);
+  assert.throws(()=>f.k.authorize(n,j.id,j.lease_token,"new-attempt"),/AttemptAlreadyRecorded/);
+  finish(f,n,j,"lost-response");
+  const settled=f.db.prepare("SELECT total_changes() n").get().n;
+  finish(f,n,j,"lost-response");f.k.sync(s.snapshot);
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,settled);
+  assert.equal(f.k.claim(n,"x.edge"),null);
+  f.db.close();
+});
+
+test("duplicate native schedule receipt is read-only and remains unclaimable", () => {
+  const f=fixture();f.seed();const n=f.node(),j=f.k.claim(n,"x.edge");
+  f.k.authorize(n,j.id,j.lease_token,"a");
+  const evidence={scheduled:true,active:true,message_ids:[1,2],lookup_message_ids:[1,2]};
+  finish(f,n,j,"a","scheduled",evidence);
+  const before=f.db.prepare("SELECT total_changes() n").get().n;
+  finish(f,n,j,"a","scheduled",evidence);
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,before);
+  assert.equal(f.k.claim(n,"x.edge"),null);
+  f.db.close();
+});
+
+test("all quota dimensions are enforced and echo imports add no duplicate rows", () => {
+  const f=fixture(),s=f.seed(),t=f.seed({id:"two",account:"b",identity:"x:b"});
+  const scopes=["target","user","campaign","pool"].map(scope=>({scope,key:"shared-"+scope,limit:{daily:1,hourly:1}}));
+  // Set before admission; version/content remains frozen throughout execution.
+  for(const v of [s,t])f.db.prepare("UPDATE jobs SET payload=? WHERE id=?").run(JSON.stringify({...v.j,scopes}),v.j.id);
+  const n=f.node(),a=f.k.claim(n,"x.edge",s.j.id),b=f.k.claim(n,"x.edge",t.j.id);
+  f.k.authorize(n,a.id,a.lease_token,"a");
+  const events=f.k.rows("SELECT * FROM quota_events").map(e=>({attempt_id:e.attempt_id,scope:e.scope,key:e.scope_key,at:e.at}));
+  const before=f.db.prepare("SELECT total_changes() n").get().n;
+  f.k.sync({accounts:[],tasks:[],jobs:[],quota_events:events});
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,before);
+  assert.equal(f.k.one("SELECT COUNT(*) n FROM quota_history").n,0);
+  assert.throws(()=>f.k.authorize(n,b.id,b.lease_token,"b"),/QuotaExceeded/);
+  assert.equal(f.k.one("SELECT attempt_id FROM jobs WHERE id=?",b.id).attempt_id,null);
+  f.db.close();
+});
+
+test("rolling hour and UTC-day limits include legacy imports without double counting", () => {
+  const f=fixture(),s=f.seed();
+  f.k.configure({global_limit:{daily:2,hourly:1}});
+  const day=Math.floor(1800000000/86400)*86400;
+  f.k.sync({accounts:[],tasks:[],jobs:[],quota_events:[
+    {attempt_id:"historical",scope:"cloud_global",key:"live",at:1800000000-3599},
+  ]});
+  const n=f.node(),j=f.k.claim(n,"x.edge",s.j.id);
+  assert.throws(()=>f.k.authorize(n,j.id,j.lease_token,"a"),/QuotaExceeded/);
+  f.advance(1);f.k.authorize(n,j.id,j.lease_token,"a");finish(f,n,j);
+  const limits=[{scope:"cloud_global",key:"live",limit:{daily:2,hourly:100}}];
+  assert.throws(()=>f.k.checkQuotas(limits,"next",1800000001),/QuotaExceeded/);
+  assert.doesNotThrow(()=>f.k.checkQuotas(limits,"next",day+86400));
+  f.db.close();
+});
+
+test("a reused attempt id cannot bypass shared quotas for a different job", () => {
+  const f=fixture();f.seed();f.seed({id:"two",account:"b",identity:"x:b"});
+  const n=f.node(),a=f.k.claim(n,"x.edge"),b=f.k.claim(n,"x.edge");
+  f.k.authorize(n,a.id,a.lease_token,"same");
+  assert.throws(()=>f.k.authorize(n,b.id,b.lease_token,"same"),/AttemptAlreadyRecorded/);
+  f.db.close();
+});
+
+test("maintenance arms only an actual expiry, advances for earlier work and stops when idle", async () => {
+  const f=fixture();let alarm=null;const writes=[];
+  const alarms={getAlarm:async()=>alarm,setAlarm:async at=>{alarm=at;writes.push(at);}};
+  await scheduleMaintenance(f.k,alarms,1800000000000);assert.equal(writes.length,0);
+  const s=f.seed();
+  await scheduleMaintenance(f.k,alarms,1800000000000);assert.equal(alarm,1800000900000);
+  for(let i=0;i<10;i++)await scheduleMaintenance(f.k,alarms,1800000000000+i*10000);
+  assert.equal(writes.length,1);
+  const n=f.node(),j=f.k.claim(n,"x.edge",s.j.id);
+  await scheduleMaintenance(f.k,alarms,1800000000000);assert.equal(alarm,1800000180000);
+  f.advance(120);f.k.renew(n,j.id,j.lease_token);
+  await scheduleMaintenance(f.k,alarms,1800000120000);assert.equal(writes.length,2);
+  f.advance(60);alarm=null;f.k.sweep();await scheduleMaintenance(f.k,alarms,1800000180000);
+  assert.equal(alarm,1800000300000);
+  f.advance(120);alarm=null;f.k.sweep();await scheduleMaintenance(f.k,alarms,1800000300000);
+  assert.equal(alarm,null);
+  assert.equal(f.k.one("SELECT state FROM jobs").state,"unknown");
+  f.k.sweep();await scheduleMaintenance(f.k,alarms,1800000300000);assert.equal(writes.length,3);
+  f.db.close();
+});
+
+test("v1 migration retains leases, attempts, quotas, immutable payloads and an archive", () => {
+  const source=fixture(),s=source.seed();s.t.manifest_hash="frozen";source.k.sync(s.snapshot);
+  const n=source.node(),j=source.k.claim(n,"x.edge");source.k.authorize(n,j.id,j.lease_token,"prior");
+  source.db.prepare("UPDATE accounts SET next_at=?").run(1800000120);
+  source.k.configure({global_stop:true});
+  const original=source.k.one("SELECT * FROM jobs");
+  const f=fixture({beforeOpen(db,storage){
+    db.exec(LEGACY_SCHEMA);
+    for(const table of ["config","accounts","tasks","jobs","task_pacing","snapshot_cursor","nodes","quota_events","audit"]){
+      const cols=db.prepare("PRAGMA table_info("+table+")").all().map(c=>c.name);
+      const rows=source.db.prepare("SELECT "+cols.join(",")+" FROM "+table).all();
+      for(const row of rows)db.prepare("INSERT OR REPLACE INTO "+table+"("+cols.join(",")+") VALUES("+cols.map(()=>"?").join(",")+")").run(...cols.map(c=>row[c]));
+    }
+    const upgraded=new ControlKernel(storage,{clock:()=>1800000000});
+    assert.equal(upgraded.settings().global_stop,true);
+    assert.equal(upgraded.accountNext("x:one"),1800000120);
+    assert.equal(upgraded.one("SELECT COUNT(*) n FROM quota_events").n,4);
+    assert.equal(upgraded.one("SELECT COUNT(*) n FROM jobs_v1_archive").n,1);
+    const preserved=upgraded.one("SELECT * FROM jobs");
+    for(const key of ["payload","state","owner","lease_token","lease_until","attempt_id","version"])
+      assert.equal(preserved[key],original[key]);
+    assert.equal(upgraded.one("SELECT payload FROM tasks").payload,source.k.one("SELECT payload FROM tasks").payload);
+    const before=db.prepare("SELECT total_changes() n").get().n;
+    new ControlKernel(storage);assert.equal(db.prepare("SELECT total_changes() n").get().n,before);
+  }});
+  assert.equal(f.k.claim(n,"x.edge"),null);
+  f.advance(180);f.k.sweep();assert.equal(f.k.one("SELECT state FROM jobs").state,"unknown");
+  f.k.sync(s.snapshot);assert.equal(f.k.claim(n,"x.edge"),null);
+  finish(f,n,j,"prior");assert.equal(f.k.one("SELECT state FROM jobs").state,"confirmed");
+  source.db.close();f.db.close();
+});
+
+test("migration interruption rolls back schema and records, then can resume", () => {
+  let checked=false;
+  const f=fixture({beforeOpen(db,storage){
+    db.exec(LEGACY_SCHEMA);
+    db.prepare("INSERT INTO quota_events VALUES(?,?,?,?)").run("kept","cloud_global","live",1800000000);
+    const exec=storage.sql.exec;
+    storage.sql.exec=(sql,...args)=>{const r=exec(sql,...args);if(sql.includes("ALTER TABLE jobs"))throw new Error("quota exhausted during migration");return r;};
+    assert.throws(()=>new ControlKernel(storage),/quota exhausted/);
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM quota_events").get().n,1);
+    assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name='jobs_v1_archive'").get(),undefined);
+    assert.equal(db.prepare("PRAGMA table_info(jobs)").all().some(c=>c.name==="attempt_at"),false);
+    storage.sql.exec=exec;checked=true;
+  }});
+  assert.equal(checked,true);assert.equal(f.k.one("SELECT COUNT(*) n FROM quota_events").n,1);f.db.close();
 });

@@ -1,6 +1,7 @@
 """Cloudflare task/attempt mirror and fail-closed executor authorization."""
 
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -16,6 +17,10 @@ from .routing import ExecutionRoute, route_for
 
 class CloudUnavailable(RuntimeError):
     safe_code = "CloudControlUnavailable"
+
+    def __init__(self, code, *, retry_after_seconds=None):
+        super().__init__(code)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class CloudJobClosed(CloudUnavailable):
@@ -35,6 +40,7 @@ class CloudControl:
             raise ValueError("InvalidCloudControlURL")
         self.url = url.rstrip("/")
         self.node_id, self.node_token, self.operator_token = node_id, node_token, operator_token
+        self.last_contact_monotonic = None
 
     @classmethod
     def configured(cls):
@@ -70,6 +76,12 @@ class CloudControl:
         }
         if not operator:
             headers["X-Node-ID"] = self.node_id
+        elif path in {"/v1/settings", "/v1/sync"} and self.node_token:
+            headers["X-Local-Control-Proof"] = hmac.new(
+                hashlib.sha256(self.node_token.encode()).hexdigest().encode(),
+                canonical(data).encode(),
+                hashlib.sha256,
+            ).hexdigest()
         request = Request(
             self.url + path,
             data=canonical(data).encode() if data is not None else None,
@@ -78,20 +90,30 @@ class CloudControl:
         )
         try:
             with urlopen(request, timeout=12) as response:
-                return json.load(response)
+                result = json.load(response)
+                self.last_contact_monotonic = time.monotonic()
+                return result
         except HTTPError as exc:
             # Provider responses and URLs may contain secrets. Only expose our allowlisted code.
             try:
-                code = json.loads(exc.read(4096)).get("error", "CloudRequestRejected")
+                details = json.loads(exc.read(4096))
+                code = details.get("error", "CloudRequestRejected")
+                if code == "CloudRequestRejected" and details.get("error_code") == 1101:
+                    code = "CloudWorkerException"
+                retry = details.get("retry_after_seconds")
             except Exception:
                 code = "CloudRequestRejected"
+                retry = None
             if not isinstance(code, str) or not code.isidentifier() or len(code) > 100:
                 code = "CloudRequestRejected"
-            raise CloudUnavailable(code) from None
+            if not isinstance(retry, (int, float)) or not 1 <= retry <= 90000:
+                retry = None
+            raise CloudUnavailable(code, retry_after_seconds=retry) from None
         except Exception:
             raise CloudUnavailable("CloudTransportUnavailable") from None
 
     def claim(self, pool, expected_id):
+        started = time.monotonic()
         result = self.request("/v1/claim", {"pool": pool, "expected_id": expected_id}).get("job")
         if result and result["id"] != expected_id:
             self.complete(result, "pending", {}, None)
@@ -100,6 +122,8 @@ class CloudControl:
             source = self.request("/v1/job", {"id": expected_id}).get("job")
             if source and source["state"] not in {"pending", "leased"}:
                 raise CloudJobClosed(source["state"])
+        if result:
+            self._renewal_deadline(result, result, started)
         return result
 
     def guard(self, context, attempt_id):
@@ -111,12 +135,27 @@ class CloudControl:
             raise CloudUnavailable("CloudExecutionClaimRequired")
 
     def renew(self, lease):
-        return (
-            self.request("/v1/renew", {"id": lease["id"], "lease_token": lease["lease_token"]}).get(
-                "renewed"
-            )
-            is True
-        )
+        now = time.monotonic()
+        if now < lease.get("_renew_at_monotonic", 0):
+            return True
+        result = self.request("/v1/renew", {"id": lease["id"], "lease_token": lease["lease_token"]})
+        if result.get("renewed") is not True:
+            return False
+        self._renewal_deadline(lease, result, now)
+        return True
+
+    @staticmethod
+    def _renewal_deadline(lease, response, started):
+        # Relative server duration + monotonic clock avoids wall-clock skew.
+        # Count network time against the margin; older servers keep the original
+        # frequent renewal behavior until they expose the duration explicitly.
+        delay = response.get("renew_after_seconds")
+        if isinstance(delay, (int, float)) and 0 <= delay <= 120:
+            lease["_renew_at_monotonic"] = started + delay
+        else:
+            lease.pop("_renew_at_monotonic", None)
+        if isinstance(response.get("lease_until"), (int, float)):
+            lease["lease_until"] = response["lease_until"]
 
     def authorize(self, lease, attempt_id):
         return (
@@ -140,8 +179,16 @@ class CloudControl:
         )
 
     def sync(self, engine, *, force=False):
+        from .execution_channels import binding
+
         # Allocate before reading: a delayed older upload cannot undo a later pause.
         with engine.store.connect(write=True) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS cloud_sync_records("
+                "destination TEXT NOT NULL,section TEXT NOT NULL,record_id TEXT NOT NULL,"
+                "digest TEXT NOT NULL,revision INTEGER NOT NULL,"
+                "PRIMARY KEY(destination,section,record_id))"
+            )
             row = db.execute(
                 "SELECT value FROM meta WHERE key='cloud_snapshot_revision'"
             ).fetchone()
@@ -151,33 +198,69 @@ class CloudControl:
                 (str(revision),),
             )
         snapshot = export_snapshot(engine)
-        fingerprint = hashlib.sha256(canonical([self.url, snapshot]).encode()).hexdigest()
-        previous = engine.store.one("SELECT value FROM meta WHERE key='cloud_snapshot_digest'")
-        if not force and previous and previous["value"] == fingerprint:
-            return {"unchanged": True}
-        # Each request contains complete account/task definitions and a bounded job slice.
-        jobs = snapshot.pop("jobs")
-        result = None
-        for start in range(0, max(1, len(jobs)), 200):
-            result = self.request(
-                "/v1/sync",
-                {**snapshot, "jobs": jobs[start : start + 200], "revision": revision},
-                operator=True,
+        destination = hashlib.sha256(self.url.encode()).hexdigest()
+        acknowledged = {
+            (r["section"], r["record_id"]): r["digest"]
+            for r in engine.store.rows(
+                "SELECT section,record_id,digest FROM cloud_sync_records WHERE destination=?",
+                (destination,),
             )
-            if result.get("stale"):
-                raise CloudUnavailable("CloudSnapshotStale")
-        with engine.store.connect(write=True) as db:
-            db.execute(
-                "INSERT INTO meta VALUES('cloud_snapshot_digest',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (fingerprint,),
-            )
-        return result
+        }
+        changed = 0
+        # Import historical quota evidence before activating any new work.
+        for section in ("quota_events", "accounts", "tasks", "jobs"):
+            pending = []
+            for record in snapshot[section]:
+                record_id = (
+                    canonical([record["attempt_id"], record["scope"], record["key"]])
+                    if section == "quota_events"
+                    else record["id"]
+                )
+                checksum = hashlib.sha256(canonical(record).encode()).hexdigest()
+                if force or acknowledged.get((section, record_id)) != checksum:
+                    pending.append((record_id, checksum, record))
+            for start in range(0, len(pending), 100):
+                batch = pending[start : start + 100]
+                payload = {
+                    "local_store_id": binding(engine),
+                    "schema": 1,
+                    "revision": revision,
+                    "accounts": [],
+                    "tasks": [],
+                    "jobs": [],
+                    "quota_events": [],
+                }
+                payload[section] = [r[2] for r in batch]
+                if len(canonical(payload).encode()) > 3_500_000:
+                    raise CloudUnavailable("CloudSnapshotBatchTooLarge")
+                result = self.request("/v1/sync", payload, operator=True)
+                if result.get("stale"):
+                    raise CloudUnavailable("CloudSnapshotStale")
+                # Commit each acknowledged slice, so failure resumes at the first
+                # unacknowledged record instead of replaying a whole snapshot.
+                with engine.store.connect(write=True) as db:
+                    db.executemany(
+                        "INSERT INTO cloud_sync_records VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(destination,section,record_id) DO UPDATE SET "
+                        "digest=excluded.digest,revision=excluded.revision "
+                        "WHERE excluded.revision>=cloud_sync_records.revision",
+                        [(destination, section, r[0], r[1], revision) for r in batch],
+                    )
+                changed += len(batch)
+        return {"changed_records": changed, "unchanged": changed == 0}
 
     def flush_settings(self, engine):
         pending = engine.store.one("SELECT value FROM meta WHERE key='cloud_pending_settings'")
         if not pending:
             return
-        self.request("/v1/settings", json.loads(pending["value"]), operator=True, method="PUT")
+        from .execution_channels import binding
+
+        self.request(
+            "/v1/settings",
+            {**json.loads(pending["value"]), "local_store_id": binding(engine)},
+            operator=True,
+            method="PUT",
+        )
         with engine.store.connect(write=True) as db:
             db.execute(
                 "DELETE FROM meta WHERE key='cloud_pending_settings' AND value=?",
@@ -257,6 +340,10 @@ def export_snapshot(engine):
     with engine.store.connect() as db:
         for row in db.execute("SELECT * FROM items").fetchall():
             t, a = tasks[row["task_id"]], accounts[row["account_id"]]
+            # A relative membership schedule is mutable until its manifest is
+            # frozen. Such placeholders must never become cloud execution jobs.
+            if not t["manifest_hash"]:
+                continue
             p, policy = json.loads(row["payload"]), json.loads(t["policy"])
             route = frozen_route("send:" + row["id"], a, p)
             native = p["action"] in {"schedule_message", "schedule_file"}
@@ -313,7 +400,9 @@ def export_snapshot(engine):
                     "action": "join",
                     "version": hashlib.sha256(row["payload"].encode()).hexdigest(),
                     "payload": json.loads(row["payload"]),
-                    "state": row["state"],
+                    "state": "cancelled"
+                    if t["state"] == "cancelled" and not attempt
+                    else row["state"],
                     "available_at": epoch(policy["starts_at"]),
                     "expires_at": epoch(policy["ends_at"]),
                     "attempt_id": attempt["id"] if attempt else None,

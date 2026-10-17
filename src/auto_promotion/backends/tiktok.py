@@ -453,13 +453,7 @@ class TikTokBackend:
                     "fields": fields,
                 },
             )
-            return {
-                "insights": {
-                    k: data[k]
-                    for k in fields
-                    if k in data
-                }
-            }
+            return {"insights": {k: data[k] for k in fields if k in data}}
         if operation == "verify":
             return self.verify(payload)
         item = payload["payload"]
