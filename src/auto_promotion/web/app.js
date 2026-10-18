@@ -165,20 +165,30 @@ function heading(title, desc, button = "") {
 function empty(title, body, button = "") {
   return `<div class="empty"><h2>${title}</h2><p>${body}</p>${button}</div>`;
 }
+let panelGeneration = 0;
 function openPanel(title, html) {
+  const generation = ++panelGeneration;
   $("#panel-title").textContent = title;
   $("#panel-content").innerHTML = html;
   $("#panel").showModal();
   $("#panel-content input")?.focus();
+  return generation;
 }
-$("#close-panel").onclick = () => $("#panel").close();
-function busy(button, fn) {
+function closePanel() {
+  ++panelGeneration;
+  $("#panel").close();
+}
+$("#close-panel").onclick = closePanel;
+$("#panel").addEventListener("cancel", () => ++panelGeneration);
+function busy(button, fn, isCurrent = () => true) {
   const label = button.textContent;
   button.disabled = true;
   button.textContent = "处理中…";
   return Promise.resolve()
     .then(fn)
-    .catch((e) => toast(e.message, true))
+    .catch((e) => {
+      if (isCurrent()) toast(e.message, true);
+    })
     .finally(() => {
       button.disabled = false;
       if (button.textContent === "处理中…") button.textContent = label;
@@ -1358,9 +1368,10 @@ async function renderAPI() {
     }</div>`;
   $("#refresh-api").onclick = () => renderAPI();
 }
-window.addEventListener("hashchange", () =>
-  render().catch((e) => toast(e.message, true)),
-);
+window.addEventListener("hashchange", () => {
+  ++panelGeneration;
+  render().catch((e) => toast(e.message, true));
+});
 (async () => {
   try {
     await api("/session", "POST");

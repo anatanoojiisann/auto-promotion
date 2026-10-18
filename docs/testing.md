@@ -102,5 +102,22 @@ macOS 的临时目录可能有 `/var` 与 `/private/var` 别名，运行全套�
 包含 schema 1→2 迁移、重新打开零写、重复授权/回执/快照零写和普通任务 6 次写入预算；
 `check` 仅打包 dry-run，不部署。CI 同时执行这些检查和 `npm run test:ui:pools`。
 
+完整隔离执行器 `node scripts/test_offline.cjs` 会创建临时 HOME、账号目录和默认数据库路径，
+强制关闭真实写入，并启动临时本机 Miniflare；使用的 operator token 是脚本内纯合成测试值。
+需要已有 Python 测试依赖、根目录及云控目录的 npm 依赖和测试 Chromium。
+可用 `AP_BROWSER_EXECUTABLE=/absolute/path/to/test-chromium node scripts/test_offline.cjs`
+指定已有测试浏览器；脚本显式启用离线浏览器及本机云控 HTTP 契约测试，不能把普通
+`unittest` 默认运行的跳过项计为通过。参数 `test_extreme_faults.py` 可只运行极端故障回归。
+结束时在 finally 中关闭临时云控并清理本轮临时目录，不读取生产会话。
+
+`AP_UI_CHROMIUM_PATH=/absolute/path/to/test-chromium node scripts/ui_fault_test.cjs`
+使用独立模拟服务，覆盖桌面与手机各三轮迟到 GET/PUT 成功及失败响应：新草稿、仅路由切换、
+按钮关闭、ESC 和同一事件内关闭重开；同时检查草稿/焦点、错误提示和实际保存值。
+共 60 个迟到响应场景及 4 个当前错误提示场景。该测试只延迟响应，
+不证明跨客户端或服务端写入顺序倒置的冲突已解决。所有服务、浏览器和临时目录在 finally 清理。
+`node scripts/test_ui_offline.cjs` 使用受控环境依次运行主 UI 和号池 UI；
+可追加 `main`、`pools` 或 `faults` 选择场景，并继承显式指定的 `AP_UI_CHROMIUM_PATH`。
+该入口不会继承已有工作台 URL、账号路径或平台凭据。
+
 
 TikTok 的授权配置、发布与自有评论管理、独立回调和真实验收见 [TikTok 接入说明](tiktok.md)。

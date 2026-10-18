@@ -314,7 +314,9 @@ class FakeTelegram:
         return types.SimpleNamespace(id=10, username="public_group", megagroup=True)
 
     async def get_permissions(self, entity, participant):
-        return types.SimpleNamespace(send_messages=True)
+        return types.SimpleNamespace(
+            send_messages=True, is_banned=False, has_left=False, participant=None
+        )
 
     async def send_message(self, entity, text, **kwargs):
         self.sends.append((text, kwargs))

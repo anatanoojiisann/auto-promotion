@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from . import quotas
 from .models import canonical, epoch
@@ -104,6 +105,8 @@ class CloudControl:
             except Exception:
                 code = "CloudRequestRejected"
                 retry = None
+            finally:
+                exc.close()
             if not isinstance(code, str) or not code.isidentifier() or len(code) > 100:
                 code = "CloudRequestRejected"
             if not isinstance(retry, (int, float)) or not 1 <= retry <= 90000:
@@ -296,7 +299,12 @@ def export_snapshot(engine):
         # One WAL read snapshot for parents, children, routes and quota evidence.
         # A concurrent task creation must not leave a child outside its parents.
         db.execute("BEGIN")
-        result, new_routes = _export_snapshot(engine, db)
+        try:
+            result, new_routes = _export_snapshot(engine, db)
+        except (KeyError, TypeError, ValueError):
+            # Imported or partially migrated definitions must fail closed with
+            # a stable code, never export an incomplete authorization boundary.
+            raise CloudUnavailable("CloudSnapshotInconsistent") from None
     if new_routes:
         with engine.store.connect(write=True) as db:
             db.executemany("INSERT OR IGNORE INTO execution_job_routes VALUES(?,?)", new_routes)
@@ -345,6 +353,15 @@ def _export_snapshot(engine, db):
             }
         )
     for t in tasks.values():
+        policy = json.loads(t["policy"])
+        if not isinstance(policy, dict) or not all(
+            isinstance(policy.get(key), str) for key in ("starts_at", "ends_at")
+        ):
+            raise CloudUnavailable("CloudSnapshotInconsistent")
+        # Missing timezone is compatible with the historical policy default.
+        ZoneInfo(policy.get("timezone", "Asia/Shanghai"))
+        if epoch(policy["ends_at"]) <= epoch(policy["starts_at"]):
+            raise CloudUnavailable("CloudSnapshotInconsistent")
         if any(account_id not in accounts for account_id in json.loads(t["account_ids"])):
             raise CloudUnavailable("CloudSnapshotInconsistent")
         result["tasks"].append(

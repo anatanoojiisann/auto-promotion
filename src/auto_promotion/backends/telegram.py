@@ -342,6 +342,26 @@ class TelegramBackend:
                 "schedule_file",
             }:
                 raise BackendError("UnsupportedTelegramAction")
+            # Permissions may change after the queue's preflight. Recheck using
+            # this exact session before the durable submission boundary. The
+            # server still decides races between this read and the final RPC.
+            from telethon import errors
+
+            try:
+                permissions = await client.get_permissions(entity, "me")
+            except (
+                errors.ChannelPrivateError,
+                errors.UserNotParticipantError,
+                errors.ChatWriteForbiddenError,
+                errors.ChatAdminRequiredError,
+            ) as exc:
+                return {"status": "failed_known", "verified": False, "reason": type(exc).__name__}
+            if not self.can_send_messages(entity, permissions):
+                return {
+                    "status": "failed_known",
+                    "verified": False,
+                    "reason": "TargetWriteForbidden",
+                }
             schedule = (
                 datetime.fromisoformat(item["scheduled_at"].replace("Z", "+00:00"))
                 if native

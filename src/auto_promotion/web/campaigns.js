@@ -451,10 +451,18 @@ async function renderCampaign(id, offset = 0) {
 }
 
 async function executionSettingsForm() {
-  const [config, health] = await Promise.all([
-    api("/execution/settings"),
-    api("/execution/pools"),
-  ]);
+  const requestGeneration = ++panelGeneration;
+  let config, health;
+  try {
+    [config, health] = await Promise.all([
+      api("/execution/settings"),
+      api("/execution/pools"),
+    ]);
+  } catch (error) {
+    if (requestGeneration !== panelGeneration) return;
+    throw error;
+  }
+  if (requestGeneration !== panelGeneration) return;
   const channels = {
     "telegram.mtproto": "Telegram 用户账号",
     "x.edge": "X · Edge",
@@ -497,7 +505,7 @@ async function executionSettingsForm() {
       : health.cloud?.state === "not_configured"
         ? "尚未连接"
         : "连接待恢复";
-  openPanel(
+  const formGeneration = openPanel(
     "调度与额度",
     `<form id="execution-form"><div class="field-grid"><div><label>全局每日额度<input name="daily" type="number" min="1" max="100000" value="${config.global_limit.daily}" required></label></div><div><label>全局每小时额度<input name="hourly" type="number" min="1" max="10000" value="${config.global_limit.hourly}" required></label></div><div><label>同时执行的账号数<input name="max_workers" type="number" min="1" max="50" value="${config.max_workers}" required></label></div></div><p class="help">额度按UTC自然日计算。调高额度用于新任务；已启动任务继续受原额度快照约束。更严格的当前限制始终生效。</p><div class="table-wrap"><table><thead><tr><th>平台</th><th>并发账号</th><th>每日额度（可空）</th><th>每小时额度（可空）</th></tr></thead><tbody>${Object.keys(
       names,
@@ -523,23 +531,28 @@ async function executionSettingsForm() {
           hourly: Number(f.get(`${p}_hourly`)) || 10000,
         };
     });
-    busy(e.submitter, async () => {
-      await api("/execution/settings", "PUT", {
-        global_limit: {
-          daily: Number(f.get("daily")),
-          hourly: Number(f.get("hourly")),
-        },
-        max_workers: Number(f.get("max_workers")),
-        platform_limits,
-        platform_workers,
-        pool_workers: Object.fromEntries(
-          channelKeys.map((key) => [key, Number(f.get(`pool_${key}`))]),
-        ),
-        quota_timezone: "UTC",
-      });
-      $("#panel").close();
-      toast("调度设置已保存");
-    });
+    busy(
+      e.submitter,
+      async () => {
+        await api("/execution/settings", "PUT", {
+          global_limit: {
+            daily: Number(f.get("daily")),
+            hourly: Number(f.get("hourly")),
+          },
+          max_workers: Number(f.get("max_workers")),
+          platform_limits,
+          platform_workers,
+          pool_workers: Object.fromEntries(
+            channelKeys.map((key) => [key, Number(f.get(`pool_${key}`))]),
+          ),
+          quota_timezone: "UTC",
+        });
+        if (formGeneration !== panelGeneration || !$("#panel").open) return;
+        closePanel();
+        toast("调度设置已保存");
+      },
+      () => formGeneration === panelGeneration && $("#panel").open,
+    );
   };
 }
 
