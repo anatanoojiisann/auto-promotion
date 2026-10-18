@@ -310,23 +310,70 @@ async function screenshots(page) {
   );
   await screenshots(page);
   await page.goto(`${base}/#campaigns`);
-  await page.getByRole("button", { name: "调度与额度", exact: true }).click();
-  await page.getByRole("heading", { name: "发送通道", exact: true }).waitFor();
-  await page.getByLabel("X · Tabbit 并发", { exact: true }).fill("2");
-  await page.getByLabel("同时执行的账号数", { exact: true }).fill("4");
-  const [settingsResponse] = await Promise.all([
-    page.waitForResponse(
-      (r) =>
-        r.url().endsWith("/api/execution/settings") &&
-        r.request().method() === "PUT",
-    ),
-    page.getByRole("button", { name: "保存调度设置", exact: true }).click(),
-  ]);
-  assert.equal(settingsResponse.status(), 200);
-  assert.equal(settingsResponse.request().postDataJSON().max_workers, 4);
-  await page.locator("#panel").waitFor({ state: "hidden" });
-  assert.equal((await read("/execution/settings")).max_workers, 4);
-  assert.equal((await read("/execution/settings")).pool_workers["x.tabbit"], 2);
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 1440, height: 1050 },
+  ]) {
+    await page.setViewportSize(viewport);
+    // Hold the former delayed initial-focus callback until the user has moved
+    // to another field. This reproduces slow-CI ordering without a timed sleep.
+    await page.evaluate(() => {
+      const original = window.setTimeout;
+      window.flushPanelFocus = () => {};
+      const pending = [];
+      window.setTimeout = (callback, delay, ...args) => {
+        if (delay === 10) {
+          pending.push(() => callback(...args));
+          return 0;
+        }
+        return original(callback, delay, ...args);
+      };
+      window.flushPanelFocus = () => {
+        window.setTimeout = original;
+        pending.splice(0).forEach((callback) => callback());
+        delete window.flushPanelFocus;
+      };
+    });
+    await page.getByRole("button", { name: "调度与额度", exact: true }).click();
+    await page
+      .getByRole("heading", { name: "发送通道", exact: true })
+      .waitFor();
+    const tabbit = page.getByLabel("X · Tabbit 并发", { exact: true });
+    const daily = page.getByLabel("全局每日额度", { exact: true });
+    assert.equal(await daily.inputValue(), "100");
+    await tabbit.focus();
+    await page.evaluate(() => window.flushPanelFocus());
+    assert.equal(
+      await tabbit.evaluate((input) => document.activeElement === input),
+      true,
+    );
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.insertText("2");
+    assert.equal(await tabbit.inputValue(), "2");
+    assert.equal(await daily.inputValue(), "100");
+    await page.getByLabel("同时执行的账号数", { exact: true }).fill("4");
+    assert.equal(await tabbit.inputValue(), "2");
+    const [settingsResponse] = await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          r.url().endsWith("/api/execution/settings") &&
+          r.request().method() === "PUT",
+      ),
+      page.getByRole("button", { name: "保存调度设置", exact: true }).click(),
+    ]);
+    assert.equal(settingsResponse.status(), 200);
+    const submitted = settingsResponse.request().postDataJSON();
+    const returned = await settingsResponse.json();
+    assert.equal(submitted.max_workers, 4);
+    assert.equal(submitted.pool_workers["x.tabbit"], 2);
+    assert.equal(submitted.global_limit.daily, 100);
+    assert.equal(returned.pool_workers["x.tabbit"], 2);
+    await page.locator("#panel").waitFor({ state: "hidden" });
+    const saved = await read("/execution/settings");
+    assert.equal(saved.max_workers, 4);
+    assert.equal(saved.pool_workers["x.tabbit"], 2);
+    assert.equal(saved.global_limit.daily, 100);
+  }
   assert.deepEqual(errors, []);
   console.log(
     JSON.stringify({
@@ -335,6 +382,8 @@ async function screenshots(page) {
       imported_contents: 3,
       started_batches: 2,
       confirmed_simulations: 3,
+      settings_viewports: ["mobile", "desktop"],
+      settings_focus_preserved: true,
       screenshots: output,
     }),
   );

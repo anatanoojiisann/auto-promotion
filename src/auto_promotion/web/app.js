@@ -169,7 +169,7 @@ function openPanel(title, html) {
   $("#panel-title").textContent = title;
   $("#panel-content").innerHTML = html;
   $("#panel").showModal();
-  setTimeout(() => $("#panel-content input")?.focus(), 10);
+  $("#panel-content input")?.focus();
 }
 $("#close-panel").onclick = () => $("#panel").close();
 function busy(button, fn) {
