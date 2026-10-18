@@ -181,14 +181,33 @@ class CloudControl:
     def sync(self, engine, *, force=False):
         from .execution_channels import binding
 
-        # Allocate before reading: a delayed older upload cannot undo a later pause.
-        with engine.store.connect(write=True) as db:
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS cloud_sync_records("
-                "destination TEXT NOT NULL,section TEXT NOT NULL,record_id TEXT NOT NULL,"
-                "digest TEXT NOT NULL,revision INTEGER NOT NULL,"
-                "PRIMARY KEY(destination,section,record_id))"
+        destination = hashlib.sha256(self.url.encode()).hexdigest()
+        acknowledged = {
+            (r["section"], r["record_id"]): r["digest"]
+            for r in engine.store.rows(
+                "SELECT section,record_id,digest FROM cloud_sync_records WHERE destination=?",
+                (destination,),
             )
+        }
+        snapshot = export_snapshot(engine)
+
+        def record_key(section, record):
+            return (
+                canonical([record["attempt_id"], record["scope"], record["key"]])
+                if section == "quota_events"
+                else record["id"]
+            )
+
+        if not force and all(
+            acknowledged.get((section, record_key(section, record)))
+            == hashlib.sha256(canonical(record).encode()).hexdigest()
+            for section in ("quota_events", "accounts", "tasks", "jobs")
+            for record in snapshot[section]
+        ):
+            return {"changed_records": 0, "unchanged": True}
+        # Allocate BEFORE the authoritative read. A delayed upload cannot undo
+        # a later pause; unchanged polling does not advance either cursor.
+        with engine.store.connect(write=True) as db:
             row = db.execute(
                 "SELECT value FROM meta WHERE key='cloud_snapshot_revision'"
             ).fetchone()
@@ -198,24 +217,12 @@ class CloudControl:
                 (str(revision),),
             )
         snapshot = export_snapshot(engine)
-        destination = hashlib.sha256(self.url.encode()).hexdigest()
-        acknowledged = {
-            (r["section"], r["record_id"]): r["digest"]
-            for r in engine.store.rows(
-                "SELECT section,record_id,digest FROM cloud_sync_records WHERE destination=?",
-                (destination,),
-            )
-        }
         changed = 0
         # Import historical quota evidence before activating any new work.
         for section in ("quota_events", "accounts", "tasks", "jobs"):
             pending = []
             for record in snapshot[section]:
-                record_id = (
-                    canonical([record["attempt_id"], record["scope"], record["key"]])
-                    if section == "quota_events"
-                    else record["id"]
-                )
+                record_id = record_key(section, record)
                 checksum = hashlib.sha256(canonical(record).encode()).hexdigest()
                 if force or acknowledged.get((section, record_id)) != checksum:
                     pending.append((record_id, checksum, record))
@@ -285,15 +292,29 @@ def queue_settings(engine, changes):
 
 def export_snapshot(engine):
     """Export business data and immutable references, never credential profiles or sessions."""
-    accounts = {a["id"]: a for a in engine.accounts()}
-    tasks = {t["id"]: t for t in engine.store.rows("SELECT * FROM tasks")}
+    with engine.store.connect() as db:
+        # One WAL read snapshot for parents, children, routes and quota evidence.
+        # A concurrent task creation must not leave a child outside its parents.
+        db.execute("BEGIN")
+        result, new_routes = _export_snapshot(engine, db)
+    if new_routes:
+        with engine.store.connect(write=True) as db:
+            db.executemany("INSERT OR IGNORE INTO execution_job_routes VALUES(?,?)", new_routes)
+    return result
+
+
+def _export_snapshot(engine, db):
+    from .backends.common import automatic_actions
+    from .models import CAPABILITIES
+
+    accounts = {a["id"]: dict(a) for a in db.execute("SELECT * FROM accounts")}
+    for a in accounts.values():
+        a["capabilities"] = sorted(CAPABILITIES[a["platform"]])
+        a["automatic_actions"] = automatic_actions(a)
+    tasks = {t["id"]: dict(t) for t in db.execute("SELECT * FROM tasks")}
     result = {"schema": 1, "accounts": [], "tasks": [], "jobs": [], "quota_events": []}
-    routes = {
-        r["job_id"]: r["route"] for r in engine.store.rows("SELECT * FROM execution_job_routes")
-    }
-    queued_routes = {
-        r["id"]: r["route"] for r in engine.store.rows("SELECT id,route FROM execution_jobs")
-    }
+    routes = {r["job_id"]: r["route"] for r in db.execute("SELECT * FROM execution_job_routes")}
+    queued_routes = {r["id"]: r["route"] for r in db.execute("SELECT id,route FROM execution_jobs")}
     new_routes = []
 
     def frozen_route(job_id, account, payload=None):
@@ -324,6 +345,8 @@ def export_snapshot(engine):
             }
         )
     for t in tasks.values():
+        if any(account_id not in accounts for account_id in json.loads(t["account_ids"])):
+            raise CloudUnavailable("CloudSnapshotInconsistent")
         result["tasks"].append(
             {
                 "id": t["id"],
@@ -337,128 +360,124 @@ def export_snapshot(engine):
                 "manifest_hash": t["manifest_hash"],
             }
         )
-    with engine.store.connect() as db:
-        for row in db.execute("SELECT * FROM items").fetchall():
-            t, a = tasks[row["task_id"]], accounts[row["account_id"]]
-            # A relative membership schedule is mutable until its manifest is
-            # frozen. Such placeholders must never become cloud execution jobs.
-            if not t["manifest_hash"]:
-                continue
-            p, policy = json.loads(row["payload"]), json.loads(t["policy"])
-            route = frozen_route("send:" + row["id"], a, p)
-            native = p["action"] in {"schedule_message", "schedule_file"}
-            scopes = [
-                {"scope": k, "key": canonical([a["mode"], str(key)]), "limit": limit}
-                for k, key, limit in quotas.scopes(db, a, t, p)
-            ]
-            result["jobs"].append(
-                {
-                    "id": "send:" + row["id"],
-                    "kind": "send",
-                    "reference_id": row["id"],
-                    "task_id": t["id"],
-                    "account_id": a["id"],
-                    "pool": route.pool,
-                    "resource": route.resource,
-                    "action": p["action"],
-                    "position": row["position"],
-                    "version": row["payload_hash"],
-                    "payload": p,
-                    "state": row["status"],
-                    "available_at": epoch(policy["starts_at"]) if native else row["due_at"],
-                    "expires_at": min(
-                        epoch(policy["ends_at"]), row["due_at"] if native else row["due_at"] + 900
-                    ),
-                    "attempt_id": row["attempt_id"],
-                    "result": json.loads(row["result"]),
-                    "scopes": scopes,
-                }
-            )
-        for row in db.execute("SELECT * FROM candidates WHERE decision='qualified'").fetchall():
-            t, a = tasks[row["task_id"]], accounts[row["account_id"]]
-            policy = json.loads(t["policy"])
-            if a["platform"] != "telegram" or not policy["max_joins"]:
-                continue
-            route = frozen_route("join:" + row["id"], a)
-            attempt = db.execute(
-                "SELECT id FROM join_attempts WHERE candidate_id=?", (row["id"],)
-            ).fetchone()
-            p = {"target": row["target"], "recipient_id": row["target"], "action": "join"}
-            scopes = [
-                {"scope": k, "key": canonical([a["mode"], str(key)]), "limit": limit}
-                for k, key, limit in quotas.scopes(db, a, t, p)
-            ]
-            result["jobs"].append(
-                {
-                    "id": "join:" + row["id"],
-                    "kind": "join",
-                    "reference_id": row["id"],
-                    "task_id": t["id"],
-                    "account_id": a["id"],
-                    "pool": route.pool,
-                    "resource": route.resource,
-                    "action": "join",
-                    "version": hashlib.sha256(row["payload"].encode()).hexdigest(),
-                    "payload": json.loads(row["payload"]),
-                    "state": "cancelled"
-                    if t["state"] == "cancelled" and not attempt
-                    else row["state"],
-                    "available_at": epoch(policy["starts_at"]),
-                    "expires_at": epoch(policy["ends_at"]),
-                    "attempt_id": attempt["id"] if attempt else None,
-                    "result": json.loads(row["result"]),
-                    "scopes": scopes,
-                }
-            )
-        # Migrate the recent quota ledger, including uncertain attempts, before admitting work.
-        attempts = {
-            (r["account_id"], r["task_id"], r["started_at"], r["target_key"], r["user_key"]): r[
-                "id"
-            ]
-            for r in db.execute(
-                "SELECT id,account_id,task_id,started_at,target_key,user_key FROM attempts UNION ALL SELECT id,account_id,task_id,started_at,target_key,user_key FROM join_attempts"
-            )
-        }
-        for event in quotas.events(db, "live") + quotas.events(db, "simulation"):
-            if event["at"] < time.time() - 86400:
-                continue
-            # A stable source-event key avoids counting the same historical event twice.
-            key = attempts.get(
-                (event["account"], event["task"], event["at"], event["target"], event["user"])
-            )
-            if key is None:
-                continue  # Future reservations are not completed attempts.
-            for scope in (
-                "global",
-                "platform",
-                "account",
-                "task",
-                "campaign",
-                "pool",
-                "target",
-                "user",
-            ):
-                if event.get(scope) is not None:
-                    result["quota_events"].append(
-                        {
-                            "attempt_id": key,
-                            "scope": scope,
-                            "key": canonical([event["mode"], str(event[scope])]),
-                            "at": event["at"],
-                        }
-                    )
-            for scope, value in (
-                ("cloud_global", event["mode"]),
-                ("cloud_account", route_for(accounts[event["account"]]).identity),
-                ("cloud_task", event["task"]),
-            ):
+    for row in db.execute("SELECT * FROM items").fetchall():
+        t, a = tasks.get(row["task_id"]), accounts.get(row["account_id"])
+        if t is None or a is None:
+            raise CloudUnavailable("CloudSnapshotInconsistent")
+        # A relative membership schedule is mutable until its manifest is
+        # frozen. Such placeholders must never become cloud execution jobs.
+        if not t["manifest_hash"]:
+            continue
+        p, policy = json.loads(row["payload"]), json.loads(t["policy"])
+        route = frozen_route("send:" + row["id"], a, p)
+        native = p["action"] in {"schedule_message", "schedule_file"}
+        scopes = [
+            {"scope": k, "key": canonical([a["mode"], str(key)]), "limit": limit}
+            for k, key, limit in quotas.scopes(db, a, t, p)
+        ]
+        result["jobs"].append(
+            {
+                "id": "send:" + row["id"],
+                "kind": "send",
+                "reference_id": row["id"],
+                "task_id": t["id"],
+                "account_id": a["id"],
+                "pool": route.pool,
+                "resource": route.resource,
+                "action": p["action"],
+                "position": row["position"],
+                "version": row["payload_hash"],
+                "payload": p,
+                "state": row["status"],
+                "available_at": epoch(policy["starts_at"]) if native else row["due_at"],
+                "expires_at": min(
+                    epoch(policy["ends_at"]), row["due_at"] if native else row["due_at"] + 900
+                ),
+                "attempt_id": row["attempt_id"],
+                "result": json.loads(row["result"]),
+                "scopes": scopes,
+            }
+        )
+    for row in db.execute("SELECT * FROM candidates WHERE decision='qualified'").fetchall():
+        t, a = tasks.get(row["task_id"]), accounts.get(row["account_id"])
+        if t is None or a is None:
+            raise CloudUnavailable("CloudSnapshotInconsistent")
+        policy = json.loads(t["policy"])
+        if a["platform"] != "telegram" or not policy["max_joins"]:
+            continue
+        route = frozen_route("join:" + row["id"], a)
+        attempt = db.execute(
+            "SELECT id FROM join_attempts WHERE candidate_id=?", (row["id"],)
+        ).fetchone()
+        p = {"target": row["target"], "recipient_id": row["target"], "action": "join"}
+        scopes = [
+            {"scope": k, "key": canonical([a["mode"], str(key)]), "limit": limit}
+            for k, key, limit in quotas.scopes(db, a, t, p)
+        ]
+        result["jobs"].append(
+            {
+                "id": "join:" + row["id"],
+                "kind": "join",
+                "reference_id": row["id"],
+                "task_id": t["id"],
+                "account_id": a["id"],
+                "pool": route.pool,
+                "resource": route.resource,
+                "action": "join",
+                "version": hashlib.sha256(row["payload"].encode()).hexdigest(),
+                "payload": json.loads(row["payload"]),
+                "state": "cancelled" if t["state"] == "cancelled" and not attempt else row["state"],
+                "available_at": epoch(policy["starts_at"]),
+                "expires_at": epoch(policy["ends_at"]),
+                "attempt_id": attempt["id"] if attempt else None,
+                "result": json.loads(row["result"]),
+                "scopes": scopes,
+            }
+        )
+    # Migrate the recent quota ledger, including uncertain attempts, before admitting work.
+    attempts = {
+        (r["account_id"], r["task_id"], r["started_at"], r["target_key"], r["user_key"]): r["id"]
+        for r in db.execute(
+            "SELECT id,account_id,task_id,started_at,target_key,user_key FROM attempts UNION ALL SELECT id,account_id,task_id,started_at,target_key,user_key FROM join_attempts"
+        )
+    }
+    for event in quotas.events(db, "live") + quotas.events(db, "simulation"):
+        if event["at"] < time.time() - 86400:
+            continue
+        # A stable source-event key avoids counting the same historical event twice.
+        key = attempts.get(
+            (event["account"], event["task"], event["at"], event["target"], event["user"])
+        )
+        if key is None:
+            continue  # Future reservations are not completed attempts.
+        for scope in (
+            "global",
+            "platform",
+            "account",
+            "task",
+            "campaign",
+            "pool",
+            "target",
+            "user",
+        ):
+            if event.get(scope) is not None:
                 result["quota_events"].append(
-                    {"attempt_id": key, "scope": scope, "key": str(value), "at": event["at"]}
+                    {
+                        "attempt_id": key,
+                        "scope": scope,
+                        "key": canonical([event["mode"], str(event[scope])]),
+                        "at": event["at"],
+                    }
                 )
-    if new_routes:
-        with engine.store.connect(write=True) as db:
-            db.executemany("INSERT OR IGNORE INTO execution_job_routes VALUES(?,?)", new_routes)
-    return result
+        for scope, value in (
+            ("cloud_global", event["mode"]),
+            ("cloud_account", route_for(accounts[event["account"]]).identity),
+            ("cloud_task", event["task"]),
+        ):
+            result["quota_events"].append(
+                {"attempt_id": key, "scope": scope, "key": str(value), "at": event["at"]}
+            )
+    return result, new_routes
 
 
 class CloudJournal:

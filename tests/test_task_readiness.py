@@ -351,6 +351,40 @@ class ReadinessTests(unittest.TestCase):
                     self.engine.prepare(task["id"])
                 self.assertIsNone(self.engine.task(task["id"])["manifest_hash"])
 
+    def test_existing_member_permissions_can_be_rechecked_without_join_or_new_wait(self):
+        task = self.discovery(self.task(max_joins=1))
+        candidate = self.candidate(task)
+        self.membership(candidate, can_send=False)
+        self.items(task)
+        fresh = {
+            "status": "joined",
+            "verified": True,
+            "can_send": True,
+            "external_reference": "simulation://membership/test",
+            "outbound_eligible_at_utc": iso(self.now + 3600),
+        }
+        with patch.object(self.engine, "call", return_value=fresh) as call:
+            result = self.engine.reconcile_join(candidate["id"])
+        self.assertEqual(call.call_args.args[1], "verify_join")
+        self.assertTrue(result["can_send"])
+        self.assertEqual(result["outbound_eligible_at_utc"], iso(self.now))
+        self.assertIsNotNone(self.engine.prepare(task["id"])["manifest_hash"])
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM join_attempts")["n"], 0)
+
+    def test_lost_membership_invalidates_old_permission_evidence_without_rejoin(self):
+        task = self.discovery(self.task(max_joins=1))
+        candidate = self.candidate(task)
+        self.membership(candidate)
+        with patch.object(
+            self.engine, "call", return_value={"verified": False, "reason": "ChannelPrivateError"}
+        ):
+            result = self.engine.reconcile_join(candidate["id"])
+        self.assertEqual(result["status"], "unknown")
+        row = self.store.one("SELECT state,result FROM candidates WHERE id=?", (candidate["id"],))
+        self.assertEqual(row["state"], "unknown")
+        self.assertFalse(json.loads(row["result"])["can_send"])
+        self.assertEqual(self.store.one("SELECT COUNT(*) n FROM join_attempts")["n"], 0)
+
     def test_membership_is_rechecked_before_approval_and_submission(self):
         task = self.discovery(self.task(max_joins=1))
         candidate = self.candidate(task)

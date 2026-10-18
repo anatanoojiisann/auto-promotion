@@ -156,7 +156,12 @@ class ClaimTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.env = patch.dict(
-            os.environ, {"AUTO_PROMOTION_LIVE_WRITES": "1", "AP_TELEGRAM_OWNER": "auto-promotion"}
+            os.environ,
+            {
+                "AUTO_PROMOTION_LIVE_WRITES": "1",
+                "AP_TELEGRAM_OWNER": "auto-promotion",
+                "AP_ACCOUNTS_DIR": str(Path(self.tmp.name) / "accounts"),
+            },
         )
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -396,9 +401,75 @@ class TelegramTests(unittest.TestCase):
     def test_plain_text_send_verifies_independent_read_and_checkpoints_first(self):
         result = self.run_action(self.backend())
         self.assertEqual(result["status"], "confirmed")
-        self.assertEqual(self.saved[0]["message_ids"], [123])
+        self.assertTrue(self.saved[0]["submission_started"])
+        self.assertEqual(self.saved[1]["message_ids"], [123])
         self.assertIsNone(self.client.sends[0][1]["parse_mode"])
         self.assertEqual(len(self.authorized), 1)
+
+    def test_submission_marker_failure_prevents_platform_send(self):
+        import sqlite3
+
+        backend = self.backend()
+
+        def fail_checkpoint(result):
+            self.assertTrue(result["submission_started"])
+            self.assertEqual(self.client.sends, [])
+            raise sqlite3.OperationalError("database is locked")
+
+        item = {"action": "send_message", "target": "@public_group", "text": "exact", "media": []}
+        with self.assertRaises(sqlite3.OperationalError):
+            asyncio.run(backend.run("execute", {"payload": item}, fail_checkpoint, lambda: None))
+        self.assertEqual(self.client.sends, [])
+
+    def test_accepted_send_receipt_failure_and_restart_never_resends(self):
+        import sqlite3
+
+        from auto_promotion.backends.telegram import TelegramBackend
+
+        self.real_backend_class = TelegramBackend
+        self.backend()
+        request = {
+            "platform": "telegram",
+            "account": "default",
+            "operation": "execute",
+            "payload": {
+                "item_id": "receipt-failure",
+                "payload": {
+                    "action": "send_message",
+                    "target": "@public_group",
+                    "text": "exact",
+                    "media": [],
+                    "reply_to": None,
+                    "scheduled_at": iso(time.time()),
+                },
+            },
+        }
+        original_save = Receipts.save
+
+        def fail_after_send(receipts, key, result):
+            if result.get("message_ids"):
+                raise sqlite3.OperationalError("database is locked")
+            return original_save(receipts, key, result)
+
+        with (
+            patch.object(native_bridge, "verify_claim"),
+            patch("auto_promotion.backends.telegram.make_client", return_value=self.client),
+            patch(
+                "auto_promotion.backends.telegram.TelegramBackend",
+                side_effect=lambda label: self._backend_for_test(label),
+            ),
+            patch.object(Receipts, "save", fail_after_send),
+        ):
+            first = native_bridge.dispatch(request)
+        with patch.object(native_bridge, "verify_claim"):
+            second = native_bridge.dispatch(request)
+        self.assertEqual(len(self.client.sends), 1)
+        self.assertEqual(first["status"], "unknown")
+        self.assertTrue(first["submission_started"])
+        self.assertEqual(first, second)
+
+    def _backend_for_test(self, label):
+        return self.real_backend_class(label, client_factory=lambda *args: self.client)
 
     def test_identity_mismatch_never_sends(self):
         backend = self.backend()
@@ -493,7 +564,8 @@ class TelegramTests(unittest.TestCase):
         self.client.fail_lookup = True
         with self.assertRaises(ConnectionError):
             self.run_action(backend)
-        self.assertEqual(self.saved[0]["message_ids"], [123])
+        self.assertTrue(self.saved[0]["submission_started"])
+        self.assertEqual(self.saved[1]["message_ids"], [123])
         self.assertEqual(len(self.client.sends), 1)
 
     def test_missing_parent_keeps_tracking_verified_receipt_but_coverage_stays_partial(self):

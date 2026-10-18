@@ -314,7 +314,16 @@ async function screenshots(page) {
   await page.getByRole("heading", { name: "发送通道", exact: true }).waitFor();
   await page.getByLabel("X · Tabbit 并发", { exact: true }).fill("2");
   await page.getByLabel("同时执行的账号数", { exact: true }).fill("4");
-  await page.getByRole("button", { name: "保存调度设置", exact: true }).click();
+  const [settingsResponse] = await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        r.url().endsWith("/api/execution/settings") &&
+        r.request().method() === "PUT",
+    ),
+    page.getByRole("button", { name: "保存调度设置", exact: true }).click(),
+  ]);
+  assert.equal(settingsResponse.status(), 200);
+  assert.equal(settingsResponse.request().postDataJSON().max_workers, 4);
   await page.locator("#panel").waitFor({ state: "hidden" });
   assert.equal((await read("/execution/settings")).max_workers, 4);
   assert.equal((await read("/execution/settings")).pool_workers["x.tabbit"], 2);

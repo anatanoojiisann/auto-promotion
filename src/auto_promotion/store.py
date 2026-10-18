@@ -10,6 +10,16 @@ from .models import canonical
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cloud_sync_records(
+ destination TEXT NOT NULL,section TEXT NOT NULL,record_id TEXT NOT NULL,
+ digest TEXT NOT NULL,revision INTEGER NOT NULL,
+ PRIMARY KEY(destination,section,record_id)
+);
+CREATE TABLE IF NOT EXISTS telegram_target_checks(
+ account_id TEXT NOT NULL,identity_key TEXT NOT NULL,check_key TEXT NOT NULL,
+ target TEXT NOT NULL,retry_at REAL NOT NULL,result TEXT NOT NULL,
+ PRIMARY KEY(account_id,identity_key,check_key)
+);
 CREATE TABLE IF NOT EXISTS tiktok_oauth(
  id TEXT PRIMARY KEY, expires_at REAL NOT NULL, client_id TEXT NOT NULL,
  redirect_uri TEXT NOT NULL, details TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
@@ -198,6 +208,19 @@ CREATE TABLE IF NOT EXISTS task_templates(
 
 
 class Store:
+    # Retry lock acquisition only: never replay a transaction body, which may
+    # have observed an external effect. Short waits keep worker heartbeats alive.
+    lock_timeout = 2
+    lock_retry_delays = (0.05, 0.15, 0.4, 1)
+
+    @staticmethod
+    def locked(exc):
+        return isinstance(exc, sqlite3.OperationalError) and (
+            getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            or str(exc).lower() in {"database is locked", "database table is locked"}
+        )
+
     def __init__(self, path: str | Path):
         self.path = str(Path(path).resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -247,17 +270,24 @@ class Store:
 
     @contextmanager
     def connect(self, write=False):
-        db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
+        db = sqlite3.connect(self.path, timeout=self.lock_timeout, isolation_level=None)
         db.row_factory = sqlite3.Row
         from .queue_store import bind_connection
 
         bind_connection(db)
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
         try:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
             if write:
-                db.execute("BEGIN IMMEDIATE")
+                for attempt in range(len(self.lock_retry_delays) + 1):
+                    try:
+                        db.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if not self.locked(exc) or attempt == len(self.lock_retry_delays):
+                            raise
+                        time.sleep(self.lock_retry_delays[attempt])
             yield db
             if write:
                 db.commit()

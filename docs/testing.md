@@ -80,5 +80,27 @@ AP_UI_SKIP_SCREENSHOTS=1 npm run test:ui
 
 GitHub Actions 在 Python 3.11 / 3.14 上执行自动检查与构建，并另行运行浏览器验收。具体运行结果以仓库 Actions 记录为准。
 
+## 执行可靠性回归
+
+`python -m unittest discover -s tests -p test_runtime_reliability.py -v` 使用临时数据库，
+覆盖真实 SQLite 写锁竞争、锁释放恢复、池心跳及领取失败后的存活、回执保存失败后不重发、
+快照并发创建的一致性、历史孤立引用的明确阻塞，以及跨时间的无变化同步。
+`test_native_backends.py` 另测提交标记保存失败时零发送、发送后回执保存失败或连接中断时只发送一次。
+锁重试仅发生在 `BEGIN IMMEDIATE` 之前；5 次、每次至多 2 秒等待，加上总计 1.6 秒退避。
+事务体、平台提交及发送结果不做自动重试。
+
+Telegram 只读权限失败按实际账号身份、目标和检查种类暂存：明确拒绝等待 5 分钟，
+网络等不确定失败等待 30 秒；FloodWait 继续使用平台返回的账号冷却期。
+资格变化后到期重新只读检查，已入群目标也可从界面或 MCP 核对当前权限，不重新入群，
+不延长原入群等待时间。此检查仍只涵盖现有文字发言权限，不能替代媒体类型权限的真实验收。
+`submission_started` 是提交前持久化的保守边界，不代表平台已接受或投递成功。
+
+macOS 的临时目录可能有 `/var` 与 `/private/var` 别名，运行全套时可用
+`TMPDIR=/private/tmp python -m unittest discover -s tests -v`，避免仅路径拼写导致的断言差异。
+
+云控离线回归：在 `cloudflare/control-plane` 运行 `npm ci && npm test && npm run check`。
+包含 schema 1→2 迁移、重新打开零写、重复授权/回执/快照零写和普通任务 6 次写入预算；
+`check` 仅打包 dry-run，不部署。CI 同时执行这些检查和 `npm run test:ui:pools`。
+
 
 TikTok 的授权配置、发布与自有评论管理、独立回调和真实验收见 [TikTok 接入说明](tiktok.md)。

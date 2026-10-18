@@ -199,10 +199,24 @@ class JobQueue:
 
     def recover(self):
         now = self.clock()
+        terminal = ",".join("?" for _ in WRITE_TERMINAL)
+        query = (
+            "SELECT j.* FROM execution_jobs j LEFT JOIN items i "
+            "ON j.kind='send' AND i.id=j.reference_id LEFT JOIN candidates c "
+            "ON j.kind='join' AND c.id=j.reference_id LEFT JOIN tasks t ON t.id=j.task_id "
+            "WHERE j.state IN ('pending','leased') AND ("
+            f"(j.kind='send' AND (i.id IS NULL OR i.status IN ({terminal}))) OR "
+            f"(j.kind='join' AND (c.id IS NULL OR c.state IN ({terminal}))) OR "
+            "(j.state='pending' AND (t.state='cancelled' OR j.expires_at<=?)) OR "
+            "(j.state='leased' AND j.lease_until<=?))"
+        )
+        params = (*sorted(WRITE_TERMINAL), *sorted(WRITE_TERMINAL), now, now)
+        if not self.store.one(query + " LIMIT 1", params):
+            return
         with self.store.connect(write=True) as db:
-            for row in db.execute(
-                "SELECT * FROM execution_jobs WHERE state IN ('pending','leased')"
-            ).fetchall():
+            # Re-read under the write lock: another worker may have renewed or
+            # settled a lease since the cheap read-only candidate check.
+            for row in db.execute(query, params).fetchall():
                 source = self._source(db, row)
                 parent = db.execute(
                     "SELECT state FROM tasks WHERE id=?", (row["task_id"],)
@@ -393,17 +407,31 @@ class JobQueue:
         with self.store.connect(write=True) as db:
             source = self._source(db, job)
             state = source["status"] if source else "cancelled"
-            if state == "executing":
+            if state == "executing" or (state == "not_attempted" and source["attempted"]):
                 state = "unknown"
             delay = now + (30 if error else 5)
             if state == "not_attempted":
                 account = db.execute(
-                    "SELECT next_at,cooldown_until,status FROM accounts WHERE id=?",
+                    "SELECT * FROM accounts WHERE id=?",
                     (job["account_id"],),
                 ).fetchone()
                 delay = max(delay, account["next_at"], account["cooldown_until"])
                 if account["status"] != "healthy":
                     delay = max(delay, now + 300)
+                if job["kind"] == "send":
+                    from .target_checks import TargetChecks
+
+                    item = db.execute(
+                        "SELECT payload FROM items WHERE id=?", (job["reference_id"],)
+                    ).fetchone()
+                    deferred = TargetChecks(
+                        self.engine,
+                        dict(account),
+                        "preflight",
+                        {"payload": json.loads(item[0])},
+                    ).read(db)
+                    if deferred:
+                        delay = max(delay, deferred["eligibility_retry_at"])
                 state = "pending"
             db.execute(
                 "UPDATE execution_jobs SET state=?,available_at=?,owner=NULL,lease_until=0,updated_at=?,result=? WHERE id=? AND owner=?",

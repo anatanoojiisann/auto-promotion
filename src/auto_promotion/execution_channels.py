@@ -22,6 +22,9 @@ def read_state(store):
 
 
 def binding(engine):
+    existing = engine.store.one("SELECT value FROM meta WHERE key='execution_store_id'")
+    if existing:
+        return existing["value"]
     with engine.store.connect(write=True) as db:
         db.execute("INSERT OR IGNORE INTO meta VALUES('execution_store_id',?)", (uuid.uuid4().hex,))
         return db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()[0]

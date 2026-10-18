@@ -127,7 +127,11 @@ class TelegramBackend:
                 item = payload["payload"]
                 target = await client.get_entity(self.target(item["target"]))
                 permissions = await client.get_permissions(target, "me")
-                return {"allowed": self.can_send_messages(target, permissions)}
+                allowed = self.can_send_messages(target, permissions)
+                return {
+                    "allowed": allowed,
+                    **({"reason": "TargetWriteForbidden"} if not allowed else {}),
+                }
             if operation == "discover":
                 return await self.discover(client, payload["policy"])
             if operation in {"join", "verify_join"}:
@@ -338,12 +342,17 @@ class TelegramBackend:
                 "schedule_file",
             }:
                 raise BackendError("UnsupportedTelegramAction")
-            authorize()
             schedule = (
                 datetime.fromisoformat(item["scheduled_at"].replace("Z", "+00:00"))
                 if native
                 else None
             )
+            progress = getattr(checkpoint, "progress", None)
+            if progress:
+                progress("platform_submission", True)
+            else:
+                checkpoint({"execution_step": "platform_submission", "submission_started": True})
+            authorize()
             if item["media"]:
                 sent = await client.send_file(
                     entity,

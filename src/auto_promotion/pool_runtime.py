@@ -3,10 +3,12 @@
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from .cloud_control import CloudControl, CloudJobClosed, CloudJournal, CloudUnavailable
@@ -298,21 +300,36 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
             (owner, pool, node_id, os.getpid(), now, now, "running", None),
         )
     idle_since = time.monotonic()
+    next_heartbeat = 0
     try:
         while max_jobs is None or handled < max_jobs:
-            with engine.store.connect(write=True) as db:
-                db.execute(
-                    "UPDATE pool_workers SET heartbeat_at=? WHERE id=?", (time.time(), owner)
+            # Preparation is read-only or transactional DB work. An exhausted
+            # lock wait must not kill the pool or replay a platform invocation.
+            try:
+                if time.monotonic() >= next_heartbeat:
+                    with engine.store.connect(write=True) as db:
+                        db.execute(
+                            "UPDATE pool_workers SET heartbeat_at=?,reason=NULL WHERE id=?",
+                            (time.time(), owner),
+                        )
+                    next_heartbeat = time.monotonic() + 10
+                local = independent_active(engine) or (
+                    local_active(engine, cloud) if cloud else False
                 )
-            local = independent_active(engine) or (local_active(engine, cloud) if cloud else False)
-            channel_state = read_state(engine.store)
-            pending = engine.store.one("SELECT value FROM meta WHERE key='cloud_retry_after'")
-            if not local and (
-                channel_state.get("active") == "local"
-                or (pending and json.loads(pending["value"])["until"] > engine.clock())
-            ):
-                break
-            job = queue.claim(pool, owner)
+                channel_state = read_state(engine.store)
+                pending = engine.store.one("SELECT value FROM meta WHERE key='cloud_retry_after'")
+                if not local and (
+                    channel_state.get("active") == "local"
+                    or (pending and json.loads(pending["value"])["until"] > engine.clock())
+                ):
+                    break
+                job = queue.claim(pool, owner)
+            except Exception as exc:
+                worker_error(engine, owner, exc)
+                if time.monotonic() - idle_since >= idle_exit:
+                    break
+                time.sleep(1)
+                continue
             if job is None:
                 if time.monotonic() - idle_since >= idle_exit:
                     break
@@ -368,30 +385,62 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                 ):
                     engine.run_reference_job(job)
             except CloudJobClosed as exc:
-                with engine.store.connect(write=True) as db:
-                    db.execute(
-                        "UPDATE execution_jobs SET state=?,owner=NULL,lease_until=0,result=? WHERE id=? AND owner=?",
-                        (
-                            exc.state,
-                            canonical({"reason": "cloud_job_already_settled"}),
-                            job["id"],
-                            owner,
-                        ),
-                    )
+                try:
+                    with engine.store.connect(write=True) as db:
+                        db.execute(
+                            "UPDATE execution_jobs SET state=?,owner=NULL,lease_until=0,result=? WHERE id=? AND owner=?",
+                            (
+                                exc.state,
+                                canonical({"reason": "cloud_job_already_settled"}),
+                                job["id"],
+                                owner,
+                            ),
+                        )
+                except sqlite3.Error as persistence_error:
+                    worker_error(engine, owner, persistence_error)
             except Exception as exc:
                 error = exc
                 if isinstance(exc, CloudUnavailable) and not local:
-                    PoolScheduler(engine)._cloud_failure(exc)
+                    try:
+                        PoolScheduler(engine)._cloud_failure(exc)
+                    except sqlite3.Error as persistence_error:
+                        worker_error(engine, owner, persistence_error)
             finally:
-                queue.settle(job, error)
+                # Never run the job again to recover a failed receipt write.
+                # Its attempt remains durable; lease recovery quarantines it.
+                try:
+                    queue.settle(job, error)
+                except Exception as exc:
+                    worker_error(engine, owner, exc)
                 if lease:
-                    journal.finish(lease)
+                    try:
+                        journal.finish(lease)
+                    except Exception as exc:
+                        worker_error(engine, owner, exc)
             handled += 1
             idle_since = time.monotonic()
     finally:
-        with engine.store.connect(write=True) as db:
-            db.execute(
-                "UPDATE pool_workers SET state='stopped',heartbeat_at=? WHERE id=?",
-                (time.time(), owner),
-            )
+        try:
+            with engine.store.connect(write=True) as db:
+                db.execute(
+                    "UPDATE pool_workers SET state='stopped',heartbeat_at=? WHERE id=?",
+                    (time.time(), owner),
+                )
+        except sqlite3.Error:
+            # A stale heartbeat remains visible after a database outage.
+            pass
     return {"pool": pool, "processed_jobs": handled}
+
+
+def worker_error(engine, owner, error):
+    """Best-effort safe diagnostics; never log exception text or credentials."""
+    try:
+        # Diagnostics must not add another full lock retry budget during an
+        # outage. This single best-effort statement never encloses execution.
+        with closing(sqlite3.connect(engine.store.path, timeout=0, isolation_level=None)) as db:
+            db.execute(
+                "UPDATE pool_workers SET reason=? WHERE id=?",
+                (type(error).__name__, owner),
+            )
+    except sqlite3.Error:
+        pass

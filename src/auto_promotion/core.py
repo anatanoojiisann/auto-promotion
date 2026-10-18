@@ -217,9 +217,30 @@ class Engine:
         return self.account(account_id)
 
     def call(self, account, operation, payload=None, task_id=None):
+        from .target_checks import TargetChecks
+
+        checks = TargetChecks(self, account, operation, payload or {})
+        if checks.enabled and account["cooldown_until"] > self.clock():
+            return {
+                "allowed": False,
+                "verified": False,
+                "reason": "AccountCooldown",
+                "rate_limited": True,
+                "retry_after_seconds": max(1, int(account["cooldown_until"] - self.clock())),
+            }
+        cached = checks.read()
+        if cached is not None:
+            return cached
         route = route_for(account, (payload or {}).get("payload", {}))
         with self.lanes.acquire(account["id"], resource=route.resource):
-            return self._call_unlocked(account, operation, payload, task_id)
+            try:
+                result = self._call_unlocked(account, operation, payload, task_id)
+            except Conflict as exc:
+                if not checks.enabled:
+                    raise
+                result = checks.failure(getattr(exc, "safe_code", "TargetCheckUnavailable"))
+            checks.save(result)
+            return result
 
     def _call_unlocked(self, account, operation, payload=None, task_id=None):
         started = time.monotonic()
@@ -292,7 +313,7 @@ class Engine:
     def check_account(self, account_id):
         account = self.account(account_id)
         if (
-            account["platform"] in {"discord", "tiktok"}
+            account["platform"] in {"telegram", "discord", "tiktok"}
             and account["cooldown_until"] > self.clock()
         ):
             return account
@@ -1221,10 +1242,22 @@ class Engine:
 
     def _claim(self, item_id, backend_gate=None):
         now = self.clock()
+        prepared = self.store.one("SELECT payload,payload_hash FROM items WHERE id=?", (item_id,))
+        if not prepared:
+            return None
+        # File hashing can be slow. Do it without holding SQLite's only writer;
+        # the provider checks the same frozen hashes again before submission.
+        for media in json.loads(prepared["payload"])["media"]:
+            self.verify_media(media)
         with self.store.connect(write=True) as db:
             row = db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             if not row or row["status"] != "not_attempted":
                 return None
+            if (
+                row["payload_hash"] != prepared["payload_hash"]
+                or row["payload"] != prepared["payload"]
+            ):
+                raise Conflict("执行项在检查期间发生变化")
             task = db.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
             if task["state"] != "active":
                 return self._skip(item_id, "task_not_active", db)
@@ -1334,8 +1367,6 @@ class Engine:
             )
             if quota_reason:
                 return self._skip(item_id, quota_reason, db)
-            for media in payload["media"]:
-                self.verify_media(media)
             reason = telegram_blocker(db, task, payload, now)
             if reason:
                 return self._skip(item_id, reason, db)
@@ -1564,6 +1595,14 @@ class Engine:
                 self._skip(
                     row["id"], "account_disabled" if account["disabled"] else "account_cooldown"
                 )
+                continue
+            from .target_checks import TargetChecks
+
+            deferred = TargetChecks(
+                self, account, "preflight", {"payload": json.loads(row["payload"])}
+            ).read()
+            if not manual and deferred:
+                self._skip(row["id"], "backend_gate_blocked")
                 continue
             if not manual and account["id"] not in checked:
                 # A fresh read-only health check before a live claim; simulation needs one too.
@@ -2366,18 +2405,33 @@ class Engine:
         row = self.store.one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
         if not row:
             raise NotFound("候选不存在")
-        if row["state"] not in {"unknown", "pending_admin_approval"}:
-            raise Conflict("只有未知或待管理员批准的入群需要核对")
+        if row["state"] not in {"unknown", "pending_admin_approval", "joined", "already_joined"}:
+            raise Conflict("只有已尝试的入群或成员身份需要核对")
+        account = self.account(row["account_id"])
         result = self.call(
-            self.account(row["account_id"]),
+            account,
             "verify_join",
             {"candidate_id": candidate_id, "target": row["target"]},
             row["task_id"],
         )
+        self.apply_cooldown(account["id"], result)
         if result.get("verified") is not True or result.get("status") not in {
             "joined",
             "already_joined",
         }:
+            if row["state"] in {"joined", "already_joined"}:
+                with self.store.connect(write=True) as db:
+                    db.execute(
+                        "UPDATE candidates SET state='unknown',result=? WHERE id=? AND result=?",
+                        (
+                            canonical(
+                                {**json.loads(row["result"]), "verified": False, "can_send": False}
+                            ),
+                            candidate_id,
+                            row["result"],
+                        ),
+                    )
+                return {"status": "unknown", "reason": "not_conclusively_verified"}
             return {"status": row["state"], "reason": "not_conclusively_verified"}
         # Membership lookup may confirm joining, but never grants another attempt.
         safe = {
@@ -2391,9 +2445,14 @@ class Engine:
             )
             if k in result
         }
+        previous = json.loads(row["result"])
+        if previous.get("outbound_eligible_at_utc"):
+            # A read-only permission refresh is not a new join; retain the
+            # original waiting deadline instead of postponing it every time.
+            safe["outbound_eligible_at_utc"] = previous["outbound_eligible_at_utc"]
         with self.store.connect(write=True) as db:
             db.execute(
-                "UPDATE candidates SET state=?,result=? WHERE id=? AND state IN ('unknown','pending_admin_approval')",
+                "UPDATE candidates SET state=?,result=? WHERE id=? AND state IN ('unknown','pending_admin_approval','joined','already_joined')",
                 (safe["status"], canonical(safe), candidate_id),
             )
             db.execute(

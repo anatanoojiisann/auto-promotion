@@ -128,6 +128,8 @@ def dispatch(request):
                                     payload.get("attempt_id"),
                                 ),
                             )
+                        else:
+                            raise BackendError("ExecutionClaimNotActive")
 
         def progress(step, submission_started=None):
             details = {"execution_step": step, "step_started_at": time.time()}

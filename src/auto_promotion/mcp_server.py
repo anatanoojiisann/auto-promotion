@@ -414,7 +414,7 @@ def create_server(engine=None):
 
     @server.tool(annotations=remote_read)
     def verify_telegram_membership(candidate_id: str) -> dict:
-        """Reconcile an uncertain Telegram join through a read-only membership lookup."""
+        """Read-only check of an attempted Telegram join or existing member's current permissions."""
         return invoke(engine.reconcile_join, candidate_id)
 
     @server.tool(annotations=local)

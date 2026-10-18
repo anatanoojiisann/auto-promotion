@@ -48,3 +48,22 @@ jobs:
         env:
           AUTO_PROMOTION_PYTHON: python
           AP_UI_SKIP_SCREENSHOTS: '1'
+      - run: npm run test:ui:pools
+        env:
+          AUTO_PROMOTION_PYTHON: python
+
+  cloud-control:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare/control-plane
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cloudflare/control-plane/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
