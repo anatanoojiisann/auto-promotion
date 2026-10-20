@@ -32,7 +32,7 @@ class VerificationTests(unittest.TestCase):
         self.db_path = (
             self.root / "队列 # ?.sqlite" if os.name != "nt" else self.root / "队列 #.sqlite"
         )
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.executescript("""
 CREATE TABLE meta(key TEXT,value TEXT);
 INSERT INTO meta VALUES('global_stop','0'),('store_schema_revision','1');
@@ -66,12 +66,12 @@ CREATE TABLE items(id TEXT,task_id TEXT,status TEXT,attempt_id TEXT,external_ref
         self.assertEqual(tool.database_evidence(missing)["code"], "DatabaseMissing")
         self.assertFalse(missing.exists())
         legacy = self.root / "legacy.sqlite"
-        with sqlite3.connect(legacy) as db:
+        with contextlib.closing(sqlite3.connect(legacy)) as db, db:
             db.execute("CREATE TABLE accounts(secret TEXT)")
         before = legacy.read_bytes()
         self.assertEqual(tool.database_evidence(legacy)["code"], "LegacyOrIncompleteSchema")
         self.assertEqual(legacy.read_bytes(), before)
-        with sqlite3.connect(self.db_path) as writer:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as writer, writer:
             writer.execute("BEGIN EXCLUSIVE")
             result = tool.database_evidence(self.db_path)
             self.assertEqual(result["status"], "unverified")
@@ -82,23 +82,21 @@ CREATE TABLE items(id TEXT,task_id TEXT,status TEXT,attempt_id TEXT,external_ref
             )
 
     def test_live_wal_includes_committed_rows_and_closed_wal_without_sidecars_is_unverified(self):
-        with sqlite3.connect(self.db_path) as writer:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as writer, writer:
             writer.execute("PRAGMA journal_mode=WAL")
             writer.execute("INSERT INTO execution_jobs VALUES('unknown','t',0,2000000000,2,0)")
             writer.commit()
             result = tool.database_evidence(self.db_path, "t")
             self.assertEqual(result["counts"]["unknown"], 1)
-        # sqlite3 context managers don't close connections.
-        writer.close()
         self.assertEqual(
             tool.database_evidence(self.db_path)["code"], "WALSidecarsRequiredForSafeRead"
         )
 
     def test_private_confirmed_queue_unknown_is_only_a_candidate_without_leaking_reference(self):
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("INSERT INTO items VALUES('i','t','unknown','attempt',NULL)")
         private = self.root / "receipts.sqlite"
-        with sqlite3.connect(private) as db:
+        with contextlib.closing(sqlite3.connect(private)) as db, db:
             db.execute("CREATE TABLE receipts(id TEXT,payload_hash TEXT,result TEXT)")
             db.execute(
                 "INSERT INTO receipts VALUES(?,?,?)",
