@@ -160,7 +160,7 @@ export class TelegramWorkflowReader {
         continue;
       }
       try {
-        let reply, nativeJob;
+        let reply, nativeJob, receiptSource, reconcileReceipt;
         if (work.stage === "goal_check")
           reply = {
             ok: true,
@@ -171,20 +171,14 @@ export class TelegramWorkflowReader {
             },
           };
         else if (["receipt_verify", "follow_up"].includes(work.stage)) {
-          const link =
-            this.k.one(
-              "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_native_links'",
-            ) &&
-            this.k.one(
-              "SELECT job_id FROM workflow_native_links WHERE plan_id=? AND step_id=?",
-              rt.plan_id,
-              work.input.target.toLowerCase().slice(1) + ":send",
-            );
-          nativeJob =
-            link && this.k.one("SELECT * FROM jobs WHERE id=?", link.job_id);
-          const stored = nativeJob && JSON.parse(nativeJob.result),
-            payload = nativeJob && JSON.parse(nativeJob.payload).payload;
-          if (!nativeJob?.attempt_id || !stored?.message_ids?.length)
+          receiptSource = this.q.receiptSource(rt.plan_id, work);
+          nativeJob = receiptSource?.job;
+          const stored = receiptSource?.receipt,
+            payload = receiptSource?.payload;
+          if (
+            !receiptSource ||
+            nativeJob.account_id !== this.env.TELEGRAM_EXECUTOR_ACCOUNT
+          )
             reply = {
               ok: false,
               result: { reason: "durable_send_receipt_required" },
@@ -232,13 +226,47 @@ export class TelegramWorkflowReader {
         } else if (work.stage === "receipt_verify") {
           if (
             r.verified === true &&
-            ["unknown", "confirmed"].includes(nativeJob.state)
+            receiptSource &&
+            JSON.stringify(r.message_ids) ===
+              JSON.stringify(receiptSource.receipt.message_ids) &&
+            r.external_reference === receiptSource.receipt.external_reference &&
+            r.discussion_id ===
+              JSON.parse(
+                this.k.one(
+                  "SELECT result FROM worksteps WHERE plan_id=? AND id=?",
+                  rt.plan_id,
+                  work.input.target.toLowerCase().slice(1) +
+                    ":membership_verify",
+                )?.result || "{}",
+              ).discussion_id
           ) {
-            this.k.sql.exec(
-              "UPDATE jobs SET state='confirmed',result=? WHERE id=? AND state<>'leased'",
-              JSON.stringify(r),
-              nativeJob.id,
-            );
+            reconcileReceipt = () => {
+              const current = this.q.receiptSource(rt.plan_id, work);
+              if (
+                !current ||
+                current.job.attempt_id !== nativeJob.attempt_id ||
+                current.job.version !== nativeJob.version ||
+                JSON.stringify(current.receipt.message_ids) !==
+                  JSON.stringify(receiptSource.receipt.message_ids)
+              )
+                throw new ControlError("NativeReceiptChanged", 409);
+              const checked = { ...current.receipt, ...r, status: "confirmed" };
+              this.k.sql.exec(
+                "UPDATE jobs SET state='confirmed',result=? WHERE id=?",
+                JSON.stringify(checked),
+                nativeJob.id,
+              );
+              this.k.sql.exec(
+                "UPDATE worksteps SET state='completed',result=? WHERE plan_id=? AND id=? AND state IN ('unknown','completed')",
+                JSON.stringify({
+                  ...checked,
+                  verdict: "pass",
+                  native_job_id: nativeJob.id,
+                }),
+                rt.plan_id,
+                current.sendId,
+              );
+            };
             result = {
               verdict: "pass",
               verified: true,
@@ -383,6 +411,7 @@ export class TelegramWorkflowReader {
             result,
             retry_at: this.k.clock() + 3600,
           },
+          reconcileReceipt,
         );
         this.k.sql.exec(
           "UPDATE telegram_reader_runtime SET lease_until=0,runs=runs+1,reads=reads+1,last_run=?,state=CASE WHEN enabled=1 THEN 'waiting_schedule' ELSE 'stopped' END WHERE plan_id=?",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ExecutorCore } from "../executor-core.mjs";
+import { ExecutorCore, preExecutionDeferral } from "../executor-core.mjs";
 const request = {
   job_id: "send:synthetic",
   account_id: "account",
@@ -9,6 +9,30 @@ const request = {
   lease_token: "synthetic-lease",
   text: "untrusted caller text",
 };
+test("pre-execution waits bind the exact unsubmitted native request", () => {
+  const result = preExecutionDeferral(
+    { ...request, operation: "execute" },
+    "waiting_cooldown",
+    220,
+    100,
+  );
+  assert.deepEqual(result, {
+    status: "waiting_cooldown",
+    retry_at: 220,
+    phase: "pre_execution",
+    native_authorized: false,
+    submission_started: false,
+    job_id: request.job_id,
+    account_id: request.account_id,
+    job_version: request.version,
+    attempt_id: request.attempt_id,
+    retry_after_seconds: 120,
+  });
+  assert.deepEqual(
+    preExecutionDeferral({ operation: "health" }, "waiting_account_lock"),
+    { status: "waiting_account_lock" },
+  );
+});
 function fixture(submit, authorize) {
   const rows = new Map(),
     store = {

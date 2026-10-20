@@ -7,7 +7,7 @@ import {
   safeError,
   LIBRARY_VERSION,
 } from "./telegram-adapter.mjs";
-import { ExecutorCore } from "./executor-core.mjs";
+import { ExecutorCore, preExecutionDeferral } from "./executor-core.mjs";
 import { authorizeNative } from "./native-authorization.mjs";
 
 function response(value, status = 200) {
@@ -105,8 +105,12 @@ export class TelegramExecutor extends DurableObject {
       );
     const cooldown = (await this.ctx.storage.get("cooldown_until")) || 0;
     if (cooldown > Date.now() / 1000)
-      return response({ status: "waiting_cooldown", retry_at: cooldown }, 409);
-    if (this.busy) return response({ status: "waiting_account_lock" }, 409);
+      return response(
+        preExecutionDeferral(input, "waiting_cooldown", cooldown),
+        409,
+      );
+    if (this.busy)
+      return response(preExecutionDeferral(input, "waiting_account_lock"), 409);
     this.busy = true;
     let discardSession = false;
     let client,

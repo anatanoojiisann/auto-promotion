@@ -19,6 +19,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .config import load_environment
+from .runtime_identity import capture_runtime
 from .store import Store
 from .workers import Workers
 
@@ -112,11 +113,11 @@ class ServiceHost:
         self.log_handles = []
         self.service_name = "reporting-service" if reports_only else "sender-service"
         self.status_path = Path(store.path).parent / f"{self.service_name}-{port}.json"
+        self.runtime = capture_runtime("service_host")
 
     def event(self, kind, **details):
         self.log.info(json.dumps({"at": self.clock(), "event": kind, **details}))
-        with self.store.connect(write=True) as db:
-            Store.audit(db, "service." + kind, details, now=self.clock())
+        self.store.audit_best_effort("service." + kind, details, now=self.clock())
 
     def _launch(self):
         folder = Path(self.store.path).parent / f"{self.service_name}-logs"
@@ -185,6 +186,7 @@ class ServiceHost:
             and health
             and health.get("worker") is True
             and worker.get("status") == "running"
+            and health.get("background", {}).get("sender", {}).get("alive", True)
         ):
             if self.sender is None or self.sender.pid != worker["pid"]:
                 if self.sender:
@@ -218,6 +220,8 @@ class ServiceHost:
             "live_writes": health.get("live_writes") if health else None,
             "reports_only": self.reports_only,
             "probe_error": health.get("probe_error") if health else None,
+            "runtime": self.runtime,
+            "sender_runtime": health.get("runtime") if health else None,
         }
         temporary = self.status_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(status, indent=2), encoding="utf-8")

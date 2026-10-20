@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -229,10 +231,25 @@ class Store:
             return
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
-            db.executescript(SCHEMA)
+            if self._schema_ready(db):
+                return
+        with self.connect(write=True) as db:
+            # Another process may have finished migration while we waited.
+            if self._schema_ready(db):
+                return
             from .queue_store import QUEUE_SCHEMA
 
-            db.executescript(QUEUE_SCHEMA)
+            # executescript implicitly commits a pending transaction. Execute
+            # complete statements instead, including each whole trigger body.
+            for script in (SCHEMA, QUEUE_SCHEMA):
+                statement = ""
+                for line in script.splitlines(keepends=True):
+                    statement += line
+                    if sqlite3.complete_statement(statement):
+                        db.execute(statement.strip())
+                        statement = ""
+                if statement.strip():
+                    raise ValueError("IncompleteSchemaStatement")
             # Existing workspaces predate identity binding and task-wide pacing.
             if "identity_hash" not in {r[1] for r in db.execute("PRAGMA table_info(accounts)")}:
                 db.execute("ALTER TABLE accounts ADD COLUMN identity_hash TEXT")
@@ -270,7 +287,54 @@ class Store:
                     "UPDATE meta SET value=CAST(value AS INTEGER)+1 "
                     "WHERE key='statistics_revision'; END"
                 )
+            db.execute(
+                "INSERT INTO meta VALUES('store_schema_revision','1') ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
         Path(self.path).chmod(0o600)
+
+    @staticmethod
+    def _schema_ready(db):
+        from .queue_store import QUEUE_SCHEMA
+
+        names = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
+        row = (
+            db.execute("SELECT value FROM meta WHERE key='store_schema_revision'").fetchone()
+            if "meta" in names
+            else None
+        )
+        if row and row[0] != "1":
+            raise ValueError("UnsupportedStoreSchemaRevision")
+        expected = set(
+            re.findall(
+                r"CREATE\s+(?:UNIQUE\s+)?(?:TABLE|VIEW|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)",
+                SCHEMA + QUEUE_SCHEMA,
+                re.I,
+            )
+        )
+        expected |= {
+            f"statistics_{table}_{event}"
+            for table in ("items", "publication_evidence", "feedback_events", "feedback_checks")
+            for event in ("insert", "update", "delete")
+        }
+        expected |= {
+            "statistics_accounts_scope",
+            "statistics_tasks_scope",
+            "tasks_campaign",
+            "accounts_identity_unique",
+        }
+        if not expected <= names:
+            return False
+        if not row:
+            return False
+        return all(
+            columns <= {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+            for table, columns in (
+                ("accounts", {"identity_hash"}),
+                ("tasks", {"next_at", "campaign_id"}),
+                ("calls", {"execution_step"}),
+                ("feedback_checks", {"last_message_id", "error_code"}),
+            )
+        )
 
     @contextmanager
     def connect(self, write=False):
@@ -280,18 +344,40 @@ class Store:
 
         bind_connection(db)
         try:
-            db.execute("PRAGMA foreign_keys=ON")
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=FULL")
-            if write:
-                for attempt in range(len(self.lock_retry_delays) + 1):
-                    try:
-                        db.execute("BEGIN IMMEDIATE")
-                        break
-                    except sqlite3.OperationalError as exc:
-                        if not self.locked(exc) or attempt == len(self.lock_retry_delays):
-                            raise
-                        time.sleep(self.lock_retry_delays[attempt])
+            deadline = (
+                time.monotonic()
+                + self.lock_timeout * (len(self.lock_retry_delays) + 1)
+                + sum(self.lock_retry_delays)
+            )
+
+            def prepare(sql):
+                remaining = max(0, deadline - time.monotonic())
+                db.execute(f"PRAGMA busy_timeout={int(min(self.lock_timeout, remaining) * 1000)}")
+                return db.execute(sql)
+
+            for attempt in range(len(self.lock_retry_delays) + 1):
+                try:
+                    prepare("PRAGMA foreign_keys=ON")
+                    mode = prepare("PRAGMA journal_mode").fetchone()[0]
+                    if mode.lower() != "wal":
+                        prepare("PRAGMA journal_mode=WAL")
+                    prepare("PRAGMA synchronous=FULL")
+                    if write:
+                        prepare("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if db.in_transaction:
+                        db.rollback()
+                    if (
+                        not self.locked(exc)
+                        or attempt == len(self.lock_retry_delays)
+                        or time.monotonic() >= deadline
+                    ):
+                        raise
+                    time.sleep(
+                        min(self.lock_retry_delays[attempt], max(0, deadline - time.monotonic()))
+                    )
+            db.execute(f"PRAGMA busy_timeout={int(self.lock_timeout * 1000)}")
             yield db
             if write:
                 db.commit()
@@ -316,6 +402,21 @@ class Store:
             "INSERT INTO audit(at,task_id,kind,details) VALUES(?,?,?,?)",
             (time.time() if now is None else now, task_id, kind, canonical(details)),
         )
+
+    def audit_best_effort(self, kind, details, *, now=None):
+        """Diagnostics may fail; never add a full lock budget or kill a host."""
+        try:
+            mirror = Store(self.path, initialize=False)
+            mirror.lock_timeout = 0
+            mirror.lock_retry_delays = ()
+            with mirror.connect(write=True) as db:
+                self.audit(db, kind, details, now=now)
+            return True
+        except sqlite3.Error as exc:
+            logging.getLogger(__name__).warning(
+                "%s audit unavailable: %s", kind, type(exc).__name__
+            )
+            return False
 
     def log_call(
         self,

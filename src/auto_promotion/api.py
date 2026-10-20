@@ -57,6 +57,7 @@ from .models import (
     TaskStateInput,
 )
 from .pools import Pools
+from .runtime_identity import capture_runtime
 from .statistics import ZONE, Statistics
 from .store import Store, decode
 from .task_tool_models import TemplateSave, TemplateTask
@@ -70,6 +71,8 @@ from .tiktok import (
     TikTokWebhookInput,
 )
 from .workers import WorkerRun, Workers
+
+WORKER_INTERVAL_SECONDS = 10
 
 
 class Toggle(BaseModel):
@@ -125,6 +128,9 @@ def create_app(
     session_token = secrets.token_urlsafe(32)
     stop = asyncio.Event()
     sender = None
+    runtime = capture_runtime("api")
+    background_tasks = {}
+    background_errors = {}
     from .pool_runtime import PoolScheduler
     from .queue_store import JobQueue
 
@@ -147,15 +153,20 @@ def create_app(
                 sender.phase("executing")
                 await asyncio.to_thread(pool_scheduler.tick if pool_scheduler else engine.run_cycle)
             except Exception as exc:
-                with store.connect(write=True) as db:
-                    Store.audit(
-                        db,
-                        "worker.error",
-                        {"reason": "worker_cycle_failed", **exception_details(exc)},
-                    )
-            sender.phase("waiting")
+                background_errors["sender"] = type(exc).__name__
+                store.audit_best_effort(
+                    "worker.error", {"reason": "worker_cycle_failed", **exception_details(exc)}
+                )
             try:
-                await asyncio.wait_for(stop.wait(), timeout=10)
+                sender.phase("waiting")
+            except Exception as exc:
+                background_errors["sender"] = type(exc).__name__
+                store.audit_best_effort(
+                    "worker.error",
+                    {"reason": "worker_phase_failed", "error_type": type(exc).__name__},
+                )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=WORKER_INTERVAL_SECONDS)
             except TimeoutError:
                 pass
 
@@ -163,13 +174,18 @@ def create_app(
         while not stop.is_set():
             try:
                 await asyncio.to_thread(callback)
-            except Exception:
-                with store.connect(write=True) as db:
-                    Store.audit(
-                        db, "statistics.error", {"reason": "report_cycle_failed", "kind": kind}
-                    )
+            except Exception as exc:
+                background_errors[kind] = type(exc).__name__
+                store.audit_best_effort(
+                    "statistics.error",
+                    {
+                        "reason": "report_cycle_failed",
+                        "kind": kind,
+                        "error_type": type(exc).__name__,
+                    },
+                )
             try:
-                await asyncio.wait_for(stop.wait(), timeout=10)
+                await asyncio.wait_for(stop.wait(), timeout=WORKER_INTERVAL_SECONDS)
             except TimeoutError:
                 pass
 
@@ -183,7 +199,8 @@ def create_app(
                 if pool_scheduler:
                     pool_scheduler.enable()
                 sender = stack.enter_context(WorkerRun(store, live_enabled=engine.live_enabled))
-                jobs.append(asyncio.create_task(work_loop()))
+                background_tasks["sender"] = asyncio.create_task(work_loop())
+                jobs.append(background_tasks["sender"])
             if report_worker:
                 callbacks = (
                     (
@@ -200,7 +217,8 @@ def create_app(
                     )
                 )
                 for callback, kind in callbacks:
-                    jobs.append(asyncio.create_task(report_loop(callback, kind)))
+                    background_tasks[kind] = asyncio.create_task(report_loop(callback, kind))
+                    jobs.append(background_tasks[kind])
             try:
                 yield
             finally:
@@ -323,14 +341,29 @@ def create_app(
 
     @app.get("/health")
     def health():
+        task = background_tasks.get("sender")
+        alive = task is not None and not task.done()
         return {
-            "status": "ok",
+            "status": "degraded" if worker and not alive else "ok",
             "version": __version__,
             "worker": worker,
             "live_writes": engine.live_enabled,
             "report_worker": report_worker,
             "execution_mode": "pooled" if pooled_worker else "legacy",
             "statistics_only": statistics_only,
+            "runtime": runtime,
+            "background": {
+                "sender": {
+                    "enabled": worker,
+                    "alive": alive,
+                    "last_error": background_errors.get("sender"),
+                },
+                "reports": {
+                    kind: {"alive": not job.done(), "last_error": background_errors.get(kind)}
+                    for kind, job in background_tasks.items()
+                    if kind != "sender"
+                },
+            },
         }
 
     @app.get("/api/statistics/feedback-issues")

@@ -405,6 +405,51 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(submissions, [])
         self.assertEqual(result["status"], "unknown")
 
+    def test_accepted_and_final_mirrors_locked_recover_from_private_receipt_once(self):
+        locked, release = threading.Event(), threading.Event()
+        submissions = []
+
+        def holder():
+            writer = sqlite3.connect(self.store.path)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                locked.set()
+                release.wait(10)
+            finally:
+                writer.close()
+
+        def submit(label, operation, payload, checkpoint, authorize):
+            checkpoint.progress("submit_click", True)
+            authorize()
+            submissions.append(True)
+            thread.start()
+            self.assertTrue(locked.wait(2))
+            result = {
+                "status": "confirmed",
+                "verified": True,
+                "message_ids": [123],
+                "external_reference": "telegram:@public_group:123",
+            }
+            checkpoint(result)
+            return result
+
+        thread = threading.Thread(target=holder)
+        self.addCleanup(lambda: thread.join(2) if thread.ident else None)
+        self.addCleanup(release.set)
+        with patch("auto_promotion.backends.telegram.call", submit):
+            first = native_bridge.dispatch(self.request)
+            saved = Receipts("telegram", "default").read(
+                "execute:" + self.request["payload"]["item_id"]
+            )
+            self.assertTrue(saved["progress_mirror_deferred"])
+            self.assertTrue(saved["verified"])
+            release.set()
+            thread.join(2)
+            second = native_bridge.dispatch(self.request)
+        self.assertEqual(submissions, [True])
+        self.assertEqual(first, second)
+        self.assertEqual(second["message_ids"], [123])
+
     def test_changed_payload_cannot_use_claim(self):
         self.request["payload"]["payload"]["text"] = "changed"
         with self.assertRaises(BackendError):

@@ -1,4 +1,27 @@
 // Receipts are durable before submission. An existing receipt is never submitted again.
+export function preExecutionDeferral(
+  request,
+  status,
+  retryAt,
+  now = Date.now() / 1000,
+) {
+  const result = { status, ...(retryAt ? { retry_at: retryAt } : {}) };
+  if (request.operation !== "execute") return result;
+  return {
+    ...result,
+    phase: "pre_execution",
+    native_authorized: false,
+    submission_started: false,
+    job_id: request.job_id,
+    account_id: request.account_id,
+    job_version: request.version,
+    attempt_id: request.attempt_id,
+    retry_after_seconds: Math.max(
+      1,
+      Math.min(86400, Math.ceil((retryAt || now + 30) - now)),
+    ),
+  };
+}
 export class ExecutorCore {
   constructor({
     store,

@@ -315,6 +315,48 @@ export class TelegramNativeGate {
         },
       );
       result = await response.json();
+      const current = this.k.one(
+        "SELECT state,attempt_id,owner,lease_token,lease_until FROM jobs WHERE id=?",
+        j.id,
+      );
+      if (
+        response.status === 409 &&
+        ["waiting_cooldown", "waiting_account_lock"].includes(result.status) &&
+        result.phase === "pre_execution" &&
+        result.native_authorized === false &&
+        result.submission_started === false &&
+        result.job_id === j.id &&
+        result.account_id === j.account_id &&
+        result.job_version === j.version &&
+        result.attempt_id === attempt &&
+        current?.state === "leased" &&
+        !current.attempt_id &&
+        current.owner === node.id &&
+        current.lease_token === lease.lease_token &&
+        current.lease_until > this.k.clock() &&
+        Number.isFinite(result.retry_after_seconds) &&
+        result.retry_after_seconds >= 1 &&
+        result.retry_after_seconds <= 86400
+      ) {
+        const retryAt = this.k.clock() + result.retry_after_seconds;
+        this.k.complete(node, j.id, lease.lease_token, {
+          state: "pending",
+          result: { reason: result.status, next_at: retryAt },
+        });
+        this.k.sql.exec(
+          "UPDATE worksteps SET available_at=?,result=? WHERE plan_id=? AND id=? AND state='pending'",
+          retryAt,
+          JSON.stringify({ verdict: "defer", reason: result.status }),
+          link.plan_id,
+          link.step_id,
+        );
+        return {
+          submitted: false,
+          job_id: j.id,
+          reason: result.status,
+          retry_at: retryAt,
+        };
+      }
       if (!response.ok)
         result = {
           status: "unknown",
@@ -376,7 +418,7 @@ export class TelegramNativeGate {
     if (!this.env.TG_QUEUE_BRIDGE || this.k.settings().global_stop)
       return { submitted: 0 };
     const rows = this.k.rows(
-      "SELECT l.plan_id,l.step_id FROM workflow_native_links l JOIN jobs j ON j.id=l.job_id JOIN workplans p ON p.id=l.plan_id WHERE p.state='active' AND j.state='pending' AND j.available_at<=? AND j.expires_at>? ORDER BY j.available_at LIMIT 1",
+      "SELECT l.plan_id,l.step_id,l.job_id FROM workflow_native_links l JOIN jobs j ON j.id=l.job_id JOIN workplans p ON p.id=l.plan_id JOIN worksteps w ON w.plan_id=l.plan_id AND w.id=l.step_id WHERE p.state='active' AND j.state='pending' AND j.available_at<=? AND j.expires_at>? ORDER BY CASE WHEN json_extract(w.result,'$.dispatch_blocked') THEN 1 ELSE 0 END,j.available_at,l.created_at LIMIT 16",
       this.k.clock(),
       this.k.clock(),
     );
@@ -385,7 +427,56 @@ export class TelegramNativeGate {
       try {
         const r = await this.dispatch(row);
         if (r.submitted) count++;
-      } catch {}
+        if (count) break; // Bound writes as before; scan past blocked candidates.
+      } catch (error) {
+        const reason =
+          error instanceof ControlError
+            ? error.message
+            : "NativeDispatchUnavailable";
+        const retryAt = this.k.clock() + 1800;
+        this.k.tx(() => {
+          this.k.sql.exec(
+            "UPDATE jobs SET available_at=MAX(available_at,?) WHERE id=? AND state='pending' AND attempt_id IS NULL",
+            retryAt,
+            row.job_id,
+          );
+          this.k.sql.exec(
+            "UPDATE worksteps SET available_at=?,result=? WHERE plan_id=? AND id=? AND state='pending'",
+            retryAt,
+            JSON.stringify({
+              verdict: "defer",
+              reason,
+              dispatch_blocked: true,
+              requires_review: reason === "NativeReplyContextNeedsRefresh",
+            }),
+            row.plan_id,
+            row.step_id,
+          );
+          if (reason === "NativeReplyContextNeedsRefresh") {
+            const send = JSON.parse(
+              this.k.one(
+                "SELECT definition FROM worksteps WHERE plan_id=? AND id=?",
+                row.plan_id,
+                row.step_id,
+              ).definition,
+            );
+            const reviewId = send.depends_on.find((id) =>
+              id.endsWith(":reply_review"),
+            );
+            this.k.sql.exec(
+              "UPDATE worksteps SET state='pending',available_at=? WHERE plan_id=? AND id=? AND state='completed'",
+              this.k.clock(),
+              row.plan_id,
+              reviewId,
+            );
+          }
+          this.k.event("workflow.native_blocked", row.plan_id, {
+            step_id: row.step_id,
+            reason,
+            retry_at: retryAt,
+          });
+        });
+      }
     }
     return { submitted: count };
   }

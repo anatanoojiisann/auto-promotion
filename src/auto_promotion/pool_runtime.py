@@ -308,11 +308,7 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
     ):
         raise CloudUnavailable("CloudControlConfigurationMissing")
     owner, now, handled = "pool-" + uuid.uuid4().hex, time.time(), 0
-    with engine.store.connect(write=True) as db:
-        db.execute(
-            "INSERT INTO pool_workers VALUES(?,?,?,?,?,?,?,?)",
-            (owner, pool, node_id, os.getpid(), now, now, "running", None),
-        )
+    registered = False
     idle_since = time.monotonic()
     next_heartbeat = 0
     try:
@@ -320,6 +316,13 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
             # Preparation is read-only or transactional DB work. An exhausted
             # lock wait must not kill the pool or replay a platform invocation.
             try:
+                if not registered:
+                    with engine.store.connect(write=True) as db:
+                        db.execute(
+                            "INSERT OR IGNORE INTO pool_workers VALUES(?,?,?,?,?,?,?,?)",
+                            (owner, pool, node_id, os.getpid(), now, now, "running", None),
+                        )
+                    registered = True
                 if time.monotonic() >= next_heartbeat:
                     with engine.store.connect(write=True) as db:
                         db.execute(
@@ -355,10 +358,11 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                 continue
             error = None
             lease = None
-            with engine.store.connect() as db:
-                is_managed = managed(db, job["task_id"], job["account_id"])
+            is_managed = False
             context = None
             try:
+                with engine.store.connect() as db:
+                    is_managed = managed(db, job["task_id"], job["account_id"])
                 if is_managed:
                     with queue.heartbeat(job):
                         context, cloud = TaskChannelRouter(engine).prepare(job)
@@ -431,11 +435,14 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
             except Exception as exc:
                 error = exc
                 if isinstance(exc, CloudUnavailable) and is_managed:
-                    with engine.store.connect(write=True) as db:
-                        db.execute(
-                            "UPDATE account_task_channels SET error=?,retry_at=? WHERE account_id=?",
-                            (str(exc), engine.clock() + 30, job["account_id"]),
-                        )
+                    try:
+                        with engine.store.connect(write=True) as db:
+                            db.execute(
+                                "UPDATE account_task_channels SET error=?,retry_at=? WHERE account_id=?",
+                                (str(exc), engine.clock() + 30, job["account_id"]),
+                            )
+                    except sqlite3.Error as persistence_error:
+                        worker_error(engine, owner, persistence_error)
                 if isinstance(exc, CloudUnavailable) and not local and not is_managed:
                     try:
                         PoolScheduler(engine)._cloud_failure(exc)

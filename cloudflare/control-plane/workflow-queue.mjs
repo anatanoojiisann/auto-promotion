@@ -269,13 +269,67 @@ export class WorkflowQueue {
       ),
     );
   }
-  dependenciesReady(step, rows) {
+  receiptSource(plan, step) {
+    const sendId = step.input?.target?.toLowerCase().slice(1) + ":send";
+    if (step.stage === "receipt_verify" && !step.depends_on.includes(sendId))
+      return null;
+    if (
+      !this.k.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_native_links'",
+      )
+    )
+      return null;
+    const link = this.k.one(
+      "SELECT * FROM workflow_native_links WHERE plan_id=? AND step_id=?",
+      plan,
+      sendId,
+    );
+    const job =
+      link && this.k.one("SELECT * FROM jobs WHERE id=?", link.job_id);
+    if (
+      !job ||
+      job.kind !== "send" ||
+      !job.attempt_id ||
+      !["unknown", "confirmed"].includes(job.state) ||
+      job.task_id !== link.task_id
+    )
+      return null;
+    const definition = this.plan(plan).definition;
+    const data = JSON.parse(job.payload),
+      receipt = JSON.parse(job.result || "{}");
+    const ids = receipt.message_ids;
+    if (
+      !definition.account_ids.includes(job.account_id) ||
+      data.account_id !== job.account_id ||
+      data.id !== job.id ||
+      data.version !== job.version ||
+      data.payload?.target?.toLowerCase() !== step.input.target.toLowerCase() ||
+      !Array.isArray(ids) ||
+      ids.length !== 1 ||
+      !Number.isSafeInteger(ids[0]) ||
+      ids[0] <= 0 ||
+      receipt.external_reference !== `telegram:${data.payload.target}:${ids[0]}`
+    )
+      return null;
+    if (
+      job.state === "unknown" &&
+      (receipt.account_id !== job.account_id ||
+        receipt.job_version !== job.version ||
+        receipt.attempt_id !== job.attempt_id)
+    )
+      return null;
+    return { job, receipt, payload: data.payload, sendId };
+  }
+  dependenciesReady(step, rows, plan) {
     return rows.every(
       (r, i) =>
         r?.state === "completed" ||
         (step.stage === "membership_verify" &&
           step.depends_on[i].endsWith(":join") &&
-          ["unknown", "pending_admin_approval"].includes(r?.state)),
+          ["unknown", "pending_admin_approval"].includes(r?.state)) ||
+        (step.stage === "receipt_verify" &&
+          r?.state === "unknown" &&
+          this.receiptSource(plan, step)?.sendId === step.depends_on[i]),
     );
   }
   status(id, { offset = 0, limit = 100 } = {}) {
@@ -311,7 +365,8 @@ export class WorkflowQueue {
         if (p.state !== "active" || stopped) state = "paused";
         else if (deps.some((r) => r?.state === "excluded"))
           state = "excluded_by_dependency";
-        else if (!this.dependenciesReady(d, deps)) state = "waiting_dependency";
+        else if (!this.dependenciesReady(d, deps, id))
+          state = "waiting_dependency";
         else if (row.available_at > now) state = "waiting_schedule";
         else if (WRITES.has(d.stage)) state = "waiting_native_dispatch";
         else if (
@@ -435,7 +490,7 @@ export class WorkflowQueue {
         if (
           WRITES.has(s.stage) ||
           !node.stages.includes(s.stage) ||
-          !this.dependenciesReady(s, this.dependencies(id, s))
+          !this.dependenciesReady(s, this.dependencies(id, s), id)
         )
           continue;
         const token = this.k.uuid();
@@ -471,7 +526,7 @@ export class WorkflowQueue {
       return { step: null };
     });
   }
-  finish(node, input) {
+  finish(node, input, reconcileReceipt = null) {
     return this.k.tx(() => {
       const p = this.plan(input.plan_id),
         r = this.k.one(
@@ -492,6 +547,14 @@ export class WorkflowQueue {
       if (!result || !["pass", "exclude", "defer"].includes(result.verdict))
         fail("WorkflowVerdictRequired");
       safe(result);
+      // Internal read reconciliation shares this lease-checked transaction.
+      // Public finish callers never supply a callback.
+      if (
+        s.stage === "receipt_verify" &&
+        result.verdict === "pass" &&
+        reconcileReceipt
+      )
+        reconcileReceipt();
       if (result.verdict === "pass") this.checkEvidence(s, result, p);
       if (result.verdict !== "pass" && !result.reason)
         fail("WorkflowReasonRequired");
