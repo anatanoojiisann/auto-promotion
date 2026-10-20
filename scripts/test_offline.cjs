@@ -26,6 +26,11 @@ let mf, child, timer;
         "maintenance.mjs",
         "standby.mjs",
         "offline-permit.mjs",
+        "workflow-queue.mjs",
+        "public-research.mjs",
+        "telegram-executor-bridge.mjs",
+        "telegram-native-gate.mjs",
+        "telegram-workflow-reader.mjs",
       ].map((name) => ({
         type: "ESModule",
         path: path.join(cloudRoot, name),

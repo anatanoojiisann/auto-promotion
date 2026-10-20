@@ -87,6 +87,7 @@ class AccountUpdate(Model):
 
 
 class Policy(Model):
+    execution_channel: Literal["inherit", "cloud", "local"] = "inherit"
     queries: list[str] = Field(default_factory=list, max_length=20)
     required_keywords: list[str] = Field(default_factory=list)
     blocked_keywords: list[str] = Field(default_factory=list)
@@ -123,7 +124,7 @@ class Policy(Model):
 
 class TaskInput(Model):
     name: str = Field(min_length=1, max_length=160)
-    account_ids: list[str] = Field(min_length=1, max_length=12)
+    account_ids: list[str] = Field(min_length=1, max_length=200)
     policy: Policy
 
 

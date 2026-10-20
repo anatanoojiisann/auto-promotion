@@ -1,0 +1,13 @@
+{
+  "name": "auto-promotion-telegram-executor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node ../control-plane/node_modules/wrangler/bin/wrangler.js deploy --dry-run",
+    "deploy": "node ../control-plane/node_modules/wrangler/bin/wrangler.js deploy"
+  },
+  "dependencies": {
+    "teleproto": "1.230.1"
+  }
+}

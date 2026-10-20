@@ -62,6 +62,11 @@ RESULT_FIELDS = (
     "platform_status",
 )
 AUDIT_FIELDS = (
+    "channel",
+    "job_id",
+    "generation",
+    "retry_at",
+    "fence_source",
     "source",
     "item_id",
     "attempt_id",
@@ -190,6 +195,8 @@ class TaskTools:
             "ends_at": value.ends_at,
             "target_allowlist": value.target_allowlist,
         }
+        if value.execution_channel is not None:
+            policy["execution_channel"] = value.execution_channel
         # Engine captures current quotas and creates a fresh ID with no approvals or items.
         return self.engine.create_task(
             TaskInput(name=value.name, account_ids=value.account_ids, policy=policy)

@@ -1,5 +1,7 @@
 """Inputs for reusable task settings and local evidence exports."""
 
+from typing import Literal
+
 from pydantic import Field, field_validator
 
 from .models import Model, epoch
@@ -12,8 +14,9 @@ class TemplateSave(Model):
 
 
 class TemplateTask(Model):
+    execution_channel: Literal["inherit", "cloud", "local"] | None = None
     name: str = Field(min_length=1, max_length=160)
-    account_ids: list[str] = Field(min_length=1, max_length=12)
+    account_ids: list[str] = Field(min_length=1, max_length=200)
     starts_at: str
     ends_at: str
     target_allowlist: list[str] = Field(default_factory=list, max_length=200)

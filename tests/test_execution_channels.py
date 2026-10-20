@@ -300,6 +300,98 @@ class ExecutionChannelTests(unittest.TestCase):
         self.assertIsNone(JobQueue(self.engine).claim("simulation.x", "extra"))
         self.assertEqual(self.engine.task(self.task["id"])["summary"], {"unknown": 1})
 
+    def crossday_task(self, *, start=True):
+        from datetime import datetime, timezone
+
+        from auto_promotion.models import ItemInput, TaskInput
+
+        now = self.engine.clock()
+
+        def iso(at):
+            return datetime.fromtimestamp(at, timezone.utc).isoformat()
+
+        task = self.engine.create_task(
+            TaskInput(
+                name="explicit multi-day continuation",
+                account_ids=[self.account["id"]],
+                policy={"starts_at": iso(now), "ends_at": iso(now + 3 * 86400), "min_interval": 0},
+            )
+        )
+        self.engine.set_items(
+            task["id"],
+            [
+                ItemInput(
+                    account_id=self.account["id"],
+                    action="reply",
+                    target="https://x.com/example/status/9000001",
+                    text="cross-day reply",
+                    scheduled_at=iso(now + 90000),
+                )
+            ],
+        )
+        if start:
+            self.engine.start_task(task["id"], source="test_explicit_start")
+        return self.engine.task(task["id"])
+
+    def test_crossday_continuation_preserves_unknown_after_restart(self):
+        task = self.crossday_task()
+        now = self.engine.clock()
+        configure_independent(
+            self.engine,
+            [self.account["id"]],
+            now + 3 * 86400,
+            through_task_ids=[task["id"]],
+        )
+        self.engine.clock = lambda: now + 90001
+        self.engine.adapters.overrides["x"] = fixtures.UnknownAdapter()
+        self.calls.clear()
+        JobQueue(self.engine).sync()
+        run_pool(self.engine, "simulation.x", "test", max_jobs=1, idle_exit=0)
+        PoolScheduler(self.engine)
+        JobQueue(self.engine).sync()
+        self.assertEqual(self.engine.task(task["id"])["summary"], {"unknown": 1})
+        self.assertEqual(self.engine.task(task["id"])["manifest_hash"], task["manifest_hash"])
+        self.assertIsNone(JobQueue(self.engine).claim("simulation.x", "replacement"))
+        self.assertEqual(
+            self.store.one("SELECT count(*) n FROM attempts WHERE task_id=?", (task["id"],))["n"], 1
+        )
+        self.assertEqual(self.calls, [])
+
+    def test_crossday_authority_rejects_draft_and_excessive_window(self):
+        task = self.crossday_task(start=False)
+        until = self.engine.clock() + 3 * 86400
+        with self.assertRaisesRegex(ValueError, "InvalidLocalContinuationTask"):
+            configure_independent(
+                self.engine, [self.account["id"]], until, through_task_ids=[task["id"]]
+            )
+        self.engine.start_task(task["id"], source="test_explicit_start")
+        with self.assertRaisesRegex(ValueError, "ExceedsTaskWindow"):
+            configure_independent(
+                self.engine, [self.account["id"]], until + 1, through_task_ids=[task["id"]]
+            )
+        with self.assertRaisesRegex(ValueError, "InvalidLocalChannelScope"):
+            configure_independent(self.engine, [self.account["id"]], until)
+
+    def test_crossday_authority_keeps_stop_and_expiry_guards(self):
+        task = self.crossday_task()
+        now = self.engine.clock()
+        configure_independent(
+            self.engine,
+            [self.account["id"]],
+            now + 3 * 86400,
+            through_task_ids=[task["id"]],
+        )
+        JobQueue(self.engine).sync()
+        self.engine.clock = lambda: now + 90001
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE meta SET value='1' WHERE key='global_stop'")
+        self.assertIsNone(JobQueue(self.engine).claim("simulation.x", "stopped"))
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE meta SET value='0' WHERE key='global_stop'")
+        self.engine.clock = lambda: now + 3 * 86400
+        self.assertIsNone(JobQueue(self.engine).claim("simulation.x", "expired"))
+        self.assertEqual(self.store.one("SELECT count(*) n FROM attempts")["n"], 0)
+
     def test_quota_failover_for_independent_policy_needs_no_server_checkpoint(self):
         until = self.engine.clock() + 3600
         configure_independent(self.engine, [self.account["id"]], until)

@@ -48,6 +48,44 @@ class CloudClientTests(unittest.TestCase):
             self.assertTrue(cloud.sync(self.engine)["unchanged"])
             request.assert_not_called()
 
+    def test_task_scoped_sync_keeps_global_ledger_and_omits_other_frozen_jobs(self):
+        first, account = self.fixture.ready()
+        second, _ = self.fixture.ready(account=account, target_id=999)
+        snapshot = export_snapshot(self.engine)
+        snapshot["quota_events"] = [
+            {
+                "attempt_id": "historical",
+                "scope": "cloud_global",
+                "key": "simulation",
+                "at": self.engine.clock(),
+            }
+        ]
+        cloud = CloudControl("http://127.0.0.1:8791", operator_token="test")
+        with (
+            patch("auto_promotion.cloud_control.export_snapshot", return_value=snapshot),
+            patch.object(cloud, "request", return_value={}) as request,
+        ):
+            cloud.sync(self.engine, task_ids=[second["id"]])
+        tasks = [t for c in request.call_args_list for t in c.args[1]["tasks"]]
+        jobs = [j for c in request.call_args_list for j in c.args[1]["jobs"]]
+        quotas = [q for c in request.call_args_list for q in c.args[1]["quota_events"]]
+        self.assertEqual([t["id"] for t in tasks], [second["id"]])
+        self.assertTrue(jobs)
+        self.assertTrue(all(j["task_id"] == second["id"] for j in jobs))
+        self.assertNotIn(first["id"], [t["id"] for t in tasks])
+        self.assertEqual(quotas[0]["attempt_id"], "historical")
+
+    def test_scoped_export_does_not_validate_unrelated_broken_definitions(self):
+        old, account = self.fixture.ready()
+        current, _ = self.fixture.ready(account=account, target_id=999)
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE tasks SET policy='{}' WHERE id=?", (old["id"],))
+        snapshot = export_snapshot(self.engine, task_ids=[current["id"]])
+        self.assertEqual([t["id"] for t in snapshot["tasks"]], [current["id"]])
+        self.assertEqual(len(snapshot["jobs"]), 1)
+        with self.assertRaisesRegex(CloudUnavailable, "CloudSnapshotInconsistent"):
+            export_snapshot(self.engine)
+
     def test_failed_delta_resumes_without_replaying_acknowledged_slices(self):
         self.fixture.ready()
         snapshot = export_snapshot(self.engine)

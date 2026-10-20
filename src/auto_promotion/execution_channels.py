@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .cloud_control import CloudControl, CloudUnavailable
-from .models import canonical
+from .models import canonical, epoch
 from .store import Store
 
 
@@ -53,19 +53,40 @@ def local_account_scope(db, now):
     return None
 
 
-def configure_independent(engine, account_ids, until, *, source="explicit_user_local"):
+def configure_independent(
+    engine, account_ids, until, *, source="explicit_user_local", through_task_ids=None
+):
     """Local ownership handoff, authorized by the user, with no server request.
 
     Claims, quota accounting and provider authorization stay in the same SQLite
     database. No attempt/outcome or publication switch is reset by this handoff.
     """
     now = engine.clock()
-    if not account_ids or not now < until <= now + 86400:
+    if not account_ids or not now < until:
         raise ValueError("InvalidLocalChannelScope")
     for account_id in account_ids:
         engine.account(account_id)
+    continuation = sorted(set(through_task_ids or []))
+    if continuation:
+        deadlines = []
+        for task_id in continuation:
+            task = engine.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            if (
+                not task
+                or task["state"] not in {"active", "completed"}
+                or task["phase"] not in {"starting", "ready", "discovered"}
+                or not set(json.loads(task["account_ids"])).issubset(account_ids)
+            ):
+                raise ValueError("InvalidLocalContinuationTask")
+            deadlines.append(epoch(json.loads(task["policy"])["ends_at"]))
+        if until > max(deadlines):
+            raise ValueError("LocalContinuationExceedsTaskWindow")
+    elif until > now + 86400:
+        raise ValueError("InvalidLocalChannelScope")
     store_id = binding(engine)
     authority = {"account_ids": sorted(set(account_ids)), "source": source, "at": now}
+    if continuation:
+        authority.update(through_task_ids=continuation, through_until=until)
     state = {
         "active": "local",
         "authorization": "local_queue",
@@ -77,6 +98,8 @@ def configure_independent(engine, account_ids, until, *, source="explicit_user_l
         "generation": uuid.uuid4().hex,
         "account_ids": authority["account_ids"],
     }
+    if continuation:
+        state.update(through_task_ids=continuation)
     with engine.store.connect(write=True) as db:
         if any(
             db.execute(sql, params).fetchone()
@@ -115,6 +138,10 @@ def local_context_valid(db, context, *, now=None):
     """Called again by the provider, using durable state, never an env bypass."""
     if not context or context.get("channel") != "local":
         return False
+    if context.get("task_channel"):
+        from .task_channels import valid_context
+
+        return valid_context(db, context, now=time.time() if now is None else now)
     policy = db.execute("SELECT value FROM meta WHERE key='execution_channel_policy'").fetchone()
     row = db.execute("SELECT value FROM meta WHERE key='execution_channel'").fetchone()
     if not policy or policy[0] != "cloud_then_local" or not row:
@@ -298,6 +325,11 @@ def use_cloud(engine):
 
 
 def guard_local(engine, context, cloud=None):
+    if context and context.get("task_channel"):
+        from .task_channels import guard_context
+
+        guard_context(engine, context)
+        return
     with engine.store.connect() as db:
         if not local_context_valid(db, context, now=engine.clock()):
             raise CloudUnavailable("LocalChannelClaimExpired")

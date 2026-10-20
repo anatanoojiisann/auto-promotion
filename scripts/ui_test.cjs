@@ -233,6 +233,11 @@ async function cleanup() {
     .locator(`input[name="accounts"][value="${secondAccount.id}"]`)
     .check();
   await page.getByLabel("发现主题（每行一个）").fill("AI video");
+  assert.equal(await page.locator("#execution-channel option").count(), 3);
+  assert.equal(
+    await page.locator("#execution-channel").inputValue(),
+    "inherit",
+  );
   await page.locator("#task-interval").fill("0");
   await page
     .locator("#task-form")
@@ -258,6 +263,7 @@ async function cleanup() {
     .getByRole("button", { name: "按模板创建任务", exact: true })
     .click();
   await page.getByLabel("新任务名称", { exact: true }).fill("模板创建的新草稿");
+  await page.locator("#template-execution-channel").selectOption("cloud");
   await page
     .locator(`input[name="accounts"][value="${testAccount.id}"]`)
     .check();
@@ -271,6 +277,48 @@ async function cleanup() {
   assert.deepEqual(templateDraft.approvals, []);
   assert.deepEqual(templateDraft.items, []);
   assert.equal(templateDraft.state, "draft");
+  assert.equal(templateDraft.policy.execution_channel, "cloud");
+  assert.equal(templateDraft.channel.requested, "cloud");
+  await page
+    .locator("#task-channel")
+    .getByText("任务选择：在线队列", { exact: true })
+    .waitFor();
+  const taskRoute = `**/api/tasks/${templateDraft.id}`;
+  await page.route(taskRoute, (route) =>
+    route.fulfill({
+      json: {
+        ...templateDraft,
+        channel: {
+          ...templateDraft.channel,
+          accounts: [
+            {
+              account_id: testAccount.id,
+              channel: "local",
+              state: "ready",
+              error: null,
+              retry_at: 0,
+            },
+          ],
+        },
+      },
+    }),
+  );
+  await page.locator("#refresh-task").click();
+  await page
+    .locator("#task-channel")
+    .getByText(/等待交接到在线队列（账号当前：本地队列）/)
+    .waitFor();
+  await page.unroute(taskRoute);
+  await page.locator("#refresh-task").click();
+  await page
+    .locator("#task-channel")
+    .getByText("开始任务后确定账号的实际通道。", { exact: true })
+    .waitFor();
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/task-channels-desktop.png",
+      fullPage: true,
+    });
   const reviewDownload = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载审阅清单", exact: true }).click();
   const review = await reviewDownload;
@@ -813,6 +861,10 @@ async function cleanup() {
           "discord_attachment",
           "discord_simulation_execution",
           "create_task",
+          "task_execution_channel_selector",
+          "template_channel_override",
+          "task_actual_channel_display",
+          "task_waiting_for_channel_handoff",
           "save_task_template",
           "template_creates_fresh_unapproved_draft",
           "review_download",
@@ -847,7 +899,7 @@ async function cleanup() {
   );
   assert.deepEqual(errors, [], "browser errors");
   console.log(
-    "UI workflow passed; 35 checks; screenshots " +
+    "UI workflow passed; 39 checks; screenshots " +
       (process.env.AP_UI_SKIP_SCREENSHOTS ? "skipped" : "saved") +
       ".",
   );

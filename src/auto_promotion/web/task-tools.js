@@ -102,6 +102,12 @@ function useTemplateForm(template) {
     "按模板创建任务",
     `<form id="use-template-form"><label for="template-task-name">新任务名称</label><input id="template-task-name" name="name" value="${esc(template.name)}" maxlength="160" required><fieldset><legend>本次执行账号</legend>${accounts.map((account) => `<label class="checkbox-label"><input type="checkbox" name="accounts" value="${esc(account.id)}">${esc(account.label)} · ${esc(names[account.platform])}</label>`).join("")}</fieldset><div class="field-grid"><div><label for="template-starts">执行开始时间</label><input id="template-starts" name="starts" type="datetime-local" value="${isoLocal(now)}" required></div><div><label for="template-ends">执行结束时间</label><input id="template-ends" name="ends" type="datetime-local" value="${isoLocal(now + 86400000)}" required></div></div><label for="template-targets">本次目标白名单（可选，每行一个）</label><textarea id="template-targets" name="targets" rows="3"></textarea><p class="help">目标留空时使用模板的发现政策。旧账号、目标、正文和启动状态均不自动带入。时间使用浏览器本地时区，保存为明确的 UTC 时间。</p><details><summary>本次复用的设置</summary><pre>${esc(JSON.stringify(template.settings, null, 2))}</pre></details><div class="form-actions"><button type="submit">创建新草稿</button></div></form>`,
   );
+  $("#use-template-form fieldset").insertAdjacentHTML(
+    "afterend",
+    '<label for="template-execution-channel">执行通道</label><select id="template-execution-channel" name="execution_channel"><option value="inherit">跟随默认</option><option value="cloud">在线队列</option><option value="local">本地队列</option></select>',
+  );
+  $("#template-execution-channel").value =
+    template.settings.execution_channel || "inherit";
   $("#use-template-form").onsubmit = (event) => {
     event.preventDefault();
     const values = new FormData(event.target);
@@ -111,6 +117,7 @@ function useTemplateForm(template) {
         account_ids: values.getAll("accounts"),
         starts_at: new Date(values.get("starts")).toISOString(),
         ends_at: new Date(values.get("ends")).toISOString(),
+        execution_channel: values.get("execution_channel"),
         target_allowlist: String(values.get("targets") || "")
           .split(/\r?\n/)
           .map((value) => value.trim())

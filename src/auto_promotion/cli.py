@@ -58,6 +58,12 @@ def main():
     )
     channels.add_argument("--account", action="append", default=[])
     channels.add_argument(
+        "--local-through-task",
+        action="append",
+        default=[],
+        help="Continue the existing local channel through these already-started task windows",
+    )
+    channels.add_argument(
         "--binding",
         action="store_true",
         help="Create/read this database's non-secret deployment binding",
@@ -91,6 +97,7 @@ def main():
     reuse.add_argument("--starts", required=True)
     reuse.add_argument("--ends", required=True)
     reuse.add_argument("--target", action="append", default=[])
+    reuse.add_argument("--channel", choices=["inherit", "cloud", "local"])
     export = sub.add_parser("task-export", help="Export task evidence without platform calls")
     export.add_argument("--task", required=True)
     export.add_argument("--format", choices=("zip", "json", "html"), default="zip")
@@ -222,8 +229,20 @@ def main():
             read_state,
         )
 
-        cloud = None if args.local_today else CloudControl.configured()
+        cloud = None if args.local_today or args.local_through_task else CloudControl.configured()
         try:
+            if args.local_today and args.local_through_task:
+                raise ValueError("ChooseOneLocalChannelWindow")
+            if args.local_through_task:
+                from .models import epoch
+
+                tasks = [engine.task(task_id) for task_id in args.local_through_task]
+                configure_independent(
+                    engine,
+                    args.account,
+                    max(epoch(task["policy"]["ends_at"]) for task in tasks),
+                    through_task_ids=args.local_through_task,
+                )
             if args.local_today:
                 from datetime import timedelta
                 from zoneinfo import ZoneInfo
@@ -332,6 +351,7 @@ def main():
                         starts_at=args.starts,
                         ends_at=args.ends,
                         target_allowlist=args.target,
+                        execution_channel=args.channel,
                     ),
                 )
             else:

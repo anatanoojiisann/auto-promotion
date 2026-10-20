@@ -1,0 +1,16 @@
+{
+  "name": "auto-promotion-telegram-executor",
+  "main": "worker.mjs",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "vars": { "TG_ACCOUNT_ID": "acc-234a19e45daf" },
+  "services": [
+    { "binding": "CONTROL_INTERNAL", "service": "auto-promotion-control" },
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "TG", "class_name": "TelegramExecutor" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TelegramExecutor"] }],
+  "observability": { "enabled": true, "head_sampling_rate": 0.1 },
+}

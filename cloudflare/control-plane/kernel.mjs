@@ -63,10 +63,15 @@ export class ControlError extends Error {
   }
 }
 export function cloudFailure(error, now = Date.now()) {
-  const quota = /Exceeded allowed rows written in Durable Objects free tier/i.test(String(error?.message || ""));
+  const quota =
+    /Exceeded allowed rows written in Durable Objects free tier/i.test(
+      String(error?.message || ""),
+    );
   return {
     error: quota ? "CloudWriteQuotaExceeded" : "CloudRuntimeUnavailable",
-    retry_after_seconds: quota ? Math.ceil((86400000 - (now % 86400000)) / 1000) + 30 : 60,
+    retry_after_seconds: quota
+      ? Math.ceil((86400000 - (now % 86400000)) / 1000) + 30
+      : 60,
   };
 }
 export function canonical(value) {
@@ -106,17 +111,38 @@ function safePayload(value) {
 export class ControlKernel {
   constructor(
     storage,
-    { clock = () => Date.now() / 1000, uuid = () => crypto.randomUUID() } = {},
+    {
+      clock = () => Date.now() / 1000,
+      uuid = () => crypto.randomUUID(),
+      legacyLocalUntil = 0,
+    } = {},
   ) {
     this.storage = storage;
     this.sql = storage.sql;
     this.clock = clock;
     this.uuid = uuid;
+    this.legacyLocalUntil = legacyLocalUntil;
     // Existing workspaces do not need schema writes on every object activation.
-    if (!this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='snapshot_cursor'"))
+    if (
+      !this.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='snapshot_cursor'",
+      )
+    )
       this.tx(() => this.sql.exec(SCHEMA));
-    else if (!this.rows("PRAGMA table_info(jobs)").some(c => c.name === "attempt_at"))
+    else if (
+      !this.rows("PRAGMA table_info(jobs)").some((c) => c.name === "attempt_at")
+    )
       migrate(storage);
+    if (
+      !this.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='account_channels'",
+      )
+    )
+      this.tx(() =>
+        this.sql.exec(
+          "CREATE TABLE account_channels(identity TEXT PRIMARY KEY,account_id TEXT NOT NULL,channel TEXT NOT NULL,generation TEXT NOT NULL,until_at REAL NOT NULL,node_id TEXT NOT NULL,task_id TEXT NOT NULL,updated_at REAL NOT NULL)",
+        ),
+      );
   }
   rows(q, ...args) {
     return this.sql.exec(q, ...args).toArray();
@@ -209,7 +235,11 @@ export class ControlKernel {
     if (!n || !n.enabled || n.token_hash !== tokenHash)
       throw new ControlError("NodeUnauthorized", 401);
     if (this.clock() - n.last_seen >= NODE_HEARTBEAT_SECONDS)
-      this.sql.exec("UPDATE nodes SET last_seen=? WHERE id=?", this.clock(), id);
+      this.sql.exec(
+        "UPDATE nodes SET last_seen=? WHERE id=?",
+        this.clock(),
+        id,
+      );
     return {
       ...n,
       pools: JSON.parse(n.pools),
@@ -280,12 +310,14 @@ export class ControlKernel {
         if (old && old.phase === "starting" && !frozen && t.manifest_hash)
           this.sql.exec(
             "DELETE FROM jobs WHERE task_id=? AND kind='send' AND state='pending' AND attempt_id IS NULL AND lease_until<=?",
-            t.id, this.clock(),
+            t.id,
+            this.clock(),
           );
         if (t.state === "cancelled")
           this.sql.exec(
             "UPDATE jobs SET state='cancelled' WHERE task_id=? AND state='pending' AND attempt_id IS NULL AND lease_until<=?",
-            t.id, this.clock(),
+            t.id,
+            this.clock(),
           );
         if (old && old.payload === canonical(t)) continue;
         this.sql.exec(
@@ -365,8 +397,16 @@ export class ControlKernel {
       for (const e of snapshot.quota_events || []) {
         // The local receipt mirror echoes the same attempt. Its dimensions
         // already live durably on the job; do not materialize nine duplicate rows.
-        const recorded = this.one("SELECT quota_scopes FROM jobs WHERE attempt_id=? AND attempt_at IS NOT NULL", e.attempt_id);
-        if (recorded && JSON.parse(recorded.quota_scopes).some(s => s.scope === e.scope && s.key === e.key))
+        const recorded = this.one(
+          "SELECT quota_scopes FROM jobs WHERE attempt_id=? AND attempt_at IS NOT NULL",
+          e.attempt_id,
+        );
+        if (
+          recorded &&
+          JSON.parse(recorded.quota_scopes).some(
+            (s) => s.scope === e.scope && s.key === e.key,
+          )
+        )
           continue;
         this.sql.exec(
           "INSERT OR IGNORE INTO quota_history VALUES(?,?,?,?)",
@@ -404,35 +444,191 @@ export class ControlKernel {
   nextMaintenanceAt() {
     // The executor wakes for due_at. The coordinator only needs to wake for
     // lease expiry or a missed delivery window; waiting itself does not write.
-    return this.one("SELECT MIN(at) at FROM (SELECT MIN(lease_until) at FROM jobs WHERE state='leased' UNION ALL SELECT MIN(expires_at) at FROM jobs WHERE state='pending')")?.at ?? null;
+    return (
+      this.one(
+        "SELECT MIN(at) at FROM (SELECT MIN(lease_until) at FROM jobs WHERE state='leased' UNION ALL SELECT MIN(expires_at) at FROM jobs WHERE state='pending')",
+      )?.at ?? null
+    );
   }
   accountNext(identity) {
     return Math.max(
-      this.one("SELECT MAX(next_at) at FROM accounts WHERE identity=?", identity)?.at || 0,
-      this.one("SELECT MAX(j.account_pacing_until) at FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE a.identity=? AND j.attempt_at IS NOT NULL", identity)?.at || 0,
+      this.one(
+        "SELECT MAX(next_at) at FROM accounts WHERE identity=?",
+        identity,
+      )?.at || 0,
+      this.one(
+        "SELECT MAX(j.account_pacing_until) at FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE a.identity=? AND j.attempt_at IS NOT NULL",
+        identity,
+      )?.at || 0,
     );
+  }
+  accountChannel(accountId) {
+    const account = this.one(
+      "SELECT identity FROM accounts WHERE id=?",
+      accountId,
+    );
+    return account
+      ? this.one(
+          "SELECT account_id,channel,generation,until_at,node_id,task_id FROM account_channels WHERE identity=?",
+          account.identity,
+        ) || null
+      : null;
+  }
+  setAccountChannel(input) {
+    if (
+      !["local", "cloud"].includes(input.channel) ||
+      typeof input.generation !== "string" ||
+      !/^[a-f0-9]{32}$/.test(input.generation) ||
+      !Number.isFinite(input.until) ||
+      input.until <= this.clock()
+    )
+      throw new ControlError("InvalidAccountChannel", 400);
+    return this.tx(() => {
+      const account = this.one(
+        "SELECT * FROM accounts WHERE id=?",
+        input.account_id,
+      );
+      const taskRow = this.one(
+        "SELECT payload FROM tasks WHERE id=?",
+        input.task_id,
+      );
+      const node = this.one(
+        "SELECT accounts,enabled FROM nodes WHERE id=?",
+        input.node_id,
+      );
+      const task = taskRow && JSON.parse(taskRow.payload);
+      if (
+        !account ||
+        !node?.enabled ||
+        !JSON.parse(node.accounts).includes(input.account_id) ||
+        !task ||
+        task.state !== "active" ||
+        !task.account_ids.includes(input.account_id)
+      )
+        throw new ControlError("AccountChannelNotAssigned", 403);
+      if (
+        task.policy.execution_channel &&
+        task.policy.execution_channel !== "inherit" &&
+        task.policy.execution_channel !== input.channel
+      )
+        throw new ControlError("TaskChannelMismatch", 403);
+      // Python policy timestamps can include microseconds; Date.parse retains
+      // milliseconds. Compare at that shared precision. Actual job authorization
+      // still checks the task deadline before permitting a platform operation.
+      if (Math.floor(input.until * 1000) > Date.parse(task.policy.ends_at))
+        throw new ControlError("ChannelExceedsTaskWindow", 403);
+      const prior = this.accountChannel(input.account_id);
+      if (input.channel === "local") {
+        const settings = this.settings();
+        const definition = JSON.parse(account.payload);
+        const automatic = this.one(
+          "SELECT 1 FROM jobs WHERE task_id=? AND account_id=? AND COALESCE(json_extract(payload,'$.payload.execution_mode'),'automatic')<>'manual' AND COALESCE(json_extract(payload,'$.action'),'')<>'manual_comment' LIMIT 1",
+          input.task_id,
+          input.account_id,
+        );
+        const health = this.one(
+          "SELECT MAX(cooldown_until) cooldown_until,MAX(disabled) disabled FROM accounts WHERE identity=?",
+          account.identity,
+        );
+        if (
+          settings.global_stop ||
+          (definition.mode === "live" && !settings.live_enabled && automatic) ||
+          health.disabled ||
+          health.cooldown_until > this.clock()
+        )
+          throw new ControlError("ExecutionStopped");
+      }
+      if (prior?.generation === input.generation) {
+        if (
+          prior.channel !== input.channel ||
+          prior.node_id !== input.node_id ||
+          prior.until_at !== input.until ||
+          prior.task_id !== input.task_id
+        )
+          throw new ControlError("AccountChannelGenerationChanged");
+        return { channel: prior };
+      }
+      if ((prior?.generation || null) !== (input.expected_generation || null))
+        throw new ControlError("AccountChannelGenerationConflict");
+      if (
+        this.one(
+          "SELECT 1 FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE a.identity=? AND j.state='leased' AND j.lease_until>? LIMIT 1",
+          account.identity,
+          this.clock(),
+        )
+      )
+        throw new ControlError("AccountChannelHandoffBusy");
+      this.sql.exec(
+        "INSERT INTO account_channels VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET account_id=excluded.account_id,channel=excluded.channel,generation=excluded.generation,until_at=excluded.until_at,node_id=excluded.node_id,task_id=excluded.task_id,updated_at=excluded.updated_at",
+        account.identity,
+        input.account_id,
+        input.channel,
+        input.generation,
+        input.until,
+        input.node_id,
+        input.task_id,
+        this.clock(),
+      );
+      this.event("account_channel_changed", null, {
+        account_id: input.account_id,
+        channel: input.channel,
+        generation: input.generation,
+      });
+      return { channel: this.accountChannel(input.account_id) };
+    });
+  }
+  cloudChannelAllowed(accountId, node, task) {
+    if (task.policy.execution_channel === "local") return false;
+    const channel = this.accountChannel(accountId);
+    if (channel)
+      return channel.channel === "cloud" && channel.node_id === node.id;
+    if (task.policy.execution_channel === "cloud") return false;
+    return this.clock() >= this.legacyLocalUntil;
   }
   taskNext(taskId) {
     return Math.max(
-      this.one("SELECT next_at FROM task_pacing WHERE task_id=?", taskId)?.next_at || 0,
-      this.one("SELECT MAX(task_pacing_until) at FROM jobs WHERE task_id=? AND attempt_at IS NOT NULL", taskId)?.at || 0,
+      this.one("SELECT next_at FROM task_pacing WHERE task_id=?", taskId)
+        ?.next_at || 0,
+      this.one(
+        "SELECT MAX(task_pacing_until) at FROM jobs WHERE task_id=? AND attempt_at IS NOT NULL",
+        taskId,
+      )?.at || 0,
     );
   }
   checkQuotas(scopes, attemptId, now) {
     const day = Math.floor(now / 86400) * 86400;
     const since = Math.min(day, now - 3600);
-    const recent = this.rows("SELECT attempt_id,attempt_at,quota_scopes FROM jobs WHERE attempt_at>=? AND attempt_id<>?", since, attemptId);
+    const recent = this.rows(
+      "SELECT attempt_id,attempt_at,quota_scopes FROM jobs WHERE attempt_at>=? AND attempt_id<>?",
+      since,
+      attemptId,
+    );
     for (const s of scopes) {
-      const attempts = new Map(this.rows(
-        "SELECT attempt_id,at FROM quota_history WHERE scope=? AND scope_key=? AND at>=? AND attempt_id<>?",
-        s.scope, s.key, since, attemptId,
-      ).map(e => [e.attempt_id, e.at]));
+      const attempts = new Map(
+        this.rows(
+          "SELECT attempt_id,at FROM quota_history WHERE scope=? AND scope_key=? AND at>=? AND attempt_id<>?",
+          s.scope,
+          s.key,
+          since,
+          attemptId,
+        ).map((e) => [e.attempt_id, e.at]),
+      );
       for (const j of recent) {
-        if (JSON.parse(j.quota_scopes).some(e => e.scope === s.scope && e.key === s.key))
-          attempts.set(j.attempt_id, Math.max(attempts.get(j.attempt_id) || 0, j.attempt_at));
+        if (
+          JSON.parse(j.quota_scopes).some(
+            (e) => e.scope === s.scope && e.key === s.key,
+          )
+        )
+          attempts.set(
+            j.attempt_id,
+            Math.max(attempts.get(j.attempt_id) || 0, j.attempt_at),
+          );
       }
       const times = [...attempts.values()];
-      if (times.filter(at => at >= day).length >= s.limit.daily || times.filter(at => at > now - 3600).length >= s.limit.hourly)
+      if (
+        times.filter((at) => at >= day).length >= s.limit.daily ||
+        times.filter((at) => at > now - 3600).length >= s.limit.hourly
+      )
         throw new ControlError("QuotaExceeded");
     }
   }
@@ -466,6 +662,7 @@ export class ControlKernel {
         const data = JSON.parse(j.payload),
           task = JSON.parse(j.task_payload),
           account = JSON.parse(j.account_payload);
+        if (!this.cloudChannelAllowed(j.account_id, node, task)) continue;
         const identityState = this.one(
           "SELECT MAX(next_at) next_at,MAX(cooldown_until) cooldown_until,MAX(disabled) disabled FROM accounts WHERE identity=?",
           j.identity,
@@ -537,7 +734,12 @@ export class ControlKernel {
           now,
           j.id,
         );
-        return { ...data, lease_token: token, lease_until: until, renew_after_seconds: LEASE_SECONDS - RENEW_MARGIN_SECONDS };
+        return {
+          ...data,
+          lease_token: token,
+          lease_until: until,
+          renew_after_seconds: LEASE_SECONDS - RENEW_MARGIN_SECONDS,
+        };
       }
       return null;
     });
@@ -558,13 +760,18 @@ export class ControlKernel {
   }
   renew(node, id, token) {
     return this.tx(() => {
-      const j = this.leased(node, id, token), now = this.clock();
+      const j = this.leased(node, id, token),
+        now = this.clock();
       let until = j.lease_until;
       if (until - now <= RENEW_MARGIN_SECONDS) {
         until = now + LEASE_SECONDS;
         this.sql.exec("UPDATE jobs SET lease_until=? WHERE id=?", until, id);
       }
-      return { renewed: true, lease_until: until, renew_after_seconds: Math.max(0, until - now - RENEW_MARGIN_SECONDS) };
+      return {
+        renewed: true,
+        lease_until: until,
+        renew_after_seconds: Math.max(0, until - now - RENEW_MARGIN_SECONDS),
+      };
     });
   }
   authorize(node, id, token, attemptId) {
@@ -578,6 +785,8 @@ export class ControlKernel {
           this.one("SELECT payload FROM tasks WHERE id=?", j.task_id).payload,
         ),
         data = JSON.parse(j.payload);
+      if (!this.cloudChannelAllowed(j.account_id, node, task))
+        throw new ControlError("AccountChannelLocalActive");
       if (
         data.payload?.execution_mode === "manual" ||
         data.action === "manual_comment"
@@ -609,7 +818,13 @@ export class ControlKernel {
           throw new ControlError("AttemptAlreadyRecorded");
         return { allowed: true };
       }
-      if (this.one("SELECT id FROM jobs WHERE attempt_id=? AND id<>? LIMIT 1", attemptId, id))
+      if (
+        this.one(
+          "SELECT id FROM jobs WHERE attempt_id=? AND id<>? LIMIT 1",
+          attemptId,
+          id,
+        )
+      )
         throw new ControlError("AttemptAlreadyRecorded");
       if (this.accountNext(a.identity) > now)
         throw new ControlError("PacingWait");
@@ -663,14 +878,26 @@ export class ControlKernel {
         },
       });
       this.checkQuotas(scopes, attemptId, now);
-      const dimensions = [...new Map(scopes.map(s => [canonical([s.scope,s.key]), {scope:s.scope,key:s.key}])).values()];
+      const dimensions = [
+        ...new Map(
+          scopes.map((s) => [
+            canonical([s.scope, s.key]),
+            { scope: s.scope, key: s.key },
+          ]),
+        ).values(),
+      ];
       // Persist the attempt BEFORE any platform call. This one row is also the
       // quota ledger, pacing reservation and durable execution audit.
       this.sql.exec(
         "UPDATE jobs SET attempt_id=?,attempt_at=?,quota_scopes=?,account_pacing_until=?,task_pacing_until=? WHERE id=? AND attempt_id IS NULL",
-        attemptId, now, canonical(dimensions),
-        now + Math.max(account.min_interval || 0, task.policy.min_interval || 0),
-        task.policy.pacing_scope !== "account" ? now + (task.policy.min_interval || 0) : 0,
+        attemptId,
+        now,
+        canonical(dimensions),
+        now +
+          Math.max(account.min_interval || 0, task.policy.min_interval || 0),
+        task.policy.pacing_scope !== "account"
+          ? now + (task.policy.min_interval || 0)
+          : 0,
         id,
       );
       return { allowed: true };
@@ -730,7 +957,13 @@ export class ControlKernel {
         state,
         canonical(normalized),
         attempt_id,
-        state === "pending" ? Math.max(j.available_at, this.clock() + 5, Number(result.next_at) || 0) : j.available_at,
+        state === "pending"
+          ? Math.max(
+              j.available_at,
+              this.clock() + 5,
+              Number(result.next_at) || 0,
+            )
+          : j.available_at,
         this.clock(),
         state === "pending" ? null : j.owner,
         state === "pending" ? null : j.lease_token,

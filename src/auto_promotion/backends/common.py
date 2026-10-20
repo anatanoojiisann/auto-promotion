@@ -271,8 +271,10 @@ def verify_claim(request):
         from ..cloud_control import CloudControl, CloudUnavailable
         from ..execution_channels import independent_scope
 
+        context = request.get("execution_job") or {}
         independent = bool(
-            independent_scope(db) and (request.get("execution_job") or {}).get("channel") == "local"
+            context.get("channel") == "local"
+            and (context.get("task_channel") or independent_scope(db))
         )
         cloud = None if independent else CloudControl.configured()
         required = db.execute(

@@ -40,7 +40,7 @@ class PersistentPoolTests(unittest.TestCase):
         with self.store.connect(write=True) as db:
             db.execute("UPDATE meta SET value='0' WHERE key='global_stop'")
 
-    def ready(self, *, account=None, start=True, target_id=None):
+    def ready(self, *, account=None, start=True, target_id=None, channel="inherit"):
         from datetime import datetime, timezone
 
         def iso(t):
@@ -65,6 +65,7 @@ class PersistentPoolTests(unittest.TestCase):
                 name="test",
                 account_ids=[account["id"]],
                 policy={
+                    "execution_channel": channel,
                     "starts_at": iso(now - 100),
                     "ends_at": iso(now + 3600),
                     "min_interval": 0,

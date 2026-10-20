@@ -27,6 +27,7 @@ from .models import canonical
 from .queue_store import JobQueue, executor_task_ids, job_scope
 from .routing import POOLS
 from .store import Store
+from .task_channels import TaskChannelRouter, managed, pending_managed
 
 
 class PoolScheduler:
@@ -65,9 +66,16 @@ class PoolScheduler:
         independent = independent_active(self.engine)
         if not independent and not self.cloud:
             self.cloud = CloudControl.configured()
-        if required and required["value"] == "1" and not self.cloud and not independent:
+        mixed = pending_managed(self.engine)
+        if (
+            required
+            and required["value"] == "1"
+            and not self.cloud
+            and not independent
+            and not mixed
+        ):
             raise CloudUnavailable("CloudControlConfigurationMissing")
-        if not independent and self.cloud and not self._control_ready():
+        if not mixed and not independent and self.cloud and not self._control_ready():
             return self.queue.pools()
         for key, child in list(self.children.items()):
             if child.poll() is not None:
@@ -95,9 +103,9 @@ class PoolScheduler:
         with self.engine.store.connect() as db:
             accounts = local_account_scope(db, now)
         if accounts is not None:
-            if not accounts:
-                return self.queue.pools()
-            sql += " AND account_id IN (" + ",".join("?" for _ in accounts) + ")"
+            sql += " AND (account_id IN (" + (",".join("?" for _ in accounts) or "NULL") + ") "
+            sql += "OR task_id IN (SELECT id FROM tasks WHERE COALESCE(json_extract(policy,'$.execution_channel'),'inherit')<>'inherit') "
+            sql += "OR account_id IN (SELECT account_id FROM account_task_channels))"
             params.extend(accounts)
         if task_ids is not None:
             if not task_ids:
@@ -291,7 +299,13 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
     cloud = None if independent else CloudControl.configured()
     journal = CloudJournal(engine, cloud) if cloud else None
     required = engine.store.one("SELECT value FROM meta WHERE key='cloud_control_required'")
-    if required and required["value"] == "1" and not cloud and not independent:
+    if (
+        required
+        and required["value"] == "1"
+        and not cloud
+        and not independent
+        and not pending_managed(engine)
+    ):
         raise CloudUnavailable("CloudControlConfigurationMissing")
     owner, now, handled = "pool-" + uuid.uuid4().hex, time.time(), 0
     with engine.store.connect(write=True) as db:
@@ -318,9 +332,13 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                 )
                 channel_state = read_state(engine.store)
                 pending = engine.store.one("SELECT value FROM meta WHERE key='cloud_retry_after'")
-                if not local and (
-                    channel_state.get("active") == "local"
-                    or (pending and json.loads(pending["value"])["until"] > engine.clock())
+                if (
+                    not pending_managed(engine)
+                    and not local
+                    and (
+                        channel_state.get("active") == "local"
+                        or (pending and json.loads(pending["value"])["until"] > engine.clock())
+                    )
                 ):
                     break
                 job = queue.claim(pool, owner)
@@ -337,11 +355,22 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                 continue
             error = None
             lease = None
+            with engine.store.connect() as db:
+                is_managed = managed(db, job["task_id"], job["account_id"])
+            context = None
             try:
+                if is_managed:
+                    with queue.heartbeat(job):
+                        context, cloud = TaskChannelRouter(engine).prepare(job)
+                    local = context["channel"] == "local"
+                    journal = CloudJournal(engine, cloud) if cloud else None
                 if local:
-                    if not independent_active(engine):
+                    if not is_managed and not independent_active(engine):
                         check_standby(engine, cloud, job)
                 elif cloud:
+                    if not is_managed and pending_managed(engine):
+                        journal.flush(account_id=job["account_id"])
+                        cloud.sync(engine, task_ids=[job["task_id"]])
                     lease = cloud.claim(pool, job["id"])
                     if not lease:
                         queue.settle(job)
@@ -361,8 +390,9 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                         )
                     ):
                         raise CloudUnavailable("CloudManifestMismatch")
-                context = {"id": job["id"], "owner": owner, "cloud": lease}
-                if local:
+                context = context or {"id": job["id"], "owner": owner}
+                context["cloud"] = lease
+                if local and not is_managed:
                     context.update(
                         {k: channel_state[k] for k in ("generation", "store_id", "node_id")}
                     )
@@ -400,7 +430,13 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                     worker_error(engine, owner, persistence_error)
             except Exception as exc:
                 error = exc
-                if isinstance(exc, CloudUnavailable) and not local:
+                if isinstance(exc, CloudUnavailable) and is_managed:
+                    with engine.store.connect(write=True) as db:
+                        db.execute(
+                            "UPDATE account_task_channels SET error=?,retry_at=? WHERE account_id=?",
+                            (str(exc), engine.clock() + 30, job["account_id"]),
+                        )
+                if isinstance(exc, CloudUnavailable) and not local and not is_managed:
                     try:
                         PoolScheduler(engine)._cloud_failure(exc)
                     except sqlite3.Error as persistence_error:

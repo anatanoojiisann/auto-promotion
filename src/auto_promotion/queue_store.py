@@ -35,6 +35,15 @@ def bind_connection(db):
 
 
 QUEUE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS account_task_channels(
+ account_id TEXT PRIMARY KEY,channel TEXT NOT NULL,generation TEXT NOT NULL,
+ until_at REAL NOT NULL,task_id TEXT NOT NULL,state TEXT NOT NULL,
+ fence_source TEXT NOT NULL,updated_at REAL NOT NULL,error TEXT,
+ retry_at REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS task_channel_claims(
+ job_id TEXT PRIMARY KEY,owner TEXT NOT NULL,generation TEXT NOT NULL,channel TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS execution_jobs(
  id TEXT PRIMARY KEY,kind TEXT NOT NULL,reference_id TEXT NOT NULL,task_id TEXT,
  account_id TEXT,pool TEXT NOT NULL,route TEXT NOT NULL,version TEXT NOT NULL,
@@ -76,6 +85,32 @@ CREATE TRIGGER IF NOT EXISTS pooled_join_attempt BEFORE INSERT ON join_attempts
  SELECT 1 FROM execution_jobs j WHERE j.kind='join' AND j.reference_id=NEW.candidate_id
  AND j.account_id=NEW.account_id AND j.state='leased' AND j.owner=ap_pool_owner()
  AND j.lease_until>unixepoch('now')) THEN RAISE(ABORT,'PersistentJobLeaseRequired') END;
+ END;
+CREATE TRIGGER IF NOT EXISTS task_channel_send_attempt_v2 BEFORE INSERT ON attempts
+ WHEN EXISTS(SELECT 1 FROM account_task_channels WHERE account_id=NEW.account_id)
+ OR COALESCE((SELECT json_extract(policy,'$.execution_channel') FROM tasks WHERE id=NEW.task_id),'inherit')<>'inherit'
+ BEGIN
+ SELECT CASE WHEN NOT EXISTS(
+ SELECT 1 FROM execution_jobs j JOIN task_channel_claims c ON c.job_id=j.id JOIN tasks t ON t.id=j.task_id
+ JOIN account_task_channels a ON a.account_id=j.account_id
+ WHERE j.reference_id=NEW.item_id AND j.kind='send' AND j.owner=ap_pool_owner()
+ AND c.owner=j.owner AND a.state='ready' AND a.channel=c.channel
+ AND COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit') IN ('inherit',a.channel)
+ AND a.generation=c.generation AND (a.channel='cloud' OR a.until_at>unixepoch('now'))
+ ) THEN RAISE(ABORT,'TaskChannelClaimRequired') END;
+ END;
+CREATE TRIGGER IF NOT EXISTS task_channel_join_attempt_v2 BEFORE INSERT ON join_attempts
+ WHEN EXISTS(SELECT 1 FROM account_task_channels WHERE account_id=NEW.account_id)
+ OR COALESCE((SELECT json_extract(policy,'$.execution_channel') FROM tasks WHERE id=NEW.task_id),'inherit')<>'inherit'
+ BEGIN
+ SELECT CASE WHEN NOT EXISTS(
+ SELECT 1 FROM execution_jobs j JOIN task_channel_claims c ON c.job_id=j.id JOIN tasks t ON t.id=j.task_id
+ JOIN account_task_channels a ON a.account_id=j.account_id
+ WHERE j.reference_id=NEW.candidate_id AND j.kind='join' AND j.owner=ap_pool_owner()
+ AND c.owner=j.owner AND a.state='ready' AND a.channel=c.channel
+ AND COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit') IN ('inherit',a.channel)
+ AND a.generation=c.generation AND (a.channel='cloud' OR a.until_at>unixepoch('now'))
+ ) THEN RAISE(ABORT,'TaskChannelClaimRequired') END;
  END;
 """
 
@@ -275,10 +310,9 @@ class JobQueue:
         now = self.clock()
         limits = self.engine.execution_settings()
         with self.store.connect(write=True) as db:
-            if db.execute(
+            expiry_pending = db.execute(
                 "SELECT 1 FROM meta WHERE key='local_fallback_expiry_requested'"
-            ).fetchone():
-                return None
+            ).fetchone()
             if db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
                 return None
             if db.execute(
@@ -302,11 +336,14 @@ class JobQueue:
 
             accounts = local_account_scope(db, now)
             if accounts is not None:
-                if not accounts:
-                    return None
-                sql += " AND j.account_id IN (" + ",".join("?" for _ in accounts) + ")"
-                sql += " AND NOT EXISTS(SELECT 1 FROM cloud_receipt_outbox receipt WHERE receipt.job_id=j.id)"
+                sql += " AND (COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')<>'inherit' "
+                sql += "OR EXISTS(SELECT 1 FROM account_task_channels ch WHERE ch.account_id=j.account_id) OR ("
+                sql += "j.account_id IN (" + (",".join("?" for _ in accounts) or "NULL") + ")"
+                sql += " AND NOT EXISTS(SELECT 1 FROM cloud_receipt_outbox receipt WHERE receipt.job_id=j.id)))"
                 params.extend(accounts)
+            if expiry_pending:
+                sql += " AND (COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')<>'inherit' "
+                sql += "OR EXISTS(SELECT 1 FROM account_task_channels ch WHERE ch.account_id=j.account_id))"
             task_ids = executor_task_ids()
             if task_ids is not None:
                 if not task_ids:
@@ -319,6 +356,16 @@ class JobQueue:
             )
             rows = db.execute(sql, params).fetchall()
             for row in rows:
+                from .task_channels import handoff_blocks
+
+                channel = db.execute(
+                    "SELECT state,task_id,retry_at FROM account_task_channels WHERE account_id=?",
+                    (row["account_id"],),
+                ).fetchone()
+                if channel and (
+                    channel["retry_at"] > now or handoff_blocks(db, channel, row["task_id"], now)
+                ):
+                    continue
                 source = self._source(db, row)
                 if not source or source["attempted"] or source["status"] != "not_attempted":
                     continue
@@ -459,6 +506,9 @@ class JobQueue:
 
         return {
             "jobs": rows,
+            "account_channels": self.store.rows(
+                "SELECT account_id,channel,state,until_at,task_id,error,retry_at FROM account_task_channels"
+            ),
             "cloud_receipts_pending": self.store.one("SELECT COUNT(*) n FROM cloud_receipt_outbox")[
                 "n"
             ],
@@ -479,6 +529,11 @@ class JobQueue:
 
 def verify_job_claim(db, request):
     context = request.get("execution_job")
+    if context and context.get("task_channel"):
+        from .task_channels import valid_context
+
+        if not valid_context(db, context, now=time.time()):
+            raise ValueError("TaskChannelClaimExpired")
     enabled = db.execute("SELECT value FROM meta WHERE key='execution_runtime'").fetchone()
     required = db.execute("SELECT value FROM meta WHERE key='cloud_control_required'").fetchone()
     from .execution_channels import local_context_valid

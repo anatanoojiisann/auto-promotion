@@ -3,12 +3,20 @@
   "main": "worker.mjs",
   "compatibility_date": "2025-09-01",
   "workers_dev": true,
+  "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
     "WORKSPACE_ID": "auto-promotion",
     "FALLBACK_NODE_ID": "windows-primary",
     "FALLBACK_STORE_ID": "feea453950ce4caebed3e167ff8598f5",
-    "LOCAL_CHANNEL_UNTIL": "1792252800",
+    "LOCAL_CHANNEL_UNTIL": "1792858322.783418",
+    "TELEGRAM_EXECUTOR_ACCOUNT": "acc-234a19e45daf",
   },
+  "services": [
+    {
+      "binding": "TELEGRAM_EXECUTOR",
+      "service": "auto-promotion-telegram-executor",
+    },
+  ],
   "durable_objects": {
     "bindings": [{ "name": "CONTROL", "class_name": "WorkspaceCoordinator" }],
   },

@@ -67,3 +67,22 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+
+  telegram-executor:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare/telegram-executor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            cloudflare/control-plane/package-lock.json
+            cloudflare/telegram-executor/package-lock.json
+      - run: npm ci --prefix ../control-plane
+      - run: npm ci
+      - run: npm test
+      - run: npm run check

@@ -77,7 +77,28 @@ class CloudControl:
         }
         if not operator:
             headers["X-Node-ID"] = self.node_id
-        elif path in {"/v1/settings", "/v1/sync"} and self.node_token:
+        elif (
+            path
+            in {
+                "/v1/settings",
+                "/v1/sync",
+                "/v1/account-channel",
+                "/v1/workflow/create",
+                "/v1/workflow/node",
+                "/v1/workflow/state",
+                "/v1/workflow/start-public",
+                "/v1/workflow/stop-public",
+                "/v1/executor/telegram/login-begin",
+                "/v1/executor/telegram/login-poll",
+                "/v1/executor/telegram/read",
+                "/v1/executor/telegram/activate",
+                "/v1/executor/telegram/link-native",
+                "/v1/executor/telegram/dispatch-native",
+                "/v1/executor/telegram/start-reader",
+                "/v1/executor/telegram/stop-reader",
+            }
+            and self.node_token
+        ):
             headers["X-Local-Control-Proof"] = hmac.new(
                 hashlib.sha256(self.node_token.encode()).hexdigest().encode(),
                 canonical(data).encode(),
@@ -181,7 +202,7 @@ class CloudControl:
             },
         )
 
-    def sync(self, engine, *, force=False):
+    def sync(self, engine, *, force=False, task_ids=None):
         from .execution_channels import binding
 
         destination = hashlib.sha256(self.url.encode()).hexdigest()
@@ -192,7 +213,25 @@ class CloudControl:
                 (destination,),
             )
         }
-        snapshot = export_snapshot(engine)
+
+        def snapshot_for_scope():
+            snapshot = (
+                export_snapshot(engine, task_ids=task_ids)
+                if task_ids is not None
+                else export_snapshot(engine)
+            )
+            if task_ids is not None:
+                selected = set(task_ids)
+                snapshot["tasks"] = [t for t in snapshot["tasks"] if t["id"] in selected]
+                if {t["id"] for t in snapshot["tasks"]} != selected:
+                    raise CloudUnavailable("CloudSnapshotTaskNotFound")
+                accounts = {a for t in snapshot["tasks"] for a in t["account_ids"]}
+                snapshot["accounts"] = [a for a in snapshot["accounts"] if a["id"] in accounts]
+                snapshot["jobs"] = [j for j in snapshot["jobs"] if j["task_id"] in selected]
+                # Retain the whole recent ledger: global limits span all tasks.
+            return snapshot
+
+        snapshot = snapshot_for_scope()
 
         def record_key(section, record):
             return (
@@ -219,7 +258,7 @@ class CloudControl:
                 "INSERT INTO meta VALUES('cloud_snapshot_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(revision),),
             )
-        snapshot = export_snapshot(engine)
+        snapshot = snapshot_for_scope()
         changed = 0
         # Import historical quota evidence before activating any new work.
         for section in ("quota_events", "accounts", "tasks", "jobs"):
@@ -293,14 +332,14 @@ def queue_settings(engine, changes):
         )
 
 
-def export_snapshot(engine):
+def export_snapshot(engine, *, task_ids=None):
     """Export business data and immutable references, never credential profiles or sessions."""
     with engine.store.connect() as db:
         # One WAL read snapshot for parents, children, routes and quota evidence.
         # A concurrent task creation must not leave a child outside its parents.
         db.execute("BEGIN")
         try:
-            result, new_routes = _export_snapshot(engine, db)
+            result, new_routes = _export_snapshot(engine, db, task_ids=task_ids)
         except (KeyError, TypeError, ValueError):
             # Imported or partially migrated definitions must fail closed with
             # a stable code, never export an incomplete authorization boundary.
@@ -311,7 +350,7 @@ def export_snapshot(engine):
     return result
 
 
-def _export_snapshot(engine, db):
+def _export_snapshot(engine, db, *, task_ids=None):
     from .backends.common import automatic_actions
     from .models import CAPABILITIES
 
@@ -320,6 +359,16 @@ def _export_snapshot(engine, db):
         a["capabilities"] = sorted(CAPABILITIES[a["platform"]])
         a["automatic_actions"] = automatic_actions(a)
     tasks = {t["id"]: dict(t) for t in db.execute("SELECT * FROM tasks")}
+    if task_ids is not None:
+        selected = set(task_ids)
+        if selected - tasks.keys():
+            raise CloudUnavailable("CloudSnapshotTaskNotFound")
+        tasks = {key: value for key, value in tasks.items() if key in selected}
+    scoped_accounts = (
+        {account_id for t in tasks.values() for account_id in json.loads(t["account_ids"])}
+        if task_ids is not None
+        else None
+    )
     result = {"schema": 1, "accounts": [], "tasks": [], "jobs": [], "quota_events": []}
     routes = {r["job_id"]: r["route"] for r in db.execute("SELECT * FROM execution_job_routes")}
     queued_routes = {r["id"]: r["route"] for r in db.execute("SELECT id,route FROM execution_jobs")}
@@ -334,6 +383,8 @@ def _export_snapshot(engine, db):
         return route
 
     for a in accounts.values():
+        if scoped_accounts is not None and a["id"] not in scoped_accounts:
+            continue
         route = route_for(a)
         allowed = a["automatic_actions"] if a["platform"] == "x" else a["capabilities"]
         if a["platform"] == "reddit":
@@ -378,6 +429,8 @@ def _export_snapshot(engine, db):
             }
         )
     for row in db.execute("SELECT * FROM items").fetchall():
+        if task_ids is not None and row["task_id"] not in tasks:
+            continue
         t, a = tasks.get(row["task_id"]), accounts.get(row["account_id"])
         if t is None or a is None:
             raise CloudUnavailable("CloudSnapshotInconsistent")
@@ -416,6 +469,8 @@ def _export_snapshot(engine, db):
             }
         )
     for row in db.execute("SELECT * FROM candidates WHERE decision='qualified'").fetchall():
+        if task_ids is not None and row["task_id"] not in tasks:
+            continue
         t, a = tasks.get(row["task_id"]), accounts.get(row["account_id"])
         if t is None or a is None:
             raise CloudUnavailable("CloudSnapshotInconsistent")
@@ -548,15 +603,18 @@ class CloudJournal:
             )
         self.flush(job_id=lease["id"])
 
-    def flush(self, job_id=None):
+    def flush(self, job_id=None, *, account_id=None):
         now = self.engine.clock()
         if not job_id:
-            self.refresh_reconciled()
+            self.refresh_reconciled(account_id=account_id)
         sql = "SELECT * FROM cloud_receipt_outbox WHERE retry_at<=?"
         args = (now,)
         if job_id:
             sql += " AND job_id=?"
             args += (job_id,)
+        if account_id:
+            sql += " AND json_extract(lease,'$.account_id')=?"
+            args += (account_id,)
         for row in self.store.rows(sql + " ORDER BY updated_at LIMIT 32", args):
             lease = json.loads(row["lease"])
             outcome = json.loads(row["outcome"]) if row["outcome"] else None
@@ -592,9 +650,13 @@ class CloudJournal:
                         (canonical(outcome), now + 30, str(exc), row["job_id"], row["lease"]),
                     )
 
-    def refresh_reconciled(self):
+    def refresh_reconciled(self, *, account_id=None):
+        scope = " AND json_extract(lease,'$.account_id')=?" if account_id else ""
         for row in self.store.rows(
-            "SELECT * FROM cloud_receipt_history WHERE json_extract(outcome,'$.state') IN ('unknown','scheduled','pending_admin_approval') LIMIT 256"
+            "SELECT * FROM cloud_receipt_history WHERE json_extract(outcome,'$.state') IN ('unknown','scheduled','pending_admin_approval')"
+            + scope
+            + " LIMIT 256",
+            (account_id,) if account_id else (),
         ):
             outcome = self.outcome(json.loads(row["lease"]))
             prior = json.loads(row["outcome"])

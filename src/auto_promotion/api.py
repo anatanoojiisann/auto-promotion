@@ -136,8 +136,14 @@ def create_app(
     pool_scheduler = PoolScheduler(engine) if worker and pooled_worker else None
 
     async def work_loop():
+        nonlocal pool_scheduler
         while not stop.is_set():
             try:
+                from .task_channels import pending_managed
+
+                if pool_scheduler is None and pending_managed(engine):
+                    pool_scheduler = PoolScheduler(engine)
+                    pool_scheduler.enable()
                 sender.phase("executing")
                 await asyncio.to_thread(pool_scheduler.tick if pool_scheduler else engine.run_cycle)
             except Exception as exc:

@@ -204,3 +204,5 @@ docs/                   平台接入与测试说明
 TikTok 的授权配置、发布与自有评论管理、独立回调和真实验收见 [TikTok 接入说明](docs/tiktok.md)。
 
 六个平台的持久任务、按平台和接入方式划分的执行池、Cloudflare 部署与常驻节点配置见 [持久化执行服务](docs/cloudflare-execution.md)。工作台“推广活动 → 调度与额度 → 发送通道”可查看通道积压、核验状态和并发设置。
+
+任务和模板支持单独选择在线或本地队列，交接状态见 [双通道执行](docs/execution-channels.md)。新增的 [云端活动工作流](docs/complete-cloud-workflow.md) 保存分阶段证据和依赖；[Telegram 专用云端执行器](docs/telegram-cloud-executor.md) 提供独立登录、只读采集和受原生队列保护的执行适配。研究评估、回复审核模型及原生子任务生成编排尚未接齐，不能把工作流入队当作完整推广已运行。

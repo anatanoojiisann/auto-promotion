@@ -671,6 +671,10 @@ function taskForm() {
     "afterend",
     '<div class="full"><label for="ordering-mode">多账号执行方式</label><select id="ordering-mode" name="ordering_mode"><option value="independent_accounts">各账号独立执行</option><option value="strict">严格按清单顺序</option></select><span class="help">独立执行时，一个账号冷却不会挡住其他账号；同一账号仍按清单顺序执行。</span></div>',
   );
+  $("#task-form fieldset").insertAdjacentHTML(
+    "afterend",
+    '<div class="full"><label for="execution-channel">执行通道</label><select id="execution-channel" name="execution_channel"><option value="inherit">跟随默认</option><option value="cloud">在线队列</option><option value="local">本地队列</option></select><span class="help">只决定本次任务的通道；同一账号仍按顺序执行。在线连接失败时等待恢复。</span></div>',
+  );
   $("#task-form").onsubmit = (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -684,6 +688,7 @@ function taskForm() {
         name: f.get("name"),
         account_ids: f.getAll("accounts"),
         policy: {
+          execution_channel: f.get("execution_channel"),
           queries: split("queries"),
           required_keywords: split("required"),
           blocked_keywords: split("blocked"),
@@ -731,6 +736,39 @@ function taskReadinessPanel(t) {
   }${skips.length ? `<details><summary>最近一次跳过执行的原因</summary><ul>${skips.map((m) => `<li>${esc(m)}</li>`).join("")}</ul></details>` : ""}</div>`;
 }
 
+function taskChannelPanel(t) {
+  const channel = t.channel;
+  if (!channel) return "";
+  const labels = { inherit: "跟随默认", cloud: "在线队列", local: "本地队列" };
+  const reasons = {
+    NotFound: "在线服务尚未升级以支持任务通道选择",
+    CloudTransportUnavailable: "在线连接暂不可用，等待恢复",
+    CloudControlConfigurationMissing: "尚未连接在线队列",
+    LocalChannelReceiptPending: "等待该账号的回执保存完成",
+    TaskChannelHandoffBusy: "等待该账号当前操作完成",
+    AccountChannelHandoffBusy: "等待该账号在线操作完成",
+    TaskChannelHandoffPending: "等待该账号完成通道交接",
+    AccountChannelGenerationConflict: "通道状态已更新，等待核对",
+  };
+  const accounts = channel.accounts
+    .map((a) => {
+      const label =
+        t.account_snapshot.find((x) => x.id === a.account_id)?.label || "账号";
+      const desired =
+        channel.requested === "inherit" ? channel.default : channel.requested;
+      const actual =
+        a.state !== "ready"
+          ? "等待交接"
+          : a.channel === desired
+            ? labels[a.channel]
+            : `等待交接到${labels[desired]}（账号当前：${labels[a.channel]}）`;
+      const reason = a.error ? reasons[a.error] || "等待队列核验" : "";
+      return `<li>${esc(label)}：${esc(actual)}${reason ? " · " + esc(reason) : ""}</li>`;
+    })
+    .join("");
+  return `<div class="surface padded mt-20" id="task-channel"><h2>执行通道</h2><p>任务选择：${esc(labels[channel.requested] || "跟随默认")}${channel.requested === "inherit" ? "（当前默认：" + esc(labels[channel.default]) + "）" : ""}</p>${accounts ? "<ul>" + accounts + "</ul>" : '<p class="help">开始任务后确定账号的实际通道。</p>'}<p class="help">同一账号等待当前操作和回执完成后交接，其他账号独立执行。在线任务遇到连接问题时保持等待。</p></div>`;
+}
+
 async function renderTask(id) {
   const t = await api("/tasks/" + id);
   if (location.hash !== "#tasks/" + id) return;
@@ -746,6 +784,7 @@ async function renderTask(id) {
       `<div class="actions"><span id="task-state">${taskExecutionBadge(t)}</span><button class="secondary compact" id="refresh-task">刷新</button></div>`,
     ) +
     `<div id="task-execution">${taskExecutionPanel(t)}</div>` +
+    taskChannelPanel(t) +
     taskReadinessPanel(t) +
     `<div class="steps"><span class="${discovery ? "done" : ""}"><b>1</b>发现政策</span><span class="${t.manifest ? "done" : ""}"><b>2</b>准备清单</span><span class="${started ? "done" : ""}"><b>3</b>开始发送</span><span class="${t.state === "completed" ? "done" : ""}"><b>4</b>执行核验</span></div><div class="detail-grid"><div class="detail-body"><div class="surface"><div class="section-header"><h2>执行清单 <span class="muted">${t.items.length}</span></h2>${!t.manifest && !started && !ended ? '<button id="edit-items" class="secondary compact">编辑执行项</button>' : ""}</div>${t.items.length ? t.items.map((item) => itemPreview(item)).join("") : empty("尚无执行项", "添加每项的目标、内容、媒体和时间，然后点击开始发送。")}</div><div class="surface mt-24"><div class="section-header"><h2>发现候选 <span class="muted">${t.candidates.length}</span></h2></div><div class="padded">${
       discovery && !ended
@@ -951,6 +990,8 @@ setInterval(async () => {
         return;
       }
       $("#task-execution").innerHTML = taskExecutionPanel(task);
+      if ($("#task-channel"))
+        $("#task-channel").outerHTML = taskChannelPanel(task);
       $("#task-state").innerHTML = taskExecutionBadge(task);
       if ($("#task-readiness"))
         $("#task-readiness").outerHTML = taskReadinessPanel(task);

@@ -102,6 +102,12 @@ macOS 的临时目录可能有 `/var` 与 `/private/var` 别名，运行全套�
 包含 schema 1→2 迁移、重新打开零写、重复授权/回执/快照零写和普通任务 6 次写入预算；
 `check` 仅打包 dry-run，不部署。CI 同时执行这些检查和 `npm run test:ui:pools`。
 
+Telegram 云端执行器离线回归：先安装 `cloudflare/control-plane` 的依赖，再在
+`cloudflare/telegram-executor` 运行 `npm ci && npm test && npm run check`。
+新增 CI 作业独立执行同样检查。云控测试覆盖任务级账号交接、工作流依赖与证据、公开资料采集、
+登录后只读采集和原生队列授权；执行器测试覆盖真实依赖的离线构造、禁止自动重试、
+回复上下文变化、提交前持久回执及未知结果不重发。测试不登录 Telegram，也不发起真实平台写入。
+
 完整隔离执行器 `node scripts/test_offline.cjs` 会创建临时 HOME、账号目录和默认数据库路径，
 强制关闭真实写入，并启动临时本机 Miniflare；使用的 operator token 是脚本内纯合成测试值。
 需要已有 Python 测试依赖、根目录及云控目录的 npm 依赖和测试 Chromium。

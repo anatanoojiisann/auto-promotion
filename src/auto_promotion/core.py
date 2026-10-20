@@ -251,8 +251,14 @@ class Engine:
                 context = getattr(self.adapters.context, "job", None)
                 from .execution_channels import independent_active
 
+                if context and context.get("task_channel"):
+                    from .task_channels import guard_context
+
+                    guard_context(self, context)
                 local_independent = bool(
-                    context and context.get("channel") == "local" and independent_active(self)
+                    context
+                    and context.get("channel") == "local"
+                    and (context.get("task_channel") or independent_active(self))
                 )
                 cloud = None if local_independent else CloudControl.configured()
                 required = self.store.one(
@@ -494,6 +500,9 @@ class Engine:
 
         result["execution"]["pools"] = JobQueue(self).pools(task_id)
         result["readiness"] = self.readiness(result)
+        from .task_channels import snapshot
+
+        result["channel"] = snapshot(self, result)
         reply = self.store.one(
             "SELECT r.event_id,r.platform,r.account_id,i.payload FROM reply_inbox r "
             "JOIN items i ON i.id=r.item_id WHERE r.followup_task_id=? LIMIT 1",
@@ -1401,11 +1410,25 @@ class Engine:
 
     def _queue_pooled_task(self, task_id):
         runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
-        if (
-            not runtime
-            or runtime["value"] != "pooled"
-            or getattr(self.adapters.context, "job", None)
-        ):
+        if getattr(self.adapters.context, "job", None):
+            return False
+        explicit = False
+        if task_id:
+            task = self.store.one("SELECT policy,account_ids FROM tasks WHERE id=?", (task_id,))
+            explicit = bool(
+                task and json.loads(task["policy"]).get("execution_channel", "inherit") != "inherit"
+            )
+            if task and not explicit:
+                accounts = json.loads(task["account_ids"])
+                explicit = bool(
+                    self.store.one(
+                        "SELECT 1 FROM account_task_channels WHERE account_id IN ("
+                        + ",".join("?" for _ in accounts)
+                        + ") LIMIT 1",
+                        tuple(accounts),
+                    )
+                )
+        if not explicit and (not runtime or runtime["value"] != "pooled"):
             return False
         from .queue_store import JobQueue
 
@@ -1420,6 +1443,9 @@ class Engine:
             self.task(task_id)
         stopped = self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0"
         sql = "SELECT i.id,i.account_id,i.task_id,i.payload,i.due_at,t.policy,t.mode,t.next_at,t.state,t.phase FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.status='not_attempted' AND t.state NOT IN ('cancelled','completed')"
+        if not getattr(self.adapters.context, "job", None):
+            sql += " AND COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')='inherit'"
+            sql += " AND NOT EXISTS(SELECT 1 FROM account_task_channels ch WHERE ch.account_id=i.account_id)"
         params = ()
         if task_id:
             sql += " AND i.task_id=?"
