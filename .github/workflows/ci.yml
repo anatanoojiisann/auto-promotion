@@ -98,6 +98,17 @@ jobs:
       - run: python -m pip install '.[dev,telegram]'
       - run: python -m ruff check scripts/verify_windows.py tests/test_windows_verification.py
       - run: python -m ruff format --check scripts/verify_windows.py tests/test_windows_verification.py
+      - name: X final receipt recovery with synthetic accounts and temporary databases
+        run: python -m unittest discover -s tests -p test_private_receipt_recovery.py -v
+        env:
+          HOME: ${{ runner.temp }}/ap-x-receipt-home
+          USERPROFILE: ${{ runner.temp }}/ap-x-receipt-home
+          APPDATA: ${{ runner.temp }}/ap-x-receipt-home/AppData/Roaming
+          LOCALAPPDATA: ${{ runner.temp }}/ap-x-receipt-home/AppData/Local
+          AP_DB: ${{ runner.temp }}/ap-x-receipt-unused-default.db
+          AP_ACCOUNTS_DIR: ${{ runner.temp }}/ap-x-receipt-accounts
+          AUTO_PROMOTION_WORKSPACE: ${{ runner.temp }}/ap-x-receipt-home
+          AUTO_PROMOTION_LIVE_WRITES: '0'
       - name: Windows readonly collector contracts, Unicode paths and PowerShell CIM
         run: python -m unittest discover -s tests -p test_windows_verification.py -v
       - name: Isolated startup, queue and receipt failures
