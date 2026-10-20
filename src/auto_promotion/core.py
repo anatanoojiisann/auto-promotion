@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -284,7 +287,7 @@ class Engine:
             result = self.adapters.call(account, operation, payload or {})
         except Exception as exc:
             # Never expose provider exceptions: they may include tokens, URLs or browser state.
-            self.store.log_call(
+            self._log_call(
                 account["platform"],
                 operation,
                 "error",
@@ -305,7 +308,7 @@ class Engine:
             or (operation == "feedback" and result.get("verified") is not True)
         ):
             status = "error"
-        self.store.log_call(
+        self._log_call(
             account["platform"],
             operation,
             status,
@@ -315,6 +318,14 @@ class Engine:
             safe_code(result.get("execution_step"), None),
         )
         return result
+
+    def _log_call(self, *args):
+        # Diagnostic persistence must never discard an accepted provider result
+        # or replace the original provider error. Do not repeat the platform call.
+        try:
+            self.store.log_call(*args)
+        except sqlite3.Error as exc:
+            logging.getLogger(__name__).warning("call audit unavailable: %s", type(exc).__name__)
 
     def check_account(self, account_id):
         account = self.account(account_id)
@@ -1179,10 +1190,71 @@ class Engine:
         }
 
     def recover(self, lease_seconds=300):
+        from .final_receipts import binding, proof
+
+        cutoff = self.clock() - lease_seconds
+        # Private SQLite I/O must not hold the shared database's writer lock.
+        proofs = []
+        for row in self.store.rows(
+            "SELECT * FROM items WHERE attempt_id IS NOT NULL AND "
+            "((status='executing' AND claimed_at<?) OR status='unknown')",
+            (cutoff,),
+        ):
+            evidence = proof(self.store, row)
+            if evidence:
+                proofs.append(evidence)
         with self.store.connect(write=True) as db:
+            for claim, expected, result in proofs:
+                account = db.execute(
+                    "SELECT * FROM accounts WHERE id=?", (expected["account_id"],)
+                ).fetchone()
+                row = db.execute("SELECT * FROM items WHERE id=?", (claim["item_id"],)).fetchone()
+                job = db.execute(
+                    "SELECT * FROM execution_jobs WHERE id=?", (expected["job_id"],)
+                ).fetchone()
+                if (
+                    not account
+                    or not row
+                    or not job
+                    or row["status"] not in {"executing", "unknown"}
+                ):
+                    continue
+                if job["state"] == "leased" and job["lease_until"] > self.clock():
+                    continue
+                if (
+                    binding(
+                        db,
+                        claim,
+                        account["id"],
+                        account["platform"],
+                        account["backend_label"],
+                        job["id"],
+                    )
+                    != expected
+                ):
+                    continue
+                self.finish(claim, result, _db=db)
+                db.execute(
+                    "UPDATE execution_jobs SET state=?,owner=NULL,lease_until=0,updated_at=? "
+                    "WHERE id=?",
+                    (result["status"], self.clock(), job["id"]),
+                )
+                Store.audit(
+                    db,
+                    "attempt.private_receipt_reconciled",
+                    {
+                        "item_id": claim["item_id"],
+                        "attempt_id": claim["attempt_id"],
+                        "hash_scope": expected["hash_scope"],
+                    },
+                    claim["task_id"],
+                    self.clock(),
+                )
             rows = db.execute(
-                "SELECT id,task_id,attempt_id,result FROM items WHERE status='executing' AND claimed_at<?",
-                (self.clock() - lease_seconds,),
+                "SELECT id,task_id,attempt_id,result FROM items WHERE status='executing' AND claimed_at<? "
+                "AND NOT EXISTS(SELECT 1 FROM execution_jobs j WHERE j.kind='send' "
+                "AND j.reference_id=items.id AND j.state='leased' AND j.lease_until>?)",
+                (cutoff, self.clock()),
             ).fetchall()
             for row in rows:
                 db.execute(
@@ -1702,7 +1774,7 @@ class Engine:
         db.execute(
             "DELETE FROM content_contacts WHERE assignment_id IN (SELECT ca.id FROM campaign_assignments ca JOIN items i ON i.id=ca.item_id WHERE i.status IN ('cancelled','missed') AND i.attempt_id IS NULL)"
         )
-        scope = " AND id=?" if task_id else " AND state='active'"
+        scope = " AND id=? AND state='active'" if task_id else " AND state='active'"
         params = (self.clock(), task_id) if task_id else (self.clock(),)
         db.execute(
             "UPDATE tasks SET state='completed',updated_at=? "
@@ -1717,7 +1789,7 @@ class Engine:
             (self.clock(),),
         )
 
-    def finish(self, claim, result):
+    def finish(self, claim, result, *, _db=None):
         status = result.get("status", "unknown")
         reference = result.get("external_reference")
         if status == "confirmed" and not (result.get("verified") and reference):
@@ -1758,7 +1830,9 @@ class Engine:
         now = self.clock()
         if "published_at" in safe:
             safe["published_at"] = publication_time(safe["published_at"], now)
-        with self.store.connect(write=True) as db:
+        with (
+            contextlib.nullcontext(_db) if _db is not None else self.store.connect(write=True)
+        ) as db:
             row = db.execute(
                 "SELECT * FROM items WHERE id=? AND attempt_id=?",
                 (claim["item_id"], claim["attempt_id"]),

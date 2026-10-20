@@ -99,9 +99,12 @@ def dispatch(request):
         if write or operation == "verify":
             receipt = Receipts(platform, label)
             if write:
-                previous = receipt.begin(key, payload)
+                from .final_receipts import capture
+
+                receipt_binding = capture(request) if operation == "execute" else None
+                previous = receipt.begin(key, payload, binding=receipt_binding)
                 if previous is not None:
-                    return previous
+                    return {k: v for k, v in previous.items() if k in RESULT_FIELDS}
             else:
                 payload["receipt"] = receipt.read(key) or payload.get("result", {})
 
@@ -215,7 +218,30 @@ def dispatch(request):
                 ):
                     result["status"] = "unknown"
             checkpoint(result)
-        return result
+            if operation == "execute" and receipt_binding:
+                from .models import digest
+
+                # A provider checkpoint is not a final result. Publish final proof
+                # only after the provider has returned and normalization completed.
+                final_result = {k: v for k, v in result.items() if k in RESULT_FIELDS}
+                finalized_at = time.time()
+                receipt.save(
+                    key,
+                    {
+                        **(receipt.read(key) or {}),
+                        "receipt_binding": receipt_binding,
+                        "receipt_finalized_at": finalized_at,
+                        "receipt_final_result": final_result,
+                        "receipt_final_hash": digest(
+                            {
+                                "binding": receipt_binding,
+                                "result": final_result,
+                                "finalized_at": finalized_at,
+                            }
+                        ),
+                    },
+                )
+        return {k: v for k, v in result.items() if k in RESULT_FIELDS}
 
 
 def main():

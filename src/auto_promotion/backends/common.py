@@ -145,7 +145,7 @@ class Receipts:
             row = db.execute("SELECT result FROM receipts WHERE id=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
-    def begin(self, key, payload):
+    def begin(self, key, payload, *, binding=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -157,7 +157,17 @@ class Receipts:
                 return json.loads(row[1])
             db.execute(
                 "INSERT INTO receipts VALUES(?,?,?)",
-                (key, digest(payload), canonical({"status": "unknown", "verified": False})),
+                (
+                    key,
+                    digest(payload),
+                    canonical(
+                        {
+                            "status": "unknown",
+                            "verified": False,
+                            **({"receipt_binding": binding} if binding else {}),
+                        }
+                    ),
+                ),
             )
         return None
 

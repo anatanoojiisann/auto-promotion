@@ -374,9 +374,19 @@ class BrowserBackend:
             # X can render a second reply control far below the target tweet.
             # The first control belongs to the target article's action bar.
             reply_control = article.get_by_test_id("reply").first
-            if not reply_control.is_visible():
-                raise BackendError("BrowserReplyControlUnavailable")
-            reply_control.click()
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+            try:
+                # The article can render before its action bar. Wait for this
+                # exact control once; do not retry a submission or pick another tweet.
+                deadline = time.monotonic() + 15
+                reply_control.wait_for(state="visible", timeout=15000)
+                remaining = (deadline - time.monotonic()) * 1000
+                if remaining <= 0:
+                    raise BackendError("BrowserReplyControlUnavailable")
+                reply_control.click(timeout=max(1, remaining))
+            except PlaywrightTimeoutError:
+                raise BackendError("BrowserReplyControlUnavailable") from None
             self.step("reply_composer")
             # X uses either an inline composer or a modal, depending on the
             # current page layout. A hidden dialog shell may coexist with the

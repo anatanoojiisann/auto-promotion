@@ -45,6 +45,7 @@ class XBrowserTests(unittest.TestCase):
         self.reply_as_dialog = False
         self.post_limited = False
         self.reply_delay_ms = 0
+        self.reply_control_delay_ms = 0
         self.pending_image = False
         self.pending_routes = []
         self.editor_requires_keyboard = False
@@ -136,7 +137,7 @@ class XBrowserTests(unittest.TestCase):
           <a href="/{author}/status/{identifier}"><time>today</time></a>
           <div data-testid="tweetText">{text}</div>
           <button data-testid="{done}" onclick="this.dataset.testid='unlike'">Like</button>
-          <button data-testid="reply" onclick="setTimeout(()=>document.querySelector('{reply_destination}').hidden=false,{self.reply_delay_ms})">Reply</button>
+          <button data-testid="reply" style="visibility:{"hidden" if self.reply_control_delay_ms else "visible"}" onclick="setTimeout(()=>document.querySelector('{reply_destination}').hidden=false,{self.reply_delay_ms})">Reply</button>
           {extra_reply_control}
         </article>"""
         route.fulfill(
@@ -147,7 +148,9 @@ class XBrowserTests(unittest.TestCase):
             <div id="reply-compose" {" " if self.reply_as_dialog else "hidden"}>
               <div contenteditable="true" data-testid="tweetTextarea_0" onkeydown="document.querySelector('[data-testid=tweetButtonInline]').disabled=false"></div>
               <button data-testid="tweetButtonInline" {"disabled" if self.editor_requires_keyboard else ""} onclick="{inline_action}">Post</button>
-            </div>{dialog_compose}""",
+            </div>{dialog_compose}
+            <script>setTimeout(()=>document.querySelectorAll('article [data-testid=reply]').forEach(
+              button=>button.style.visibility='visible'),{self.reply_control_delay_ms})</script>""",
         )
 
     def test_reply_uses_one_submission_and_verifies_target_and_actual_author(self):
@@ -165,6 +168,12 @@ class XBrowserTests(unittest.TestCase):
 
     def test_extra_reply_control_does_not_prevent_target_reply(self):
         self.duplicate_reply_control = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_reply_control_that_renders_after_target_is_waited_for(self):
+        self.reply_control_delay_ms = 600
         result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
         self.assertEqual(result["status"], "confirmed")
         self.assertEqual((self.posts, self.checks), (1, 1))
