@@ -1,5 +1,9 @@
 # 测试说明
 
+Windows现场只读采集、隔离故障入口和交接清单见
+[Windows 验证 TODO](windows-verification-todo.md)。`scripts/verify_windows.py` 的
+collect/observe仅用标准库，不import项目Store/Engine；Windows专用合成CI不能替代现场验收。
+
 本仓库的默认测试不连接社交平台、不需要真实账号，也不依赖相邻后端目录。
 
 ## Python

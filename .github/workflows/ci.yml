@@ -86,3 +86,36 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+
+  windows-verification:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+      - run: python -m pip install '.[dev,telegram]'
+      - run: python -m ruff check scripts/verify_windows.py tests/test_windows_verification.py
+      - run: python -m ruff format --check scripts/verify_windows.py tests/test_windows_verification.py
+      - name: Windows readonly collector contracts, Unicode paths and PowerShell CIM
+        run: python -m unittest discover -s tests -p test_windows_verification.py -v
+      - name: Isolated startup, queue and receipt failures
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'windows-verification-faults.json'
+          python -s scripts/verify_windows.py faults --output $report
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic fault verification failed' }
+      - name: Default collector does not require a running service
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'windows-verification-collect.json'
+          python -s scripts/verify_windows.py collect --health-url http://127.0.0.1:1/health --output $report
+          if ($LASTEXITCODE -ne 2) { throw 'Missing field service must remain unverified' }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-verification-synthetic-reports
+          path: ${{ runner.temp }}/windows-verification-*.json
+          if-no-files-found: ignore
