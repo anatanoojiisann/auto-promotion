@@ -287,7 +287,12 @@ def verify_claim(request):
 
             # Recheck local ownership immediately before submission. All normal
             # task, stop, permission and payload checks above remain mandatory.
-            local_engine = Engine(Store(path), AdapterRegistry(path.parent), live_enabled=True)
+            # Submission checks read an initialized queue. Re-running schema
+            # migrations here can collide with an unrelated writer and turn a
+            # prepared reply into an uncertain outcome before submission.
+            local_engine = Engine(
+                Store(path, initialize=False), AdapterRegistry(path.parent), live_enabled=True
+            )
             try:
                 guard_local(local_engine, request["execution_job"], cloud)
             except CloudUnavailable:

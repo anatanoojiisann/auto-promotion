@@ -13,6 +13,7 @@ import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime, timezone
 from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -215,12 +216,14 @@ class ExtremeTelegramTests(unittest.TestCase):
         self.assertEqual(call("join")["status"], "pending_admin_approval")
         self.assertFalse(call("verify_join")["verified"])
         self.client.joined = True  # synthetic administrator approval
-        before = time.time()
-        result = call("verify_join")
+        before = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+        with patch("auto_promotion.backends.telegram.datetime", wraps=datetime) as clock:
+            clock.now.return_value = before
+            result = call("verify_join")
         self.assertTrue(result["verified"])
         from auto_promotion.models import epoch
 
-        self.assertGreaterEqual(epoch(result["outbound_eligible_at_utc"]), before + 3600)
+        self.assertEqual(epoch(result["outbound_eligible_at_utc"]), before.timestamp() + 3600)
         self.assertEqual(self.client.join_calls, 1)
 
     def test_timeout_incomplete_read_and_process_interruption_never_replay(self):
@@ -282,10 +285,13 @@ print(json.dumps(native_bridge.dispatch(request)))
             "AP_ACCOUNTS_DIR": self.temp.name,
             "SYNTHETIC_MARKER": str(marker),
         }
+        # Windows needs these non-secret OS paths to initialize asyncio/Winsock.
+        # Keep the child otherwise isolated from real service credentials.
+        env.update({key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR") if key in os.environ})
         first = subprocess.run(
             [sys.executable, "-c", program], env=env, capture_output=True, timeout=15
         )
-        self.assertEqual(first.returncode, 17)
+        self.assertEqual(first.returncode, 17, first.stderr.decode(errors="replace"))
         second = subprocess.run(
             [sys.executable, "-c", program], env=env, capture_output=True, timeout=15
         )

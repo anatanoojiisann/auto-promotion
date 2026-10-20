@@ -221,8 +221,12 @@ class Store:
             or str(exc).lower() in {"database is locked", "database table is locked"}
         )
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, initialize=True):
         self.path = str(Path(path).resolve())
+        if not initialize:
+            if not Path(self.path).is_file():
+                raise FileNotFoundError(self.path)
+            return
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)

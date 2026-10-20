@@ -13,6 +13,7 @@ import time
 from .backends.common import BackendError, Receipts, account_lock, verify_claim
 from .execution_diagnostics import FIELDS, exception_details
 from .models import PLATFORMS, canonical
+from .store import Store
 
 OPERATIONS = {
     "health",
@@ -71,6 +72,7 @@ RESULT_FIELDS = {
     "mutation_accepted",
 }
 RESULT_FIELDS.update(FIELDS)
+RESULT_FIELDS.add("progress_mirror_deferred")
 
 
 def dispatch(request):
@@ -111,8 +113,11 @@ def dispatch(request):
                 details = {
                     k: result[k] for k in FIELDS + ("external_reference", "reason") if k in result
                 }
-                with contextlib.closing(sqlite3.connect(request["database"], timeout=10)) as db:
-                    with db:
+                mirror = Store(request["database"], initialize=False)
+                mirror.lock_timeout = 0.2
+                mirror.lock_retry_delays = (0.05, 0.1, 0.2)
+                try:
+                    with mirror.connect(write=True) as db:
                         row = db.execute(
                             "SELECT result FROM items WHERE id=? AND attempt_id=? AND status='executing'",
                             (payload.get("item_id"), payload.get("attempt_id")),
@@ -130,6 +135,16 @@ def dispatch(request):
                             )
                         else:
                             raise BackendError("ExecutionClaimNotActive")
+                except sqlite3.OperationalError as exc:
+                    if receipt is None or not Store.locked(exc):
+                        raise
+                    # The synchronous, account-local receipt above is already
+                    # durable. A busy shared progress mirror must not abort a
+                    # reply. Submission still performs every normal claim,
+                    # stop, permission, quota and lease check through authorize.
+                    receipt.save(
+                        key, {**(receipt.read(key) or {}), "progress_mirror_deferred": True}
+                    )
 
         def progress(step, submission_started=None):
             details = {"execution_step": step, "step_started_at": time.time()}

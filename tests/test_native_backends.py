@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import sqlite3
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -225,6 +227,183 @@ class ClaimTests(unittest.TestCase):
         self.engine.set_stop(True)
         with self.assertRaises(BackendError):
             verify_claim(self.request)
+
+    def test_local_submit_check_survives_an_unrelated_database_writer(self):
+        from auto_promotion.execution_channels import binding
+
+        now = time.time()
+        context = {
+            "id": "send:" + self.request["payload"]["item_id"],
+            "owner": "local-test",
+            "channel": "local",
+            "generation": "test-generation",
+            "store_id": binding(self.engine),
+            "node_id": "test-node",
+        }
+        state = {
+            **context,
+            "active": "local",
+            "authorization": "local_queue",
+            "reason": "explicit_user_local",
+            "until": now + 3600,
+            "account_ids": [self.account["id"]],
+        }
+        task_id = self.request["payload"]["task_id"]
+        with self.store.connect(write=True) as db:
+            for key, value in (
+                ("execution_channel_policy", "cloud_then_local"),
+                ("local_channel_authority", json.dumps({"account_ids": state["account_ids"]})),
+                ("execution_channel", json.dumps(state)),
+            ):
+                db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, value))
+            db.execute(
+                "INSERT INTO execution_jobs(id,kind,reference_id,task_id,account_id,pool,route,"
+                "version,available_at,expires_at,state,owner,lease_until,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    context["id"],
+                    "send",
+                    self.request["payload"]["item_id"],
+                    task_id,
+                    self.account["id"],
+                    "telegram.mtproto",
+                    "{}",
+                    "test",
+                    now - 1,
+                    now + 900,
+                    "leased",
+                    context["owner"],
+                    now + 90,
+                    now,
+                    now,
+                ),
+            )
+        self.request["execution_job"] = context
+        # A WAL reader must not need the schema writer lock just to reauthorize.
+        with patch.dict(os.environ, {"AP_NODE_ID": "test-node"}):
+            writer = sqlite3.connect(self.store.path)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                verify_claim(self.request)
+            finally:
+                writer.close()
+            self.engine.set_stop(True)
+            with self.assertRaisesRegex(BackendError, "ExecutionStopped"):
+                verify_claim(self.request)
+
+    def test_existing_store_check_never_creates_a_missing_database(self):
+        missing = Path(self.tmp.name) / "missing.sqlite"
+        with self.assertRaises(FileNotFoundError):
+            Store(missing, initialize=False)
+        self.assertFalse(missing.exists())
+
+    def test_progress_waits_for_writer_and_never_replays_submission(self):
+        locked, release = threading.Event(), threading.Event()
+        submissions = []
+
+        def hold_writer():
+            writer = sqlite3.connect(self.store.path)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                locked.set()
+                release.wait(3)
+            finally:
+                writer.close()
+
+        def submit(label, operation, payload, checkpoint, authorize):
+            thread = threading.Thread(target=hold_writer)
+            thread.start()
+            self.addCleanup(thread.join)
+            self.addCleanup(release.set)
+            self.assertTrue(locked.wait(2))
+            timer = threading.Timer(0.1, release.set)
+            timer.start()
+            self.addCleanup(timer.join)
+            checkpoint.progress("submit_click", True)
+            observed = self.store.one("SELECT result FROM items WHERE id=?", (payload["item_id"],))
+            self.assertTrue(json.loads(observed["result"])["submission_started"])
+            submissions.append(True)
+            result = {
+                "status": "confirmed",
+                "verified": True,
+                "external_reference": "telegram:@public_group:123",
+            }
+            checkpoint(result)
+            return result
+
+        with patch("auto_promotion.backends.telegram.call", submit):
+            first = native_bridge.dispatch(self.request)
+            second = native_bridge.dispatch(self.request)
+        self.assertEqual(submissions, [True])
+        self.assertEqual(first, second)
+        self.assertTrue(first["verified"])
+
+    def test_busy_progress_mirror_keeps_durable_marker_and_submits_once(self):
+        locked, release = threading.Event(), threading.Event()
+        submissions = []
+
+        def holder():
+            writer = sqlite3.connect(self.store.path)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                locked.set()
+                release.wait(10)
+            finally:
+                writer.close()
+
+        def submit(label, operation, payload, checkpoint, authorize):
+            thread = threading.Thread(target=holder)
+            thread.start()
+            self.addCleanup(thread.join)
+            self.addCleanup(release.set)
+            self.assertTrue(locked.wait(2))
+            started = time.monotonic()
+            checkpoint.progress("submit_click", True)
+            self.assertLess(time.monotonic() - started, 2)
+            saved = Receipts("telegram", "default").read("execute:" + payload["item_id"])
+            self.assertTrue(saved["submission_started"])
+            self.assertTrue(saved["progress_mirror_deferred"])
+            authorize()
+            submissions.append(True)
+            release.set()
+            thread.join(2)
+            result = {
+                "status": "confirmed",
+                "verified": True,
+                "external_reference": "telegram:@public_group:123",
+            }
+            checkpoint(result)
+            return result
+
+        with patch("auto_promotion.backends.telegram.call", submit):
+            first = native_bridge.dispatch(self.request)
+            second = native_bridge.dispatch(self.request)
+        self.assertEqual(submissions, [True])
+        self.assertEqual(first, second)
+
+    def test_private_marker_failure_still_prevents_submission(self):
+        submissions = []
+        original = Receipts.save
+        failed = []
+
+        def save(receipts, key, result):
+            if result.get("execution_step") == "submit_click" and not failed:
+                failed.append(True)
+                raise sqlite3.OperationalError("database is locked")
+            return original(receipts, key, result)
+
+        def submit(label, operation, payload, checkpoint, authorize):
+            checkpoint.progress("submit_click", True)
+            submissions.append(True)
+            return {"status": "confirmed", "verified": True}
+
+        with (
+            patch.object(Receipts, "save", save),
+            patch("auto_promotion.backends.telegram.call", submit),
+        ):
+            result = native_bridge.dispatch(self.request)
+        self.assertEqual(submissions, [])
+        self.assertEqual(result["status"], "unknown")
 
     def test_changed_payload_cannot_use_claim(self):
         self.request["payload"]["payload"]["text"] = "changed"

@@ -29,7 +29,7 @@ def call(platform, settings, operation):
         raise BackendError("InvalidBrowserUseConfiguration")
     try:
         UUID(settings["browser_instance_id"])
-        if settings["browser_family"] != "chrome" or not re.fullmatch(
+        if settings["browser_family"] not in {"chrome", "edge"} or not re.fullmatch(
             r"[1-9][0-9]*", settings["browser_tab_id"]
         ):
             raise ValueError

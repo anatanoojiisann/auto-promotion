@@ -27,6 +27,21 @@ class BrowserUseConnectionTests(unittest.TestCase):
         settings["browser_use_observation"]["profile_href"] = "/another"
         self.assertFalse(call("x", settings, "health")["healthy"])
 
+    @patch("auto_promotion.backends.browser_use.time.time", return_value=1001)
+    def test_edge_observation_verifies_identity_without_enabling_actions(self, _clock):
+        settings = self.settings()
+        settings["browser_family"] = "edge"
+        self.assertTrue(call("x", settings, "health")["identity_verified"])
+        self.assertFalse(call("x", settings, "preflight")["allowed"])
+        with self.assertRaises(BackendError):
+            call("x", settings, "execute")
+
+    def test_unsupported_browser_family_is_rejected(self):
+        settings = self.settings()
+        settings["browser_family"] = "unknown"
+        with self.assertRaises(BackendError):
+            call("x", settings, "health")
+
     @patch("auto_promotion.backends.browser_use.time.time", return_value=1301)
     def test_expired_observation_requires_browser_recheck(self, _clock):
         result = call("x", self.settings(), "health")
