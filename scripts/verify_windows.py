@@ -207,11 +207,12 @@ def loopback_health(url, disk, timeout=2):
 
 WINDOWS_METADATA = r"""
 $ErrorActionPreference='Stop'
-$p=@(Get-CimInstance Win32_Process -Filter "Name LIKE 'python%' OR Name LIKE 'auto-promotion%'" |
+$p=@(Get-CimInstance Win32_Process -OperationTimeoutSec 5 -Filter "Name LIKE 'python%' OR Name LIKE 'auto-promotion%'" |
   Select-Object ProcessId,Name,@{n='Started';e={$_.CreationDate.ToUniversalTime().ToString('o')}})
-$s=@(Get-CimInstance Win32_Service -Filter "Name LIKE '%auto%promotion%'" |
+$s=@(Get-CimInstance Win32_Service -OperationTimeoutSec 5 -Filter "Name LIKE '%auto%promotion%'" |
   Select-Object Name,State,ProcessId,StartMode)
-$t=@(Get-ScheduledTask | Where-Object {$_.TaskName -match '^auto[-_ ]?promotion'} |
+$t=@(Get-CimInstance -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName MSFT_ScheduledTask `
+  -OperationTimeoutSec 5 -Filter "TaskName LIKE 'auto%promotion%'" |
   Select-Object TaskName,State)
 @{processes=$p;services=$s;scheduled_tasks=$t} | ConvertTo-Json -Depth 4 -Compress
 """
@@ -231,7 +232,7 @@ def windows_evidence():
                 "[Console]::OutputEncoding=[Text.UTF8Encoding]::new();" + WINDOWS_METADATA,
             ],
             capture_output=True,
-            timeout=15,
+            timeout=20,
             check=True,
         )
         if len(result.stdout) > 1048576:
@@ -506,7 +507,8 @@ def observe(
         or deadline > clock() + 3600
     ):
         return check("failed", "ExplicitBoundedTaskWindowRequired")
-    end = min(clock() + duration, deadline)
+    started = clock()
+    end = min(started + duration, deadline)
     samples = []
     for _ in range(min(301, int(duration / interval) + 2)):
         samples.append(reader(database, task_id, now=clock()))
@@ -523,16 +525,24 @@ def observe(
         for s in samples[1:]
     )
     task = last.get("task", {})
-    if changed:
-        code, status = "QueueChangedNotDeliveryProof", "passed"
-    elif last.get("counts", {}).get("unknown"):
+    if any(sample.get("counts", {}).get("unknown") for sample in samples):
         code, status = "UnknownReadOnlyReconciliationRequired", "unverified"
-    elif task.get("starts_at") is None or task.get("ends_at") is None:
+    elif any(
+        sample.get("task", {}).get("starts_at") is None
+        or sample.get("task", {}).get("ends_at") is None
+        for sample in samples
+    ):
         code, status = "TaskWindowUnverified", "unverified"
+    elif any(sample["task"]["ends_at"] <= sample["task"]["starts_at"] for sample in samples):
+        code, status = "TaskWindowInvalid", "unverified"
     elif clock() > until or clock() >= task["ends_at"]:
         code, status = "WindowExpiredNoAutomaticResume", "unverified"
-    elif last.get("future") or clock() < since or task["starts_at"] > clock():
-        code, status = "FutureWork", "passed"
+    elif any(
+        any(sample.get("counts", {}).get(state) for state in ("failed", "failed_known", "missed"))
+        or sample.get("task", {}).get("state") in {"failed", "missed", "cancelled"}
+        for sample in samples
+    ):
+        code, status = "UnsuccessfulQueueOutcomesNeedReview", "unverified"
     elif (
         last.get("counts", {}).get("pending_admin_approval")
         or last.get("counts", {}).get("waiting_dependency")
@@ -543,6 +553,12 @@ def observe(
         "discovery",
     }:
         code, status = "WaitingApprovalOrDependency", "unverified"
+    elif not last.get("due_pending") and (
+        last.get("future") or clock() < since or task["starts_at"] > clock()
+    ):
+        code, status = "FutureWork", "passed"
+    elif changed:
+        code, status = "QueueChangedNotDeliveryProof", "unverified"
     elif (
         last.get("due_pending")
         and not last.get("active_leases")
@@ -558,7 +574,8 @@ def observe(
         status,
         code,
         samples=len(samples),
-        observed_seconds=duration,
+        observed_seconds=max(0, clock() - started),
+        queue_changed=changed,
         window={"since": since, "until": until},
         final=last,
     )
@@ -568,7 +585,7 @@ def faults(timeout=180):
     """Reviewed source/test copies, minimal env, temporary worktree; no production imports here."""
     missing = [
         name
-        for name in ("fastapi", "pydantic", "telethon")
+        for name in ("fastapi", "pydantic", "telethon", "httpx")
         if importlib.util.find_spec(name) is None
     ]
     if missing:

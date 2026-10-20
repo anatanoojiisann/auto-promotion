@@ -93,7 +93,7 @@ private payload_hash 与中央 content_hash 作用域不同，不直接比较或
 
 ## 4. 隔离故障回归
 
-- [ ] 已有环境具备项目 FastAPI/Pydantic/Telegram 测试依赖，才运行以下命令；
+- [ ] 已有环境具备项目 FastAPI/Pydantic/Telegram 和 dev 中的 HTTPX 测试依赖，才运行以下命令；
   缺依赖是未验证，依赖安装仍需现场批准。
 
 ```powershell
@@ -126,6 +126,8 @@ AP_DB、AP_ACCOUNTS_DIR 和工作区均隔离，父环境的平台凭据不继�
 无队列变化且有到期任务，也只报 `SuspectedStallNeedsHostAndDependencyEvidence`；
 还要结合健康、实际池进程及依赖证据，不能自动恢复或重发。
 统计有变化只证明队列变化，不证明投递成功。读取最多可能超出deadline一个250ms DB等待。
+`queue_changed` 独立记录；unknown、窗口缺失/过期、失败/错过投递优先保留未验证。
+只有没有到期 backlog 的 future 项才归类预期等待，不能用稍后的任务遮盖已到期任务。
 
 ## 验收、报告与退出
 

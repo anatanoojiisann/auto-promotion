@@ -272,8 +272,10 @@ CREATE TABLE items(id TEXT,task_id TEXT,status TEXT,attempt_id TEXT,external_ref
 
         self.assertEqual(run()["code"], "SuspectedStallNeedsHostAndDependencyEvidence")
         sample["future"] = 1
+        sample["due_pending"] = 0
         self.assertEqual(run()["code"], "FutureWork")
         sample["future"] = 0
+        sample["due_pending"] = 1
         sample["counts"] = {"unknown": 1}
         self.assertEqual(run()["code"], "UnknownReadOnlyReconciliationRequired")
         sample["counts"] = {}
@@ -286,6 +288,64 @@ CREATE TABLE items(id TEXT,task_id TEXT,status TEXT,attempt_id TEXT,external_ref
         self.assertEqual(run()["code"], "IncompleteObservation")
         self.assertLessEqual(now[0], 103)
         self.assertEqual(tool.observe(self.db_path, "", 1, 2, 9999, 0, 100)["status"], "failed")
+
+    def test_future_item_never_hides_an_unchanged_due_backlog(self):
+        now = [1790000000.0]
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("INSERT INTO execution_jobs VALUES('pending','t',1790001000,2000000000,1,0)")
+        result = tool.observe(
+            self.db_path,
+            "t",
+            1789999000,
+            1790002000,
+            1,
+            1,
+            1790000010,
+            clock=lambda: now[0],
+            sleep=lambda amount: now.__setitem__(0, now[0] + amount),
+        )
+        self.assertEqual(result["status"], "unverified")
+        self.assertEqual(result["code"], "SuspectedStallNeedsHostAndDependencyEvidence")
+        self.assertEqual(result["final"]["due_pending"], 1)
+        self.assertEqual(result["final"]["future"], 1)
+
+    def test_changed_queue_never_overrides_unknown_missing_or_expired_window(self):
+        for mode, expected in (
+            ("unknown", "UnknownReadOnlyReconciliationRequired"),
+            ("missing", "TaskWindowUnverified"),
+            ("expired", "WindowExpiredNoAutomaticResume"),
+        ):
+            with self.subTest(mode=mode):
+                now = [100.0]
+                first = {
+                    "status": "passed",
+                    "counts": {"pending": 1},
+                    "last_queue_update": 1,
+                    "task": {"starts_at": 90, "ends_at": 200, "phase": "ready", "state": "active"},
+                }
+                second = json.loads(json.dumps(first))
+                second["last_queue_update"] = 2
+                if mode == "unknown":
+                    second["counts"] = {"unknown": 1}
+                elif mode == "missing":
+                    second["task"]["ends_at"] = None
+                else:
+                    second["task"]["ends_at"] = 99
+                result = tool.observe(
+                    self.db_path,
+                    "t",
+                    90,
+                    200,
+                    1,
+                    1,
+                    110,
+                    reader=lambda *a, **k: first if now[0] == 100 else second,
+                    clock=lambda: now[0],
+                    sleep=lambda amount: now.__setitem__(0, now[0] + amount),
+                )
+                self.assertEqual(result["status"], "unverified")
+                self.assertEqual(result["code"], expected)
+                self.assertTrue(result["queue_changed"])
 
     def test_log_tail_only_exports_allowlisted_codes_with_bounded_time(self):
         log = self.root / "synthetic.log"
@@ -302,6 +362,58 @@ CREATE TABLE items(id TEXT,task_id TEXT,status TEXT,attempt_id TEXT,external_ref
         self.assertEqual(result["window_counts"], {"OperationalError": 1})
         self.assertEqual(result["unknown_time_lines"], 1)
         self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_observation_indicator_matrix_never_overrides_uncertain_or_failed_evidence(self):
+        for changed in (False, True):
+            for future in (0, 1):
+                for issue in ("unknown", "missing", "expired", "due", "failed", "missed"):
+                    with self.subTest(changed=changed, future=future, issue=issue):
+                        now = [100.0]
+                        sample = {
+                            "status": "passed",
+                            "counts": {"pending": 1},
+                            "last_queue_update": 1,
+                            "future": future,
+                            "due_pending": 1,
+                            "global_stop": False,
+                            "active_leases": 0,
+                            "task": {
+                                "starts_at": 90,
+                                "ends_at": 200,
+                                "phase": "ready",
+                                "state": "active",
+                            },
+                        }
+                        if issue == "unknown":
+                            sample["counts"]["unknown"] = 1
+                        if issue == "missing":
+                            sample["task"]["ends_at"] = None
+                        if issue == "expired":
+                            sample["task"]["ends_at"] = 99
+                        if issue in {"failed", "missed"}:
+                            sample["counts"][issue] = 1
+
+                        def read(*args, **kwargs):
+                            value = json.loads(json.dumps(sample))
+                            if changed and now[0] > 100:
+                                value["last_queue_update"] = 2
+                            return value
+
+                        result = tool.observe(
+                            self.db_path,
+                            "t",
+                            90,
+                            200,
+                            1,
+                            1,
+                            110,
+                            reader=read,
+                            clock=lambda: now[0],
+                            sleep=lambda amount: now.__setitem__(0, now[0] + amount),
+                        )
+                        self.assertEqual(result["status"], "unverified")
+                        self.assertNotEqual(result["code"], "FutureWork")
+                        self.assertEqual(result["queue_changed"], changed)
 
     def test_output_utf8_never_overwrites_inputs_or_existing_report(self):
         output = self.root / "报告.json"
@@ -344,7 +456,8 @@ CREATE TABLE items(id TEXT,task_id TEXT,status TEXT,attempt_id TEXT,external_ref
 
     @unittest.skipUnless(sys.platform == "win32", "actual Windows PowerShell/CIM required")
     def test_actual_windows_powershell_metadata_is_readable(self):
-        self.assertEqual(tool.windows_evidence()["status"], "passed")
+        result = tool.windows_evidence()
+        self.assertEqual(result["status"], "passed", result)
 
 
 if __name__ == "__main__":

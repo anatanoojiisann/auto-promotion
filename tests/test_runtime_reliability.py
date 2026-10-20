@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from unittest.mock import patch
 
 import test_persistent_pools as fixtures
@@ -31,7 +32,7 @@ class RuntimeReliabilityTests(unittest.TestCase):
         locked, release = threading.Event(), threading.Event()
 
         def holder():
-            with sqlite3.connect(self.store.path) as db:
+            with closing(sqlite3.connect(self.store.path)) as db, db:
                 db.execute("BEGIN IMMEDIATE")
                 locked.set()
                 release.wait(2)
@@ -79,7 +80,7 @@ class RuntimeReliabilityTests(unittest.TestCase):
 
     def test_existing_binding_is_read_only_under_other_writer(self):
         expected = binding(self.engine)
-        with sqlite3.connect(self.store.path) as db:
+        with closing(sqlite3.connect(self.store.path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             self.assertEqual(binding(self.engine), expected)
 
@@ -201,7 +202,7 @@ class RuntimeReliabilityTests(unittest.TestCase):
     def test_historical_orphan_fails_closed_without_exporting_partial_snapshot(self):
         self.fixture.ready()
         # Reproduce an old/imported database with unenforced foreign keys.
-        with sqlite3.connect(self.store.path) as db:
+        with closing(sqlite3.connect(self.store.path)) as db, db:
             db.execute("DELETE FROM tasks")
         with self.assertRaisesRegex(CloudUnavailable, "CloudSnapshotInconsistent"):
             export_snapshot(self.engine)
