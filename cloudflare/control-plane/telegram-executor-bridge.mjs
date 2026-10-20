@@ -1,7 +1,22 @@
 import { ControlError } from "./kernel.mjs";
 
 const PREFIX = "/v1/executor/telegram/";
-export async function telegramExecutorBridge(env, workflows, path, body) {
+export function executorRequestId(value) {
+  return typeof value === "string" &&
+    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+      value,
+    )
+    ? value
+    : crypto.randomUUID();
+}
+export async function telegramExecutorBridge(
+  env,
+  workflows,
+  path,
+  body,
+  incomingRequestId,
+) {
+  const request_id = executorRequestId(incomingRequestId);
   if (!env.TELEGRAM_EXECUTOR)
     throw new ControlError("TelegramExecutorNotBound", 409);
   const plan = workflows.plan(body.plan_id);
@@ -15,6 +30,18 @@ export async function telegramExecutorBridge(env, workflows, path, body) {
     if (!body.source)
       throw new ControlError("ExplicitExecutorSetupRequired", 400);
     input.operation = action === "login-begin" ? "login_begin" : "login_poll";
+    for (const key of ["flow_id", "replace_flow_id"]) {
+      if (body[key] !== undefined) {
+        if (!/^[a-f0-9-]{36}$/.test(body[key]))
+          throw new ControlError("InvalidLoginFlow", 400);
+        input[key] = body[key];
+      }
+    }
+    if (body.generation !== undefined) {
+      if (!Number.isSafeInteger(body.generation) || body.generation < 1)
+        throw new ControlError("InvalidLoginFlow", 400);
+      input.generation = body.generation;
+    }
   } else if (action === "read") {
     const operation = body.read?.operation;
     if (
@@ -39,7 +66,10 @@ export async function telegramExecutorBridge(env, workflows, path, body) {
     "https://telegram-executor/internal",
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-AP-Request-ID": request_id,
+      },
       body: JSON.stringify(input),
     },
   );
@@ -49,5 +79,5 @@ export async function telegramExecutorBridge(env, workflows, path, body) {
       result.reason || result.error || "TelegramExecutorUnavailable",
       response.status,
     );
-  return result;
+  return { ...result, request_id };
 }

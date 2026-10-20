@@ -44,6 +44,15 @@ test("production Worker enforces the fence on online and standby requests", asyn
         WORKSPACE_ID: "synthetic-only",
         LOCAL_CHANNEL_UNTIL: String(Date.now() / 1000 + 3600),
         TG_QUEUE_BRIDGE: "synthetic-executor-bridge",
+        TELEGRAM_EXECUTOR_ACCOUNT: "synthetic-account",
+      },
+      serviceBindings: {
+        TELEGRAM_EXECUTOR: async () =>
+          Response.json({
+            status: "authorized",
+            reader_started: false,
+            last_verified_at: "2026-10-20T00:00:00Z",
+          }),
       },
       durableObjects: {
         CONTROL: { className: "WorkspaceCoordinator", useSQLite: true },
@@ -61,6 +70,7 @@ test("production Worker enforces the fence on online and standby requests", asyn
       token = "synthetic-node",
       method = "POST",
       proof = true,
+      requestId,
     } = {},
   ) => {
     body = operator ? { ...body, local_store_id: "only-db" } : body;
@@ -70,6 +80,7 @@ test("production Worker enforces the fence on online and standby requests", asyn
         Authorization: "Bearer " + (operator ? "synthetic-operator" : token),
         "X-Node-ID": node,
         "Content-Type": "application/json",
+        ...(requestId ? { "X-AP-Request-ID": requestId } : {}),
         "X-Local-Control-Proof": proof
           ? await controlProof(canonical(body), await sha("synthetic-node"))
           : "forged",
@@ -325,6 +336,23 @@ test("production Worker enforces the fence on online and standby requests", asyn
       source: "explicit_human_start",
     });
     assert.equal(r.status, 200, await r.clone().text());
+    r = await request("/v1/workflow/status", { id: definition.id });
+    assert.equal((await r.json()).counts.waiting_cloud_executor, 1);
+    const setupRequestId = "00000000-0000-4000-8000-000000000001";
+    r = await request(
+      "/v1/executor/telegram/login-poll",
+      {
+        plan_id: definition.id,
+        source: "explicit_login_setup",
+      },
+      { requestId: setupRequestId },
+    );
+    assert.equal(r.status, 200, await r.clone().text());
+    const login = await r.json();
+    assert.equal(login.status, "authorized");
+    assert.equal(login.request_id, setupRequestId);
+    assert.equal(login.reader_started, false);
+    assert.equal(Object.hasOwn(login, "reader"), false);
     r = await request("/v1/workflow/status", { id: definition.id });
     assert.equal((await r.json()).counts.waiting_cloud_executor, 1);
     r = await request(

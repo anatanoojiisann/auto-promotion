@@ -11,7 +11,10 @@ import { standbyCheck } from "./standby.mjs";
 import { issuePermit, offlineCheck, controlProof } from "./offline-permit.mjs";
 import { WorkflowQueue } from "./workflow-queue.mjs";
 import { PublicResearch } from "./public-research.mjs";
-import { telegramExecutorBridge } from "./telegram-executor-bridge.mjs";
+import {
+  telegramExecutorBridge,
+  executorRequestId,
+} from "./telegram-executor-bridge.mjs";
 import { TelegramWorkflowReader } from "./telegram-workflow-reader.mjs";
 import {
   TelegramNativeGate,
@@ -173,28 +176,10 @@ export class WorkspaceCoordinator extends DurableObject {
               this.workflows,
               path,
               body,
+              request.headers.get("X-AP-Request-ID"),
             );
-          if (
-            path === "/v1/executor/telegram/login-poll" &&
-            result.status === "authorized"
-          ) {
-            try {
-              result.reader = await this.telegramReader.start(
-                body.plan_id,
-                body.source,
-              );
-              this.publicResearch.stop(
-                body.plan_id,
-                "authenticated_reader_enabled",
-              );
-              this.ctx.waitUntil(this.telegramReader.tick());
-            } catch {
-              result.reader = {
-                started: false,
-                reason: "reader_setup_pending",
-              };
-            }
-          }
+          // Login confirms identity only. Reader execution remains behind the
+          // separate, explicit start-reader route above, including its guards.
         }
       } else if (path.startsWith("/v1/workflow/")) {
         const operator = request.headers.get("X-Control-Role") === "operator";
@@ -430,6 +415,10 @@ export default {
         "X-Local-Control-Proof",
         request.headers.get("X-Local-Control-Proof"),
       );
+    headers.set(
+      "X-AP-Request-ID",
+      executorRequestId(request.headers.get("X-AP-Request-ID")),
+    );
     if (token && (await sha(token)) === (await sha(env.OPERATOR_TOKEN)))
       headers.set("X-Control-Role", "operator");
     else {

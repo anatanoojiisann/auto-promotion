@@ -3,10 +3,15 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
+import socket
+import ssl
 import time
+import uuid
+from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -16,12 +21,48 @@ from .models import canonical, epoch
 from .routing import ExecutionRoute, route_for
 
 
+def _safe_transport_cause(error):
+    """Finite, cyclic-safe classification; never stringify an exception/cause."""
+    seen = set()
+    for _ in range(4):
+        if not isinstance(error, BaseException) or id(error) in seen:
+            break
+        seen.add(id(error))
+        for cls, category in (
+            (TimeoutError, "timeout"),
+            (ssl.SSLError, "tls"),
+            (socket.gaierror, "dns"),
+            (RemoteDisconnected, "remote_disconnected"),
+            (IncompleteRead, "incomplete_read"),
+            (ConnectionRefusedError, "connection_refused"),
+            (ConnectionResetError, "connection_reset"),
+            (json.JSONDecodeError, "json_decode"),
+            (UnicodeDecodeError, "text_decode"),
+            (HTTPError, "http_rejected"),
+        ):
+            if isinstance(error, cls):
+                return category
+        error = error.reason if isinstance(error, URLError) else error.__cause__
+    return "unknown"
+
+
+def _safe_diagnostic_id(value):
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        parsed = uuid.UUID(value)
+        return value if parsed.version == 4 and str(parsed) == value else None
+    except ValueError:
+        return None
+
+
 class CloudUnavailable(RuntimeError):
     safe_code = "CloudControlUnavailable"
 
-    def __init__(self, code, *, retry_after_seconds=None):
+    def __init__(self, code, *, retry_after_seconds=None, diagnostics=None):
         super().__init__(code)
         self.retry_after_seconds = retry_after_seconds
+        self.diagnostics = diagnostics
 
 
 class CloudJobClosed(CloudUnavailable):
@@ -42,6 +83,87 @@ class CloudControl:
         self.url = url.rstrip("/")
         self.node_id, self.node_token, self.operator_token = node_id, node_token, operator_token
         self.last_contact_monotonic = None
+        self.last_request_diagnostics = None
+        self._diagnostic_logs = 0
+        self._diagnostic_normal_logs = 0
+
+    def _request_diagnostic(self, request_id, path, started, outcome, **metadata):
+        try:
+            return self._build_request_diagnostic(request_id, path, started, outcome, **metadata)
+        except Exception:
+            # Even malformed error objects or a failing formatter are optional
+            # diagnostics. Preserve the original successful result/exception.
+            result = {"schema": 1, "request_id": request_id, "outcome": "diagnostic_unavailable"}
+            self.last_request_diagnostics = result
+            return result
+
+    def _build_request_diagnostic(
+        self,
+        request_id,
+        path,
+        started,
+        outcome,
+        *,
+        error=None,
+        status=None,
+        payload=None,
+        parse_error=None,
+        context=None,
+    ):
+        # No URL, body, account, exception text, stack or credential is retained.
+        operation = {
+            "/v1/executor/telegram/login-begin": "login_begin",
+            "/v1/executor/telegram/login-poll": "login_poll",
+            "/v1/executor/telegram/status": "status",
+            "/v1/executor/telegram/read": "read",
+        }.get(path, "cloud_request")
+        result = {
+            "schema": 1,
+            "request_id": request_id,
+            "operation": operation,
+            "outcome": outcome,
+            "elapsed_ms": min(1200000, max(0, int((time.monotonic() - started) * 1000))),
+            "timeout_ms": 12000,
+        }
+        if error is not None:
+            result["cause"] = _safe_transport_cause(error)
+        if parse_error is not None:
+            result["response_parse_cause"] = _safe_transport_cause(parse_error)
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            result["http_status"] = status
+        if isinstance(payload, dict):
+            for key in ("flow_id", "request_id"):
+                value = _safe_diagnostic_id(payload.get(key))
+                if value:
+                    result["response_request_id" if key == "request_id" else key] = value
+            generation = payload.get("generation")
+            if (
+                isinstance(generation, int)
+                and not isinstance(generation, bool)
+                and 0 < generation < 2**53
+            ):
+                result["generation"] = generation
+        if "flow_id" not in result and isinstance(context, dict):
+            flow_id = _safe_diagnostic_id(context.get("flow_id"))
+            if flow_id:
+                result["flow_id"] = flow_id
+        self.last_request_diagnostics = result
+        if (
+            operation != "cloud_request"
+            and self._diagnostic_logs < 96
+            and (outcome != "completed" or self._diagnostic_normal_logs < 64)
+        ):
+            self._diagnostic_logs += 1
+            if outcome == "completed":
+                self._diagnostic_normal_logs += 1
+            try:
+                logger = logging.getLogger(__name__)
+                (logger.info if outcome == "completed" else logger.warning)(
+                    "cloud_request %s", json.dumps(result, sort_keys=True)
+                )
+            except Exception:
+                pass  # An optional log sink must never change the request outcome.
+        return result
 
     @classmethod
     def configured(cls):
@@ -66,6 +188,8 @@ class CloudControl:
         )
 
     def request(self, path, data=None, *, operator=False, method="POST"):
+        request_id = str(uuid.uuid4())
+        started = time.monotonic()
         token = self.operator_token if operator else self.node_token
         if not token or (not operator and not self.node_id):
             raise CloudUnavailable("CloudCredentialNotConfigured")
@@ -74,6 +198,7 @@ class CloudControl:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "AutoPromotionExecutor/1.0",
+            "X-AP-Request-ID": request_id,
         }
         if not operator:
             headers["X-Node-ID"] = self.node_id
@@ -114,27 +239,53 @@ class CloudControl:
             with urlopen(request, timeout=12) as response:
                 result = json.load(response)
                 self.last_contact_monotonic = time.monotonic()
+                self._request_diagnostic(
+                    request_id,
+                    path,
+                    started,
+                    "completed",
+                    status=getattr(response, "status", None),
+                    payload=result,
+                    context=data,
+                )
                 return result
         except HTTPError as exc:
             # Provider responses and URLs may contain secrets. Only expose our allowlisted code.
+            parse_error = None
             try:
                 details = json.loads(exc.read(4096))
                 code = details.get("error", "CloudRequestRejected")
                 if code == "CloudRequestRejected" and details.get("error_code") == 1101:
                     code = "CloudWorkerException"
                 retry = details.get("retry_after_seconds")
-            except Exception:
+            except Exception as decode_error:
                 code = "CloudRequestRejected"
                 retry = None
+                parse_error = decode_error
             finally:
                 exc.close()
             if not isinstance(code, str) or not code.isidentifier() or len(code) > 100:
                 code = "CloudRequestRejected"
             if not isinstance(retry, (int, float)) or not 1 <= retry <= 90000:
                 retry = None
-            raise CloudUnavailable(code, retry_after_seconds=retry) from None
-        except Exception:
-            raise CloudUnavailable("CloudTransportUnavailable") from None
+            diagnostic = self._request_diagnostic(
+                request_id,
+                path,
+                started,
+                "http_rejected",
+                error=exc,
+                status=exc.code,
+                parse_error=parse_error,
+                context=data,
+            )
+            raise CloudUnavailable(
+                code, retry_after_seconds=retry, diagnostics=diagnostic
+            ) from None
+        except Exception as exc:
+            diagnostic = self._request_diagnostic(
+                request_id, path, started, "transport_failed", error=exc, context=data
+            )
+            raise CloudUnavailable("CloudTransportUnavailable", diagnostics=diagnostic) from None
 
     def claim(self, pool, expected_id):
         started = time.monotonic()

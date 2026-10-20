@@ -60,3 +60,58 @@ test("executor account is taken from the deployment, never a caller field", asyn
     /ExecutorAccountNotAssigned/,
   );
 });
+
+test("login bridge forwards flow ownership and rejects malformed generations", async () => {
+  const observed = [];
+  const requests = [];
+  const env = {
+    TELEGRAM_EXECUTOR_ACCOUNT: "only-account",
+    TELEGRAM_EXECUTOR: {
+      fetch: async (url, request) => {
+        observed.push(JSON.parse(request.body));
+        requests.push(request.headers["X-AP-Request-ID"]);
+        return Response.json({ status: "waiting_device_confirmation" });
+      },
+    },
+  };
+  const flow_id = "00000000-0000-4000-8000-000000000001";
+  const result = await telegramExecutorBridge(
+    env,
+    workflows,
+    "/v1/executor/telegram/login-poll",
+    {
+      plan_id: "p",
+      source: "explicit_login_setup",
+      flow_id,
+      generation: 2,
+    },
+    flow_id,
+  );
+  assert.equal(result.request_id, flow_id);
+  assert.deepEqual(requests, [flow_id]);
+  assert.deepEqual(observed, [
+    {
+      account_id: "only-account",
+      operation: "login_poll",
+      flow_id,
+      generation: 2,
+    },
+  ]);
+  for (const generation of [true, 0, -1, 1.5, "2"]) {
+    await assert.rejects(
+      telegramExecutorBridge(
+        env,
+        workflows,
+        "/v1/executor/telegram/login-poll",
+        {
+          plan_id: "p",
+          source: "explicit_login_setup",
+          flow_id,
+          generation,
+        },
+      ),
+      /InvalidLoginFlow/,
+    );
+  }
+  assert.equal(observed.length, 1);
+});

@@ -323,24 +323,69 @@ export async function submitOperation(client, job, checkpoint, authorize) {
   return await readOperation(client, "verify", { ...item, ...receipt });
 }
 
-export async function loginToken(client, env) {
-  let result = await client.invoke(
-    new Api.auth.ExportLoginToken({
-      apiId: Number(env.TG_API_ID),
-      apiHash: env.TG_API_HASH,
-      exceptIds: [],
-    }),
-    undefined,
-    { maxRetryCount: 0 },
+export async function loginToken(client, env, observe = async () => {}) {
+  async function step(phase, action, dc) {
+    const started = Date.now();
+    await observe({ phase, dc });
+    try {
+      const result = await action();
+      await observe({
+        phase,
+        dc,
+        event: "stage_completed",
+        elapsed_ms: Date.now() - started,
+      });
+      return result;
+    } catch (error) {
+      try {
+        await observe({
+          phase,
+          dc,
+          event: "stage_failed",
+          elapsed_ms: Date.now() - started,
+          error,
+        });
+      } catch {}
+      throw error;
+    }
+  }
+  let result = await step(
+    "export_login_token",
+    () =>
+      client.invoke(
+        new Api.auth.ExportLoginToken({
+          apiId: Number(env.TG_API_ID),
+          apiHash: env.TG_API_HASH,
+          exceptIds: [],
+        }),
+        undefined,
+        { maxRetryCount: 0 },
+      ),
+    client.session?.dcId,
   );
   if (result instanceof Api.auth.LoginTokenMigrateTo) {
-    await client._switchDC(result.dcId);
-    result = await client.invoke(
-      new Api.auth.ImportLoginToken({ token: result.token }),
-      undefined,
-      { maxRetryCount: 0 },
+    await step(
+      "migrate_login",
+      () => client._switchDC(result.dcId),
+      result.dcId,
+    );
+    result = await step(
+      "import_login_token",
+      () =>
+        client.invoke(
+          new Api.auth.ImportLoginToken({ token: result.token }),
+          undefined,
+          { maxRetryCount: 0 },
+        ),
+      result.dcId,
     );
   }
+  await observe({
+    phase:
+      result instanceof Api.auth.LoginTokenSuccess
+        ? "login_token_authorized"
+        : "login_token_pending",
+  });
   if (result instanceof Api.auth.LoginTokenSuccess)
     return { status: "authorized" };
   if (result instanceof Api.auth.LoginToken)

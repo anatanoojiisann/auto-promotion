@@ -3,12 +3,13 @@ import {
   createClient,
   readOperation,
   submitOperation,
-  loginToken,
   safeError,
   LIBRARY_VERSION,
 } from "./telegram-adapter.mjs";
 import { ExecutorCore, preExecutionDeferral } from "./executor-core.mjs";
 import { authorizeNative } from "./native-authorization.mjs";
+import { QrLoginController } from "./qr-login-controller.mjs";
+import { requestId } from "./qr-login-diagnostics.mjs";
 
 function response(value, status = 200) {
   return Response.json(value, {
@@ -20,6 +21,14 @@ export class TelegramExecutor extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.busy = false;
+    this.login = new QrLoginController({
+      store: ctx.storage,
+      env,
+      createClient: (session) => createClient(session, env),
+      seal: (session) => this.seal(session),
+      unseal: (sealed) => this.unseal(sealed),
+      waitUntil: (promise) => ctx.waitUntil(promise),
+    });
   }
   configured() {
     return !!(
@@ -49,7 +58,9 @@ export class TelegramExecutor extends DurableObject {
     };
   }
   async session() {
-    const s = await this.ctx.storage.get("cloud_session");
+    return this.unseal(await this.ctx.storage.get("cloud_session"));
+  }
+  async unseal(s) {
     if (!s) return "";
     const key = await crypto.subtle.importKey(
       "raw",
@@ -69,14 +80,23 @@ export class TelegramExecutor extends DurableObject {
   async fetch(request) {
     const input = await request.json(),
       op = input.operation;
-    if (op === "status")
+    input.request_id = requestId(request.headers?.get("X-AP-Request-ID"));
+    if (op === "status") {
+      const login = await this.login.view();
       return response({
         installed: true,
+        request_id: input.request_id,
         runtime: "cloudflare-workers",
         library: LIBRARY_VERSION,
         api_configured: this.configured(),
-        login_state:
-          (await this.ctx.storage.get("login_state")) || "not_logged_in",
+        login_state: login.status,
+        login_diagnostics: login.login_diagnostics || null,
+        diagnostic_trace: login.diagnostic_trace || null,
+        last_verified_at: login.last_verified_at || null,
+        connection_status:
+          login.status === "authorized"
+            ? "last_identity_verified"
+            : "unverified",
         native_gate_configured:
           !!this.env.CONTROL_INTERNAL && !!this.env.TG_QUEUE_BRIDGE,
         local_session_copied: false,
@@ -95,6 +115,7 @@ export class TelegramExecutor extends DurableObject {
         supported_content: "plain_text_reply_with_reviewed_context",
         write_requires_native_lease: true,
       });
+    }
     if (!this.configured())
       return response(
         {
@@ -109,7 +130,19 @@ export class TelegramExecutor extends DurableObject {
         preExecutionDeferral(input, "waiting_cooldown", cooldown),
         409,
       );
-    if (this.busy)
+    if (op === "login_begin" || op === "login_poll") {
+      if (this.busy)
+        return response(
+          preExecutionDeferral(input, "waiting_account_lock"),
+          409,
+        );
+      return response(
+        op === "login_begin"
+          ? await this.login.begin(input)
+          : await this.login.view(input),
+      );
+    }
+    if (this.busy || this.login.active)
       return response(preExecutionDeferral(input, "waiting_account_lock"), 409);
     this.busy = true;
     let discardSession = false;
@@ -119,29 +152,6 @@ export class TelegramExecutor extends DurableObject {
       client = createClient(await this.session(), this.env);
       phase = "connect";
       await client.connect();
-      if (op === "login_begin" || op === "login_poll") {
-        phase = "login_token";
-        const result = await loginToken(client, this.env);
-        if (result.status === "authorized") {
-          const me = await client.getMe();
-          if (
-            !me ||
-            String(me.id) !== this.env.TG_EXPECTED_ID ||
-            me.bot ||
-            me.restricted ||
-            me.deleted
-          )
-            throw new Error("TelegramIdentityMismatch");
-        }
-        const saved = client.session.save();
-        if (!saved) throw new Error("CloudSessionPersistenceRequired");
-        await this.ctx.storage.put("cloud_session", await this.seal(saved));
-        await this.ctx.storage.put("login_state", result.status);
-        if (result.expires_at)
-          await this.ctx.storage.put("login_expires_at", result.expires_at);
-        await this.ctx.storage.delete("last_error");
-        return response(result);
-      }
       phase = "identity_check";
       const me = await client.getMe();
       if (
