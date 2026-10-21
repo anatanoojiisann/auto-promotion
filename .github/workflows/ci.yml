@@ -18,8 +18,8 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: python -m pip install '.[dev,telegram,mcp]'
-      - run: ruff check src tests
-      - run: ruff format --check src tests
+      - run: ruff check src tests scripts/telegram_online_replies.py
+      - run: ruff format --check src tests scripts/telegram_online_replies.py
       - run: python -m unittest discover -s tests -v
       - run: python -m build
 
@@ -41,6 +41,7 @@ jobs:
         run: |
           export AP_BROWSER_EXECUTABLE="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
           python -m unittest discover -s tests -p test_browser_contracts.py -v
+          python -m unittest discover -s tests -p test_x_post_browser.py -v
         env:
           AP_TEST_BROWSER_BACKENDS: '1'
       - run: npm run format:check
@@ -49,6 +50,9 @@ jobs:
           AUTO_PROMOTION_PYTHON: python
           AP_UI_SKIP_SCREENSHOTS: '1'
       - run: npm run test:ui:pools
+        env:
+          AUTO_PROMOTION_PYTHON: python
+      - run: npm run test:ui:interactions
         env:
           AUTO_PROMOTION_PYTHON: python
 

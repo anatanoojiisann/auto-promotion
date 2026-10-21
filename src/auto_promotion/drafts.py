@@ -23,6 +23,53 @@ class DraftService:
     def status(self):
         return {"configured": bool(self.endpoint), "fallback": "imported_text_or_persona_template"}
 
+    def structured(self, purpose, instructions, data, *, timeout=60):
+        """The same configured model transport, for evidence-bearing classification/validation."""
+        parsed = urlparse(self.endpoint)
+        if not self.endpoint:
+            raise Conflict("model_connection_unavailable")
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.scheme not in {"http", "https"}
+            or (
+                parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+            )
+        ):
+            raise Conflict("model_endpoint_invalid")
+        headers = {"Content-Type": "application/json"}
+        if self.key:
+            headers["Authorization"] = "Bearer " + self.key
+        request = Request(
+            self.endpoint,
+            data=canonical(
+                {
+                    "model": self.model,
+                    "purpose": purpose,
+                    "instructions": instructions,
+                    "data": data,
+                }
+            ).encode(),
+            headers=headers,
+            method="POST",
+        )
+
+        class NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        try:
+            with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+                raw = response.read(262145)
+                if len(raw) > 262144:
+                    raise ValueError()
+                value = json.loads(raw)
+                if not isinstance(value, dict):
+                    raise ValueError()
+                return value
+        except Exception:
+            raise Conflict("model_response_invalid_or_unavailable") from None
+
     def generate(self, profile, opportunity):
         parsed = urlparse(self.endpoint)
         if not self.endpoint:

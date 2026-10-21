@@ -117,6 +117,12 @@ macOS 的临时目录可能有 `/var` 与 `/private/var` 别名，运行全套�
 包含 schema 1→2 迁移、重新打开零写、重复授权/回执/快照零写和普通任务 6 次写入预算；
 `check` 仅打包 dry-run，不部署。CI 同时执行这些检查和 `npm run test:ui:pools`。
 
+高频互动界面可通过 `npm run test:ui:interactions` 独立验收；统一隔离入口也支持
+`node scripts/test_ui_offline.cjs main pools interactions`。CI 同时运行高频界面与
+`test_x_post_browser.py` 的离线浏览器合同。新增 Telegram 线上回复客户端纳入
+`ruff check src tests scripts/telegram_online_replies.py` 和相同范围的格式检查。
+完整 Python 隔离入口显式加载 Telegram 准备回复的三个新增云控模块，避免只测旧的模块列表。
+
 Telegram 云端执行器离线回归：先安装 `cloudflare/control-plane` 的依赖，再在
 `cloudflare/telegram-executor` 运行 `npm ci && npm test && npm run check`。
 新增 CI 作业独立执行同样检查。云控测试覆盖任务级账号交接、工作流依赖与证据、公开资料采集、

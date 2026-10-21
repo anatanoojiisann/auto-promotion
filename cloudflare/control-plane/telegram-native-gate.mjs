@@ -1,4 +1,5 @@
 import { ControlError, sha } from "./kernel.mjs";
+import { checkGeneratedTask } from "./telegram-task-builder.mjs";
 export const TELEGRAM_NODE = "cloudflare-telegram";
 export async function signNativeGate(secret, raw) {
   const key = await crypto.subtle.importKey(
@@ -167,6 +168,7 @@ export class TelegramNativeGate {
       data.payload?.target?.toLowerCase() !== step.input.target.toLowerCase()
     )
       throw new ControlError("NativeWorkflowScopeMismatch", 403);
+    checkGeneratedTask(this.k, p, j, task);
     if (j.kind === "send") {
       const reviewId = step.depends_on.find((id) =>
         id.endsWith(":reply_review"),
@@ -289,7 +291,31 @@ export class TelegramNativeGate {
       body.step_id,
     );
     if (!link) throw new ControlError("NativeWorkflowLinkRequired", 403);
-    const { j } = this.checkLink(link.plan_id, link.step_id, link.job_id);
+    const { j, data } = this.checkLink(link.plan_id, link.step_id, link.job_id);
+    if (
+      JSON.parse(
+        this.k.one("SELECT payload FROM tasks WHERE id=?", j.task_id).payload,
+      ).workflow_provenance
+    ) {
+      const statusResponse = await this.env.TELEGRAM_EXECUTOR.fetch(
+        "https://telegram-executor/internal",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            account_id: data.account_id,
+            operation: "status",
+          }),
+        },
+      );
+      const status = await statusResponse.json();
+      if (
+        !statusResponse.ok ||
+        status.login_state !== "authorized" ||
+        !status.last_verified_at
+      )
+        return { submitted: false, reason: "waiting_cloud_login" };
+    }
     const node = this.k.node(
       TELEGRAM_NODE,
       await sha(this.env.TG_QUEUE_BRIDGE),

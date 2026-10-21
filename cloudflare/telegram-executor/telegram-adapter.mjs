@@ -132,6 +132,8 @@ export async function readOperation(client, operation, input) {
       text: (m.message || "").slice(0, 12000),
       date: iso(m.date),
       out: !!m.out,
+      author_id: String(m.fromId?.userId || ""),
+      author_is_bot: typeof m.sender?.bot === "boolean" ? m.sender.bot : null,
       reply_to: m.replyTo?.replyToMsgId || null,
       url: `https://t.me/${entity.username}/${m.id}`,
     });
@@ -170,6 +172,8 @@ export async function readOperation(client, operation, input) {
       text: (m.message || "").slice(0, 8000),
       reply_to: m.replyTo?.replyToMsgId || null,
       author_id: String(m.fromId?.userId || m.fromId?.channelId || ""),
+      author_is_bot: typeof m.sender?.bot === "boolean" ? m.sender.bot : null,
+      out: !!m.out,
       url: `https://t.me/${entity.username}/${m.id}`,
     });
     return {

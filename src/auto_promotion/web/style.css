@@ -1152,3 +1152,27 @@ td code {
   color: var(--muted);
   font-size: 11px;
 }
+/* High-frequency review shares the workbench's surfaces and form controls. */
+.hf-candidate {
+  border-top: 1px solid var(--border, #e5e7eb);
+  padding: 24px 0;
+  overflow-wrap: anywhere;
+}
+.hf-candidate .section-header {
+  padding-left: 0;
+  padding-right: 0;
+}
+.hf-candidate input[type="checkbox"],
+.hf-account input[type="checkbox"] {
+  width: auto;
+  margin-right: 6px;
+}
+.hf-account {
+  display: inline-flex;
+  align-items: center;
+  margin: 8px 16px 8px 0;
+}
+#hf-advanced {
+  font-family: ui-monospace, monospace;
+  width: 100%;
+}

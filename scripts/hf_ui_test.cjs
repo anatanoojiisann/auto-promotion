@@ -1,0 +1,221 @@
+/* Real HTTP/UI acceptance in a temporary store; no real account or external endpoint. */
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn, execFileSync } = require("node:child_process");
+const { chromium } = require("playwright");
+const root = path.resolve(__dirname, "..");
+const temp = fs.realpathSync(
+  fs.mkdtempSync(path.join(os.tmpdir(), "ap-hf-ui-")),
+);
+const db = path.join(temp, "hf.db");
+const python =
+  process.env.AUTO_PROMOTION_PYTHON ||
+  path.join(
+    root,
+    process.platform === "win32"
+      ? ".venv/Scripts/python.exe"
+      : ".venv/bin/python",
+  );
+const env = {
+  PATH: process.env.PATH,
+  PYTHONPATH: path.join(root, "src"),
+  PYTHONIOENCODING: "utf-8",
+  HOME: temp,
+  AP_DB: db,
+  AP_ACCOUNTS_DIR: path.join(temp, "accounts"),
+  AP_API_TOKEN: "synthetic-hf-ui-token",
+  AUTO_PROMOTION_WORKSPACE: temp,
+  AUTO_PROMOTION_LIVE_WRITES: "0",
+  AP_CLOUD_CONTROL_URL: "",
+  AP_CLOUD_NODE_TOKEN: "",
+  AP_CLOUD_OPERATOR_TOKEN: "",
+  AP_CLOUD_OPERATOR_TOKEN_FILE: "",
+  AP_DRAFT_ENDPOINT: "",
+};
+for (const key of ["SYSTEMROOT", "WINDIR", "TEMP", "TMP"])
+  if (process.env[key]) env[key] = process.env[key];
+let server, browser, page;
+const errors = [];
+async function cleanup() {
+  if (browser) await browser.close();
+  if (server && server.exitCode === null) {
+    const exited = new Promise((resolve) => server.once("exit", resolve));
+    server.kill("SIGTERM");
+    await Promise.race([
+      exited,
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+  }
+  assert.equal(path.dirname(temp), fs.realpathSync(os.tmpdir()));
+  fs.rmSync(temp, { recursive: true, force: true });
+}
+(async () => {
+  const seed = `
+import time
+from pathlib import Path
+from auto_promotion.core import Engine
+from auto_promotion.store import Store
+from auto_promotion.models import AccountInput
+from auto_promotion.interaction_models import InteractionConfig,ConfigSave
+from auto_promotion.interaction_simulation import OfflineRegistry,SimulationConnectors,source
+from auto_promotion.interactions import Interactions
+engine=Engine(Store(${JSON.stringify(db)}),OfflineRegistry(Path(${JSON.stringify(temp)})))
+a=engine.add_account(AccountInput(platform='x',mode='simulation',label='UI simulated X',backend_label='hf-ui'))
+engine.check_account(a['id'])
+io=SimulationConnectors(engine)
+s=Interactions(engine,connectors=io)
+now=time.time()
+cfg=InteractionConfig(project_id='ui-acceptance',enabled=True,account_ids=[a['id']],queries=['synthetic'],facts=[{'id':'demo-fact','text':'Synthetic fact','source':'simulation://fact','verified_at':now-10,'valid_until':now+86400}])
+p=s.save(ConfigSave(config=cfg))
+io.sources=[source(9101,'P2',now),source(9102,'P2',now)]
+s.trigger(p['id'],manual=True)
+s.run_stage('scan')
+s.run_stage('classify')
+s.settle_rounds()
+print(p['id'])
+`;
+  const id = execFileSync(python, ["-c", seed], {
+    cwd: root,
+    env,
+    encoding: "utf8",
+  }).trim();
+  const url = await new Promise((resolve, reject) => {
+    server = spawn(
+      python,
+      [
+        "-m",
+        "auto_promotion.cli",
+        "--db",
+        db,
+        "serve",
+        "--port",
+        "0",
+        "--no-worker",
+      ],
+      { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const timer = setTimeout(
+      () => reject(new Error("HTTP server startup timeout")),
+      20000,
+    );
+    server.once("error", reject);
+    server.stderr.on("data", (chunk) => {
+      const match = chunk
+        .toString()
+        .match(/Uvicorn running on (http:\/\/127\.0\.0\.1:\d+)/);
+      if (match) {
+        clearTimeout(timer);
+        resolve(match[1]);
+      }
+    });
+  });
+  browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.AP_UI_CHROMIUM_PATH || undefined,
+  });
+  page = await browser.newPage({
+    viewport: { width: 1440, height: 1000 },
+  });
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto(url + "/#interactions/" + id);
+  await page.getByRole("heading", { name: "候选选择", exact: true }).waitFor();
+  assert.equal(await page.locator("[data-hf-select]:enabled").count(), 2);
+  const first = page.locator("[data-hf-select]:enabled").first();
+  const cid = await first.getAttribute("data-hf-select");
+  await page.locator(`[data-hf-edit="${cid}"]`).click();
+  await page
+    .locator("#hf-edit-form textarea")
+    .fill("A precise human-edited answer preserved by the server.");
+  await page.getByRole("button", { name: "保存编辑", exact: true }).click();
+  await page.locator("#panel").waitFor({ state: "hidden" });
+  await page.locator(`[data-hf-select="${cid}"]`).check();
+  await page.getByRole("button", { name: "采用所选", exact: true }).click();
+  await page.waitForFunction(
+    () => document.querySelectorAll("[data-hf-select]:enabled").length === 1,
+  );
+  const backend = await page.evaluate(
+    async (id) => api(`/interactions/${id}/candidates`),
+    id,
+  );
+  assert.equal(backend.find((c) => c.id === cid).state, "QUEUED");
+  assert.equal(
+    backend.find((c) => c.id === cid).draft,
+    "A precise human-edited answer preserved by the server.",
+  );
+  assert.equal(backend.filter((c) => c.state === "REVIEW_PENDING").length, 1);
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.locator('#hf-settings-form [name="interval"]').fill("300");
+  assert.match(await page.locator("#hf-calculation").textContent(), /25 分钟/);
+  await page.getByRole("button", { name: "保存策略", exact: true }).click();
+  await page.locator("#panel").waitFor({ state: "hidden" });
+  const saved = await page.evaluate(
+    async (id) => api(`/interactions/${id}`),
+    id,
+  );
+  assert.equal(saved.config.scan.interval_seconds, 300);
+  assert.equal(saved.version, 2);
+  await page.getByRole("button", { name: "扫描一次", exact: true }).click();
+  await page.waitForFunction(() =>
+    document.body.textContent.includes("collecting"),
+  );
+  fs.mkdirSync(path.join(root, "output/playwright"), { recursive: true });
+  await page.screenshot({
+    path: path.join(root, "output/playwright/hf-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({
+    path: path.join(root, "output/playwright/hf-mobile.png"),
+    fullPage: true,
+  });
+  assert.ok(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth + 1,
+    ),
+    "mobile document overflow",
+  );
+  await page.getByRole("button", { name: "全部策略", exact: true }).click();
+  await page.getByRole("button", { name: "运行隔离模拟", exact: true }).click();
+  await page.getByText("隔离模拟验收", { exact: true }).waitFor();
+  assert.match(await page.locator("#panel-content").textContent(), /通过/);
+  assert.deepEqual(errors, []);
+  fs.writeFileSync(
+    path.join(root, "var/hf-ui-test-result.json"),
+    JSON.stringify(
+      {
+        passed: true,
+        checks: [
+          "real_backend_candidates",
+          "human_edit_preserved",
+          "selected_only_adoption",
+          "settings_version_and_timing",
+          "queued_scan",
+          "desktop",
+          "mobile_no_overflow",
+          "isolated_e2e_modal",
+          "no_browser_errors",
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+  console.log(
+    "High-frequency UI passed; 9 checks; desktop/mobile screenshots saved.",
+  );
+})()
+  .catch(async (e) => {
+    console.error(e);
+    if (page) {
+      console.error((await page.locator("body").innerText()).slice(-3000));
+      fs.mkdirSync(path.join(root, "output/playwright"), { recursive: true });
+      await page.screenshot({
+        path: path.join(root, "output/playwright/hf-failure.png"),
+        fullPage: true,
+      });
+    }
+    process.exitCode = 1;
+  })
+  .finally(cleanup);

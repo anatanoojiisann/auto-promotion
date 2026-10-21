@@ -142,6 +142,21 @@ class JobQueue:
         added = 0
         for task in self.store.rows(sql, params):
             policy = json.loads(task["policy"])
+            if task["phase"] == "starting" and policy.get("outbound_after_task_ids"):
+                from .core import Conflict
+                from .task_dependencies import publication_schedule
+
+                with self.store.connect() as db:
+                    _, reason = publication_schedule(db, task, self.clock())
+                if reason not in {
+                    "interaction_dependencies_pending",
+                    "interaction_schedule_pacing_blocked",
+                }:
+                    try:
+                        self.engine.start_task(task["id"], source="scheduler")
+                    except Conflict:
+                        pass
+                    task = self.store.one("SELECT * FROM tasks WHERE id=?", (task["id"],))
             if (
                 task["phase"] == "starting"
                 and policy.get("outbound_after_membership_seconds") is not None
@@ -239,7 +254,7 @@ class JobQueue:
             "SELECT j.* FROM execution_jobs j LEFT JOIN items i "
             "ON j.kind='send' AND i.id=j.reference_id LEFT JOIN candidates c "
             "ON j.kind='join' AND c.id=j.reference_id LEFT JOIN tasks t ON t.id=j.task_id "
-            "WHERE (j.state IN ('pending','leased') OR (j.state='unknown' AND j.kind='send' "
+            "WHERE j.kind IN ('send','join') AND (j.state IN ('pending','leased') OR (j.state='unknown' AND j.kind='send' "
             "AND i.status IN ('confirmed','scheduled','failed_known','cancelled','missed') "
             "AND j.account_id=i.account_id AND j.task_id=i.task_id AND j.version=i.payload_hash "
             "AND EXISTS(SELECT 1 FROM attempts a WHERE a.id=i.attempt_id AND a.item_id=i.id "

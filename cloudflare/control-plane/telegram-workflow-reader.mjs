@@ -339,6 +339,7 @@ export class TelegramWorkflowReader {
                 checked_at: r.checked_at,
                 transport: "authenticated_mtproto",
                 observation: r,
+                account_id: this.env.TELEGRAM_EXECUTOR_ACCOUNT,
               },
             ],
           };

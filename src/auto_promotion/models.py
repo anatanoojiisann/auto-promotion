@@ -21,7 +21,7 @@ CAPABILITIES = {
     },
     "reddit": {"discover", "reply", "post"},
     "instagram": {"publish", "manual_comment"},
-    "x": {"discover", "like", "reply", "repost", "quote"},
+    "x": {"discover", "like", "reply", "repost", "quote", "post"},
     "discord": {"send_message", "reply", "send_file"},
     "tiktok": {
         "publish",
@@ -87,6 +87,9 @@ class AccountUpdate(Model):
 
 
 class Policy(Model):
+    project_id: str = Field(default="default", pattern=r"^[\w-]{1,80}$")
+    account_hourly_limit: int | None = Field(default=None, ge=1, le=20)
+    account_daily_limit: int | None = Field(default=None, ge=1, le=300)
     execution_channel: Literal["inherit", "cloud", "local"] = "inherit"
     queries: list[str] = Field(default_factory=list, max_length=20)
     required_keywords: list[str] = Field(default_factory=list)
@@ -100,6 +103,9 @@ class Policy(Model):
     max_joins: int = Field(default=0, ge=0, le=20)
     outbound_after_membership_seconds: int | None = Field(default=None, ge=3600, le=604800)
     outbound_after_service_recovery_seconds: int | None = Field(default=None, ge=30, le=86400)
+    allow_owned_x_posts: bool = False
+    outbound_after_task_ids: list[str] = Field(default_factory=list, max_length=50)
+    outbound_after_tasks_seconds: int | None = Field(default=None, ge=0, le=604800)
     timezone: str = "Asia/Shanghai"
     starts_at: str
     ends_at: str
@@ -119,6 +125,15 @@ class Policy(Model):
             raise ValueError("结束时间必须晚于开始时间")
         if not self.languages:
             raise ValueError("必须指定允许语言")
+        if bool(self.outbound_after_task_ids) != (self.outbound_after_tasks_seconds is not None):
+            raise ValueError("完成后发布需要同时指定互动任务和等待秒数")
+        if len(set(self.outbound_after_task_ids)) != len(self.outbound_after_task_ids):
+            raise ValueError("前置互动任务不能重复")
+        if self.outbound_after_task_ids and (
+            self.outbound_after_membership_seconds is not None
+            or self.outbound_after_service_recovery_seconds is not None
+        ):
+            raise ValueError("互动完成后发布不能同时使用入群或服务恢复计时")
         return self
 
 

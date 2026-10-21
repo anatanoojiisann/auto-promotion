@@ -19,6 +19,12 @@ const env = {
   ...process.env,
   AUTO_PROMOTION_LIVE_WRITES: "0",
   AUTO_PROMOTION_WORKSPACE: temp,
+  AP_ACCOUNTS_DIR: path.join(temp, "accounts"),
+  AP_CLOUD_CONTROL_URL: "",
+  AP_CLOUD_NODE_TOKEN: "",
+  AP_CLOUD_OPERATOR_TOKEN: "",
+  AP_CLOUD_OPERATOR_TOKEN_FILE: "",
+  AP_API_TOKEN: "",
 };
 const db = path.join(temp, "test.db");
 let server, browser;
@@ -844,6 +850,75 @@ async function cleanup() {
     ).every((g) => g.payload.mode === "simulation"),
     true,
   );
+  const xAccount = await page.evaluate(async () => {
+    const accounts = await fetch("/api/accounts").then((r) => r.json());
+    if (accounts.some((a) => a.mode !== "simulation"))
+      throw new Error("Original-post UI tests require synthetic accounts");
+    return accounts.find((a) => a.platform === "x");
+  });
+  await page.getByRole("link", { name: "任务中心", exact: true }).click();
+  await page.getByRole("button", { name: "创建任务", exact: true }).click();
+  await page.locator("#task-name").fill("X original UI simulation");
+  await page
+    .locator(`#task-form [name=accounts][value="${xAccount.id}"]`)
+    .check();
+  await page.locator("#task-form [name=allow_owned_x_posts]").check();
+  assert.equal(await page.locator("#execution-channel").inputValue(), "cloud");
+  assert.equal(
+    await page
+      .locator("#task-form [name=outbound_after_tasks_minutes]")
+      .inputValue(),
+    "60",
+  );
+  await page.locator("#task-form button[type=submit]").click();
+  await page.locator("#edit-items").click();
+  assert.equal(
+    await page.locator("#items-form [name=action]").inputValue(),
+    "post",
+  );
+  assert.equal(
+    await page.locator("#items-form [name=target]").inputValue(),
+    xAccount.owned_target_url,
+  );
+  assert.equal(
+    await page.locator("#items-form [name=target]").getAttribute("readonly"),
+    "",
+  );
+  assert.equal(
+    await page.locator("#items-form [name=target_owned]").isChecked(),
+    true,
+  );
+  assert.equal(
+    await page.locator("#items-form [name=title]").getAttribute("type"),
+    "hidden",
+  );
+  assert.equal(
+    await page.locator("#items-form [name=reply_to]").isVisible(),
+    false,
+  );
+  assert.equal(
+    await page.locator('#items-form input[type="file"]').getAttribute("accept"),
+    "image/png,image/jpeg",
+  );
+  await page
+    .locator("#items-form [name=text]")
+    .fill("Synthetic owned original post; no publication is started.");
+  if (!process.env.AP_UI_SKIP_SCREENSHOTS)
+    await page.screenshot({
+      path: "output/playwright/x-original-post-editor.png",
+      fullPage: true,
+    });
+  await page.getByRole("button", { name: "保存清单", exact: true }).click();
+  const originalDraft = await page.evaluate(async () => {
+    const tasks = await fetch("/api/tasks").then((r) => r.json());
+    const task = tasks.find((t) => t.name === "X original UI simulation");
+    return fetch("/api/tasks/" + task.id).then((r) => r.json());
+  });
+  assert.equal(originalDraft.state, "draft");
+  assert.equal(originalDraft.policy.allow_owned_x_posts, true);
+  assert.equal(originalDraft.items[0].payload.action, "post");
+  assert.equal(originalDraft.items[0].payload.target_owned, true);
+  assert.equal(originalDraft.items[0].attempt_id, null);
   fs.writeFileSync(
     "var/ui-test-result.json",
     JSON.stringify(
@@ -891,6 +966,10 @@ async function cleanup() {
           "reply_inbox_entry",
           "read_only_content_feed",
           "content_review",
+          "owned_x_post_task_opt_in",
+          "owned_x_post_readonly_target",
+          "owned_x_post_draft_does_not_publish",
+          "owned_x_post_no_unrelated_fields",
         ],
       },
       null,
@@ -899,7 +978,7 @@ async function cleanup() {
   );
   assert.deepEqual(errors, [], "browser errors");
   console.log(
-    "UI workflow passed; 39 checks; screenshots " +
+    "UI workflow passed; 43 checks; screenshots " +
       (process.env.AP_UI_SKIP_SCREENSHOTS ? "skipped" : "saved") +
       ".",
   );

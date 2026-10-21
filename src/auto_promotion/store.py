@@ -237,11 +237,12 @@ class Store:
             # Another process may have finished migration while we waited.
             if self._schema_ready(db):
                 return
+            from .interaction_schema import SCHEMA as INTERACTION_SCHEMA
             from .queue_store import QUEUE_SCHEMA
 
             # executescript implicitly commits a pending transaction. Execute
             # complete statements instead, including each whole trigger body.
-            for script in (SCHEMA, QUEUE_SCHEMA):
+            for script in (SCHEMA, QUEUE_SCHEMA, INTERACTION_SCHEMA):
                 statement = ""
                 for line in script.splitlines(keepends=True):
                     statement += line
@@ -294,6 +295,7 @@ class Store:
 
     @staticmethod
     def _schema_ready(db):
+        from .interaction_schema import SCHEMA as INTERACTION_SCHEMA
         from .queue_store import QUEUE_SCHEMA
 
         names = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
@@ -307,7 +309,7 @@ class Store:
         expected = set(
             re.findall(
                 r"CREATE\s+(?:UNIQUE\s+)?(?:TABLE|VIEW|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)",
-                SCHEMA + QUEUE_SCHEMA,
+                SCHEMA + QUEUE_SCHEMA + INTERACTION_SCHEMA,
                 re.I,
             )
         )

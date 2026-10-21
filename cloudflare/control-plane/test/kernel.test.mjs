@@ -43,6 +43,9 @@ function fixture({ beforeOpen } = {}) {
     resource = null,
     state = "not_attempted",
     payload = {},
+    action = "reply",
+    policy = {},
+    ownedTarget = "",
   } = {}) {
     const platform = pool.startsWith("simulation.")
       ? pool.split(".")[1]
@@ -55,6 +58,7 @@ function fixture({ beforeOpen } = {}) {
       limits: { daily: 50, hourly: 20 },
       min_interval: 0,
       allowed_actions: ["reply", "join"],
+      owned_target_url: ownedTarget,
     };
     const t = {
       id: "t-" + id,
@@ -67,6 +71,7 @@ function fixture({ beforeOpen } = {}) {
         ends_at: new Date((now + 3600) * 1000).toISOString(),
         min_interval: 0,
         daily_limit: 50,
+        ...policy,
       },
     };
     const j = {
@@ -79,7 +84,7 @@ function fixture({ beforeOpen } = {}) {
       resource,
       payload,
       version: "payload-v1",
-      action: "reply",
+      action,
       available_at: now,
       expires_at: now + 900,
       state,
@@ -420,6 +425,48 @@ test("platform permissions remain enforced at final authorization", () => {
     /ActionNotEnabled/,
   );
   f.db.close();
+});
+test("owned X originals require frozen task opt-in and the exact owned profile", () => {
+  for (const [enabled, target, allowed] of [
+    [true, "https://x.com/brand", true],
+    [false, "https://x.com/brand", false],
+    [true, "https://x.com/other", false],
+  ]) {
+    const f = fixture();
+    const s = f.seed({
+      action: "post",
+      ownedTarget: "https://x.com/brand",
+      policy: { allow_owned_x_posts: enabled, execution_channel: "cloud" },
+      payload: { target_owned: true, target },
+    });
+    const node = f.node();
+    f.k.setAccountChannel({
+      account_id: s.a.id,
+      task_id: s.t.id,
+      node_id: node.id,
+      channel: "cloud",
+      expected_generation: null,
+      generation: "1".repeat(32),
+      until: 1800000900,
+    });
+    const job = f.k.claim(node, "x.edge");
+    if (allowed)
+      assert.equal(
+        f.k.authorize(node, job.id, job.lease_token, "post-one").allowed,
+        true,
+      );
+    else
+      assert.throws(
+        () => f.k.authorize(node, job.id, job.lease_token, "post-one"),
+        /ActionNotEnabled/,
+      );
+    assert.deepEqual(
+      JSON.parse(f.k.one("SELECT payload FROM accounts WHERE id='a'").payload)
+        .allowed_actions,
+      ["reply", "join"],
+    );
+    f.db.close();
+  }
 });
 test("quota ledger import does not count a recorded attempt twice", () => {
   const f = fixture(),

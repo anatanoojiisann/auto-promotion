@@ -16,6 +16,8 @@ import {
   executorRequestId,
 } from "./telegram-executor-bridge.mjs";
 import { TelegramWorkflowReader } from "./telegram-workflow-reader.mjs";
+import { TelegramPreparedReplies } from "./telegram-prepared-replies.mjs";
+import { TelegramTaskBuilder } from "./telegram-task-builder.mjs";
 import {
   TelegramNativeGate,
   verifyNativeGate,
@@ -47,6 +49,21 @@ export class WorkspaceCoordinator extends DurableObject {
   get telegramReader() {
     return (this._telegramReader ||= new TelegramWorkflowReader(
       this.workflows,
+      this.env,
+    ));
+  }
+  get replyPipeline() {
+    return (this._replyPipeline ||= new TelegramPreparedReplies(
+      this.workflows,
+      this.telegramReader,
+      this.env,
+    ));
+  }
+  get telegramTaskBuilder() {
+    this.replyPipeline;
+    return (this._telegramTaskBuilder ||= new TelegramTaskBuilder(
+      this.workflows,
+      this.telegramNative,
       this.env,
     ));
   }
@@ -105,6 +122,10 @@ export class WorkspaceCoordinator extends DurableObject {
           "/v1/workflow/state",
           "/v1/workflow/start-public",
           "/v1/workflow/stop-public",
+          "/v1/workflow/replies/start",
+          "/v1/workflow/replies/stop",
+          "/v1/workflow/replies/prepare",
+          "/v1/workflow/replies/reconfirm",
           "/v1/executor/telegram/login-begin",
           "/v1/executor/telegram/login-poll",
           "/v1/executor/telegram/read",
@@ -134,16 +155,29 @@ export class WorkspaceCoordinator extends DurableObject {
       if (path === "/internal/public-research") {
         if (request.headers.get("X-Control-Role") !== "scheduler")
           throw new ControlError("Unauthorized", 403);
-        result = {
-          public: await this.publicResearch.tick(),
-          telegram: this.env.TELEGRAM_EXECUTOR
-            ? await this.telegramReader.tick()
-            : null,
-          native:
-            this.env.TELEGRAM_EXECUTOR && this.env.TG_QUEUE_BRIDGE
-              ? await this.telegramNative.tick()
-              : null,
-        };
+        result = {};
+        const stages = [["public", () => this.publicResearch.tick()]];
+        if (this.env.TELEGRAM_EXECUTOR)
+          stages.push(
+            ["telegram", () => this.telegramReader.tick()],
+            ["prepared_replies", () => this.replyPipeline.tick()],
+            ["task_builder", () => this.telegramTaskBuilder.tick()],
+          );
+        if (this.env.TELEGRAM_EXECUTOR && this.env.TG_QUEUE_BRIDGE)
+          stages.push(["native", () => this.telegramNative.tick()]);
+        for (const [name, run] of stages) {
+          try {
+            result[name] = await run();
+          } catch (error) {
+            result[name] = {
+              deferred: true,
+              reason:
+                error instanceof ControlError
+                  ? error.message
+                  : "WorkflowStageUnavailable",
+            };
+          }
+        }
       } else if (path.startsWith("/v1/executor/telegram/")) {
         if (path === "/v1/executor/telegram/gate") {
           if (request.headers.get("X-Control-Role") !== "telegram-native")
@@ -183,7 +217,21 @@ export class WorkspaceCoordinator extends DurableObject {
         }
       } else if (path.startsWith("/v1/workflow/")) {
         const operator = request.headers.get("X-Control-Role") === "operator";
-        if (
+        if (path.startsWith("/v1/workflow/replies/")) {
+          if (!operator || request.method !== "POST")
+            throw new ControlError("Unauthorized", 403);
+          if (path.endsWith("/start"))
+            result = await this.replyPipeline.start(body);
+          else if (path.endsWith("/stop"))
+            result = this.replyPipeline.stop(body);
+          else if (path.endsWith("/prepare"))
+            result = await this.replyPipeline.prepare(body);
+          else if (path.endsWith("/reconfirm"))
+            result = await this.replyPipeline.reconfirm(body);
+          else if (path.endsWith("/status"))
+            result = this.replyPipeline.snapshot(body.plan_id);
+          else throw new ControlError("NotFound", 404);
+        } else if (
           path === "/v1/workflow/create" &&
           operator &&
           request.method === "POST"
@@ -230,6 +278,7 @@ export class WorkspaceCoordinator extends DurableObject {
             authenticated_telegram_reader: this.env.TELEGRAM_EXECUTOR
               ? this.telegramReader.snapshot(body.id)
               : null,
+            prepared_reply_pipeline: this.replyPipeline.snapshot(body.id),
           };
         else if (
           path === "/v1/workflow/node" &&

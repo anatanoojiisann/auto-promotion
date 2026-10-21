@@ -15,7 +15,7 @@ TRANSPORTS = {
 }
 POOLS = frozenset(
     [f"{p}.{t}" for p, t in TRANSPORTS.items()]
-    + ["x.edge", "x.tabbit", "x.browser_use"]
+    + ["x.edge", "x.tabbit", "x.browser_use", "x.api"]
     + [f"{p}.manual" for p in PLATFORMS]
     + [f"simulation.{p}" for p in PLATFORMS]
 )
@@ -53,6 +53,8 @@ def route_for(account, payload=None, *, profile=None):
         transport = {"tabbit": "tabbit", "browser_use": "browser_use", "msedge": "edge"}.get(
             channel, "playwright"
         )
+        if profile.get("connection_type") == "x_api":
+            transport = "api"
         if transport in {"tabbit", "browser_use"}:
             # These desktop integrations can share the active login/profile across accounts.
             resource = (

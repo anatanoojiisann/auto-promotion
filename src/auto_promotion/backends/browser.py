@@ -10,6 +10,7 @@ from .common import (
     BackendError,
     language_evidence,
     observed_timestamp,
+    owned_x_target,
     profile_path,
     read_profile,
     save_profile,
@@ -158,6 +159,17 @@ class BrowserBackend:
                     "rate_limited": True,
                     "retry_after_seconds": 3600,
                     "reason": "BrowserRateLimited",
+                    **self.diagnostics(),
+                }
+            if (
+                operation == "execute"
+                and payload.get("payload", {}).get("action") == "post"
+                and not self.submission_started
+            ):
+                return {
+                    "status": "failed_known",
+                    "verified": False,
+                    "reason": getattr(exc, "safe_code", type(exc).__name__),
                     **self.diagnostics(),
                 }
             raise
@@ -337,6 +349,8 @@ class BrowserBackend:
 
     def x_execute(self, payload, checkpoint, authorize):
         item = payload["payload"]
+        if item["action"] == "post":
+            return self.x_original_post(payload, checkpoint, authorize)
         page = self.page
         parsed = urlparse(item["target"])
         if parsed.scheme != "https" or parsed.hostname not in {
@@ -465,6 +479,93 @@ class BrowserBackend:
         self.step("receipt_saved")
         return self.verify({**payload, "receipt": result})
 
+    def x_original_post(self, payload, checkpoint, authorize):
+        from playwright.sync_api import expect
+
+        item, page = payload["payload"], self.page
+        if not item.get("target_owned") or not owned_x_target(
+            item["target"], self.settings["identity"]
+        ):
+            raise BackendError("XOwnedTargetRequired")
+        self.step("post_composer", False)
+        check_response(page.goto("https://x.com/compose/post", wait_until="domcontentloaded"))
+        self.check_identity()
+        editor = page.locator('[data-testid="tweetTextarea_0"]:visible')
+        editor.first.wait_for(state="visible", timeout=15000)
+        editor = visible_one(editor)
+        dialogs = page.locator('[role="dialog"]:visible').filter(has=editor)
+        composer = visible_one(dialogs) if dialogs.count() else page
+        if (
+            editor.inner_text()
+            or composer.locator(
+                '[data-testid="attachments"] img, [data-testid="attachments"] video'
+            ).count()
+        ):
+            raise BackendError("XComposerNotEmpty")
+        button = composer.get_by_test_id("tweetButton" if dialogs.count() else "tweetButtonInline")
+        editor.click()
+        editor.press_sequentially(item["text"])
+        if editor.inner_text() != item["text"]:
+            raise BackendError("ApprovedTextNotRetained")
+        if item["media"]:
+            self.step("attach_media", False)
+            composer.locator('input[type="file"]').set_input_files(
+                [m["path"] for m in item["media"]]
+            )
+        expect(composer.locator('[data-testid="attachments"] img')).to_have_count(
+            len(item["media"]), timeout=45000
+        )
+        expect(composer.locator('[data-testid="attachments"] [role="progressbar"]')).to_have_count(
+            0, timeout=45000
+        )
+        expect(button).to_be_enabled(timeout=45000)
+        self.check_identity()
+        if editor.inner_text() != item["text"]:
+            raise BackendError("ApprovedTextNotRetained")
+        self.step("submission_authorization", False)
+        authorize()
+        with page.expect_response(
+            lambda r: r.request.method == "POST" and "/CreateTweet" in r.url, timeout=25000
+        ) as accepted:
+            self.step("submit_click", True)
+            visible_one(button).click()
+        self.step("parse_receipt", True)
+        data = (
+            check_response(accepted.value)
+            .json()
+            .get("data", {})
+            .get("create_tweet", {})
+            .get("tweet_results", {})
+            .get("result", {})
+        )
+        data = data.get("tweet", data)
+        tweet_id, legacy = str(data.get("rest_id", "")), data.get("legacy", {})
+        if not tweet_id.isdigit():
+            raise BackendError("XTweetReceiptUnavailable")
+        media = legacy.get("extended_entities", legacy.get("entities", {})).get("media", [])
+        original = bool(
+            legacy.get("created_at")
+            and "full_text" in legacy
+            and not legacy.get("in_reply_to_status_id_str")
+            and not legacy.get("quoted_status_id_str")
+            and not legacy.get("is_quote_status")
+            and len(media) == len(item["media"])
+            and all(entry.get("type") == "photo" for entry in media)
+        )
+        result = {
+            "status": "unknown",
+            "verified": False,
+            "external_reference": HOME["x"]
+            + "/"
+            + self.settings["identity"]
+            + "/status/"
+            + tweet_id,
+            "target_verified": original,
+        }
+        checkpoint(result)
+        self.step("receipt_saved", True)
+        return self.verify({**payload, "receipt": result})
+
     def verify(self, payload):
         item = payload["payload"]
         result = payload.get("receipt") or payload.get("result", {})
@@ -531,7 +632,12 @@ class BrowserBackend:
                 verified = bool(
                     {author.casefold() for author in authors} == {self.settings["identity"]}
                     and result.get("target_verified")
-                    and article.get_by_test_id("tweetText").inner_text() == item["text"]
+                    and (
+                        article.get_by_test_id("tweetText").inner_text()
+                        if article.get_by_test_id("tweetText").count()
+                        else ""
+                    )
+                    == item["text"]
                     and (
                         not item["media"]
                         or article.locator(
@@ -543,6 +649,10 @@ class BrowserBackend:
                 timestamp = article.locator("time")
                 if verified and timestamp.count() == 1:
                     published = observed_timestamp(timestamp.get_attribute("datetime"))
+                if item["action"] == "post":
+                    verified &= bool(published) and article.locator(
+                        '[data-testid="tweetPhoto"]'
+                    ).count() >= len(item["media"])
         return {
             **result,
             "status": "confirmed" if verified else "unknown",
@@ -554,6 +664,10 @@ class BrowserBackend:
 
 def call(platform, label, operation, payload, checkpoint, authorize):
     settings = read_profile(platform, label)
+    if platform == "x" and settings.get("connection_type") == "x_api":
+        from .x_api import call as api_call
+
+        return api_call(label, operation, payload, checkpoint, authorize)
     if settings.get("browser_channel") == "browser_use":
         from .browser_use import call as browser_use_call
 

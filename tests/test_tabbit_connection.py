@@ -203,6 +203,80 @@ class TabbitConnectionTests(unittest.TestCase):
         self.assertEqual(cli.call_count, 4)
         self.assertEqual(cli.call_args.args[0][0], "receipt")
 
+    def test_owned_original_with_png_is_prepared_authorized_and_verified_once(self):
+        settings = {**self.settings, "automatic_actions": ["reply"]}
+        receipt = {
+            "status": "unknown",
+            "external_reference": "https://x.com/brand/status/789",
+            "target_verified": True,
+        }
+        verified = {
+            **receipt,
+            "status": "confirmed",
+            "verified": True,
+            "published_at": "2026-10-20T12:00:00Z",
+        }
+        events = []
+
+        def respond(value):
+            return {"status": "succeeded", "result": {"value": value}}
+
+        with patch(
+            "auto_promotion.backends.tabbit.cli",
+            side_effect=[
+                self.inventory,
+                respond({"prepared": True}),
+                respond(receipt),
+                respond(verified),
+                {"ok": True},
+            ],
+        ) as cli:
+            result = call(
+                "x",
+                settings,
+                "execute",
+                {
+                    "item_id": "post-one",
+                    "payload": {
+                        "action": "post",
+                        "target_owned": True,
+                        "target": "https://x.com/brand",
+                        "text": "exact post",
+                        "media": [{"path": "/synthetic/approved.png", "mime_type": "image/png"}],
+                    },
+                },
+                lambda value: events.append(value),
+                lambda: events.append("authorized"),
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(events[0], "authorized")
+        self.assertEqual(cli.call_count, 5)
+        self.assertIn("setInputFiles", cli.call_args_list[1].kwargs["code"])
+        self.assertIn("X post post-one", cli.call_args_list[0].args[0])
+
+    def test_original_cannot_target_another_account(self):
+        settings = {**self.settings, "automatic_actions": ["reply"]}
+        with patch("auto_promotion.backends.tabbit.cli") as cli:
+            with self.assertRaisesRegex(BackendError, "XOwnedTargetRequired"):
+                call(
+                    "x",
+                    settings,
+                    "execute",
+                    {
+                        "item_id": "post-one",
+                        "payload": {
+                            "action": "post",
+                            "target_owned": True,
+                            "target": "https://x.com/other",
+                            "text": "exact",
+                            "media": [],
+                        },
+                    },
+                    lambda _: None,
+                    lambda: None,
+                )
+        cli.assert_not_called()
+
     def test_settled_prepare_failure_is_reconciled_without_browser_or_retry(self):
         settings = {**self.settings, "automatic_actions": ["reply"]}
         with patch("auto_promotion.backends.tabbit.cli") as cli:

@@ -89,8 +89,9 @@ function fixture() {
         emit = fn;
       },
       removeEventHandler: () => {},
-      invoke: async () =>
-        f.invokeGate
+      invoke: async () => {
+        if (f.invokeError) throw f.invokeError;
+        return f.invokeGate
           ? f.invokeGate.promise
           : !session && !f.accepted
             ? new Api.auth.LoginToken({
@@ -101,7 +102,8 @@ function fixture() {
                 authorization: new Api.auth.Authorization({
                   user: new Api.UserEmpty({ id: 42 }),
                 }),
-              }),
+              });
+      },
     };
     clients.push(client);
     return client;
@@ -456,6 +458,82 @@ test("actual Worker routes fence native/read clients during QR login while polls
   } finally {
     await worker.login.current?.run?.cancel();
   }
+  const configuredUntil = Date.now() / 1000 + 3600;
+  worker.env.TG_ACCOUNT_NOT_BEFORE = String(configuredUntil);
+  const clients = f.clients.length;
+  for (const operation of ["health", "execute", "discover"]) {
+    const response = await request(operation);
+    assert.equal(response.status, 409);
+    const outcome = await response.json();
+    assert.equal(outcome.status, "waiting_cooldown");
+    assert.equal(outcome.reason, "AccountCooldown");
+    assert.equal(outcome.retry_at, configuredUntil);
+    if (operation === "execute") {
+      assert.equal(outcome.submission_started, false);
+      assert.equal(outcome.native_authorized, false);
+    }
+  }
+  assert.equal((await request("status")).status, 200);
+  assert.equal(
+    f.clients.length,
+    clients,
+    "read/write cooldown does not create a platform client",
+  );
+  try {
+    const login = await request("login_begin");
+    assert.equal(
+      login.status,
+      200,
+      "historical message limits do not block independent device authorization",
+    );
+    assert.equal((await login.json()).status, "waiting_device_confirmation");
+    const count = f.clients.length;
+    assert.equal((await request("login_poll")).status, 200);
+    assert.equal(f.clients.length, count, "polls remain metadata-only");
+  } finally {
+    await worker.login.current?.run?.cancel();
+  }
+  const afterLogin = f.clients.length;
+  const loginUntil = configuredUntil + 1800;
+  await f.storage.transaction((tx) =>
+    tx.put({ login_cooldown_until: loginUntil }),
+  );
+  const loginBlocked = await request("login_begin");
+  assert.equal(loginBlocked.status, 409);
+  assert.equal((await loginBlocked.json()).reason, "TelegramLoginCooldown");
+  assert.equal((await request("login_poll")).status, 200);
+  const storedUntil = configuredUntil + 7200;
+  await f.storage.transaction((tx) => tx.put({ cooldown_until: storedUntil }));
+  assert.equal((await (await request("health")).json()).retry_at, storedUntil);
+  worker.env.TG_ACCOUNT_NOT_BEFORE = "invalid";
+  const invalid = await request("health");
+  assert.equal(invalid.status, 409);
+  assert.equal((await invalid.json()).reason, "InvalidAccountCooldown");
+  assert.equal(
+    f.clients.length,
+    afterLogin,
+    "login-specific cooldown/configuration rejection creates no SDK client",
+  );
+  assert.equal(platformCalls, 0);
+});
+
+test("a platform limit during device authorization persists its own deadline without clearing message limits", async () => {
+  const f = fixture();
+  const error = new Error("synthetic rate limit");
+  error.name = "FloodWaitError";
+  error.errorMessage = "FLOOD_WAIT_120";
+  error.seconds = 120;
+  f.invokeError = error;
+  await f.storage.transaction((tx) => tx.put({ cooldown_until: 5000 }));
+  const result = await f.controller.begin();
+  assert.equal(result.status, "login_failed");
+  assert.equal(result.login_diagnostics.reason, "TelegramCooldown");
+  assert.equal(f.rows().get("login_cooldown_until"), 120);
+  assert.equal(f.rows().get("cooldown_until"), 5000);
+  assert.equal(
+    (await f.newController().view()).login_diagnostics.retry_at,
+    120,
+  );
 });
 
 test("logging failures do not alter successful authorization and terminal trace survives repeated polls", async () => {

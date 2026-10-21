@@ -22,8 +22,9 @@ export class QrLoginController {
     unseal,
     waitUntil = () => {},
     clock = () => Date.now(),
-    timer = setTimeout,
-    cancelTimer = clearTimeout,
+    timer = (callback, milliseconds) =>
+      globalThis.setTimeout(callback, milliseconds),
+    cancelTimer = (handle) => globalThis.clearTimeout(handle),
     diagnosticSink,
   }) {
     Object.assign(this, {
@@ -197,7 +198,14 @@ export class QrLoginController {
   }
   async end(flow, error, status = "login_failed") {
     if (!this.owns(flow) || flow.terminal) return;
-    const safe = safeLoginError(error, safeError(error).reason);
+    const platformError = safeError(error);
+    const safe = safeLoginError(error, platformError.reason);
+    const retryAt =
+      (platformError.rate_limited || platformError.risk_warning) &&
+      Number.isFinite(platformError.retry_after_seconds) &&
+      platformError.retry_after_seconds > 0
+        ? this.clock() / 1000 + platformError.retry_after_seconds
+        : null;
     if (safe.reason === "TelegramIdentityMismatch")
       status = "identity_mismatch";
     if (safe.reason === "TelegramTwoStepLoginRequired")
@@ -220,6 +228,7 @@ export class QrLoginController {
       diagnostic_trace: flow.diagnostics.snapshot(status),
       finished_at: new Date(this.clock()).toISOString(),
       persistence_verified: false,
+      ...(retryAt ? { retry_at: retryAt } : {}),
     };
     flow.qr = null;
     try {
@@ -235,6 +244,7 @@ export class QrLoginController {
             exception_type: safe.exception_type,
           },
           qr_pending_session: null,
+          ...(retryAt ? { login_cooldown_until: retryAt } : {}),
         },
         null,
         true,

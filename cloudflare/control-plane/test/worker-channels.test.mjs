@@ -24,6 +24,9 @@ test("production Worker enforces the fence on online and standby requests", asyn
           "telegram-executor-bridge.mjs",
           "telegram-native-gate.mjs",
           "telegram-workflow-reader.mjs",
+          "telegram-reply-policy.mjs",
+          "telegram-task-builder.mjs",
+          "telegram-prepared-replies.mjs",
         ].map(async (name) => ({
           type: "ESModule",
           path: fileURLToPath(new URL("../" + name, import.meta.url)),

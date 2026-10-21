@@ -17,6 +17,7 @@ export const POOLS = new Set([
   "x.edge",
   "x.tabbit",
   "x.browser_use",
+  "x.api",
   "x.manual",
   "reddit.manual",
   "instagram.graph",
@@ -806,7 +807,22 @@ export class ControlKernel {
         throw new ControlError("ExecutionStopped");
       if (
         account.mode === "live" &&
-        !(account.allowed_actions || []).includes(data.action)
+        !(account.allowed_actions || []).includes(data.action) &&
+        !(
+          account.platform === "x" &&
+          data.action === "post" &&
+          task.policy.allow_owned_x_posts === true &&
+          task.policy.execution_channel === "cloud" &&
+          (account.allowed_actions || []).includes("reply") &&
+          data.payload?.target_owned === true &&
+          typeof account.owned_target_url === "string" &&
+          account.owned_target_url &&
+          typeof data.payload?.target === "string" &&
+          data.payload.target
+            .toLowerCase()
+            .replace(/^https:\/\/www\.x\.com\//, "https://x.com/") ===
+            account.owned_target_url.toLowerCase()
+        )
       )
         throw new ControlError("ActionNotEnabled", 403);
       if (j.expires_at <= now || now >= Date.parse(task.policy.ends_at) / 1000)

@@ -929,7 +929,14 @@ class EngineTests(unittest.TestCase):
                     changes["target"] = "https://x.com/example/status/" + str(number)
                     if action in {"like", "repost"}:
                         changes["text"] = ""
-                t = self.start(self.task(platform), [self.item(platform, **changes)])
+                    if action == "post":
+                        changes.update(
+                            target="https://x.com/simulation", target_owned=True, media=[media]
+                        )
+                t = self.start(
+                    self.task(platform, allow_owned_x_posts=platform == "x" and action == "post"),
+                    [self.item(platform, **changes)],
+                )
                 self.engine.run_once(t["id"])
                 item = self.engine.task(t["id"])["items"][0]
                 expected = (
@@ -942,8 +949,8 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(item["status"], expected, (platform, action))
                 if expected != "manual_attention":
                     self.assertTrue(item["external_reference"].startswith("simulation://"))
-        self.assertEqual(number, 13)
-        self.assertEqual(self.provider.sends, 12)
+        self.assertEqual(number, 14)
+        self.assertEqual(self.provider.sends, 13)
 
     def test_simulated_discovery_flows_through_qualification(self):
         for platform in ["telegram", "reddit", "x"]:

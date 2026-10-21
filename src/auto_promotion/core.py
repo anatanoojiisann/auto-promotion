@@ -15,7 +15,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import quotas
-from .backends.common import BackendError, automatic_actions, read_profile
+from .backends.common import (
+    BackendError,
+    automatic_action_allowed,
+    automatic_actions,
+    owned_x_target,
+    read_profile,
+    x_post_weight,
+)
 from .dispatcher import AccountBusy, AccountLanes
 from .execution_diagnostics import FIELDS, safe_code
 from .models import (
@@ -34,6 +41,7 @@ from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_
 from .routing import route_for
 from .statistics import ZONE, Statistics, publication_time, record_publication
 from .store import Store, decode
+from .task_dependencies import publication_schedule
 from .workers import Workers
 
 
@@ -111,6 +119,26 @@ class Engine:
         value = decode(row, "health")
         value["capabilities"] = sorted(CAPABILITIES[value["platform"]])
         value["automatic_actions"] = automatic_actions(value)
+        if value["platform"] == "x":
+            try:
+                identity = (
+                    read_profile(
+                        "x",
+                        value["backend_label"],
+                        accounts_dir=os.getenv(
+                            "AP_ACCOUNTS_DIR", Path(self.store.path).parent / "accounts"
+                        ),
+                    )["identity"]
+                    if value["mode"] == "live"
+                    else "simulation"
+                )
+                value["owned_target_url"] = (
+                    "https://x.com/" + identity
+                    if isinstance(identity, str) and re.fullmatch(r"[A-Za-z0-9_]{1,15}", identity)
+                    else ""
+                )
+            except BackendError:
+                value["owned_target_url"] = ""
         if value["platform"] == "tiktok":
             try:
                 value["owned_target_id"] = (
@@ -248,7 +276,10 @@ class Engine:
     def _call_unlocked(self, account, operation, payload=None, task_id=None):
         started = time.monotonic()
         try:
-            if operation in {"execute", "join"}:
+            if operation in {"execute", "join"} and not (
+                account["mode"] == "simulation"
+                and getattr(self.adapters, "offline_simulation", False)
+            ):
                 from .cloud_control import CloudControl
 
                 context = getattr(self.adapters.context, "job", None)
@@ -439,6 +470,25 @@ class Engine:
             raise Conflict("真实任务最小发送间隔为 120 秒")
         if value.policy.max_joins and not any(a["platform"] == "telegram" for a in accounts):
             raise Conflict("只有 Telegram 支持入群")
+        if value.policy.allow_owned_x_posts and any(a["platform"] != "x" for a in accounts):
+            raise Conflict("自有 X 原创发布任务只能选择 X 账号")
+        if (
+            value.policy.allow_owned_x_posts
+            and accounts[0]["mode"] == "live"
+            and value.policy.execution_channel != "cloud"
+        ):
+            raise Conflict("X 原创发布需要明确选择在线队列")
+        if value.policy.outbound_after_task_ids:
+            if len(accounts) != 1 or not value.policy.allow_owned_x_posts:
+                raise Conflict("完成互动后发布需要一个账号及自有 X 原创发布选项")
+            for source_id in value.policy.outbound_after_task_ids:
+                source = self.store.one("SELECT * FROM tasks WHERE id=?", (source_id,))
+                if (
+                    not source
+                    or source["mode"] != accounts[0]["mode"]
+                    or accounts[0]["id"] not in json.loads(source["account_ids"])
+                ):
+                    raise Conflict("前置互动任务不存在、账号不匹配或混用了模拟与真实任务")
         snapshot = [
             {
                 k: a[k]
@@ -547,10 +597,13 @@ class Engine:
         items = []
         with self.store.connect() as db:
             raw_task = db.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone()
+            _, dependency_reason = publication_schedule(db, raw_task, self.clock())
             for item in task["items"]:
                 if item["status"] != "not_attempted":
                     continue
-                reason = telegram_blocker(db, raw_task, item["payload"], item["due_at"])
+                reason = dependency_reason or telegram_blocker(
+                    db, raw_task, item["payload"], item["due_at"]
+                )
                 if reason:
                     items.append(
                         {"item_id": item["id"], "reason": reason, "message": REASONS[reason]}
@@ -623,10 +676,23 @@ class Engine:
                     "SELECT * FROM items WHERE task_id=? ORDER BY position", (task_id,)
                 ).fetchall()
                 phase = "discovered"
+                dependency_missed = False
                 if rows and sending:
-                    if not self._execution_service_ready(db, task):
+                    _, dependency_reason = publication_schedule(db, task, self.clock())
+                    if dependency_reason in {
+                        "interaction_schedule_elapsed",
+                        "interaction_schedule_outside_window",
+                    }:
+                        db.execute(
+                            "UPDATE items SET status='missed',result=? WHERE task_id=? "
+                            "AND status='not_attempted' AND attempt_id IS NULL",
+                            (canonical({"reason": dependency_reason, "verified": False}), task_id),
+                        )
+                        phase, dependency_missed = "starting", True
+                    elif dependency_reason or not self._execution_service_ready(db, task):
                         phase = "starting"
                     else:
+                        self._resolve_task_schedule(db, task)
                         self._resolve_membership_schedule(db, task)
                         rows = db.execute(
                             "SELECT * FROM items WHERE task_id=? ORDER BY position", (task_id,)
@@ -645,6 +711,9 @@ class Engine:
                     "UPDATE tasks SET state='active',phase=?,updated_at=? WHERE id=?",
                     (phase, self.clock(), task_id),
                 )
+                if dependency_missed:
+                    db.execute("UPDATE tasks SET phase='ready' WHERE id=?", (task_id,))
+                    self._mark_completed(db, task_id)
                 if task["state"] != "active" or task["phase"] != phase:
                     current = db.execute(
                         "SELECT manifest_hash FROM tasks WHERE id=?", (task_id,)
@@ -663,6 +732,40 @@ class Engine:
                         self.clock(),
                     )
         return self.task(task_id)
+
+    def _resolve_task_schedule(self, db, task):
+        policy = json.loads(task["policy"])
+        if not policy.get("outbound_after_task_ids") or task["manifest_hash"]:
+            return
+        due, reason = publication_schedule(db, task, self.clock())
+        if reason:
+            raise Conflict(REASONS[reason])
+        rows = db.execute("SELECT * FROM items WHERE task_id=?", (task["id"],)).fetchall()
+        if len(rows) != 1 or json.loads(rows[0]["payload"])["action"] != "post":
+            raise Conflict("完成互动后发布的任务需要且只允许一条原创推文")
+        row = rows[0]
+        if row["attempt_id"] or row["status"] != "not_attempted":
+            raise Conflict("已尝试的项目不能重新计算发布时间")
+        if row["due_at"] == due:
+            return
+        payload = json.loads(row["payload"])
+        payload["scheduled_at"] = datetime.fromtimestamp(due, timezone.utc).isoformat()
+        db.execute(
+            "UPDATE items SET payload=?,payload_hash=?,due_at=? WHERE id=?",
+            (canonical(payload), digest(payload), due, row["id"]),
+        )
+        Store.audit(
+            db,
+            "item.interaction_schedule_resolved",
+            {
+                "item_id": row["id"],
+                "source_task_ids": policy["outbound_after_task_ids"],
+                "completed_at": due - policy["outbound_after_tasks_seconds"],
+                "due_at": due,
+            },
+            task["id"],
+            self.clock(),
+        )
 
     def _execution_service_ready(self, db, task):
         policy = json.loads(task["policy"])
@@ -812,7 +915,7 @@ class Engine:
                 account["platform"] == "reddit"
                 or (
                     account["platform"] == "x"
-                    and value.action not in account.get("automatic_actions", [])
+                    and not automatic_action_allowed(account, value.action, task["policy"])
                 )
             )
             and value.execution_mode != "manual"
@@ -924,18 +1027,30 @@ class Engine:
                     raise Conflict("Discord 文件名不能包含换行、引号或反斜杠")
         if platform == "x":
             parsed = urlparse(value.target)
-            if (
+            if value.action == "post":
+                identity = urlparse(account.get("owned_target_url", "")).path.lstrip("/")
+                if (
+                    not policy.get("allow_owned_x_posts")
+                    or not value.target_owned
+                    or not owned_x_target(value.target, identity)
+                ):
+                    raise Conflict("X 原创发布需要本任务明确启用，并使用当前账号的自有主页链接")
+                if value.title or value.reply_to or value.recipient_id:
+                    raise Conflict("X 原创推文不使用标题、回复或收件人字段")
+                if any(m.mime_type not in {"image/png", "image/jpeg"} for m in value.media):
+                    raise Conflict("X 原创配图仅支持 PNG 或 JPEG")
+            elif (
                 parsed.scheme != "https"
                 or parsed.hostname not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
                 or not re.fullmatch(r"/[A-Za-z0-9_]+/status/\d+/?", parsed.path)
             ):
                 raise Conflict("X 目标必须是明确的帖子链接")
             if (
-                len(value.text) > 280
+                (x_post_weight(value.text) if value.action == "post" else len(value.text)) > 280
                 or len(value.media) > 4
-                or (value.media and value.action != "reply")
+                or (value.media and value.action not in {"reply", "post"})
             ):
-                raise Conflict("X 回复/引用最多 280 字符；仅回复支持最多 4 个媒体")
+                raise Conflict("X 正文最多 280 加权字符；回复与原创推文最多 4 个媒体")
         if platform == "reddit":
             if value.media:
                 raise Conflict("Reddit 当前执行器仅支持文字")
@@ -1010,6 +1125,10 @@ class Engine:
         task = self.task(task_id)
         if not values or len(values) > 200:
             raise Conflict("每批需要 1–200 个执行项")
+        if task["policy"].get("outbound_after_task_ids") and (
+            len(values) != 1 or values[0].action != "post"
+        ):
+            raise Conflict("完成互动后发布的任务需要且只允许一条原创推文")
         previous_due = 0
         last_by_account = {}
         payloads = []
@@ -1110,6 +1229,7 @@ class Engine:
         if row["manifest_hash"]:
             self._integrity(db, row, "outbound")
             return
+        self._resolve_task_schedule(db, row)
         self._validate_outbound_readiness(db, row)
         quotas.reserve(db, row)
         items = [
@@ -1365,7 +1485,7 @@ class Engine:
                     account["platform"] == "reddit"
                     or (
                         account["platform"] == "x"
-                        and payload["action"] not in account["automatic_actions"]
+                        and not automatic_action_allowed(account, payload["action"], policy)
                     )
                 )
                 and payload.get("execution_mode", "automatic") != "manual"
@@ -1410,7 +1530,10 @@ class Engine:
                 return self._skip(item_id, "scheduled_time_pending", db)
             if (
                 now >= epoch(policy["ends_at"])
-                or now - row["due_at"] > DELIVERY_GRACE_SECONDS
+                or (
+                    now - row["due_at"] > DELIVERY_GRACE_SECONDS
+                    and not (row["phase"] == "starting" and policy.get("outbound_after_task_ids"))
+                )
                 or (native and row["due_at"] <= now)
             ):
                 db.execute(
@@ -1451,6 +1574,13 @@ class Engine:
             reason = telegram_blocker(db, task, payload, now)
             if reason:
                 return self._skip(item_id, reason, db)
+            from .interaction_intents import candidate_guard, claim_intent
+
+            reason = candidate_guard(db, item_id, now)
+            if not reason:
+                reason = claim_intent(db, account, task, payload, item_id, now)
+            if reason:
+                return self._skip(item_id, reason, db)
             attempt = "attempt-" + uuid.uuid4().hex
             db.execute(
                 "INSERT INTO attempts(id,item_id,account_id,task_id,target_key,user_key,mode,started_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -1459,6 +1589,10 @@ class Engine:
             db.execute(
                 "UPDATE items SET status='executing',attempt_id=?,claimed_at=?,result='{}' WHERE id=?",
                 (attempt, now, item_id),
+            )
+            db.execute(
+                "UPDATE hf_candidates SET state='PUBLISHING',verification_started_at=COALESCE(verification_started_at,?) WHERE item_id=?",
+                (now, item_id),
             )
             db.execute("UPDATE quota_reservations SET state='consumed' WHERE item_id=?", (item_id,))
             db.execute(
@@ -1810,6 +1944,7 @@ class Engine:
             k: result[k]
             for k in (
                 "verified",
+                "confirmed_not_submitted",
                 "scheduled",
                 "active",
                 "message_ids",
@@ -1906,6 +2041,7 @@ class Engine:
             "item_id": item_id,
             "task_id": row["task_id"],
             "attempt_id": row["attempt_id"],
+            "attempt_started_at": row["claimed_at"],
             "payload": json.loads(row["payload"]),
             "external_reference": row["external_reference"],
             "result": json.loads(row["result"]),

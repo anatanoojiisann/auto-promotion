@@ -87,6 +87,10 @@ export class TelegramExecutor extends DurableObject {
         installed: true,
         request_id: input.request_id,
         runtime: "cloudflare-workers",
+        account_id: this.env.TG_ACCOUNT_ID,
+        account_not_before: Number(this.env.TG_ACCOUNT_NOT_BEFORE || 0),
+        login_cooldown_until:
+          (await this.ctx.storage.get("login_cooldown_until")) || 0,
         library: LIBRARY_VERSION,
         api_configured: this.configured(),
         login_state: login.status,
@@ -124,24 +128,62 @@ export class TelegramExecutor extends DurableObject {
         },
         409,
       );
-    const cooldown = (await this.ctx.storage.get("cooldown_until")) || 0;
-    if (cooldown > Date.now() / 1000)
-      return response(
-        preExecutionDeferral(input, "waiting_cooldown", cooldown),
-        409,
-      );
+    // Device authorization is separate from historical read/write cooldowns.
+    // Its own server-returned limits still block a new login attempt.
     if (op === "login_begin" || op === "login_poll") {
       if (this.busy)
         return response(
           preExecutionDeferral(input, "waiting_account_lock"),
           409,
         );
+      if (op === "login_begin") {
+        const until = Number(
+          (await this.ctx.storage.get("login_cooldown_until")) || 0,
+        );
+        if (!Number.isFinite(until) || until < 0)
+          return response(
+            { status: "waiting_configuration", reason: "InvalidLoginCooldown" },
+            409,
+          );
+        if (until > Date.now() / 1000)
+          return response(
+            {
+              status: "waiting_cooldown",
+              reason: "TelegramLoginCooldown",
+              retry_at: until,
+            },
+            409,
+          );
+      }
       return response(
         op === "login_begin"
           ? await this.login.begin(input)
           : await this.login.view(input),
       );
     }
+    const accountNotBefore = Number(this.env.TG_ACCOUNT_NOT_BEFORE || 0);
+    const storedCooldown = Number(
+      (await this.ctx.storage.get("cooldown_until")) || 0,
+    );
+    if (
+      !Number.isFinite(accountNotBefore) ||
+      accountNotBefore < 0 ||
+      !Number.isFinite(storedCooldown) ||
+      storedCooldown < 0
+    )
+      return response(
+        { status: "waiting_configuration", reason: "InvalidAccountCooldown" },
+        409,
+      );
+    const cooldown = Math.max(accountNotBefore, storedCooldown);
+    if (cooldown > Date.now() / 1000)
+      return response(
+        {
+          ...preExecutionDeferral(input, "waiting_cooldown", cooldown),
+          reason: "AccountCooldown",
+        },
+        409,
+      );
     if (this.busy || this.login.active)
       return response(preExecutionDeferral(input, "waiting_account_lock"), 409);
     this.busy = true;

@@ -462,7 +462,9 @@ export class WorkflowQueue {
       updated_at: p.updated_at,
     };
   }
-  claim(node, id) {
+  claim(node, id, { target = null } = {}) {
+    if (target !== null && !/^@[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(target))
+      fail("InvalidWorkflowTarget");
     return this.k.tx(() => {
       const p = this.plan(id),
         now = this.k.clock();
@@ -481,10 +483,12 @@ export class WorkflowQueue {
       for (const row of this.k.rows(
         "SELECT * FROM worksteps WHERE plan_id=? AND state='pending' AND json_extract(definition,'$.stage') IN (" +
           node.stages.map(() => "?").join(",") +
-          ") AND available_at<=? ORDER BY available_at,rowid",
+          ") AND available_at<=? AND (? IS NULL OR lower(json_extract(definition,'$.input.target'))=?) ORDER BY available_at,rowid",
         id,
         ...node.stages,
         now,
+        target,
+        target?.toLowerCase() || null,
       )) {
         const s = JSON.parse(row.definition);
         if (

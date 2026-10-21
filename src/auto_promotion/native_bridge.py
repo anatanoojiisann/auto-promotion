@@ -73,6 +73,16 @@ RESULT_FIELDS = {
 }
 RESULT_FIELDS.update(FIELDS)
 RESULT_FIELDS.add("progress_mirror_deferred")
+RESULT_FIELDS.update(
+    {
+        "coverage_complete",
+        "eligibility",
+        "source",
+        "source_status",
+        "actual_cost",
+        "confirmed_not_submitted",
+    }
+)
 
 
 def dispatch(request):

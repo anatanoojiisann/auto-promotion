@@ -32,7 +32,7 @@ const actions = {
   send_file: "发送文件",
   schedule_message: "原生定时文字",
   schedule_file: "原生定时文件",
-  post: "发布文字帖子",
+  post: "发布原创帖子",
   publish: "发布媒体",
   manual_comment: "人工评论",
   like: "点赞",
@@ -254,10 +254,12 @@ async function render() {
       inbox: "回复待办",
       feeds: "内容采集来源",
       templates: "任务模板",
+      interactions: "高频互动",
     }[section] || "任务中心");
   if (hash.startsWith("tasks/")) return renderTask(hash.slice(6));
   if (hash.startsWith("campaigns/")) return renderCampaign(hash.slice(10));
   if (hash.startsWith("growth/")) return renderGrowthGoal(hash.slice(7));
+  if (section === "interactions") return renderInteractions(hash.split("/")[1]);
   if (section === "growth") return renderGrowth();
   if (section === "inbox") return renderInbox();
   if (section === "feeds") return renderFeeds();
@@ -689,6 +691,16 @@ function taskForm() {
         account_ids: f.getAll("accounts"),
         policy: {
           execution_channel: f.get("execution_channel"),
+          ...(f.get("allow_owned_x_posts") === "on"
+            ? { allow_owned_x_posts: true }
+            : {}),
+          ...(split("outbound_after_task_ids").length
+            ? {
+                outbound_after_task_ids: split("outbound_after_task_ids"),
+                outbound_after_tasks_seconds:
+                  Number(f.get("outbound_after_tasks_minutes")) * 60,
+              }
+            : {}),
           queries: split("queries"),
           required_keywords: split("required"),
           blocked_keywords: split("blocked"),
@@ -712,6 +724,13 @@ function taskForm() {
       await refresh();
       location.hash = "tasks/" + task.id;
     });
+  };
+  $("#task-form .form-actions").insertAdjacentHTML(
+    "beforebegin",
+    '<fieldset><legend>X 原创发布</legend><label class="checkbox-label"><input type="checkbox" name="allow_owned_x_posts">允许本任务向自有 X 账号发布原创推文</label><p class="help">使用在线队列，保留账号限额和每条仅提交一次的规则。每个账号分别创建一条发布任务。</p><label>等待完成的互动任务 ID（每行一个，可留空）<textarea name="outbound_after_task_ids" rows="2"></textarea></label><label>全部核验发布后等待（分钟）<input type="number" name="outbound_after_tasks_minutes" min="0" max="10080" value="60"></label><p class="help">有漏发、结果未知或缺少实际发布时间时继续等待。目标时间已过时不会补发。</p></fieldset>',
+  );
+  $("#task-form [name=allow_owned_x_posts]").onchange = (e) => {
+    if (e.target.checked) $("#execution-channel").value = "cloud";
   };
 }
 function taskReadinessPanel(t) {
@@ -1019,17 +1038,26 @@ function itemEditor(t) {
     const live = state.accounts.find((x) => x.id === a.id);
     return {
       execution_mode:
-        live.mode === "live" && ["x", "reddit"].includes(live.platform)
-          ? "manual"
-          : "automatic",
+        t.policy.allow_owned_x_posts && live.platform === "x"
+          ? "automatic"
+          : live.mode === "live" && ["x", "reddit"].includes(live.platform)
+            ? "manual"
+            : "automatic",
       account_id: a.id,
       action:
-        live.platform === "tiktok"
-          ? "publish"
-          : state.accounts
-              .find((x) => x.id === a.id)
-              .capabilities.find((c) => !["discover", "join"].includes(c)),
-      target: live.platform === "tiktok" ? live.owned_target_id || "" : "",
+        t.policy.allow_owned_x_posts && live.platform === "x"
+          ? "post"
+          : live.platform === "tiktok"
+            ? "publish"
+            : state.accounts
+                .find((x) => x.id === a.id)
+                .capabilities.find((c) => !["discover", "join"].includes(c)),
+      target:
+        t.policy.allow_owned_x_posts && live.platform === "x"
+          ? live.owned_target_url || ""
+          : live.platform === "tiktok"
+            ? live.owned_target_id || ""
+            : "",
       text: "",
       title: "",
       media: [],
@@ -1039,7 +1067,9 @@ function itemEditor(t) {
       reply_to: null,
       discord_reply_to: "",
       recipient_id: "",
-      target_owned: live.platform === "tiktok",
+      target_owned:
+        live.platform === "tiktok" ||
+        (live.platform === "x" && t.policy.allow_owned_x_posts),
       tiktok_video_id: "",
       tiktok_comment_id: "",
       tiktok_options: null,
@@ -1053,6 +1083,11 @@ function itemEditor(t) {
     );
   openPanel("编辑执行清单", "");
   function targetField(p, n) {
+    if (
+      state.accounts.find((a) => a.id === p.account_id).platform === "x" &&
+      p.action === "post"
+    )
+      return `<label>当前 X 账号主页<input name="target" value="${esc(p.target)}" readonly required></label><p class="help">发布前会再次核对当前账号和主页身份。</p>`;
     if (
       state.accounts.find((a) => a.id === p.account_id).platform !== "discord"
     )
@@ -1086,6 +1121,35 @@ function itemEditor(t) {
       .join(
         "",
       )}<button class="secondary" type="button" id="append-item">添加执行项</button><div class="form-actions"><button type="submit">保存清单</button></div></form>`;
+    container.querySelectorAll("[data-index]").forEach((row) => {
+      const item = items[Number(row.dataset.index)];
+      const account = state.accounts.find((a) => a.id === item.account_id);
+      if (account.platform !== "x" || item.action !== "post") return;
+      const title = row.querySelector("[name=title]");
+      title.type = "hidden";
+      title.value = "";
+      title.closest("div").hidden = true;
+      item.title = "";
+      const reply = row.querySelector("[name=reply_to]");
+      if (reply) reply.closest("div").hidden = true;
+      row
+        .querySelector("[name=scheduled_at]")
+        .closest("div")
+        .classList.add("full");
+      const file = row.querySelector('input[type="file"]');
+      file.accept = "image/png,image/jpeg";
+      file.disabled = item.media.length >= 4;
+      file.closest("div").querySelector("p.help").textContent =
+        (item.media.map((m) => m.filename).join(" · ") || "尚未添加配图") +
+        " · PNG/JPEG，最多 4 张";
+      row
+        .querySelectorAll("[data-source], [data-media-type]")
+        .forEach((field) => {
+          field.closest("label").hidden = true;
+        });
+      const owned = row.querySelector("[name=target_owned]").parentElement;
+      owned.lastChild.textContent = "这是当前 X 账号的自有发布目标";
+    });
     function collect() {
       container.querySelectorAll("[data-index]").forEach((row) => {
         const n = Number(row.dataset.index),
@@ -1145,6 +1209,11 @@ function itemEditor(t) {
             items[index].target = account.owned_target_id || "";
             items[index].target_owned = true;
             items[index].action = "publish";
+          } else if (account.platform === "x" && t.policy.allow_owned_x_posts) {
+            items[index].action = "post";
+            items[index].execution_mode = "automatic";
+            items[index].target = account.owned_target_url || "";
+            items[index].target_owned = true;
           }
           draw();
         }),
@@ -1153,6 +1222,14 @@ function itemEditor(t) {
       (el) =>
         (el.onchange = () => {
           collect();
+          const index = Number(el.closest("[data-index]").dataset.index);
+          const account = state.accounts.find(
+            (a) => a.id === items[index].account_id,
+          );
+          if (account.platform === "x" && el.value === "post") {
+            items[index].target = account.owned_target_url || "";
+            items[index].target_owned = true;
+          }
           draw();
         }),
     );

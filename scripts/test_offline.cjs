@@ -31,6 +31,9 @@ let mf, child, timer;
         "telegram-executor-bridge.mjs",
         "telegram-native-gate.mjs",
         "telegram-workflow-reader.mjs",
+        "telegram-prepared-replies.mjs",
+        "telegram-reply-policy.mjs",
+        "telegram-task-builder.mjs",
       ].map((name) => ({
         type: "ESModule",
         path: path.join(cloudRoot, name),
@@ -83,7 +86,10 @@ let mf, child, timer;
     child = spawn(python, args, { cwd: root, env, stdio: "inherit" });
     child.once("error", reject);
     child.once("close", (code) => resolve(code ?? 1));
-    timer = setTimeout(() => child.kill("SIGTERM"), 300000);
+    timer = setTimeout(
+      () => child.kill("SIGTERM"),
+      Number(process.env.AP_TEST_TIMEOUT_MS || 300000),
+    );
   });
 })()
   .catch((error) => {

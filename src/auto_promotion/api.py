@@ -37,6 +37,8 @@ from .growth_models import (
     InboxUpdate,
     StoreMetricImport,
 )
+from .interaction_models import CandidateAction, ConfigSave
+from .interactions import Interactions
 from .legacy import inventory
 from .models import (
     AccountInput,
@@ -113,6 +115,7 @@ def create_app(
     growth = Growth(engine)
     task_tools = TaskTools(engine)
     tiktok = TikTokManager(engine)
+    interactions = Interactions(engine)
     report_worker = worker if report_worker is None else report_worker
     operator_token = token or os.getenv("AP_API_TOKEN")
     if not operator_token:
@@ -201,6 +204,14 @@ def create_app(
                 sender = stack.enter_context(WorkerRun(store, live_enabled=engine.live_enabled))
                 background_tasks["sender"] = asyncio.create_task(work_loop())
                 jobs.append(background_tasks["sender"])
+                callbacks = [(interactions.schedule, "hf_schedule")]
+                callbacks.extend(
+                    (lambda stage=stage: interactions.run_stage(stage, max_jobs=3), "hf_" + stage)
+                    for stage in interactions.stages
+                )
+                for callback, kind in callbacks:
+                    background_tasks[kind] = asyncio.create_task(report_loop(callback, kind))
+                    jobs.append(background_tasks[kind])
             if report_worker:
                 callbacks = (
                     (
@@ -245,6 +256,7 @@ def create_app(
     app.state.statistics = statistics
     app.state.pools, app.state.campaigns = pools, campaigns
     app.state.tiktok = tiktok
+    app.state.interactions = interactions
 
     @app.middleware("http")
     async def boundary(request: Request, call_next):
@@ -312,6 +324,42 @@ def create_app(
     @app.exception_handler(BackendError)
     async def backend_error(request, exc):
         return JSONResponse({"error": exc.safe_code}, status_code=409)
+
+    @app.get("/api/interactions")
+    def interaction_policies():
+        return interactions.list()
+
+    @app.get("/api/interactions/defaults")
+    def interaction_defaults():
+        from .interaction_models import InteractionConfig
+
+        return InteractionConfig().model_dump()
+
+    @app.post("/api/interactions")
+    def interaction_save(value: ConfigSave):
+        return interactions.save(value)
+
+    @app.post("/api/interactions/simulate")
+    def interaction_simulate():
+        from .interaction_simulation import simulate
+
+        return simulate()
+
+    @app.get("/api/interactions/{policy_id}")
+    def interaction_status(policy_id: str):
+        return interactions.status(policy_id)
+
+    @app.get("/api/interactions/{policy_id}/candidates")
+    def interaction_candidates(policy_id: str, offset: int = 0, limit: int = 100):
+        return interactions.candidates(policy_id, offset=offset, limit=limit)
+
+    @app.post("/api/interactions/{policy_id}/scan")
+    def interaction_trigger(policy_id: str):
+        return interactions.trigger(policy_id, manual=True)
+
+    @app.post("/api/interactions/actions")
+    def interaction_action(value: CandidateAction):
+        return interactions.action(value)
 
     @app.get("/api/tiktok/app")
     def tiktok_app_status():

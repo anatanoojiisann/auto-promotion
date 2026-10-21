@@ -39,7 +39,16 @@ def scopes(db, account, task, payload):
         (
             "account",
             account["id"],
-            {"daily": account["daily_limit"], "hourly": account["hourly_limit"]},
+            {
+                "daily": min(
+                    account["daily_limit"],
+                    policy.get("account_daily_limit") or account["daily_limit"],
+                ),
+                "hourly": min(
+                    account["hourly_limit"],
+                    policy.get("account_hourly_limit") or account["hourly_limit"],
+                ),
+            },
         ),
         ("task", task["id"], {"daily": policy["daily_limit"], "hourly": 100000}),
         (

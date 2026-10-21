@@ -42,6 +42,14 @@ def main():
     )
     sub.add_parser("init")
     sub.add_parser("worker-once")
+    sub.add_parser(
+        "interaction-once",
+        help="Advance durable high-frequency jobs once; publish through existing sender",
+    )
+    sub.add_parser(
+        "interaction-simulate",
+        help="Run isolated fake-clock end-to-end acceptance, without external calls",
+    )
     pool = sub.add_parser("pool-worker", help="Run one persistent platform/connection executor")
     pool.add_argument("--pool", required=True)
     pool.add_argument("--node-id", required=True)
@@ -198,6 +206,11 @@ def main():
             port=args.port,
             access_log=False,
         )
+        return
+    if args.command == "interaction-simulate":
+        from .interaction_simulation import simulate
+
+        print(json.dumps(simulate(), ensure_ascii=False, indent=2))
         return
     store = Store(args.db)
     if args.command in {"statistics", "report-once"}:
@@ -399,6 +412,13 @@ def main():
             "source": "historical_task_account_labels_only",
             "external_actions": 0,
         }
+    elif args.command == "interaction-once":
+        from .interactions import Interactions
+
+        service = Interactions(engine)
+        service.schedule()
+        result = [service.run_stage(stage) for stage in service.stages]
+        service.schedule()
     elif args.command == "worker-once":
         with WorkerRun(engine.store, live_enabled=engine.live_enabled) as sender:
             sender.phase("executing")

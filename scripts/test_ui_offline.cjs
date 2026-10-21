@@ -8,6 +8,7 @@ const root = path.resolve(__dirname, "..");
 const suites = {
   main: "ui_test.cjs",
   pools: "pool_ui_test.cjs",
+  interactions: "hf_ui_test.cjs",
   faults: "ui_fault_test.cjs",
 };
 const selected = process.argv.slice(2);

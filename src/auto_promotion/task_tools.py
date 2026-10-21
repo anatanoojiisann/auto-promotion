@@ -158,7 +158,14 @@ class TaskTools:
     def save_template(self, value):
         task = self.engine.task(value.source_task_id)
         settings = Policy.model_validate(task["policy"]).model_dump(
-            exclude={"starts_at", "ends_at", "target_allowlist", "quota_snapshot"}
+            exclude={
+                "starts_at",
+                "ends_at",
+                "target_allowlist",
+                "quota_snapshot",
+                "outbound_after_task_ids",
+                "outbound_after_tasks_seconds",
+            }
         )
         template_id = "tpl-" + uuid.uuid4().hex[:16]
         platforms = sorted({a["platform"] for a in task["account_snapshot"]})

@@ -10,7 +10,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .common import BackendError, observed_timestamp
+from .common import BackendError, observed_timestamp, owned_x_target
 
 
 def launcher_path():
@@ -175,13 +175,14 @@ async function composerControls() {
   const scope = count === 1 ? dialogs : page;
   const editor = scope.getByTestId("tweetTextarea_0");
   await expect(editor).toHaveCount(1);
-  return {editor, button: scope.getByTestId(count === 1 ? "tweetButton" : "tweetButtonInline")};
+  return {editor, scope, button: scope.getByTestId(count === 1 ? "tweetButton" : "tweetButtonInline")};
 }
 """
 
 PREPARE_JS = r"""
-await page.goto(item.target, {waitUntil: "domcontentloaded"});
+await page.goto(item.action === "post" ? "https://x.com/compose/post" : item.target, {waitUntil: "domcontentloaded"});
 await checkIdentity();
+if (item.action === "reply") {
 const article = await targetArticle(item.target);
 const reply = article.getByTestId("reply").first();
 await expect(reply).toBeVisible();
@@ -191,22 +192,35 @@ await reply.click();
 // Wait for the modal itself; choosing a visible editor immediately races it.
 await page.locator('[role="dialog"]:visible').filter({has:page.getByTestId("tweetTextarea_0")})
   .waitFor({state:"visible", timeout:15000});
-const {editor} = await composerControls();
+}
+const {editor, scope, button} = await composerControls();
 await editor.waitFor({state: "visible", timeout: 15000});
+if (item.action === "post") assert((await editor.innerText()) === "" &&
+  await scope.locator('[data-testid="attachments"] img, [data-testid="attachments"] video').count() === 0, "XComposerNotEmpty");
 await editor.click();
 await editor.press("Control+A");
 await editor.press("Backspace");
 await editor.pressSequentially(item.text);
 await expect(editor).toHaveText(item.text);
+if (item.media.length) await scope.locator('input[type="file"]').setInputFiles(item.media.map(m => m.path));
+if (item.action === "post") {
+  await expect(scope.locator('[data-testid="attachments"] img')).toHaveCount(item.media.length, {timeout:45000});
+  await expect(scope.locator('[data-testid="attachments"] [role="progressbar"]')).toHaveCount(0, {timeout:45000});
+}
+await expect(button).toBeEnabled({timeout: 45000});
 return {prepared: true};
 """
 
 SUBMIT_JS = r"""
 await checkIdentity();
 assert(page.url().split("?")[0] === item.target || page.url().includes("/compose/"), "XTargetChanged");
-await targetArticle(item.target);
-const {editor, button} = await composerControls();
+if (item.action === "reply") await targetArticle(item.target);
+const {editor, button, scope} = await composerControls();
 await expect(editor).toHaveText(item.text);
+if (item.action === "post") {
+  await expect(scope.locator('[data-testid="attachments"] img')).toHaveCount(item.media.length);
+  await expect(scope.locator('[data-testid="attachments"] [role="progressbar"]')).toHaveCount(0);
+}
 await expect(button).toBeVisible();
 await expect(button).toBeEnabled();
 const receiptPromise = page.waitForResponse(r => r.request().method() === "POST" && r.url().includes("/CreateTweet"), {timeout: 25000});
@@ -220,8 +234,13 @@ const id = tweet?.rest_id;
 const parent = tweet?.legacy?.in_reply_to_status_id_str;
 if (!/^\d+$/.test(id || "")) return {status: "unknown", verified: false,
   reason: "XTweetReceiptUnavailable", submission_started: true};
+const legacy = tweet.legacy || {};
+const media = (legacy.extended_entities || legacy.entities || {}).media || [];
+const targetVerified = item.action === "post" ? !!(legacy.created_at && "full_text" in legacy &&
+  !parent && !legacy.quoted_status_id_str && !legacy.is_quote_status && media.length === item.media.length && media.every(m=>m.type === "photo"))
+  : parent === new URL(item.target).pathname.split("/").pop();
 return {status: "unknown", verified: false, external_reference: `https://x.com/${expected}/status/${id}`,
-  target_verified: parent === new URL(item.target).pathname.split("/").pop(), submission_started: true};
+  target_verified: targetVerified, submission_started: true};
 """
 
 VERIFY_JS = r"""
@@ -232,9 +251,10 @@ const showOriginal = article.getByRole("button", {name:"Show original", exact:tr
 if (await showOriginal.count() === 1) await showOriginal.click();
 const authors = [...new Set([...(await article.getByTestId("User-Name").first().innerText())
   .matchAll(/@([A-Za-z0-9_]{1,15})\b/g)].map(m => m[1].toLowerCase()))];
-const text = await article.getByTestId("tweetText").innerText();
+const text = await article.getByTestId("tweetText").count() ? await article.getByTestId("tweetText").innerText() : "";
 const stamp = await article.locator("time").getAttribute("datetime");
-const verified = receipt.target_verified === true && authors.length === 1 && authors[0] === expected && text === item.text;
+const mediaVerified = item.action !== "post" || await article.getByTestId("tweetPhoto").count() >= item.media.length;
+const verified = receipt.target_verified === true && authors.length === 1 && authors[0] === expected && text === item.text && mediaVerified && !!stamp;
 return {...receipt, status: verified ? "confirmed" : "unknown", verified, published_at: verified ? stamp : null};
 """
 
@@ -242,14 +262,21 @@ return {...receipt, status: verified ? "confirmed" : "unknown", verified, publis
 def reply(settings, operation, payload, checkpoint, authorize):
     """Prepare without posting, reauthorize, submit once, and retain uncertain receipts."""
     item = payload["payload"]
-    if item["action"] != "reply" or item.get("media"):
+    if item["action"] not in {"reply", "post"} or (item["action"] == "reply" and item.get("media")):
         raise BackendError("TabbitReplyOnly")
     expected, instance = settings.get("identity", ""), settings.get("tabbit_instance", "")
     if not re.fullmatch(r"[a-z0-9_]{1,15}", expected) or not re.fullmatch(
         r"[0-9A-F]{16}", instance
     ):
         raise BackendError("InvalidTabbitConfiguration")
-    if not re.fullmatch(r"https://x\.com/[A-Za-z0-9_]+/status/[0-9]+", item["target"]):
+    if item["action"] == "post":
+        if not item.get("target_owned") or not owned_x_target(item["target"], expected):
+            raise BackendError("XOwnedTargetRequired")
+        if len(item.get("media", [])) > 4 or any(
+            m.get("mime_type") not in {"image/png", "image/jpeg"} for m in item.get("media", [])
+        ):
+            raise BackendError("XPostMediaInvalid")
+    elif not re.fullmatch(r"https://x\.com/[A-Za-z0-9_]+/status/[0-9]+", item["target"]):
         raise BackendError("InvalidXTarget")
     prior = payload.get("receipt") or payload.get("result") or {}
     if (
@@ -267,7 +294,7 @@ def reply(settings, operation, payload, checkpoint, authorize):
             "verified": True,
             "reason": "TabbitPreparationFailedBeforeSubmission",
         }
-    task = "X reply " + payload["item_id"]
+    task = "X " + item["action"] + " " + payload["item_id"]
     inventory = cli(["create", "--task", task], instance)
     if inventory.get("task", {}).get("reused"):
         raise BackendError("TabbitCheckPending")

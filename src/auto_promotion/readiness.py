@@ -7,6 +7,17 @@ from .models import epoch
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "facts_unverified": "当前草稿依赖的产品事实尚未核实或已经失效",
+    "account_profile_mismatch": "语言或目标不符合发送账号资料",
+    "interaction_already_claimed": "同一项目、目标事件的互动已由另一个任务占用",
+    "interaction_history_unresolved_or_published": "历史互动已发布或结果未决，禁止重复发送",
+    "strategy_paused_or_dry_run": "高频互动策略已停用或切换为 dry-run",
+    "candidate_expired": "候选已超过有效期",
+    "candidate_not_ready": "候选状态已变化，暂不能发布",
+    "manual_selection_required": "P2/P3 需要有效的人工选择",
+    "account_authorization_revoked": "账号已不在策略授权范围",
+    "candidate_requires_current_rules": "候选需要按当前配置重新检查",
+    "outside_publish_hours": "当前时间不在策略发布时段内",
     "task_not_active": "任务未激活或已暂停",
     "task_not_started": "任务尚未开始发送",
     "global_stop": "全局执行已停止",
@@ -33,6 +44,11 @@ REASONS = {
     "join_wait_unverified": "入群等待截止时间尚未核实",
     "join_wait_pending": "尚未满足入群后等待时间",
     "manifest_integrity_failed": "任务配置或发送清单完整性检查未通过",
+    "interaction_dependencies_pending": "前置互动尚未全部核验实际发布，暂不开始计时",
+    "interaction_dependencies_invalid": "前置互动任务或账号范围不匹配",
+    "interaction_schedule_elapsed": "互动完成后的目标时间已过，需要创建新排期",
+    "interaction_schedule_outside_window": "互动完成后的目标时间超出本任务窗口",
+    "interaction_schedule_pacing_blocked": "现有账号间隔或冷却晚于目标时间，需要重新排期",
 }
 
 
@@ -82,7 +98,10 @@ def task_workflow(task, blockers, item_blockers, now):
                 now - i["due_at"] > DELIVERY_GRACE_SECONDS
                 and not (
                     task["phase"] == "starting"
-                    and task["policy"].get("outbound_after_service_recovery_seconds") is not None
+                    and (
+                        task["policy"].get("outbound_after_service_recovery_seconds") is not None
+                        or task["policy"].get("outbound_after_task_ids")
+                    )
                 )
             )
             or (
@@ -102,6 +121,14 @@ def task_workflow(task, blockers, item_blockers, now):
             "保存每项的账号、目标、完整正文和计划时间。",
             "edit_items",
         )
+    if task["phase"] == "starting" and task["policy"].get("outbound_after_task_ids"):
+        reasons = {i["reason"] for i in item_blockers}
+        if reasons:
+            return step(
+                "waiting_interactions",
+                "等待互动核验",
+                "；".join(REASONS[r] for r in sorted(reasons)),
+            )
     if (
         task["phase"] == "starting"
         and task["policy"].get("outbound_after_service_recovery_seconds") is not None

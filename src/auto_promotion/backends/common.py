@@ -66,9 +66,65 @@ def automatic_actions(account):
         profile = read_profile("x", account["backend_label"])
     except BackendError:
         return []
+    if profile.get("connection_type") == "x_api":
+        return [
+            "reply"
+        ]  # Every target still requires the official API preflight and submit checks.
     if profile.get("browser_channel") == "browser_use":
         return []
     return ["reply"] if "reply" in profile.get("automatic_actions", []) else []
+
+
+def automatic_action_allowed(account, action, policy):
+    """An owned post is a task-scoped opt-in on an already commissioned X connection."""
+    allowed = account.get("automatic_actions", [])
+    return action in allowed or (
+        account.get("platform") == "x"
+        and action == "post"
+        and policy.get("allow_owned_x_posts") is True
+        and policy.get("execution_channel") == "cloud"
+        and "reply" in allowed
+    )
+
+
+def owned_x_target(target, identity):
+    from urllib.parse import urlparse
+
+    parsed = urlparse(target)
+    return bool(
+        isinstance(identity, str)
+        and re.fullmatch(r"[a-z0-9_]{1,15}", identity.casefold())
+        and parsed.scheme == "https"
+        and parsed.netloc.casefold() in {"x.com", "www.x.com"}
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path.casefold() == "/" + identity.casefold()
+    )
+
+
+def x_post_weight(text):
+    """Conservative twitter-text v3 weights; joined emoji can be over-counted."""
+
+    def weight(fragment):
+        return sum(
+            1
+            if (
+                ord(c) <= 4351
+                or 8192 <= ord(c) <= 8205
+                or 8208 <= ord(c) <= 8223
+                or 8242 <= ord(c) <= 8247
+            )
+            else 2
+            for c in fragment
+        )
+
+    total, cursor = 0, 0
+    for match in re.finditer(r"https?://[^\s<>()]+", text):
+        total += weight(text[cursor : match.start()])
+        raw = match.group().rstrip(".,!?;:'\"")
+        total += 23 + weight(match.group()[len(raw) :])
+        cursor = match.end()
+    return total + weight(text[cursor:])
 
 
 def save_profile(platform, label, data, *, accounts_dir=None):
@@ -242,6 +298,11 @@ def verify_claim(request):
         else:
             if row["attempt_id"] != payload.get("attempt_id"):
                 raise BackendError("InvalidExecutionClaim")
+            from ..interaction_intents import candidate_guard
+
+            reason = candidate_guard(db, row["id"], now)
+            if reason:
+                raise BackendError(reason)
             item = json.loads(row["payload"])
             if item.get("execution_mode") == "manual":
                 raise BackendError("ManualActionMustNotUseBackend")
@@ -249,9 +310,15 @@ def verify_claim(request):
             current_account["automatic_actions"] = automatic_actions(current_account)
             if account["platform"] == "reddit" or (
                 account["platform"] == "x"
-                and item["action"] not in current_account["automatic_actions"]
+                and not automatic_action_allowed(current_account, item["action"], policy)
             ):
                 raise BackendError("PlatformAutomationNotEnabled")
+            if account["platform"] == "x" and item["action"] == "post":
+                profile = read_profile("x", account["backend_label"])
+                if not item.get("target_owned") or not owned_x_target(
+                    item["target"], profile["identity"]
+                ):
+                    raise BackendError("XOwnedTargetRequired")
             if item.get("opportunity_id"):
                 from ..planner import execution_mode
 

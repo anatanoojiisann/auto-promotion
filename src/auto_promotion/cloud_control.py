@@ -213,6 +213,10 @@ class CloudControl:
                 "/v1/workflow/state",
                 "/v1/workflow/start-public",
                 "/v1/workflow/stop-public",
+                "/v1/workflow/replies/start",
+                "/v1/workflow/replies/stop",
+                "/v1/workflow/replies/prepare",
+                "/v1/workflow/replies/reconfirm",
                 "/v1/executor/telegram/login-begin",
                 "/v1/executor/telegram/login-poll",
                 "/v1/executor/telegram/read",
@@ -502,13 +506,27 @@ def export_snapshot(engine, *, task_ids=None):
 
 
 def _export_snapshot(engine, db, *, task_ids=None):
-    from .backends.common import automatic_actions
+    from .backends.common import BackendError, automatic_actions, read_profile
     from .models import CAPABILITIES
 
     accounts = {a["id"]: dict(a) for a in db.execute("SELECT * FROM accounts")}
     for a in accounts.values():
         a["capabilities"] = sorted(CAPABILITIES[a["platform"]])
         a["automatic_actions"] = automatic_actions(a)
+        a["owned_target_url"] = ""
+        if a["platform"] == "x" and a["mode"] == "live":
+            try:
+                identity = read_profile("x", a["backend_label"]).get("identity", "")
+                if (
+                    isinstance(identity, str)
+                    and identity
+                    and identity.isascii()
+                    and len(identity) <= 15
+                    and identity.replace("_", "").isalnum()
+                ):
+                    a["owned_target_url"] = "https://x.com/" + identity
+            except BackendError:
+                pass
     tasks = {t["id"]: dict(t) for t in db.execute("SELECT * FROM tasks")}
     if task_ids is not None:
         selected = set(task_ids)
@@ -552,6 +570,7 @@ def _export_snapshot(engine, db, *, task_ids=None):
                 "cooldown_until": a["cooldown_until"],
                 "disabled": bool(a["disabled"]),
                 "allowed_actions": allowed,
+                **({"owned_target_url": a["owned_target_url"]} if a["platform"] == "x" else {}),
             }
         )
     for t in tasks.values():
