@@ -6,6 +6,7 @@ import re
 import time
 from urllib.parse import quote, urlparse
 
+from ..models import epoch
 from .common import (
     BackendError,
     language_evidence,
@@ -193,6 +194,10 @@ class BrowserBackend:
         if operation == "preflight":
             return {"allowed": True}
         if operation == "discover":
+            if payload.get("high_frequency"):
+                if self.platform != "x" or payload.get("read_only") is not True:
+                    raise BackendError("BrowserHighFrequencyReadOnlyRequired")
+                return self.hf_discover(payload)
             return self.discover(payload["policy"])
         if operation == "verify":
             return self.verify(payload)
@@ -311,6 +316,75 @@ class BrowserBackend:
         return {
             "candidates": list(records.values())[:maximum],
             "source_note": "浏览器公开搜索；无法证明语言、活跃度或置信度时保守拒绝",
+        }
+
+    def hf_discover(self, payload):
+        """Observe the visible live results only; never claim complete time coverage."""
+        if payload.get("cursor"):
+            raise BackendError("BrowserSearchCursorUnavailable")
+        query = payload["query"]
+        check_response(
+            self.page.goto(HOME["x"] + "/search?q=" + quote(query) + "&src=typed_query&f=live")
+        )
+        if "/search" not in urlparse(self.page.url).path:
+            raise BackendError("BrowserSearchUnavailable")
+        # Search results belong to the primary column. Other visible tweets can
+        # appear in side panels and must not be admitted as query matches.
+        articles = self.page.locator('[data-testid="primaryColumn"] [data-testid="tweet"]')
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            articles.first.wait_for(timeout=15000)
+        except PlaywrightTimeoutError:
+            return {
+                "candidates": [],
+                "next_cursor": None,
+                "coverage_complete": False,
+                "reason": "browser_results_not_observable",
+            }
+        observed = []
+        for index in range(min(articles.count(), 100)):
+            article = articles.nth(index)
+            links = article.locator('a[href*="/status/"]').filter(has=self.page.locator("time"))
+            if links.count() != 1:
+                continue
+            path = links.first.get_attribute("href") or ""
+            match = re.fullmatch(r"/([A-Za-z0-9_]+)/status/(\d+)", path)
+            texts = article.get_by_test_id("tweetText")
+            times = links.first.locator("time")
+            if not match or texts.count() != 1 or times.count() != 1:
+                continue
+            when = times.first.get_attribute("datetime")
+            if not when:
+                continue
+            try:
+                at = epoch(when)
+            except ValueError:
+                continue
+            if not payload["lower_at"] <= at <= payload["upper_at"]:
+                continue
+            content = texts.first.inner_text()
+            if not content.strip():
+                continue
+            language, _ = language_evidence(content)
+            observed.append(
+                {
+                    "id": match[2],
+                    "url": HOME["x"] + "/i/web/status/" + match[2],
+                    "text": content,
+                    "author_id": "@" + match[1],
+                    "source_event_at": at,
+                    "context_status": "missing",
+                    "context": "",
+                    "language": language,
+                    "query_visible_text": article.inner_text()[:2000],
+                }
+            )
+        return {
+            "candidates": observed,
+            "next_cursor": None,
+            "coverage_complete": False,
+            "reason": "browser_window_not_exhaustive",
         }
 
     def reddit_execute(self, payload, checkpoint, authorize):
@@ -732,7 +806,7 @@ def call(platform, label, operation, payload, checkpoint, authorize):
             runtime,
             profile_path(platform, label),
             browser_channel=settings.get("browser_channel", "chromium"),
-            headless=True,
+            headless=settings.get("browser_headless", True) is not False,
         )
         try:
             page = context.pages[0] if context.pages else context.new_page()

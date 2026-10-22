@@ -24,10 +24,12 @@ EXPANSIONS = "referenced_tweets.id,referenced_tweets.id.author_id,attachments.me
 
 
 class Rejected(BackendError):
-    def __init__(self, status, retry_after_seconds=900):
+    def __init__(self, status, retry_after_seconds=900, *, reset_at=0):
         super().__init__("XAPIRequestRejected")
         self.status = status
         self.retry_after_seconds = retry_after_seconds
+        self.retry_after = retry_after_seconds
+        self.reset_at = reset_at
 
 
 class XHTTP:
@@ -60,17 +62,25 @@ class XHTTP:
                 raw = response.read(2_000_001)
                 if len(raw) > 2_000_000:
                     raise BackendError("XAPIResponseTooLarge")
-                return json.loads(raw)
+                result = json.loads(raw)
+                for header, field in (
+                    ("x-rate-limit-remaining", "rate_limit_remaining"),
+                    ("x-rate-limit-reset", "rate_limit_reset_at"),
+                ):
+                    value = response.headers.get(header)
+                    if value and value.isdigit():
+                        result[field] = int(value)
+                return result
         except HTTPError as exc:
             # Only explicit rejections prove a create request was not accepted.
             if exc.code in {400, 401, 403, 404, 422, 429}:
                 delay = 900
+                reset_at = 0
                 if exc.code == 429:
                     now = time.time()
                     try:
-                        delay = max(
-                            delay, int(exc.headers.get("x-rate-limit-reset", "0")) - int(now)
-                        )
+                        reset_at = int(exc.headers.get("x-rate-limit-reset", "0"))
+                        delay = max(delay, reset_at - int(now))
                     except (TypeError, ValueError, OverflowError):
                         pass
                     retry_after = exc.headers.get("Retry-After", "0")
@@ -83,7 +93,7 @@ class XHTTP:
                             wait = 0
                     delay = max(delay, wait)
                 exc.close()
-                raise Rejected(exc.code, delay) from None
+                raise Rejected(exc.code, delay, reset_at=reset_at) from None
             exc.close()
             raise BackendError("XAPIOutcomeUnknown") from None
         except BackendError:
@@ -135,6 +145,23 @@ class XAPI:
             "media": media,
             "language": tweet.get("lang", "unknown"),
             "context_status": "complete" if complete else "missing",
+            "conversation_id": str(tweet.get("conversation_id", tweet["id"])),
+            "mentioned_user_ids": [
+                str(m["id"]) for m in tweet.get("entities", {}).get("mentions", []) if m.get("id")
+            ],
+            "in_reply_to_event_id": next(
+                (str(r["id"]) for r in refs if r.get("type") == "replied_to"), None
+            ),
+            "in_reply_to_user_id": next(
+                (
+                    str(indexed[str(r["id"])]["author_id"])
+                    for r in refs
+                    if r.get("type") == "replied_to"
+                    and str(r["id"]) in indexed
+                    and indexed[str(r["id"])].get("author_id")
+                ),
+                None,
+            ),
         }
 
     def lookup(self, event, timeout=30):
@@ -188,6 +215,8 @@ class XAPI:
                     429: "XAPIRateLimited",
                 }.get(exc.status, "XAPISearchRejected"),
                 "retry_after_seconds": exc.retry_after_seconds if exc.status == 429 else 0,
+                "rate_limited": exc.status == 429,
+                "rate_limit_reset_at": exc.reset_at if exc.status == 429 else 0,
             }
         if not isinstance(response, dict):
             raise BackendError("XAPISearchResponseInvalid")
@@ -229,6 +258,11 @@ class XAPI:
             "candidates": candidates,
             "next_cursor": meta.get("next_token"),
             "coverage_complete": True,
+            **{
+                k: response[k]
+                for k in ("rate_limit_remaining", "rate_limit_reset_at")
+                if k in response
+            },
         }
 
     def health(self):

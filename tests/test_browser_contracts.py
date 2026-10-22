@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -159,6 +160,40 @@ class XBrowserTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertTrue(self.receipts[0]["target_verified"])
         self.assertEqual(result["external_reference"], "https://x.com/brand/status/123")
+
+    def test_high_frequency_browser_read_is_partial_and_never_submits(self):
+        from auto_promotion.models import epoch
+
+        when = "2026-10-22T06:00:00Z"
+
+        def search(route):
+            route.fulfill(
+                content_type="text/html; charset=utf-8",
+                body=f'''<button data-testid="SideNav_AccountSwitcher_Button">Brand @brand</button>
+                <div data-testid="primaryColumn"><article data-testid="tweet"><a href="/target/status/456"><time datetime="{when}">now</time></a>
+                <div data-testid="tweetText">Looking for a useful video tool</div></article></div>''',
+            )
+
+        self.context.route(re.compile(r"https://x\.com/search\?.*"), search)
+        at = epoch(when)
+        result = self.backend.run(
+            "discover",
+            {
+                "high_frequency": True,
+                "read_only": True,
+                "query": "video tool",
+                "lower_at": at - 100,
+                "upper_at": at + 100,
+                "cursor": None,
+            },
+            self.receipts.append,
+            self.authorize,
+        )
+        self.assertEqual(result["candidates"][0]["id"], "456")
+        self.assertEqual(result["candidates"][0]["source_event_at"], at)
+        self.assertIn("video tool", result["candidates"][0]["query_visible_text"])
+        self.assertFalse(result["coverage_complete"])
+        self.assertEqual((self.posts, self.checks), (0, 0))
 
     def test_reply_to_another_parent_stays_unknown(self):
         self.relation = "999"

@@ -38,6 +38,7 @@ for (const key of ["SYSTEMROOT", "WINDIR", "TEMP", "TMP"])
   if (process.env[key]) env[key] = process.env[key];
 let server, browser, page;
 const errors = [];
+const scanKeys = [];
 async function cleanup() {
   if (browser) await browser.close();
   if (server && server.exitCode === null) {
@@ -58,7 +59,7 @@ from pathlib import Path
 from auto_promotion.core import Engine
 from auto_promotion.store import Store
 from auto_promotion.models import AccountInput,TaskInput,CandidateInput
-from auto_promotion.interaction_models import InteractionConfig,ConfigSave
+from auto_promotion.interaction_models import InteractionConfig,ConfigSave,joint_defaults
 from auto_promotion.interaction_simulation import OfflineRegistry,SimulationConnectors,source
 from auto_promotion.interactions import Interactions
 engine=Engine(Store(${JSON.stringify(db)}),OfflineRegistry(Path(${JSON.stringify(temp)})))
@@ -81,13 +82,40 @@ s.trigger(p['id'],manual=True)
 s.run_stage('scan')
 s.run_stage('classify')
 s.settle_rounds()
-print(p['id'])
+b=engine.add_account(AccountInput(platform='x',mode='simulation',label='Joint second identity',backend_label='hf-ui-second'))
+engine.check_account(b['id'])
+joint=joint_defaults().model_dump()
+joint.update(project_id='ui-acceptance',enabled=True)
+joint['search_accounts']['account_ids']=[a['id'],b['id']]
+for product in joint['products']:
+    product['execution_account_ids']=[a['id']]
+    product['query_groups']=[{'id':'needs','expression':product['product_id']}]
+    product['facts']=[{'id':product['product_id']+':fact','product_id':product['product_id'],'text':'Synthetic fact','source':'simulation://fact','verified_at':now-10,'valid_until':now+86400}]
+j=s.save(ConfigSave(config=joint))
+event=source(9201,'P1',now)
+event['simulation_classification'].update(unresolved=True,intent_type='solution_request',matched_product_ids=['aigram','aurax'],intent_evidence=[{'source_event_id':'9201','field':'text','quote':event['text']}],product_matches=[{'product_id':x,'verified_fact_ids':[x+':fact']} for x in ['aigram','aurax']])
+io.sources=[event]
+s.trigger(j['id'],manual=True)
+s.run_stage('scan')
+s.run_stage('classify')
+s.run_stage('assign')
+readonly={**joint,'policy_key':'aigram_aurax_observer','run_mode':'discovery_only','account_ids':[a['id']],'search_accounts':{**joint['search_accounts'],'account_ids':[a['id']],'require_different_from_previous':False}}
+r=s.save(ConfigSave(config=readonly))
+io.sources=[source(9203,'P1',now)]
+s.trigger(r['id'],manual=True)
+s.run_stage('readonly_scan')
+s.run_stage('readonly_classify')
+import json
+print(json.dumps({'legacy':p['id'],'joint':j['id'],'readonly':r['id']}))
 `;
-  const id = execFileSync(python, ["-c", seed], {
-    cwd: root,
-    env,
-    encoding: "utf8",
-  }).trim();
+  const seeded = JSON.parse(
+    execFileSync(python, ["-c", seed], {
+      cwd: root,
+      env,
+      encoding: "utf8",
+    }).trim(),
+  );
+  const id = seeded.legacy;
   const url = await new Promise((resolve, reject) => {
     server = spawn(
       python,
@@ -126,6 +154,10 @@ print(p['id'])
     viewport: { width: 1440, height: 1000 },
   });
   page.on("pageerror", (e) => errors.push(e.message));
+  page.on("request", (request) => {
+    if (request.url().endsWith("/scan"))
+      scanKeys.push(request.headers()["idempotency-key"]);
+  });
   await page.goto(url + "/#interactions/" + id);
   await page.getByRole("heading", { name: "候选选择", exact: true }).waitFor();
   assert.equal(await page.locator("[data-hf-select]:enabled").count(), 2);
@@ -182,6 +214,15 @@ print(p['id'])
   await page.waitForFunction(() =>
     document.body.textContent.includes("collecting"),
   );
+  assert.match(scanKeys[0], /^[0-9a-f-]{36}$/);
+  const replay = await page.evaluate(
+    async ({ id, key }) =>
+      api(`/interactions/${id}/scan`, "POST", undefined, {
+        "Idempotency-Key": key,
+      }),
+    { id, key: scanKeys[0] },
+  );
+  assert.equal(replay.idempotent, true);
   assert.match(
     await page.locator("#hf-readiness").textContent(),
     /外部连接未验证/,
@@ -249,6 +290,79 @@ print(p['id'])
   await page.getByRole("button", { name: "运行隔离模拟", exact: true }).click();
   await page.getByText("隔离模拟验收", { exact: true }).waitFor();
   assert.match(await page.locator("#panel-content").textContent(), /通过/);
+  await page.evaluate(() => closePanel());
+  await page.goto(url + "/#interactions/" + seeded.joint);
+  await page.locator("[data-processing-id]").waitFor();
+  assert.equal(await page.locator("[data-processing-id]").count(), 1);
+  assert.match(
+    await page.locator("#hf-processing").textContent(),
+    /主产品 aigram/,
+  );
+  assert.match(await page.locator("#hf-processing").textContent(), /会话账号/);
+  await page.locator("#hf-product-filter").selectOption("aurax");
+  assert.equal(await page.locator("[data-processing-id]:visible").count(), 1);
+  assert.equal(await page.locator("#hf-adopt").isVisible(), false);
+  assert.doesNotMatch(await page.locator("#main").textContent(), /P3 冷却/);
+  const nextScan = await page.locator("#hf-next-scan").textContent();
+  await page.getByRole("button", { name: "刷新", exact: true }).click();
+  assert.equal(await page.locator("#hf-next-scan").textContent(), nextScan);
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.locator('#hf-joint-form [name="minimum"]').fill("3100");
+  await page.getByRole("button", { name: "保存策略", exact: true }).click();
+  await page.locator("#panel").waitFor({ state: "hidden" });
+  assert.equal(await page.locator("#hf-next-scan").textContent(), nextScan);
+  const jointSaved = await page.evaluate(
+    async (id) => api(`/interactions/${id}`),
+    seeded.joint,
+  );
+  assert.equal(jointSaved.config.scan.min_interval_seconds, 3100);
+  assert.equal(jointSaved.config.products[0].query_groups[0].id, "needs");
+  assert.equal(jointSaved.config.review.enabled, false);
+  assert.equal(jointSaved.config.fallback.enabled, false);
+  assert.ok(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth + 1,
+    ),
+    "joint mobile overflow",
+  );
+  await page.screenshot({
+    path: path.join(root, "output/playwright/hf-joint-mobile.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.screenshot({
+    path: path.join(root, "output/playwright/hf-joint-desktop.png"),
+    fullPage: true,
+  });
+  await page.goto(url + "/#interactions/" + seeded.readonly);
+  await page.getByRole("heading", { name: "公开帖子观察" }).waitFor();
+  assert.match(
+    await page.locator("#main").textContent(),
+    /只读发现 · 回复逐条启动/,
+  );
+  assert.match(
+    await page.locator("#main").textContent(),
+    /分账号优先级：P0 → P1 → P2/,
+  );
+  assert.match(
+    await page.locator(".hf-candidate").last().textContent(),
+    /待人工查看/,
+  );
+  assert.equal(await page.locator("#hf-adopt").isVisible(), false);
+  await page.locator("#hf-product-filter").selectOption("aurax");
+  assert.equal(await page.locator("[data-hf-products]:visible").count(), 1);
+  assert.equal(await page.locator("[data-hf-edit]").count(), 0);
+  await page.getByRole("button", { name: "全部策略", exact: true }).click();
+  await page
+    .getByRole("button", { name: "联合 P0/P1 模板", exact: true })
+    .click();
+  await page.locator('#hf-joint-form [name="project"]').fill("ui-joint-draft");
+  await page.getByRole("button", { name: "保存策略", exact: true }).click();
+  await page.locator("#panel").waitFor({ state: "hidden" });
+  await page.waitForFunction(() =>
+    document.querySelector("#main").textContent.includes("策略已停用"),
+  );
+  assert.match(await page.locator("#main").textContent(), /策略已停用/);
   assert.deepEqual(errors, []);
   fs.writeFileSync(
     path.join(root, "var/hf-ui-test-result.json"),
@@ -264,6 +378,15 @@ print(p['id'])
           "desktop",
           "mobile_no_overflow",
           "isolated_e2e_modal",
+          "joint_template_disabled_dry_run",
+          "joint_processing_account_roles",
+          "joint_refresh_and_save_preserve_next_scan",
+          "joint_query_identity_and_p2_p3_disabled",
+          "joint_mobile_no_overflow",
+          "manual_scan_idempotency_header",
+          "joint_product_filter_and_no_review_gate",
+          "read_only_observation_without_send_controls",
+          "account_priority_observer_banner",
           "no_browser_errors",
           "backend_readiness_and_delivery_summary",
           "saved_candidate_import_partial_coverage",
@@ -275,9 +398,7 @@ print(p['id'])
       2,
     ),
   );
-  console.log(
-    "High-frequency UI passed; 13 checks; desktop/mobile screenshots saved.",
-  );
+  console.log("High-frequency UI passed; desktop/mobile screenshots saved.");
 })()
   .catch(async (e) => {
     console.error(e);

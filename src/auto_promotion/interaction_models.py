@@ -10,6 +10,9 @@ from .models import Model
 
 class ScanSettings(Model):
     source: Literal["x_api", "imported_results"] = "x_api"
+    schedule_mode: Literal["fixed_interval", "random_interval"] = "fixed_interval"
+    min_interval_seconds: int = Field(default=3000, ge=30, le=604800, strict=True)
+    max_interval_seconds: int = Field(default=4200, ge=30, le=604800, strict=True)
     interval_seconds: int = Field(default=600, ge=30, le=604800)
     initial_lookback_seconds: int = Field(default=1800, ge=60, le=604800)
     overlap_seconds: int = Field(default=1200, ge=0, le=604800)
@@ -25,12 +28,20 @@ class ScanSettings(Model):
     def timing(self):
         if self.heartbeat_seconds * 2 >= self.lease_seconds:
             raise ValueError("心跳间隔必须小于租约的一半")
-        if self.long_gap_reset_seconds < self.interval_seconds * 2:
+        if self.min_interval_seconds > self.max_interval_seconds:
+            raise ValueError("最小扫描间隔不能大于最大间隔（秒）")
+        maximum = (
+            self.max_interval_seconds
+            if self.schedule_mode == "random_interval"
+            else self.interval_seconds
+        )
+        if self.long_gap_reset_seconds < maximum * 2:
             raise ValueError("长期中断阈值至少为扫描间隔的两倍")
         return self
 
 
 class ReviewSettings(Model):
+    enabled: bool = True
     batch_wait_seconds: int = Field(default=18000, ge=0, le=604800)
     expiry_alert_enabled: bool = True
     expiry_alert_lead_seconds: int = Field(default=1800, ge=0, le=86400)
@@ -38,6 +49,7 @@ class ReviewSettings(Model):
 
 
 class FallbackSettings(Model):
+    enabled: bool = True
     empty_rounds_required: int = Field(default=5, ge=1, le=100)
     evaluation_cooldown_seconds: int = Field(default=3000, ge=30, le=604800)
     max_candidates_per_evaluation: int = Field(default=3, ge=1, le=3)
@@ -116,15 +128,85 @@ class VerifiedFact(Model):
     source: str = Field(min_length=1, max_length=1000)
     verified_at: float = Field(gt=0)
     valid_until: float = Field(gt=0)
+    product_id: str | None = None
+    platforms: list[str] = Field(default_factory=list)
+    versions: list[str] = Field(default_factory=list)
+    release_status: Literal[
+        "source_integrated", "test_verified", "release_verified", "unavailable"
+    ] = "release_verified"
+    constraints: list[str] = Field(default_factory=list)
+
+
+class QueryGroup(Model):
+    id: str = Field(pattern=r"^[\w-]{1,80}$")
+    expression: str = Field(min_length=1, max_length=512)
+    product_ids: list[str] = Field(default_factory=list)
+    source_type: Literal["public_need", "public_mentions", "conversation", "private"] = (
+        "public_need"
+    )
+    visibility_scope: str = Field(default="public", min_length=1, max_length=100)
+    version: str = Field(default="1", min_length=1, max_length=100)
+    enabled: bool = True
+    max_reads_per_round: int = Field(default=20, ge=1, le=1000)
+    required_any_phrases: list[str] = Field(default_factory=list, max_length=20)
+    required_intent_phrases: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def read_filter(self):
+        if any(
+            not phrase.strip() or len(phrase) > 100
+            for phrase in (self.required_any_phrases + self.required_intent_phrases)
+        ):
+            raise ValueError("查询本地筛选短语必须非空且不超过 100 字符")
+        return self
+
+
+class SearchAccounts(Model):
+    account_pool_id: str | None = None
+    account_ids: list[str] = Field(default_factory=list, max_length=200)
+    rotation: Literal["round_robin"] = "round_robin"
+    require_different_from_previous: bool = True
+
+
+class ProductSettings(Model):
+    product_id: str = Field(pattern=r"^[\w-]{1,80}$")
+    enabled: bool = True
+    execution_pool_id: str | None = None
+    execution_account_ids: list[str] = Field(default_factory=list, max_length=200)
+    preferred_execution_account_ids_by_language: dict[str, list[str]] = Field(default_factory=dict)
+    languages: list[str] = Field(default_factory=lambda: ["en", "zh"], min_length=1)
+    knowledge_version: str = "1"
+    target_platforms: list[str] = Field(default_factory=list)
+    target_versions: list[str] = Field(default_factory=list)
+    query_groups: list[QueryGroup] = Field(default_factory=list, max_length=40)
+    facts: list[VerifiedFact] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def account_preferences(self):
+        if any(
+            language not in self.languages
+            or not choices
+            or len(choices) != len(set(choices))
+            or not set(choices) <= set(self.execution_account_ids)
+            for language, choices in self.preferred_execution_account_ids_by_language.items()
+        ):
+            raise ValueError("语言优先账号必须在该产品的执行账号池内")
+        return self
 
 
 class InteractionConfig(Model):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
+    strategy_profile: Literal["legacy", "joint_p0_p1"] = "legacy"
+    dedupe_scope_id: str | None = Field(default=None, pattern=r"^[\w-]{1,80}$")
+    historical_project_ids: list[str] = Field(default_factory=list)
+    search_accounts: SearchAccounts = Field(default_factory=SearchAccounts)
+    products: list[ProductSettings] = Field(default_factory=list, max_length=20)
+    product_tie_break_order: list[str] = Field(default_factory=lambda: ["aigram", "aurax"])
     project_id: str = Field(default="default", pattern=r"^[\w-]{1,80}$")
     policy_key: str = Field(default="default", pattern=r"^[\w-]{1,80}$")
     platform: Literal["x"] = "x"
     enabled: bool = False
-    run_mode: Literal["dry_run", "live"] = "dry_run"
+    run_mode: Literal["dry_run", "live", "discovery_only"] = "dry_run"
     timezone: str = "Asia/Shanghai"
     account_ids: list[str] = Field(default_factory=list, max_length=200)
     account_pool_id: str | None = None
@@ -158,7 +240,42 @@ class InteractionConfig(Model):
             raise ValueError("产品事实 ID 不能重复")
         if any(not q.strip() or len(q) > 512 for q in self.queries):
             raise ValueError("查询必须非空且不超过 512 字符")
-        if self.enabled and (not self.queries or not (self.account_ids or self.account_pool_id)):
+        if self.strategy_profile == "joint_p0_p1":
+            if self.schema_version != 2:
+                raise ValueError("联合策略使用 schema_version=2")
+            self.review.enabled = self.fallback.enabled = False
+            products = {p.product_id: p for p in self.products if p.enabled}
+            if len({p.product_id for p in self.products}) != len(self.products):
+                raise ValueError("产品 ID 不能重复")
+            fact_ids = set()
+            for p in self.products:
+                if len({q.id for q in p.query_groups}) != len(p.query_groups):
+                    raise ValueError("同产品查询组 ID 不能重复")
+                for q in p.query_groups:
+                    if not q.expression.strip() or not set(q.product_ids) <= products.keys():
+                        raise ValueError("查询表达式或产品关联无效")
+                for f in p.facts:
+                    if f.product_id != p.product_id or f.id in fact_ids:
+                        raise ValueError("事实必须有唯一 ID 和正确的产品归属")
+                    fact_ids.add(f.id)
+            required_products = {"aigram", "aurax"}
+            valid_products = (
+                bool(products) and set(products) <= required_products
+                if self.run_mode == "discovery_only"
+                else set(products) == required_products
+            )
+            if self.enabled and (
+                not valid_products
+                or any(not any(q.enabled for q in p.query_groups) for p in products.values())
+            ):
+                raise ValueError("启用联合扫描前需为所选产品配置查询组")
+            if self.enabled and not (
+                self.search_accounts.account_ids or self.search_accounts.account_pool_id
+            ):
+                raise ValueError("启用前必须指定搜索账号池")
+            if len(set(self.search_accounts.account_ids)) != len(self.search_accounts.account_ids):
+                raise ValueError("搜索账号不能重复")
+        elif self.enabled and (not self.queries or not (self.account_ids or self.account_pool_id)):
             raise ValueError("启用前必须指定查询和账号或号池")
         if any(not 0 <= n <= 23 for n in (*self.scan_hours, *self.publish_hours)):
             raise ValueError("运行时段使用 0 至 23 时")
@@ -168,18 +285,80 @@ class InteractionConfig(Model):
             raise ValueError("观察间隔必须为 1 至 2592000 秒")
         return self
 
+    @property
+    def joint(self):
+        return self.strategy_profile == "joint_p0_p1"
+
+    @property
+    def scope_id(self):
+        return self.dedupe_scope_id or self.project_id
+
+    def active_facts(self, now, product_id=None):
+        if not self.joint:
+            return [f for f in self.facts if f.verified_at <= now < f.valid_until]
+        return [
+            f
+            for p in self.products
+            if p.enabled and (not product_id or p.product_id == product_id)
+            for f in p.facts
+            if f.verified_at <= now < f.valid_until
+            and f.release_status == "release_verified"
+            and (not f.platforms or bool(set(f.platforms) & set(p.target_platforms)))
+            and (not f.versions or bool(set(f.versions) & set(p.target_versions)))
+        ]
+
+
+def joint_defaults():
+    return InteractionConfig(
+        schema_version=2,
+        strategy_profile="joint_p0_p1",
+        policy_key="aigram_aurax_joint",
+        scan=ScanSettings(
+            schedule_mode="random_interval",
+            interval_seconds=3600,
+            initial_lookback_seconds=7200,
+            long_gap_reset_seconds=9000,
+        ),
+        products=[ProductSettings(product_id=p) for p in ("aigram", "aurax")],
+    )
+
+
+class IntentEvidence(Model):
+    source_event_id: str
+    field: Literal["text", "context"]
+    quote: str = Field(min_length=1, max_length=3000)
+
+
+class ProductMatch(Model):
+    product_id: str
+    verified_fact_ids: list[str] = Field(default_factory=list)
+    satisfied_constraints: list[str] = Field(default_factory=list)
+    unsatisfied_constraints: list[str] = Field(default_factory=list)
+
 
 class Classification(Model):
+    classification_status: Literal[
+        "classified", "pending_context", "pending_facts", "model_failed"
+    ] = "classified"
+    intent_type: str = ""
+    unresolved: bool = False
+    matched_product_ids: list[str] = Field(default_factory=list)
+    primary_product_id: str | None = None
+    explicit_product_id: str | None = None
+    product_matches: list[ProductMatch] = Field(default_factory=list)
+    primary_product_reason: str = ""
     priority: Literal["P0", "P1", "P2", "P3", "EXCLUDED"]
     priority_reason: str = Field(min_length=1, max_length=3000)
-    intent_evidence: list[str] = Field(default_factory=list, max_length=20)
+    intent_evidence: list[str | IntentEvidence] = Field(default_factory=list, max_length=20)
     product_fit: str = Field(default="", max_length=3000)
     verified_fact_ids: list[str] = Field(default_factory=list, max_length=100)
     contribution: str = Field(default="", max_length=5000)
     language: str = Field(default="unknown", max_length=30)
     target_account_fit: bool = False
     context_status: Literal["complete", "missing", "inaccessible"] = "missing"
-    opportunity_type: Literal["time_sensitive", "explicit_unresolved_need", "related_discussion"]
+    opportunity_type: Literal[
+        "time_sensitive", "explicit_unresolved_need", "related_discussion"
+    ] = "explicit_unresolved_need"
     recommended_media: Literal["none", "image", "video", "reuse_existing"] = "none"
     quality_status: Literal["passed", "pending", "failed"] = "pending"
     exclusion_reason: str = Field(default="", max_length=3000)
@@ -190,6 +369,10 @@ class ConfigSave(Model):
     config: InteractionConfig
     expected_version: int = Field(default=0, ge=0)
     apply_timing_to_open_batches: bool = False
+
+
+class ScheduleChange(Model):
+    expected_version: int = Field(ge=1)
 
 
 class CandidateAction(Model):

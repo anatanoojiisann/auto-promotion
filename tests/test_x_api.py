@@ -1,9 +1,12 @@
 import hashlib
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
+from unittest.mock import patch
+from urllib.error import HTTPError
 
-from auto_promotion.backends.x_api import XAPI
+from auto_promotion.backends.x_api import XAPI, XHTTP, Rejected
 from auto_promotion.models import canonical
 
 
@@ -18,6 +21,34 @@ class HTTP:
 
 
 class XAPIContractTests(unittest.TestCase):
+    def test_read_429_retains_retry_after_and_reset_headers(self):
+        headers = Message()
+        headers["Retry-After"] = "123"
+        headers["x-rate-limit-reset"] = "1800000300"
+        error = HTTPError("https://api.x.com/2/tweets/search/recent", 429, "limited", headers, None)
+        with patch("auto_promotion.backends.x_api.build_opener") as opener:
+            opener.return_value.open.side_effect = error
+            with self.assertRaises(Rejected) as caught:
+                XHTTP({"access_token": "synthetic-test-only"}).request(
+                    "GET", "tweets/search/recent"
+                )
+        self.assertGreaterEqual(caught.exception.retry_after, 123)
+        self.assertEqual(caught.exception.retry_after, caught.exception.retry_after_seconds)
+        self.assertEqual(caught.exception.reset_at, 1800000300)
+
+    def test_native_source_keeps_actual_mention_and_reply_owner_ids(self):
+        tweet = {
+            **self.tweet,
+            "referenced_tweets": [{"type": "replied_to", "id": "77"}],
+            "conversation_id": "70",
+        }
+        result = self.api._source(
+            tweet, {"tweets": [{"id": "77", "author_id": "300", "text": "original"}]}
+        )
+        self.assertEqual(result["mentioned_user_ids"], ["100"])
+        self.assertEqual(result["in_reply_to_user_id"], "300")
+        self.assertEqual(result["in_reply_to_event_id"], "77")
+
     def setUp(self):
         self.now = 1800000000.0
         self.http = HTTP()

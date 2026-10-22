@@ -597,7 +597,7 @@ class Engine:
                     db.execute("UPDATE accounts SET disabled=1 WHERE id=?", (account_id,))
                 Store.audit(db, "account.cooldown", {"account_id": account_id, "until": until})
 
-    def create_task(self, value: TaskInput):
+    def create_task(self, value: TaskInput, *, interaction_claim=None):
         if len(set(value.account_ids)) != len(value.account_ids):
             raise Conflict("任务账号不能重复")
         accounts = [self.account(a) for a in value.account_ids]
@@ -651,6 +651,23 @@ class Engine:
         task_id = "AP-" + uuid.uuid4().hex[:14].upper()
         now = self.clock()
         with self.store.connect(write=True) as db:
+            if interaction_claim:
+                candidate = db.execute(
+                    "SELECT * FROM hf_candidates WHERE id=?", (interaction_claim["candidate_id"],)
+                ).fetchone()
+                lease = db.execute(
+                    "SELECT 1 FROM execution_jobs WHERE id=? AND owner=? AND state='leased' AND lease_until>?",
+                    (interaction_claim["job_id"], interaction_claim["job_owner"], now),
+                ).fetchone()
+                if (
+                    not lease
+                    or not candidate
+                    or candidate["version"] != interaction_claim["version"]
+                    or candidate["state"] != "READY"
+                ):
+                    raise Conflict("interaction_sender_claim_stale")
+                if candidate["task_id"]:
+                    return self.task(candidate["task_id"])
             db.execute(
                 "INSERT INTO tasks(id,name,mode,account_ids,account_snapshot,policy,policy_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
@@ -665,6 +682,11 @@ class Engine:
                     now,
                 ),
             )
+            if interaction_claim:
+                db.execute(
+                    "UPDATE hf_candidates SET task_id=? WHERE id=?",
+                    (task_id, interaction_claim["candidate_id"]),
+                )
             Store.audit(db, "task.created", {"policy_hash": digest(envelope)}, task_id, now)
         return self.task(task_id)
 
@@ -800,6 +822,9 @@ class Engine:
             if task["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
             self._integrity(db, task, "discovery_join")
+            from .interaction_intents import reserve_task_intents
+
+            reserve_task_intents(db, task, self.clock())
             if task["campaign_id"]:
                 campaign = db.execute(
                     "SELECT state FROM campaigns WHERE id=?", (task["campaign_id"],)

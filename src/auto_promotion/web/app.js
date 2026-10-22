@@ -118,10 +118,14 @@ const isoLocal = (v) =>
   new Date(v - new Date().getTimezoneOffset() * 60000)
     .toISOString()
     .slice(0, 16);
-const api = async (path, method = "GET", body) => {
+const api = async (path, method = "GET", body, extraHeaders = {}) => {
   const response = await fetch("/api" + path, {
     method,
-    headers: { "Content-Type": "application/json", "X-AP-Client": "local-ui" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-AP-Client": "local-ui",
+      ...extraHeaders,
+    },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   const result = await response.json();

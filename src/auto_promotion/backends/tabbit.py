@@ -10,7 +10,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .common import BackendError, observed_timestamp, owned_x_target
+from ..models import epoch
+from .common import BackendError, language_evidence, observed_timestamp, owned_x_target
 
 
 def launcher_path():
@@ -55,6 +56,10 @@ def cli(arguments, instance, *, code=None):
 def call(platform, settings, operation, payload=None, checkpoint=None, authorize=None):
     if platform != "x":
         raise BackendError("UnsupportedPlatformOperation")
+    if operation == "discover" and payload and payload.get("high_frequency"):
+        if payload.get("read_only") is not True:
+            raise BackendError("TabbitHighFrequencyReadOnlyRequired")
+        return hf_discover(settings, payload)
     if operation in {"execute", "verify", "preflight"} and "reply" in settings.get(
         "automatic_actions", []
     ):
@@ -178,6 +183,142 @@ async function composerControls() {
   return {editor, scope, button: scope.getByTestId(count === 1 ? "tweetButton" : "tweetButtonInline")};
 }
 """
+
+
+def hf_discover(settings, payload):
+    """Observe public X search results in the authenticated Tabbit tab only."""
+    if payload.get("cursor"):
+        raise BackendError("TabbitSearchCursorUnavailable")
+    expected, instance = settings.get("identity", ""), settings.get("tabbit_instance", "")
+    if not re.fullmatch(r"[a-z0-9_]{1,15}", expected) or not re.fullmatch(
+        r"[0-9A-F]{16}", instance
+    ):
+        raise BackendError("InvalidTabbitConfiguration")
+    task = "X read-only scan " + expected + " " + uuid.uuid4().hex[:8]
+    inventory = cli(["create", "--task", task, "--limit", "200"], instance)
+    if inventory.get("task", {}).get("reused") or inventory.get("truncated"):
+        raise BackendError("TabbitInventoryUnavailable")
+    available = [
+        tab
+        for tab in inventory.get("tabs", [])
+        if tab.get("state") == "available"
+        and urlparse(tab.get("url", "")).hostname in {"x.com", "www.x.com"}
+    ]
+    preferred = [tab for tab in available if tab.get("tabId") == settings.get("tabbit_tab_id")]
+    if not preferred:
+        preferred = [
+            tab
+            for tab in available
+            if urlparse(tab["url"]).path.strip("/").split("/")[0].casefold() == expected
+        ]
+    selected = preferred[0] if len(preferred) == 1 else None
+    if selected is None and len(available) == 1:
+        selected = available[0]
+
+    code = (
+        "const expected = "
+        + json.dumps(expected)
+        + "; const query = "
+        + json.dumps(payload["query"], ensure_ascii=False)
+        + "; const scratch = "
+        + json.dumps(selected is None)
+        + ";\n"
+        + r"""
+async function checkReadOnlyIdentity() {
+  const menu = page.getByTestId("SideNav_AccountSwitcher_Button");
+  await menu.waitFor({state: "attached", timeout: 45000});
+  const handles = [...new Set([...(await menu.textContent()).matchAll(/@([A-Za-z0-9_]{1,15})\b/g)]
+    .map(m => m[1].toLowerCase()))];
+  const profile = await page.getByRole("link", {name: "Profile", exact: true, includeHidden: true})
+    .getAttribute("href");
+  assert(handles.length === 1 && handles[0] === expected && profile.toLowerCase() === "/" + expected,
+    "XIdentityMismatch");
+}
+await page.goto("https://x.com/home", {waitUntil: "domcontentloaded", timeout: 30000});
+await checkReadOnlyIdentity();
+await page.goto("https://x.com/search?q=" + encodeURIComponent(query) + "&src=typed_query&f=live",
+  {waitUntil: "domcontentloaded", timeout: 30000});
+const articles = page.locator('[data-testid="primaryColumn"] [data-testid="tweet"]');
+try { await articles.first().waitFor({state: "attached", timeout: 15000}); } catch (_) {}
+const posts = await page.evaluate(() => [...document.querySelectorAll(
+  '[data-testid="primaryColumn"] [data-testid="tweet"]')].slice(0, 100).flatMap(article => {
+  const links = [...article.querySelectorAll('a[href*="/status/"]')].filter(a => a.querySelector('time'));
+  const texts = article.querySelectorAll('[data-testid="tweetText"]');
+  if (links.length !== 1 || texts.length !== 1) return [];
+  const match = new URL(links[0].href).pathname.match(/^\/([A-Za-z0-9_]+)\/status\/(\d+)$/);
+  const datetime = links[0].querySelector('time')?.getAttribute('datetime');
+  const text = texts[0].innerText || '';
+  if (!match || !datetime || !text.trim()) return [];
+  return [{id: match[2], author_id: '@' + match[1], datetime, text,
+    query_visible_text: (article.innerText || '').slice(0, 2000)}];
+}));
+const observedUrl = page.url();
+if (scratch) { try { await page.close(); } catch (_) {} }
+return {url: observedUrl, posts};
+"""
+    )
+    settled = False
+    try:
+        request_id = "observe-" + uuid.uuid4().hex
+        arguments = ["nodejs", "--task", task]
+        if selected:
+            arguments.extend(["--tab", str(selected["tabId"])])
+        arguments.extend(["--request-id", request_id, "--timeout-ms", "60000"])
+        response = cli(arguments, instance, code=code)
+        if response.get("status") in {"queued", "running"}:
+            response = cli(
+                ["receipt", "--task", task, "--request-id", request_id, "--wait-ms", "60000"],
+                instance,
+            )
+        settled = response.get("status") in {"succeeded", "failed", "interrupted"}
+        if not settled:
+            raise BackendError("TabbitReadOnlyPending")
+        if response.get("status") != "succeeded":
+            raise BackendError("TabbitReadOnlySearchUnavailable")
+        result = response.get("result", {}).get("value", {})
+        if urlparse(result.get("url", "")).path != "/search":
+            raise BackendError("TabbitSearchUnavailable")
+        observed = []
+        for post in result.get("posts", [])[:100]:
+            if not isinstance(post, dict) or not re.fullmatch(r"\d+", str(post.get("id", ""))):
+                continue
+            try:
+                at = epoch(post["datetime"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not payload["lower_at"] <= at <= payload["upper_at"]:
+                continue
+            content = str(post.get("text", ""))
+            if not content.strip():
+                continue
+            language, _ = language_evidence(content)
+            observed.append(
+                {
+                    "id": str(post["id"]),
+                    "url": "https://x.com/i/web/status/" + str(post["id"]),
+                    "text": content,
+                    "author_id": post.get("author_id", ""),
+                    "source_event_at": at,
+                    "context_status": "missing",
+                    "context": "",
+                    "language": language,
+                    "query_visible_text": str(post.get("query_visible_text", ""))[:2000],
+                }
+            )
+        return {
+            "candidates": observed,
+            "next_cursor": None,
+            "coverage_complete": False,
+            "reason": "browser_window_not_exhaustive"
+            if result.get("posts")
+            else "browser_results_not_observable",
+        }
+    finally:
+        if settled:
+            finished = cli(["finish", "--task", task], instance)
+            if finished.get("forcedCleanup") or finished.get("ok") is False:
+                raise BackendError("TabbitFinishIncomplete")
+
 
 PREPARE_JS = r"""
 await page.goto(item.action === "post" ? "https://x.com/compose/post" : item.target, {waitUntil: "domcontentloaded"});

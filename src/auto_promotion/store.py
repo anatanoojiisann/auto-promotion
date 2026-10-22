@@ -252,6 +252,9 @@ class Store:
                 if statement.strip():
                     raise ValueError("IncompleteSchemaStatement")
             # Existing workspaces predate identity binding and task-wide pacing.
+            from .interaction_schema import migrate
+
+            migrate(db)
             if "identity_hash" not in {r[1] for r in db.execute("PRAGMA table_info(accounts)")}:
                 db.execute("ALTER TABLE accounts ADD COLUMN identity_hash TEXT")
             if "next_at" not in {r[1] for r in db.execute("PRAGMA table_info(tasks)")}:
@@ -295,6 +298,7 @@ class Store:
 
     @staticmethod
     def _schema_ready(db):
+        from .interaction_schema import ADDITIONS
         from .interaction_schema import SCHEMA as INTERACTION_SCHEMA
         from .queue_store import QUEUE_SCHEMA
 
@@ -327,6 +331,16 @@ class Store:
         if not expected <= names:
             return False
         if not row:
+            return False
+        hf_version = db.execute("SELECT value FROM meta WHERE key='hf_schema_version'").fetchone()
+        if hf_version and hf_version[0] not in {"1", "2"}:
+            raise ValueError("UnsupportedInteractionSchemaVersion")
+        if not hf_version or hf_version[0] != "2":
+            return False
+        if any(
+            not set(fields) <= {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+            for table, fields in ADDITIONS.items()
+        ):
             return False
         return all(
             columns <= {r[1] for r in db.execute(f"PRAGMA table_info({table})")}

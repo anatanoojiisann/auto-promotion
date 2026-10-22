@@ -37,7 +37,13 @@ from .growth_models import (
     InboxUpdate,
     StoreMetricImport,
 )
-from .interaction_models import CandidateAction, ConfigSave, SourceImport
+from .interaction_models import (
+    CandidateAction,
+    ConfigSave,
+    ScheduleChange,
+    SourceImport,
+    joint_defaults,
+)
 from .interactions import Interactions
 from .legacy import inventory
 from .models import (
@@ -339,10 +345,12 @@ def create_app(
         return interactions.list()
 
     @app.get("/api/interactions/defaults")
-    def interaction_defaults():
+    def interaction_defaults(profile: str = "legacy"):
         from .interaction_models import InteractionConfig
 
-        return InteractionConfig().model_dump()
+        if profile not in {"legacy", "joint_p0_p1"}:
+            raise Conflict("未知策略模板")
+        return (joint_defaults() if profile == "joint_p0_p1" else InteractionConfig()).model_dump()
 
     @app.get("/api/interactions/accounts")
     def interaction_accounts():
@@ -379,8 +387,22 @@ def create_app(
         return interactions.candidates(policy_id, offset=offset, limit=limit)
 
     @app.post("/api/interactions/{policy_id}/scan")
-    def interaction_trigger(policy_id: str):
-        return interactions.trigger(policy_id, manual=True)
+    def interaction_trigger(policy_id: str, request: Request):
+        return interactions.trigger(
+            policy_id, manual=True, request_key=request.headers.get("Idempotency-Key")
+        )
+
+    @app.post("/api/interactions/{policy_id}/reschedule")
+    def interaction_reschedule(policy_id: str, value: ScheduleChange):
+        return interactions.reschedule(policy_id, value.expected_version)
+
+    @app.get("/api/interactions/{policy_id}/processing-tasks")
+    def interaction_processing_tasks(policy_id: str, offset: int = 0, limit: int = 100):
+        return interactions.processing_tasks(policy_id, offset=offset, limit=limit)
+
+    @app.get("/api/interactions/processing-tasks/{task_id}")
+    def interaction_processing_task(task_id: str):
+        return interactions.processing_task(task_id)
 
     @app.post("/api/interactions/actions")
     def interaction_action(value: CandidateAction):

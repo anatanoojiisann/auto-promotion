@@ -1,0 +1,204 @@
+{
+  "schema_version": 2,
+  "strategy_profile": "joint_p0_p1",
+  "dedupe_scope_id": null,
+  "historical_project_ids": [],
+  "search_accounts": {
+    "account_pool_id": null,
+    "account_ids": [],
+    "rotation": "round_robin",
+    "require_different_from_previous": true
+  },
+  "products": [
+    {
+      "product_id": "aigram",
+      "enabled": true,
+      "execution_pool_id": null,
+      "execution_account_ids": [],
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "knowledge_version": "1",
+      "target_platforms": [],
+      "target_versions": [],
+      "query_groups": [
+        {
+          "id": "public-mentions",
+          "expression": "to:YOUR_AIGRAM_HANDLE -is:retweet",
+          "product_ids": [
+            "aigram"
+          ],
+          "source_type": "public_mentions",
+          "visibility_scope": "public",
+          "version": "1",
+          "enabled": true,
+          "max_reads_per_round": 10
+        },
+        {
+          "id": "explicit-needs",
+          "expression": "(\"looking for\" OR \"求推荐\") (\"Telegram client\" OR \"消息整理\") -is:retweet",
+          "product_ids": [
+            "aigram"
+          ],
+          "source_type": "public_need",
+          "visibility_scope": "public",
+          "version": "1",
+          "enabled": true,
+          "max_reads_per_round": 10
+        }
+      ],
+      "facts": []
+    },
+    {
+      "product_id": "aurax",
+      "enabled": true,
+      "execution_pool_id": null,
+      "execution_account_ids": [],
+      "languages": [
+        "en",
+        "zh"
+      ],
+      "knowledge_version": "1",
+      "target_platforms": [],
+      "target_versions": [],
+      "query_groups": [
+        {
+          "id": "public-mentions",
+          "expression": "to:YOUR_AURAX_HANDLE -is:retweet",
+          "product_ids": [
+            "aurax"
+          ],
+          "source_type": "public_mentions",
+          "visibility_scope": "public",
+          "version": "1",
+          "enabled": true,
+          "max_reads_per_round": 10
+        },
+        {
+          "id": "explicit-needs",
+          "expression": "(\"looking for\" OR \"求推荐\") (\"image to video\" OR \"图生视频\") -is:retweet",
+          "product_ids": [
+            "aurax"
+          ],
+          "source_type": "public_need",
+          "visibility_scope": "public",
+          "version": "1",
+          "enabled": true,
+          "max_reads_per_round": 10
+        }
+      ],
+      "facts": []
+    }
+  ],
+  "product_tie_break_order": [
+    "aigram",
+    "aurax"
+  ],
+  "project_id": "default",
+  "policy_key": "aigram_aurax_joint",
+  "platform": "x",
+  "enabled": false,
+  "run_mode": "dry_run",
+  "timezone": "Asia/Shanghai",
+  "account_ids": [],
+  "account_pool_id": null,
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "audience": "",
+  "queries": [],
+  "classifier_version": "hf-v1",
+  "product_knowledge_version": "1",
+  "facts": [],
+  "scan": {
+    "schedule_mode": "random_interval",
+    "min_interval_seconds": 3000,
+    "max_interval_seconds": 4200,
+    "interval_seconds": 3600,
+    "initial_lookback_seconds": 7200,
+    "overlap_seconds": 1200,
+    "request_timeout_seconds": 30,
+    "round_deadline_seconds": 300,
+    "lease_seconds": 120,
+    "heartbeat_seconds": 30,
+    "long_gap_reset_seconds": 9000,
+    "max_pages_per_query": 20,
+    "max_reads_per_day": 1000
+  },
+  "review": {
+    "enabled": false,
+    "batch_wait_seconds": 18000,
+    "expiry_alert_enabled": true,
+    "expiry_alert_lead_seconds": 1800,
+    "notification_channel": "inherit"
+  },
+  "fallback": {
+    "enabled": false,
+    "empty_rounds_required": 5,
+    "evaluation_cooldown_seconds": 3000,
+    "max_candidates_per_evaluation": 3
+  },
+  "ttl": {
+    "time_sensitive_seconds": 14400,
+    "explicit_unresolved_need_seconds": 86400,
+    "related_discussion_seconds": 14400
+  },
+  "generation": {
+    "retry_after_failure_seconds": 30,
+    "classification_max_retries": 3,
+    "text_timeout_seconds": 60,
+    "image_timeout_seconds": 180,
+    "video_timeout_seconds": 600,
+    "max_media_concurrency_per_project": 1,
+    "max_retries_after_confirmed_not_submitted": 1,
+    "daily_image_budget": null,
+    "daily_video_budget": null,
+    "daily_cost_budget": null,
+    "currency": "credits",
+    "min_remaining_seconds": 120
+  },
+  "publishing": {
+    "request_timeout_seconds": 30,
+    "min_account_interval_seconds": null,
+    "max_per_account_hour": null,
+    "max_per_account_day": null,
+    "retry_after_confirmed_not_submitted_seconds": 60,
+    "max_retries_after_confirmed_not_submitted": 1
+  },
+  "verification": {
+    "backoff_seconds": [
+      30,
+      120,
+      300,
+      900
+    ],
+    "attention_after_seconds": 3600,
+    "pause_polling_after_attention": true
+  },
+  "notifications": {
+    "retry_delays_seconds": [
+      30,
+      120,
+      600
+    ],
+    "max_retries_after_confirmed_not_sent": 3,
+    "quiet_hours": [
+      0,
+      0
+    ]
+  },
+  "scan_hours": [
+    0,
+    0
+  ],
+  "publish_hours": [
+    0,
+    0
+  ],
+  "observation_offsets_seconds": [
+    86400,
+    259200
+  ]
+}

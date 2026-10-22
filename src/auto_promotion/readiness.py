@@ -7,6 +7,9 @@ from .models import epoch
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "execution_account_mismatch": "发送清单账号与当前执行归属不一致，已阻止提交",
+    "conversation_owner_mismatch": "P0 执行账号必须与原会话账号一致",
+    "joint_priority_not_dispatched": "联合策略仅处理已确认的 P0/P1 需求",
     "candidate_waiting_enqueue": "尚未到达首次入队等待截止时间，保持未尝试。",
     "facts_unverified": "当前草稿依赖的产品事实尚未核实或已经失效",
     "account_profile_mismatch": "语言或目标不符合发送账号资料",

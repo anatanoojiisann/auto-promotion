@@ -4,6 +4,46 @@ import json
 import re
 
 
+def scope_id(db, project):
+    row = db.execute(
+        "SELECT scope_id FROM hf_dedupe_projects WHERE project_id=?", (project,)
+    ).fetchone()
+    return row[0] if row else project
+
+
+def reserve_task_intents(db, task, now):
+    """Legacy starts and joint sender creation share the same atomic reservation."""
+    policy = json.loads(task["policy"])
+    project = scope_id(db, policy.get("project_id", "default"))
+    for item in db.execute(
+        "SELECT i.*,a.platform FROM items i JOIN accounts a ON a.id=i.account_id WHERE task_id=?",
+        (task["id"],),
+    ).fetchall():
+        payload = json.loads(item["payload"])
+        event = event_id(item["platform"], payload)
+        if not event or payload.get("execution_mode") == "manual":
+            continue
+        db.execute(
+            "INSERT OR IGNORE INTO interaction_intents(project_id,platform,source_event_id,action_kind,item_id,state,created_at) VALUES(?,?,?,'reply',?,'reserved',?)",
+            (project, item["platform"], event, item["id"], now),
+        )
+
+
+def historical_sender(db, scope, platform, event):
+    for item in db.execute(
+        "SELECT i.*,t.policy FROM items i JOIN tasks t ON t.id=i.task_id JOIN accounts a ON a.id=i.account_id WHERE a.platform=? AND (i.attempt_id IS NOT NULL OR (t.state='active' AND i.status='not_attempted') OR i.status IN ('confirmed','executing','unknown','scheduled')) ORDER BY i.rowid",
+        (platform,),
+    ).fetchall():
+        if (
+            scope_id(db, json.loads(item["policy"]).get("project_id", "default")) == scope
+            and event_id(platform, json.loads(item["payload"])) == event
+        ):
+            if json.loads(item["result"]).get("confirmed_not_submitted") is True:
+                continue
+            return item
+    return None
+
+
 def event_id(platform, payload):
     if platform != "x" or payload.get("action") != "reply":
         return None
@@ -20,7 +60,7 @@ def claim_intent(db, account, task, payload, item_id, now):
     if not source_id:
         return None
     policy = json.loads(task["policy"]) if isinstance(task["policy"], str) else task["policy"]
-    project = policy.get("project_id", "default")
+    project = scope_id(db, policy.get("project_id", "default"))
     key = (project, account["platform"], source_id, "reply")
     row = db.execute(
         "SELECT item_id FROM interaction_intents WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind=?",
@@ -53,7 +93,7 @@ def claim_intent(db, account, task, payload, item_id, now):
         if proven_not_submitted and retry:
             continue
         if (
-            json.loads(old["policy"]).get("project_id", "default") == project
+            scope_id(db, json.loads(old["policy"]).get("project_id", "default")) == project
             and event_id(account["platform"], json.loads(old["payload"])) == source_id
         ):
             return "interaction_history_unresolved_or_published"
@@ -76,7 +116,10 @@ def candidate_guard(db, item_id, now):
     ).fetchone()
     if not row:
         return None
-    config = json.loads(row["config"])
+    from .interaction_models import InteractionConfig
+
+    model = InteractionConfig.model_validate_json(row["config"])
+    config = model.model_dump()
     if not config["enabled"] or config["run_mode"] != "live":
         return "strategy_paused_or_dry_run"
     if row["expires_at"] <= now:
@@ -90,7 +133,24 @@ def candidate_guard(db, item_id, now):
         return "candidate_not_ready"
     if row["priority"] not in {"P0", "P1"} and row["selected_version"] != row["version"]:
         return "manual_selection_required"
-    if row["owner_account_id"] not in config["account_ids"]:
+    execution = row["execution_account_id"] or row["owner_account_id"]
+    sender = db.execute("SELECT account_id FROM items WHERE id=?", (item_id,)).fetchone()
+    if not sender or sender[0] != execution:
+        return "execution_account_mismatch"
+    allowed_ids = config["account_ids"]
+    pool_id = config.get("account_pool_id")
+    if model.joint:
+        product = next(
+            (p for p in model.products if p.enabled and p.product_id == row["primary_product_id"]),
+            None,
+        )
+        allowed_ids = product.execution_account_ids if product else []
+        pool_id = product.execution_pool_id if product else None
+        if row["priority"] == "P0" and execution != row["conversation_owner_account_id"]:
+            return "conversation_owner_mismatch"
+        if row["priority"] not in {"P0", "P1"}:
+            return "joint_priority_not_dispatched"
+    if execution not in allowed_ids:
         return "account_authorization_revoked"
     # Recheck actual dispatch and profile at the existing final submit boundary.
     from .backends.common import x_api_channel
@@ -100,17 +160,17 @@ def candidate_guard(db, item_id, now):
     if channel["blockers"]:
         return channel["blockers"][0]
     if (
-        config.get("account_pool_id")
+        pool_id
         and not db.execute(
             "SELECT 1 FROM pool_members WHERE pool_id=? AND account_id=?",
-            (config["account_pool_id"], row["owner_account_id"]),
+            (pool_id, execution),
         ).fetchone()
     ):
         return "account_authorization_revoked"
     if row["config_version"] != row["policy_version"]:
         return "candidate_requires_current_rules"
     classification = json.loads(row["classification"])
-    facts = {f["id"] for f in config["facts"] if f["verified_at"] <= now < f["valid_until"]}
+    facts = {f.id for f in model.active_facts(now, row["primary_product_id"])}
     if (
         not classification.get("verified_fact_ids")
         or not set(classification["verified_fact_ids"]) <= facts

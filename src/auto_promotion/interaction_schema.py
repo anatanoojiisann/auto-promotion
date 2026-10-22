@@ -114,4 +114,107 @@ CREATE TABLE IF NOT EXISTS interaction_intents(
  PRIMARY KEY(project_id,platform,source_event_id,action_kind)
 );
 INSERT OR IGNORE INTO meta VALUES('hf_schema_version','1');
+
+CREATE TABLE IF NOT EXISTS hf_dedupe_projects(
+ project_id TEXT PRIMARY KEY,scope_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hf_discoveries(
+ candidate_id TEXT NOT NULL,policy_id TEXT NOT NULL,run_id TEXT NOT NULL,
+ partition_key TEXT NOT NULL,discovery_account_id TEXT NOT NULL,product_ids TEXT NOT NULL,
+ source_hash TEXT NOT NULL,discovered_at REAL NOT NULL,
+ PRIMARY KEY(candidate_id,run_id,partition_key,discovery_account_id)
+);
+CREATE TABLE IF NOT EXISTS hf_classification_history(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,candidate_id TEXT NOT NULL,policy_id TEXT NOT NULL,
+ config_version INTEGER NOT NULL,source_hash TEXT NOT NULL,classification TEXT NOT NULL,at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hf_processing_tasks(
+ id TEXT PRIMARY KEY,candidate_id TEXT NOT NULL,policy_id TEXT NOT NULL,
+ dedupe_scope_id TEXT NOT NULL,platform TEXT NOT NULL,source_event_id TEXT NOT NULL,
+ action_kind TEXT NOT NULL DEFAULT 'reply',priority TEXT NOT NULL,primary_product_id TEXT,
+ matched_product_ids TEXT NOT NULL DEFAULT '[]',conversation_owner_account_id TEXT,
+ execution_account_id TEXT,assignment_status TEXT NOT NULL DEFAULT 'WAITING_ACCOUNT',
+ channel_eligibility TEXT NOT NULL DEFAULT 'unknown',state TEXT NOT NULL DEFAULT 'TASK_CREATED',
+ block_reason TEXT,qualified_at REAL NOT NULL,created_at REAL NOT NULL,assigned_at REAL,
+ updated_at REAL NOT NULL,version INTEGER NOT NULL DEFAULT 1,task_id TEXT,item_id TEXT,
+ UNIQUE(dedupe_scope_id,platform,source_event_id,action_kind)
+);
+CREATE INDEX IF NOT EXISTS hf_processing_policy ON hf_processing_tasks(policy_id,state,priority);
+CREATE TABLE IF NOT EXISTS hf_assignment_events(
+ id TEXT PRIMARY KEY,processing_task_id TEXT NOT NULL,version INTEGER NOT NULL,
+ account_id TEXT,status TEXT NOT NULL,reason TEXT NOT NULL,at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hf_manual_triggers(
+ policy_id TEXT NOT NULL,request_key TEXT NOT NULL,run_id TEXT,created_at REAL NOT NULL,
+ PRIMARY KEY(policy_id,request_key)
+);
+CREATE TABLE IF NOT EXISTS hf_read_cooldowns(
+ scope_id TEXT PRIMARY KEY,until_at REAL NOT NULL,reason TEXT NOT NULL
+);
 """
+
+# All additions apply to existing tables too. Kept explicit for startup readiness checks.
+ADDITIONS = {
+    "hf_policies": {
+        "rotation_cursor": "INTEGER NOT NULL DEFAULT 0",
+        "last_search_account_id": "TEXT",
+        "last_search_identity": "TEXT",
+        "account_pool_version": "TEXT",
+        "deferred_until": "REAL NOT NULL DEFAULT 0",
+        "deferred_reason": "TEXT",
+        "pending_manual": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "hf_scan_runs": {
+        "scheduled_at": "REAL",
+        "actual_started_at": "REAL",
+        "sampled_interval_seconds": "INTEGER",
+        "next_scan_at": "REAL",
+        "schedule_config_version": "INTEGER",
+        "search_account_id": "TEXT",
+        "account_pool_snapshot": "TEXT NOT NULL DEFAULT '[]'",
+        "trigger_type": "TEXT NOT NULL DEFAULT 'scheduled'",
+        "collection_finished_at": "REAL",
+    },
+    "hf_query_progress": {
+        "expression": "TEXT",
+        "product_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "source_type": "TEXT NOT NULL DEFAULT 'public_need'",
+        "visibility_scope": "TEXT NOT NULL DEFAULT 'public'",
+        "semantic_version": "TEXT NOT NULL DEFAULT '1'",
+        "read_budget": "INTEGER NOT NULL DEFAULT 20",
+        "error": "TEXT",
+        "retry_at": "REAL NOT NULL DEFAULT 0",
+        "failures": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "hf_candidates": {
+        "classification_revision": "INTEGER NOT NULL DEFAULT 0",
+        "processing_task_id": "TEXT",
+        "discovery_account_id": "TEXT",
+        "conversation_owner_account_id": "TEXT",
+        "execution_account_id": "TEXT",
+        "matched_product_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "primary_product_id": "TEXT",
+        "classification_status": "TEXT NOT NULL DEFAULT 'pending_context'",
+    },
+    "execution_jobs": {"business_priority": "INTEGER NOT NULL DEFAULT 2"},
+    "hf_processing_tasks": {
+        "config_version": "INTEGER NOT NULL DEFAULT 0",
+        "source_hash": "TEXT",
+        "classification": "TEXT NOT NULL DEFAULT '{}'",
+    },
+}
+
+
+def migrate(db):
+    for table, fields in ADDITIONS.items():
+        existing = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        for name, definition in fields.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    db.execute(
+        "INSERT OR IGNORE INTO hf_dedupe_projects SELECT DISTINCT project_id,project_id FROM hf_candidates"
+    )
+    db.execute(
+        "INSERT OR IGNORE INTO hf_dedupe_projects SELECT DISTINCT project_id,project_id FROM hf_policies"
+    )
+    db.execute("UPDATE meta SET value='2' WHERE key='hf_schema_version'")

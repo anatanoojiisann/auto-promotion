@@ -34,6 +34,16 @@ class InteractionQueue:
                 now,
             ),
         )
+        parts = reference.split("|")
+        candidate_id = parts[1] if stage == "classify" and len(parts) > 1 else parts[0]
+        candidate = db.execute(
+            "SELECT priority FROM hf_candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        if candidate:
+            db.execute(
+                "UPDATE execution_jobs SET business_priority=? WHERE id=?",
+                (0 if candidate[0] == "P0" else 1 if candidate[0] == "P1" else 2, key),
+            )
         return key
 
     def claim(self, stage, lease_seconds=120):
@@ -46,8 +56,8 @@ class InteractionQueue:
             )
             row = db.execute(
                 "SELECT * FROM execution_jobs WHERE kind=? AND state='pending' AND available_at<=? "
-                "ORDER BY available_at,created_at,id LIMIT 1",
-                ("hf_" + stage, now),
+                "ORDER BY CASE WHEN created_at<=? THEN -1 ELSE business_priority END,available_at,created_at,id LIMIT 1",
+                ("hf_" + stage, now, now - 300),
             ).fetchone()
             if not row:
                 return None

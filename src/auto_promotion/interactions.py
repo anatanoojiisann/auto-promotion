@@ -10,8 +10,10 @@ from datetime import datetime, timezone
 
 from .core import Conflict, NotFound
 from .interaction_connectors import InteractionConnectors, source_hash
+from .interaction_joint import JointInteractions
 from .interaction_models import Classification, InteractionConfig
 from .interaction_queue import InteractionQueue, LostLease
+from .interaction_schedule import InteractionSchedule
 from .models import ItemInput, TaskInput, canonical, digest
 from .store import Store, decode
 
@@ -32,12 +34,25 @@ def within_hours(at, zone, hours):
     return start == end or (start <= hour < end if start < end else hour >= start or hour < end)
 
 
-class Interactions:
-    stages = ("scan", "classify", "generate", "media", "publish", "notify", "verify", "observe")
+class Interactions(InteractionSchedule, JointInteractions):
+    stages = (
+        "scan",
+        "readonly_scan",
+        "classify",
+        "readonly_classify",
+        "assign",
+        "generate",
+        "media",
+        "publish",
+        "notify",
+        "verify",
+        "observe",
+    )
 
-    def __init__(self, engine, *, connectors=None, worker_available=None):
+    def __init__(self, engine, *, connectors=None, worker_available=None, randint=None):
         self.engine, self.store, self.clock = engine, engine.store, engine.clock
         self.io = connectors or InteractionConnectors(engine)
+        self.randint = randint or random.SystemRandom().randint
         self.queue = InteractionQueue(self.store, self.clock)
         self.worker_available = worker_available or (lambda: False)
         self.draw_delay = random.SystemRandom().randint
@@ -57,17 +72,31 @@ class Interactions:
         row = self.store.one("SELECT * FROM hf_policies WHERE id=?", (policy_id,))
         if not row:
             raise NotFound("高频互动策略不存在")
-        return decode(row, "config")
+        policy = decode(row, "config")
+        mapping = self.store.one(
+            "SELECT scope_id FROM hf_dedupe_projects WHERE project_id=?",
+            (policy["config"].get("dedupe_scope_id") or policy["project_id"],),
+        )
+        if mapping and mapping["scope_id"] != policy["project_id"]:
+            policy["config"]["dedupe_scope_id"] = mapping["scope_id"]
+        return policy
 
     def candidate(self, candidate_id):
         row = self.store.one("SELECT * FROM hf_candidates WHERE id=?", (candidate_id,))
         if not row:
             raise NotFound("候选不存在")
-        candidate = decode(row, "source", "classification", "media_plan")
+        candidate = decode(row, "source", "classification", "media_plan", "matched_product_ids")
         timing = self.store.one(
             "SELECT * FROM hf_enqueue_times WHERE candidate_id=?", (candidate_id,)
         )
         candidate["not_before"] = timing["not_before"] if timing else None
+        candidate["discoveries"] = [
+            decode(r, "product_ids")
+            for r in self.store.rows(
+                "SELECT * FROM hf_discoveries WHERE candidate_id=? ORDER BY discovered_at",
+                (candidate_id,),
+            )
+        ]
         candidate["generations"] = self.store.rows(
             "SELECT id,version,kind,state,provider,provider_job_id,source,real_product_output,started_at,finished_at,estimated_cost,actual_cost FROM hf_generation WHERE candidate_id=? ORDER BY started_at",
             (candidate_id,),
@@ -82,23 +111,21 @@ class Interactions:
 
     def save(self, value):
         config = value.config.model_copy(deep=True)
-        if config.account_pool_id:
-            from .pools import Pools
-
-            config.account_ids = Pools(self.engine).get(config.account_pool_id)["account_ids"]
-        accounts = [self.engine.account(a) for a in config.account_ids]
-        if (
-            any(a["platform"] != config.platform for a in accounts)
-            or len({a["mode"] for a in accounts}) > 1
-        ):
-            raise Conflict("策略必须使用同平台、同模式账号")
+        self._resolve_accounts(config)
         config = InteractionConfig.model_validate(config.model_dump())
+        accounts = [self.engine.account(a) for a in config.account_ids]
         readiness = self.readiness(config, accounts)
         if config.enabled and config.run_mode == "live" and readiness["blockers"]:
             raise Conflict("interaction_not_ready:" + ",".join(readiness["blockers"]))
         policy_id = "HF-" + digest([config.project_id, config.platform, config.policy_key])[:24]
         now = self.clock()
         with self.store.connect(write=True) as db:
+            from .interaction_intents import scope_id
+
+            effective_scope = scope_id(db, config.scope_id)
+            if effective_scope != config.project_id:
+                config.dedupe_scope_id = effective_scope
+            self._register_scope(db, config)
             row = db.execute("SELECT * FROM hf_policies WHERE id=?", (policy_id,)).fetchone()
             if value.expected_version != (row["version"] if row else 0):
                 raise Conflict("配置已改变，请刷新后保存")
@@ -106,7 +133,7 @@ class Interactions:
             epoch = row["count_epoch"] if row else 1
             reset = False
             if row:
-                old = json.loads(row["config"])
+                old = InteractionConfig.model_validate_json(row["config"]).model_dump()
                 keys = (
                     "queries",
                     "audience",
@@ -115,19 +142,22 @@ class Interactions:
                     "product_knowledge_version",
                     "facts",
                     "account_ids",
+                    "products",
+                    "strategy_profile",
                 )
-                reset = any(old[k] != config.model_dump()[k] for k in keys)
+                reset = any(
+                    old.get(k, config.model_dump()[k]) != config.model_dump()[k] for k in keys
+                )
                 reset = reset or old["scan"].get("source", "x_api") != config.scan.source
                 epoch += int(reset)
                 db.execute(
                     "UPDATE hf_policies SET config=?,version=?,count_epoch=?,empty_streak=CASE WHEN ? THEN 0 ELSE empty_streak END,"
-                    "next_scan_at=MIN(next_scan_at,?) WHERE id=?",
+                    "next_scan_at=next_scan_at WHERE id=?",
                     (
                         canonical(config.model_dump()),
                         version,
                         epoch,
                         reset,
-                        now + config.scan.interval_seconds,
                         policy_id,
                     ),
                 )
@@ -146,13 +176,70 @@ class Interactions:
                         "UPDATE hf_candidates SET state='DISCOVERED',version=version+1,selected_version=NULL,external_reference=NULL WHERE policy_id=? AND state='SIMULATED' AND external_reference LIKE 'simulation://dry-run/%'",
                         (policy_id,),
                     )
-                # Current-rule reclassification is explicit and does not silently regenerate human text.
-                for candidate in db.execute(
-                    "SELECT id,source_hash FROM hf_candidates WHERE policy_id=? AND state NOT IN ('CLOSED','PUBLISHED','SIMULATED','PUBLISHING','VERIFYING')",
-                    (policy_id,),
-                ).fetchall():
-                    self.queue.put(
-                        db, "classify", "current|" + candidate["id"] + "|" + str(version)
+                if reset:
+                    old_products = {p["product_id"]: p for p in old.get("products", [])}
+                    new_products = {p.product_id: p.model_dump() for p in config.products}
+                    changed_products = {
+                        p
+                        for p in old_products.keys() | new_products.keys()
+                        if old_products.get(p) != new_products.get(p)
+                    }
+                    global_change = any(
+                        old.get(k) != config.model_dump()[k]
+                        for k in (
+                            "audience",
+                            "languages",
+                            "classifier_version",
+                            "product_knowledge_version",
+                            "facts",
+                            "strategy_profile",
+                        )
+                    )
+                    for candidate in db.execute(
+                        "SELECT * FROM hf_candidates WHERE policy_id=? AND state NOT IN ('CLOSED','PUBLISHED','SIMULATED','PUBLISHING','VERIFYING')",
+                        (policy_id,),
+                    ).fetchall():
+                        if config.joint:
+                            related = (
+                                global_change
+                                or not candidate["priority"]
+                                or bool(
+                                    set(json.loads(candidate["matched_product_ids"]))
+                                    & changed_products
+                                )
+                            )
+                            if not related:
+                                db.execute(
+                                    "UPDATE hf_candidates SET config_version=? WHERE id=?",
+                                    (version, candidate["id"]),
+                                )
+                                continue
+                            item = (
+                                db.execute(
+                                    "SELECT attempt_id FROM items WHERE id=?",
+                                    (candidate["item_id"],),
+                                ).fetchone()
+                                if candidate["item_id"]
+                                else None
+                            )
+                            if item and item[0]:
+                                continue
+                            self._retire_unsubmitted(db, candidate)
+                            db.execute(
+                                "UPDATE hf_candidates SET version=version+1,selected_version=CASE WHEN selected_version=version AND draft_origin='human' THEN version+1 ELSE NULL END,draft=CASE WHEN draft_origin='human' THEN draft ELSE '' END,media_plan='{}',task_id=NULL,item_id=NULL,state='DISCOVERED',classification_status='pending_context',block_reason='classification_pending' WHERE id=?",
+                                (candidate["id"],),
+                            )
+                        self.queue.put(
+                            db,
+                            "readonly_classify"
+                            if config.run_mode == "discovery_only"
+                            else "classify",
+                            "current|" + candidate["id"] + "|" + str(version),
+                        )
+                else:
+                    db.execute(
+                        "UPDATE hf_candidates SET config_version=? WHERE policy_id=? AND state NOT IN ('PUBLISHED','SIMULATED','CLOSED','PUBLISHING','VERIFYING')",
+                        (version, policy_id),
                     )
             else:
                 db.execute(
@@ -194,6 +281,36 @@ class Interactions:
         )
         synthetic = bool(accounts) and all(a["mode"] == "simulation" for a in accounts)
         caps = [self.io.capabilities(a) for a in accounts]
+        if config.joint and config.run_mode == "discovery_only":
+            blockers = []
+            for account, cap in zip(accounts, caps):
+                if account["disabled"] or account["status"] != "healthy":
+                    blockers.append("account_unavailable")
+                if cap.get("transport") not in {"browser", "x_api", "simulation"}:
+                    blockers.append("scan_source_unavailable")
+                elif cap.get("transport") == "x_api" and cap.get("blockers"):
+                    blockers.extend(cap["blockers"])
+            if not accounts:
+                blockers.append("accounts_missing")
+            return {
+                "ready": not blockers,
+                "blockers": list(dict.fromkeys(blockers)),
+                "source": "browser_read_only",
+                "coverage": "partial_browser_only",
+                "worker": "external_observer",
+                "model_connectivity": "unused",
+                "simulation": synthetic,
+                "publishing": "manual_task_start_required",
+                "accounts": [
+                    {
+                        "account_id": account["id"],
+                        "transport": cap.get("transport"),
+                        "blockers": cap.get("blockers", []),
+                    }
+                    for account, cap in zip(accounts, caps)
+                ],
+                "retry_at": None,
+            }
         blockers = []
         if not accounts:
             blockers.append("accounts_missing")
@@ -279,7 +396,12 @@ class Interactions:
     def status(self, policy_id):
         policy = self.policy(policy_id)
         config = InteractionConfig.model_validate(policy["config"])
-        accounts = [self.engine.account(a) for a in config.account_ids]
+        accounts = [
+            self.engine.account(a)
+            for a in dict.fromkeys(
+                config.account_ids + [a for p in config.products for a in p.execution_account_ids]
+            )
+        ]
         effective = []
         for account in accounts:
             effective.append(
@@ -306,16 +428,31 @@ class Interactions:
             config.ttl.model_dump().values()
         ):
             warnings.append("部分候选会在首次摘要前失效；临期提醒已关闭")
+        from .interaction_observer import account_review_status, fallback_status
+
         policy.update(
             {
                 "effective_accounts": effective,
                 "readiness": self.readiness(config, accounts),
                 "delivery_summary": self.delivery_summary(policy_id),
+                "readonly_fallback": (
+                    fallback_status(self.store, policy_id, now=self.clock())
+                    if config.joint
+                    and config.run_mode == "discovery_only"
+                    and config.policy_key == "aigram_aurax_joint"
+                    else None
+                ),
+                "account_review": (
+                    account_review_status(self.store, policy_id)
+                    if config.run_mode == "discovery_only"
+                    and config.policy_key.endswith("_observer")
+                    else None
+                ),
                 "routing": {
                     "P0": "auto",
                     "P1": "auto",
-                    "P2": "manual_review",
-                    "P3": "manual_review",
+                    "P2": "record_only" if config.joint else "manual_review",
+                    "P3": "record_only" if config.joint else "manual_review",
                 },
                 "fallback_after_seconds": config.scan.interval_seconds
                 * config.fallback.empty_rounds_required,
@@ -323,12 +460,12 @@ class Interactions:
                 "media": self.io.media_status(),
                 "warnings": warnings,
                 "counts": self.store.rows(
-                    "SELECT priority,state,count(*) count FROM hf_candidates WHERE policy_id=? GROUP BY priority,state",
-                    (policy_id,),
+                    "SELECT c.priority,c.state,count(DISTINCT c.id) count FROM hf_candidates c LEFT JOIN hf_discoveries d ON d.candidate_id=c.id WHERE c.policy_id=? OR d.policy_id=? GROUP BY c.priority,c.state",
+                    (policy_id, policy_id),
                 ),
                 "block_reasons": self.store.rows(
-                    "SELECT block_reason,count(*) count FROM hf_candidates WHERE policy_id=? AND block_reason IS NOT NULL GROUP BY block_reason",
-                    (policy_id,),
+                    "SELECT c.block_reason,count(DISTINCT c.id) count FROM hf_candidates c LEFT JOIN hf_discoveries d ON d.candidate_id=c.id WHERE (c.policy_id=? OR d.policy_id=?) AND c.block_reason IS NOT NULL GROUP BY c.block_reason",
+                    (policy_id, policy_id),
                 ),
                 "runs": self.store.rows(
                     "SELECT * FROM hf_scan_runs WHERE policy_id=? ORDER BY seq DESC LIMIT 30",
@@ -366,6 +503,45 @@ class Interactions:
                 "SELECT state,priority,count(*) count FROM hf_scan_candidates WHERE run_id=? GROUP BY state,priority",
                 (run["id"],),
             )
+            run["product_coverage"] = [
+                {
+                    "product_id": p.product_id,
+                    "partitions": sum(
+                        p.product_id in json.loads(q["product_ids"]) for q in run["queries"]
+                    ),
+                    "complete": all(
+                        q["complete"]
+                        for q in run["queries"]
+                        if p.product_id in json.loads(q["product_ids"])
+                    ),
+                    "errors": [
+                        q["error"]
+                        for q in run["queries"]
+                        if p.product_id in json.loads(q["product_ids"]) and q["error"]
+                    ],
+                }
+                for p in config.products
+                if p.enabled
+            ]
+        policy["rotation"] = {
+            "order": config.account_ids,
+            "cursor": policy["rotation_cursor"],
+            "current_search_account_id": next(
+                (
+                    r["search_account_id"]
+                    for r in policy["runs"]
+                    if r["id"] == policy["active_run_id"]
+                ),
+                None,
+            ),
+            "last_started_account_id": policy["last_search_account_id"],
+            "previous_search_account_id": policy["runs"][1]["search_account_id"]
+            if len(policy["runs"]) > 1
+            else None,
+            "require_different": config.joint
+            and config.search_accounts.require_different_from_previous,
+            "pool_version": policy["account_pool_version"],
+        }
         return policy
 
     def delivery_summary(self, policy_id):
@@ -483,8 +659,8 @@ class Interactions:
         return [
             self.candidate(r["id"])
             for r in self.store.rows(
-                "SELECT id FROM hf_candidates WHERE policy_id=? ORDER BY first_seen_at DESC LIMIT ? OFFSET ?",
-                (policy_id, limit, offset),
+                "SELECT DISTINCT c.id,c.first_seen_at FROM hf_candidates c LEFT JOIN hf_discoveries d ON d.candidate_id=c.id WHERE c.policy_id=? OR d.policy_id=? ORDER BY c.first_seen_at DESC LIMIT ? OFFSET ?",
+                (policy_id, policy_id, limit, offset),
             )
         ]
 
@@ -496,66 +672,6 @@ class Interactions:
             else config.review.notification_channel
         )
 
-    def trigger(self, policy_id, *, manual=False):
-        policy, now = self.policy(policy_id), self.clock()
-        config = InteractionConfig.model_validate(policy["config"])
-        if config.scan.source == "imported_results":
-            raise Conflict("manual_import_required:no_live_browser_scan")
-        if not config.enabled:
-            raise Conflict("策略已停用；请先启用或使用隔离模拟")
-        with self.store.connect(write=True) as db:
-            row = db.execute("SELECT * FROM hf_policies WHERE id=?", (policy_id,)).fetchone()
-            if row["active_run_id"]:
-                db.execute("UPDATE hf_policies SET pending_trigger=1 WHERE id=?", (policy_id,))
-                return {"run_id": row["active_run_id"], "coalesced": True}
-            if not manual and row["next_scan_at"] > now:
-                return {"due": False}
-            if not within_hours(now, config.timezone, config.scan_hours):
-                return {"due": False, "reason": "outside_scan_hours"}
-            seq = db.execute(
-                "SELECT COALESCE(MAX(seq),0)+1 FROM hf_scan_runs WHERE policy_id=?", (policy_id,)
-            ).fetchone()[0]
-            run_id = uid("scan-")
-            if (
-                row["last_complete_at"]
-                and now - row["last_complete_at"] > config.scan.long_gap_reset_seconds
-            ):
-                db.execute("UPDATE hf_policies SET empty_streak=0 WHERE id=?", (policy_id,))
-            db.execute(
-                "INSERT INTO hf_scan_runs(id,policy_id,seq,config_version,count_epoch,config,upper_at,started_at,deadline_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    run_id,
-                    policy_id,
-                    seq,
-                    row["version"],
-                    row["count_epoch"],
-                    row["config"],
-                    now,
-                    now,
-                    now + config.scan.round_deadline_seconds,
-                ),
-            )
-            for query in dict.fromkeys(config.queries):
-                watermark = db.execute(
-                    "SELECT watermark FROM hf_watermarks WHERE policy_id=? AND query=?",
-                    (policy_id, query),
-                ).fetchone()
-                lower = (
-                    watermark[0] - config.scan.overlap_seconds
-                    if watermark
-                    else now - config.scan.initial_lookback_seconds
-                )
-                db.execute(
-                    "INSERT INTO hf_query_progress(run_id,query,lower_at,upper_at) VALUES(?,?,?,?)",
-                    (run_id, query, lower, now),
-                )
-            db.execute(
-                "UPDATE hf_policies SET active_run_id=?,pending_trigger=0,next_scan_at=? WHERE id=?",
-                (run_id, now + config.scan.interval_seconds, policy_id),
-            )
-            self.queue.put(db, "scan", run_id)
-        return {"run_id": run_id, "coalesced": False}
-
     def schedule(self):
         """Short coordinator; external calls happen only in independently consumed stage jobs."""
         now = self.clock()
@@ -564,7 +680,8 @@ class Interactions:
             if (
                 config.enabled
                 and config.scan.source != "imported_results"
-                and policy["next_scan_at"] <= now
+                and (policy["next_scan_at"] <= now or policy["pending_manual"])
+                and policy["deferred_until"] <= now
             ):
                 self.trigger(policy["id"])
         self.sync_results()
@@ -577,6 +694,14 @@ class Interactions:
                 "SELECT * FROM hf_scan_runs WHERE state IN ('collecting','classifying') AND deadline_at<=?",
                 (now,),
             ).fetchall():
+                if (
+                    run["state"] == "collecting"
+                    and db.execute(
+                        "SELECT 1 FROM execution_jobs WHERE kind='hf_scan' AND reference_id=? AND state='leased' AND lease_until>?",
+                        (run["id"], now),
+                    ).fetchone()
+                ):
+                    continue
                 db.execute(
                     "UPDATE hf_scan_runs SET state='failed',error='round_deadline',finished_at=? WHERE id=?",
                     (now, run["id"]),
@@ -654,6 +779,7 @@ class Interactions:
         self.sync_results()
         self.settle_rounds()
         self.assess_fallback()
+        self.sync_processing()
 
     def _release_scan(self, db, run):
         db.execute(
@@ -681,17 +807,20 @@ class Interactions:
         if not run or run["state"] != "collecting":
             return
         config = InteractionConfig.model_validate_json(run["config"])
-        readiness = self.readiness(config)
-        if readiness["blockers"]:
-            if readiness["retry_at"]:
-                with self.store.connect(write=True) as db:
-                    self.queue.guard(db, job)
-                    db.execute(
-                        "UPDATE hf_policies SET next_scan_at=MAX(next_scan_at,?) WHERE id=?",
-                        (readiness["retry_at"], run["policy_id"]),
-                    )
-            raise Conflict("interaction_not_ready:" + ",".join(readiness["blockers"]))
-        account = self.engine.account(config.account_ids[0])
+        if config.run_mode != "discovery_only":
+            readiness = self.readiness(config)
+            if readiness["blockers"]:
+                if readiness["retry_at"]:
+                    with self.store.connect(write=True) as db:
+                        self.queue.guard(db, job)
+                        db.execute(
+                            "UPDATE hf_policies SET next_scan_at=MAX(next_scan_at,?) WHERE id=?",
+                            (readiness["retry_at"], run["policy_id"]),
+                        )
+                raise Conflict("interaction_not_ready:" + ",".join(readiness["blockers"]))
+        account = self.engine.account(run["search_account_id"] or config.account_ids[0])
+        if config.joint:
+            return self._scan_joint(job, run, config, account)
         for progress in self.store.rows(
             "SELECT * FROM hf_query_progress WHERE run_id=? AND complete=0", (run["id"],)
         ):
@@ -788,7 +917,10 @@ class Interactions:
             )
             self._release_scan(db, run)
 
-    def _ingest(self, db, run, source, config, account):
+    def _readonly_scan(self, job):
+        return self._scan(job)
+
+    def _ingest(self, db, run, source, config, account, *, partition=None):
         # Whitelist public source fields; discard arbitrary provider data and secrets.
         fields = (
             "id",
@@ -800,6 +932,10 @@ class Interactions:
             "media",
             "language",
             "context_status",
+            "conversation_id",
+            "mentioned_user_ids",
+            "in_reply_to_user_id",
+            "in_reply_to_event_id",
         )
         allowed = fields + (
             ("simulation_classification", "simulation_eligibility", "simulation_current")
@@ -815,7 +951,7 @@ class Interactions:
             or not isinstance(source.get("text"), str)
         ):
             raise Conflict("invalid_source_event")
-        from .interaction_intents import event_id
+        from .interaction_intents import event_id, scope_id
 
         if (
             event_id(config.platform, {"action": "reply", "target": source["url"]}) != source["id"]
@@ -829,14 +965,27 @@ class Interactions:
             raise Conflict("source_too_large")
         hashed, now = source_hash(source), self.clock()
         row = db.execute(
-            "SELECT * FROM hf_candidates WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind='reply'",
-            (config.project_id, config.platform, source["id"]),
+            "SELECT * FROM hf_candidates WHERE project_id IN (SELECT project_id FROM hf_dedupe_projects WHERE scope_id=?) AND platform=? AND source_event_id=? AND action_kind='reply' ORDER BY CASE WHEN state IN ('CLOSED','PUBLISHED','VERIFYING','PUBLISHING') THEN 0 ELSE 1 END,first_seen_at LIMIT 1",
+            (scope_id(db, config.scope_id), config.platform, source["id"]),
         ).fetchone()
         db.execute(
             "UPDATE hf_scan_runs SET fetched=fetched+1,duplicates=duplicates+? WHERE id=?",
             (int(bool(row)), run["id"]),
         )
         candidate_id = row["id"] if row else uid("hfc-")
+        db.execute(
+            "INSERT OR IGNORE INTO hf_discoveries VALUES(?,?,?,?,?,?,?,?)",
+            (
+                candidate_id,
+                run["policy_id"],
+                run["id"],
+                partition["query"] if partition else "legacy",
+                account["id"],
+                partition["product_ids"] if partition else "[]",
+                hashed,
+                now,
+            ),
+        )
         if not row:
             db.execute(
                 "INSERT INTO hf_candidates(id,policy_id,project_id,platform,source_event_id,source,source_hash,source_event_at,first_seen_at,owner_account_id,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -866,6 +1015,10 @@ class Interactions:
                 "UPDATE hf_candidates SET source=?,source_hash=?,source_event_at=?,version=version+1,selected_version=NULL,state='DISCOVERED',task_id=NULL,item_id=NULL,draft=CASE WHEN draft_origin='human' THEN draft ELSE '' END,updated_at=? WHERE id=?",
                 (canonical(source), hashed, source["source_event_at"], now, candidate_id),
             )
+        db.execute(
+            "UPDATE hf_candidates SET discovery_account_id=COALESCE(discovery_account_id,?) WHERE id=?",
+            (account["id"], candidate_id),
+        )
         terminal = row and row["state"] in {
             "CLOSED",
             "PUBLISHED",
@@ -876,6 +1029,7 @@ class Interactions:
         same = (
             row
             and row["source_hash"] == hashed
+            and row["policy_id"] == run["policy_id"]
             and row["config_version"] == run["config_version"]
             and row["priority"] is not None
         )
@@ -890,7 +1044,11 @@ class Interactions:
             ),
         )
         if not terminal and not same:
-            self.queue.put(db, "classify", run["id"] + "|" + candidate_id + "|" + hashed)
+            self.queue.put(
+                db,
+                "readonly_classify" if config.run_mode == "discovery_only" else "classify",
+                run["id"] + "|" + candidate_id + "|" + hashed,
+            )
 
     def _retire_unsubmitted(self, db, row):
         if not row["item_id"]:
@@ -917,6 +1075,8 @@ class Interactions:
         )
 
     def _quality(self, classification, source, config):
+        if config.joint:
+            return self._joint_quality(classification, source, config)
         now = self.clock()
         if classification.priority == "EXCLUDED":
             return None if classification.exclusion_reason else "exclusion_reason_missing"
@@ -935,7 +1095,8 @@ class Interactions:
             return "contribution_or_intent_missing"
         context = source["text"] + "\n" + source.get("context", "")
         if any(
-            not evidence or evidence not in context for evidence in classification.intent_evidence
+            not isinstance(evidence, str) or not evidence or evidence not in context
+            for evidence in classification.intent_evidence
         ):
             return "intent_evidence_invalid"
         facts = {f.id for f in config.facts if f.verified_at <= now < f.valid_until}
@@ -953,13 +1114,41 @@ class Interactions:
         candidate = self.candidate(candidate_id)
         if candidate["state"] in {"CLOSED", "PUBLISHED", "SIMULATED", "PUBLISHING", "VERIFYING"}:
             return
-        policy = self.policy(candidate["policy_id"])
+        origin_run = (
+            self.store.one("SELECT policy_id FROM hf_scan_runs WHERE id=?", (run_id,))
+            if run_id != "current"
+            else None
+        )
+        policy = self.policy(origin_run["policy_id"] if origin_run else candidate["policy_id"])
+        if candidate["processing_task_id"] or candidate["item_id"]:
+            policy = self.policy(candidate["policy_id"])
         config = InteractionConfig.model_validate(policy["config"])
-        account = self.engine.account(candidate["owner_account_id"])
+        if config.run_mode == "discovery_only":
+            with self.store.connect(write=True) as db:
+                self.queue.guard(db, job)
+                db.execute(
+                    "UPDATE hf_scan_candidates SET state='complete',error='manual_review_required' WHERE run_id=? AND candidate_id=? AND state='pending'",
+                    (run_id, candidate_id),
+                )
+                db.execute(
+                    "UPDATE hf_candidates SET block_reason='manual_review_required',classification_status='pending_context' WHERE id=? AND state='DISCOVERED'",
+                    (candidate_id,),
+                )
+            return
+        account = self.engine.account(
+            candidate["discovery_account_id"] or candidate["owner_account_id"]
+        )
         started = time.monotonic()
         classification = Classification.model_validate(
             self.io.classify(candidate["source"], config, account)
         )
+        if (
+            config.joint
+            and candidate["priority"] == "P0"
+            and classification.priority == "P1"
+            and self._conversation_owner(candidate["source"])
+        ):
+            classification.priority = "P0"
         reason = self._quality(classification, candidate["source"], config)
         if reason:
             raise Conflict(reason)
@@ -977,15 +1166,17 @@ class Interactions:
             ).fetchone()[0]
             if (
                 current["version"] != candidate["version"]
+                or current["classification_revision"] != candidate["classification_revision"]
                 or current["source_hash"] != candidate["source_hash"]
                 or current_policy != policy["version"]
                 or current["state"]
                 in {"CLOSED", "PUBLISHING", "VERIFYING", "PUBLISHED", "SIMULATED"}
             ):
                 return
+            high_priorities = {"P0", "P1"} if config.joint else {"P0", "P1", "P2"}
             new_high = (
-                classification.priority in {"P0", "P1", "P2"}
-                and current["priority"] not in {"P0", "P1", "P2"}
+                classification.priority in high_priorities
+                and current["priority"] not in high_priorities
                 and expiry > now
             )
             if new_high:
@@ -1015,6 +1206,42 @@ class Interactions:
                     "UPDATE hf_assessments SET state='superseded' WHERE policy_id=? AND state='assessed'",
                     (policy["id"],),
                 )
+            db.execute(
+                "INSERT INTO hf_classification_history(candidate_id,policy_id,config_version,source_hash,classification,at) VALUES(?,?,?,?,?,?)",
+                (
+                    candidate_id,
+                    policy["id"],
+                    policy["version"],
+                    candidate["source_hash"],
+                    canonical(classification.model_dump()),
+                    now,
+                ),
+            )
+            if current["policy_id"] != policy["id"] and (
+                current["processing_task_id"] or current["item_id"]
+            ):
+                db.execute(
+                    "UPDATE hf_scan_candidates SET state='complete',priority=?,error=NULL WHERE run_id=? AND candidate_id=?",
+                    (classification.priority, run_id, candidate_id),
+                )
+                return
+            if config.joint:
+                if current["policy_id"] != policy["id"] and json.loads(current["classification"]):
+                    db.execute(
+                        "INSERT INTO hf_classification_history(candidate_id,policy_id,config_version,source_hash,classification,at) VALUES(?,?,?,?,?,?)",
+                        (
+                            candidate_id,
+                            current["policy_id"],
+                            current["config_version"],
+                            current["source_hash"],
+                            current["classification"],
+                            now,
+                        ),
+                    )
+                db.execute(
+                    "UPDATE hf_candidates SET policy_id=?,classification_status=? WHERE id=?",
+                    (policy["id"], classification.classification_status, candidate_id),
+                )
             state = "QUEUED" if classification.priority in {"P0", "P1"} else "REVIEW_PENDING"
             closed = classification.priority == "EXCLUDED" or expiry <= now
             if closed:
@@ -1025,7 +1252,7 @@ class Interactions:
             if classification.priority == "P3" and not current["p3_assessment_id"]:
                 state = "DISCOVERED"
             db.execute(
-                "UPDATE hf_candidates SET priority=?,classification=?,config_version=?,expires_at=?,state=?,closed_reason=?,block_reason=NULL,updated_at=? WHERE id=?",
+                "UPDATE hf_candidates SET priority=?,classification=?,config_version=?,expires_at=?,state=?,closed_reason=?,block_reason=NULL,classification_revision=classification_revision+1,updated_at=? WHERE id=?",
                 (
                     classification.priority,
                     canonical(
@@ -1052,12 +1279,24 @@ class Interactions:
                 "UPDATE hf_scan_candidates SET state='complete',priority=?,error=NULL WHERE candidate_id=? AND source_hash=? AND state='pending'",
                 (classification.priority, candidate_id, candidate["source_hash"]),
             )
-            if state == "REVIEW_PENDING" and classification.priority == "P2":
+            if config.joint and classification.priority in {"P2", "P3"}:
+                db.execute(
+                    "UPDATE hf_candidates SET state='DISCOVERED',block_reason='joint_priority_not_dispatched' WHERE id=?",
+                    (candidate_id,),
+                )
+                state = "DISCOVERED"
+            if (
+                state == "REVIEW_PENDING"
+                and classification.priority == "P2"
+                and config.review.enabled
+            ):
                 self._batch(db, policy, candidate_id, config)
             elif classification.priority in {"P0", "P1"}:
                 db.execute("DELETE FROM hf_batch_members WHERE candidate_id=?", (candidate_id,))
                 db.execute("UPDATE hf_candidates SET batch_id=NULL WHERE id=?", (candidate_id,))
-            if state == "QUEUED":
+            if state == "QUEUED" and config.joint:
+                self._create_processing(db, candidate_id, config, classification)
+            elif state == "QUEUED":
                 self.queue.put(
                     db,
                     "generate",
@@ -1074,6 +1313,9 @@ class Interactions:
                     canonical({"candidate_id": candidate_id}),
                 ),
             )
+
+    def _readonly_classify(self, job):
+        return self._classify(job)
 
     def _batch(self, db, policy, candidate_id, config):
         current = db.execute(
@@ -1117,9 +1359,19 @@ class Interactions:
                     if run["state"] == "classifying" and pending:
                         break
                     complete = run["state"] == "classifying" and not run["coverage_incomplete"]
+                    partial = (
+                        run["state"] == "classifying"
+                        and bool(run["coverage_incomplete"])
+                        and json.loads(policy["config"]).get("run_mode") == "discovery_only"
+                    )
                     db.execute(
                         "UPDATE hf_scan_runs SET state=?,finished_at=COALESCE(finished_at,?),settled_at=? WHERE id=? AND settled_at IS NULL",
-                        ("complete" if complete else "failed", now, now, run["id"]),
+                        (
+                            "complete" if complete else "partial" if partial else "failed",
+                            now,
+                            now,
+                            run["id"],
+                        ),
                     )
                     if run["count_epoch"] == policy["count_epoch"]:
                         if complete:
@@ -1143,7 +1395,9 @@ class Interactions:
             for policy in db.execute("SELECT * FROM hf_policies").fetchall():
                 config = InteractionConfig.model_validate_json(policy["config"])
                 if (
-                    ready.get(policy["id"]) != (policy["version"], True)
+                    not config.fallback.enabled
+                    or config.joint
+                    or ready.get(policy["id"]) != (policy["version"], True)
                     or config.scan.source == "imported_results"
                 ):
                     continue
@@ -1455,8 +1709,23 @@ class Interactions:
                     "SELECT * FROM hf_policies WHERE id=?", (row["policy_id"],)
                 ).fetchone()
                 cfg = InteractionConfig.model_validate_json(policy["config"])
-                if value.account_id and value.account_id not in cfg.account_ids:
+                if (
+                    cfg.joint
+                    and value.action in {"adopt", "edit"}
+                    and row["priority"] not in {"P0", "P1"}
+                ):
+                    raise Conflict("联合策略不派发 P2/P3")
+                if value.account_id and value.account_id not in self._execution_ids(
+                    cfg, row["primary_product_id"]
+                ):
                     raise Conflict("账号不在当前策略范围")
+                if (
+                    cfg.joint
+                    and value.account_id
+                    and row["priority"] == "P0"
+                    and value.account_id != row["conversation_owner_account_id"]
+                ):
+                    raise Conflict("P0 必须使用原会话账号")
                 if row["item_id"]:
                     item = db.execute(
                         "SELECT status,attempt_id FROM items WHERE id=?", (row["item_id"],)
@@ -1510,7 +1779,7 @@ class Interactions:
                         "UPDATE hf_candidates SET version=?,state=?,selected_version=?,selected_at=?,selected_by=?,draft=?,draft_origin=?,owner_account_id=?,defer_until=NULL,updated_at=? WHERE id=?",
                         (
                             new_version,
-                            "QUEUED" if value.action == "adopt" else "REVIEW_PENDING",
+                            "QUEUED" if value.action == "adopt" or cfg.joint else "REVIEW_PENDING",
                             new_version if value.action == "adopt" else None,
                             now if value.action == "adopt" else None,
                             actor,
@@ -1521,7 +1790,35 @@ class Interactions:
                             candidate_id,
                         ),
                     )
-                    if value.action == "adopt":
+                    if cfg.joint:
+                        execution = value.account_id or row["execution_account_id"]
+                        db.execute(
+                            "UPDATE hf_candidates SET execution_account_id=?,owner_account_id=? WHERE id=?",
+                            (execution, execution, candidate_id),
+                        )
+                        if execution:
+                            db.execute(
+                                "UPDATE hf_processing_tasks SET execution_account_id=?,assignment_status='ASSIGNED',state='TASK_CREATED',version=version+1,assigned_at=COALESCE(assigned_at,?),updated_at=? WHERE id=?",
+                                (execution, now, now, row["processing_task_id"]),
+                            )
+                            db.execute(
+                                "INSERT OR IGNORE INTO hf_assignment_events VALUES(?,?,?,?,?,?,?)",
+                                (
+                                    digest([candidate_id, new_version, actor, execution]),
+                                    row["processing_task_id"],
+                                    new_version,
+                                    execution,
+                                    "ASSIGNED",
+                                    "human_edit",
+                                    now,
+                                ),
+                            )
+                        self.queue.put(
+                            db,
+                            "generate" if execution else "assign",
+                            candidate_id + "|" + str(new_version) + "|" + str(policy["version"]),
+                        )
+                    elif value.action == "adopt":
                         self.queue.put(
                             db,
                             "generate",
@@ -1546,6 +1843,7 @@ class Interactions:
                     ),
                 )
                 rows.append(row)
+        self.sync_processing()
         return [self.candidate(r["id"]) for r in rows]
 
     def _eligible(self, candidate, config, account):
@@ -1562,7 +1860,7 @@ class Interactions:
         ):
             return {"status": "ineligible", "reasons": ["account_profile_mismatch"], "evidence": []}
         if (
-            account["id"] not in config.account_ids
+            account["id"] not in self._execution_ids(config, candidate.get("primary_product_id"))
             or account["disabled"]
             or account["status"] != "healthy"
             or account["cooldown_until"] > self.clock()
@@ -1581,6 +1879,8 @@ class Interactions:
             quality = "classification_unresolved"
         if quality:
             return {"status": "ineligible", "reasons": [quality], "evidence": []}
+        if config.joint and not candidate["classification"].get("verified_fact_ids"):
+            return {"status": "unknown", "reasons": ["answer_facts_missing"], "evidence": []}
         return self.io.eligibility(candidate, config, account)
 
     def _block(self, job, candidate, eligibility):
@@ -1602,6 +1902,8 @@ class Interactions:
         candidate = self.candidate(candidate_id)
         policy = self.policy(candidate["policy_id"])
         config = InteractionConfig.model_validate(policy["config"])
+        if config.run_mode == "discovery_only":
+            return
         if candidate["version"] != int(version) or candidate["state"] not in {
             "QUEUED",
             "GENERATING",
@@ -1614,11 +1916,15 @@ class Interactions:
             return
         if candidate["expires_at"] <= self.clock():
             return
-        account = self.engine.account(candidate["owner_account_id"])
+        if config.joint and not candidate["execution_account_id"]:
+            return
+        account = self.engine.account(
+            candidate["execution_account_id"] or candidate["owner_account_id"]
+        )
         eligible = self._eligible(candidate, config, account)
         if eligible["status"] != "eligible":
             self._block(job, candidate, eligible)
-            return
+            return self.clock() + 60 if config.joint else None
         with self.store.connect(write=True) as db:
             self.queue.guard(db, job)
             db.execute(
@@ -1718,6 +2024,8 @@ class Interactions:
         candidate_id, version = job["reference_id"].split("|", 1)
         candidate = self.candidate(candidate_id)
         config = InteractionConfig.model_validate(self.policy(candidate["policy_id"])["config"])
+        if config.run_mode == "discovery_only":
+            return
         existing = self.store.one(
             "SELECT * FROM hf_generation WHERE candidate_id=? AND version=? AND kind<>'text'",
             (candidate_id, int(version)),
@@ -1995,13 +2303,19 @@ class Interactions:
         candidate = self.candidate(candidate_id)
         policy = self.policy(candidate["policy_id"])
         config = InteractionConfig.model_validate(policy["config"])
+        if config.run_mode == "discovery_only":
+            return
         if candidate["version"] != int(version) or candidate["state"] != "READY":
             return
         with self.store.connect(write=True) as db:
             self.queue.guard(db, job)
             if self._recover_handoff(db, candidate):
                 return
-        account = self.engine.account(candidate["owner_account_id"])
+        if config.joint and not candidate["execution_account_id"]:
+            return
+        account = self.engine.account(
+            candidate["execution_account_id"] or candidate["owner_account_id"]
+        )
         if candidate["expires_at"] <= self.clock():
             return
         if (
@@ -2012,7 +2326,7 @@ class Interactions:
         eligibility = self._eligible(candidate, config, account)
         if eligibility["status"] != "eligible":
             self._block(job, candidate, eligibility)
-            return
+            return self.clock() + 60 if config.joint else None
         current = self.io.revalidate(candidate, config, account)
         if (
             current.get("status") != "valid"
@@ -2106,8 +2420,44 @@ class Interactions:
                 return
             intent = db.execute(
                 "SELECT * FROM interaction_intents WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind='reply'",
-                (config.project_id, config.platform, candidate["source_event_id"]),
+                (config.scope_id, config.platform, candidate["source_event_id"]),
             ).fetchone()
+            from .interaction_intents import historical_sender
+
+            old_sender = historical_sender(
+                db, config.scope_id, config.platform, candidate["source_event_id"]
+            )
+            linked = (
+                intent["item_id"]
+                if intent and intent["item_id"]
+                else old_sender["id"]
+                if old_sender
+                else None
+            )
+            if linked and linked != row["item_id"]:
+                item = db.execute("SELECT * FROM items WHERE id=?", (linked,)).fetchone()
+                if item:
+                    db.execute(
+                        "UPDATE hf_candidates SET task_id=?,item_id=?,execution_account_id=?,owner_account_id=?,block_reason='existing_sender_reused' WHERE id=?",
+                        (
+                            item["task_id"],
+                            item["id"],
+                            item["account_id"],
+                            item["account_id"],
+                            candidate_id,
+                        ),
+                    )
+                    db.execute(
+                        "UPDATE hf_processing_tasks SET execution_account_id=?,assignment_status='ASSIGNED',task_id=?,item_id=?,assigned_at=COALESCE(assigned_at,?) WHERE id=?",
+                        (
+                            item["account_id"],
+                            item["task_id"],
+                            item["id"],
+                            self.clock(),
+                            row["processing_task_id"],
+                        ),
+                    )
+                    return
             if intent and intent["candidate_id"] != candidate_id:
                 db.execute(
                     "UPDATE hf_candidates SET block_reason='interaction_already_claimed' WHERE id=?",
@@ -2117,7 +2467,7 @@ class Interactions:
             db.execute(
                 "INSERT OR IGNORE INTO interaction_intents(project_id,platform,source_event_id,action_kind,candidate_id,state,created_at) VALUES(?,?,?,'reply',?,'reserved',?)",
                 (
-                    config.project_id,
+                    config.scope_id,
                     config.platform,
                     candidate["source_event_id"],
                     candidate_id,
@@ -2156,7 +2506,13 @@ class Interactions:
                             "target_allowlist": [candidate["source"]["url"]],
                             "languages": config.languages,
                         },
-                    )
+                    ),
+                    interaction_claim={
+                        "candidate_id": candidate_id,
+                        "version": candidate["version"],
+                        "job_id": job["id"],
+                        "job_owner": job["owner"],
+                    },
                 )
             )
         if not task["items"]:
@@ -2300,6 +2656,7 @@ class Interactions:
                         "UPDATE hf_candidates SET state='CLOSED',closed_reason=?,block_reason=?,updated_at=? WHERE id=?",
                         (state, json.loads(row["item_result"]).get("reason"), now, row["id"]),
                     )
+        self.sync_processing()
 
     def _verify(self, job):
         candidate = self.candidate(job["reference_id"])
@@ -2408,7 +2765,7 @@ class Interactions:
                     with self.store.connect(write=True) as db:
                         self.queue.guard(db, job)
                         retry = None
-                        if stage == "scan":
+                        if stage in {"scan", "readonly_scan"}:
                             run = db.execute(
                                 "SELECT * FROM hf_scan_runs WHERE id=?", (job["reference_id"],)
                             ).fetchone()
@@ -2417,7 +2774,7 @@ class Interactions:
                                 (reason, self.clock(), job["reference_id"]),
                             )
                             self._release_scan(db, run)
-                        elif stage == "classify":
+                        elif stage in {"classify", "readonly_classify"}:
                             run_id, candidate_id, _ = job["reference_id"].split("|", 2)
                             db.execute(
                                 "UPDATE hf_scan_candidates SET error=? WHERE run_id=? AND candidate_id=? AND state='pending'",
@@ -2426,6 +2783,17 @@ class Interactions:
                             db.execute(
                                 "UPDATE hf_candidates SET block_reason=? WHERE id=? AND state NOT IN ('CLOSED','PUBLISHED','SIMULATED','PUBLISHING','VERIFYING')",
                                 (reason, candidate_id),
+                            )
+                            db.execute(
+                                "UPDATE hf_candidates SET classification_status=? WHERE id=? AND state NOT IN ('CLOSED','PUBLISHED','SIMULATED','PUBLISHING','VERIFYING')",
+                                (
+                                    "pending_facts"
+                                    if "fact" in reason
+                                    else "pending_context"
+                                    if "context" in reason
+                                    else "model_failed",
+                                    candidate_id,
+                                ),
                             )
                             attempts = json.loads(job["result"]).get("retry_count", 0) + 1
                             if attempts <= config.generation.classification_max_retries:
@@ -2459,11 +2827,12 @@ class Interactions:
                 except LostLease:
                     pass
             processed += 1
+        self.sync_processing()
         return {"stage": stage, "processed": processed}
 
     def _job_config(self, stage, job):
         reference = job["reference_id"]
-        if stage == "scan":
+        if stage in {"scan", "readonly_scan"}:
             row = self.store.one("SELECT config FROM hf_scan_runs WHERE id=?", (reference,))
         elif stage == "notify":
             row = self.store.one(
@@ -2472,7 +2841,9 @@ class Interactions:
             )
         else:
             candidate_id = (
-                reference.split("|", 2)[1] if stage == "classify" else reference.split("|", 1)[0]
+                reference.split("|", 2)[1]
+                if stage in {"classify", "readonly_classify"}
+                else reference.split("|", 1)[0]
             )
             row = self.store.one(
                 "SELECT p.config FROM hf_policies p JOIN hf_candidates c ON c.policy_id=p.id WHERE c.id=?",
@@ -2481,11 +2852,39 @@ class Interactions:
         return InteractionConfig.model_validate_json(row["config"]) if row else InteractionConfig()
 
     def metrics(self, policy_id):
-        rows = self.store.rows("SELECT * FROM hf_candidates WHERE policy_id=?", (policy_id,))
+        rows = self.store.rows(
+            "SELECT DISTINCT c.* FROM hf_candidates c LEFT JOIN hf_discoveries d ON d.candidate_id=c.id WHERE c.policy_id=? OR d.policy_id=?",
+            (policy_id, policy_id),
+        )
+        tasks = self.store.rows(
+            "SELECT DISTINCT t.* FROM hf_processing_tasks t LEFT JOIN hf_discoveries d ON d.candidate_id=t.candidate_id WHERE t.policy_id=? OR d.policy_id=?",
+            (policy_id, policy_id),
+        )
+        runs = self.store.rows(
+            "SELECT actual_started_at FROM hf_scan_runs WHERE policy_id=? AND actual_started_at IS NOT NULL ORDER BY seq",
+            (policy_id,),
+        )
         reviewed = [r for r in rows if r["priority"] in {"P2", "P3"}]
         selected = sum(r["selected_at"] is not None for r in reviewed)
         return {
             "candidate_count": len(rows),
+            "qualified_p0_p1": sum(r["priority"] in {"P0", "P1"} for r in rows),
+            "duplicates": self.store.one(
+                "SELECT COALESCE(sum(duplicates),0) n FROM hf_scan_runs WHERE policy_id=?",
+                (policy_id,),
+            )["n"],
+            "processing_count": len(tasks),
+            "assigned": sum(t["assignment_status"] == "ASSIGNED" for t in tasks),
+            "waiting_assignment": sum(t["assignment_status"] == "WAITING_ACCOUNT" for t in tasks),
+            "qualified_to_task_seconds": [t["created_at"] - t["qualified_at"] for t in tasks],
+            "qualified_to_assignment_seconds": [
+                t["assigned_at"] - t["qualified_at"] for t in tasks if t["assigned_at"]
+            ],
+            "actual_start_intervals_seconds": [
+                b["actual_started_at"] - a["actual_started_at"] for a, b in zip(runs, runs[1:])
+            ],
+            "published": sum(r["state"] == "PUBLISHED" for r in rows),
+            "verifying": sum(r["state"] == "VERIFYING" for r in rows),
             "manual_adoption_rate": selected / len(reviewed) if reviewed else None,
             "expired_waiting_review": sum(
                 r["closed_reason"] == "expired_waiting_review" for r in reviewed

@@ -308,3 +308,72 @@ class TabbitConnectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_high_frequency_discover_observes_without_submitting(self):
+        response = {
+            "status": "succeeded",
+            "result": {
+                "value": {
+                    "url": "https://x.com/search?q=AI%20video&f=live",
+                    "posts": [
+                        {
+                            "id": "123456",
+                            "author_id": "@someone",
+                            "datetime": "2026-10-22T09:00:00Z",
+                            "text": "Need an AI video tool",
+                            "query_visible_text": "Need an AI video tool",
+                        }
+                    ],
+                }
+            },
+        }
+        with patch(
+            "auto_promotion.backends.tabbit.cli",
+            side_effect=[self.inventory, response, {"ok": True}],
+        ) as cli:
+            result = call(
+                "x",
+                self.settings,
+                "discover",
+                {
+                    "high_frequency": True,
+                    "read_only": True,
+                    "query": "AI video",
+                    "lower_at": 0,
+                    "upper_at": 9999999999,
+                    "cursor": None,
+                },
+            )
+        self.assertFalse(result["coverage_complete"])
+        self.assertEqual(result["candidates"][0]["url"], "https://x.com/i/web/status/123456")
+        program = cli.call_args_list[1].kwargs["code"]
+        self.assertIn("checkReadOnlyIdentity();", program)
+        self.assertIn("primaryColumn", program)
+        self.assertNotIn("button.click()", program)
+        self.assertNotIn("CreateTweet", program)
+        self.assertEqual(cli.call_args_list[-1].args[0][0], "finish")
+
+    def test_high_frequency_discover_can_open_a_new_tab_when_inventory_has_no_x_tab(self):
+        inventory = {**self.inventory, "tabs": []}
+        response = {
+            "status": "succeeded",
+            "result": {"value": {"url": "https://x.com/search", "posts": []}},
+        }
+        with patch(
+            "auto_promotion.backends.tabbit.cli",
+            side_effect=[inventory, response, {"ok": True}],
+        ) as cli:
+            result = call(
+                "x",
+                self.settings,
+                "discover",
+                {
+                    "high_frequency": True,
+                    "read_only": True,
+                    "query": "Telegram",
+                    "lower_at": 0,
+                    "upper_at": 9999999999,
+                },
+            )
+        self.assertEqual(result["candidates"], [])
+        self.assertNotIn("--tab", cli.call_args_list[1].args[0])

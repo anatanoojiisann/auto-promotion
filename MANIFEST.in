@@ -1,5 +1,6 @@
 include AGENTS.md .env.example start.sh start.ps1 start.cmd install.ps1 package.json package-lock.json
 recursive-include docs *.md
+recursive-include examples *.json
 recursive-include integrations *.py *.patch
 recursive-include scripts *.cjs
 recursive-include scripts *.py

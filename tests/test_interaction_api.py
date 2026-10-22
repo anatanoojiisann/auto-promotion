@@ -180,3 +180,25 @@ class InteractionAPITests(unittest.TestCase):
         report = self.client.get(f"/api/interactions/{policy['id']}").json()
         self.assertEqual(report["runs"][0]["coverage_incomplete"], 1)
         self.assertEqual(report["empty_streak"], 0)
+
+    def test_joint_template_processing_and_schedule_routes(self):
+        config = self.client.get("/api/interactions/defaults?profile=joint_p0_p1").json()
+        self.assertEqual(config["schema_version"], 2)
+        self.assertFalse(config["enabled"])
+        self.assertEqual(config["scan"]["min_interval_seconds"], 3000)
+        self.assertFalse(config["fallback"]["enabled"])
+        saved = self.client.post("/api/interactions", json={"config": config})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        policy = saved.json()
+        path = "/api/interactions/" + policy["id"]
+        self.assertEqual(self.client.get(path + "/processing-tasks").json(), [])
+        self.assertEqual(self.client.get(path + "/processing-tasks?limit=0").status_code, 409)
+        updated = self.client.post(
+            path + "/reschedule", json={"expected_version": policy["version"]}
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertGreaterEqual(updated.json()["next_scan_at"], self.now + 3000)
+        self.assertEqual(
+            self.client.post(path + "/reschedule", json={"expected_version": 999}).status_code, 409
+        )
+        self.assertEqual(self.client.get(path, headers={"Authorization": ""}).status_code, 401)
