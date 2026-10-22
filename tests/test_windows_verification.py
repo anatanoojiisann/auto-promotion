@@ -50,6 +50,41 @@ CREATE TABLE items(id TEXT,task_id TEXT,status TEXT,attempt_id TEXT,external_ref
             db.execute("INSERT INTO tasks VALUES('t','active','ready',?)", (json.dumps(policy),))
             db.execute("INSERT INTO execution_jobs VALUES('pending','t',0,2000000000,1,0)")
 
+    def test_collector_fingerprint_matches_startup_source_manifest(self):
+        # Runtime capture is metadata-only, not an Engine/Store/service startup.
+        from auto_promotion.runtime_identity import capture_runtime
+
+        runtime = capture_runtime("isolated-fingerprint-contract")
+        self.assertEqual(tool.fingerprint(), runtime["source_fingerprint"])
+
+    def test_fingerprint_manifest_is_data_and_never_imported(self):
+        package = self.root / "src" / "auto_promotion"
+        package.mkdir(parents=True)
+        (package / "runtime_identity.py").write_text(
+            "raise AssertionError('must never execute')\nFINGERPRINT_FILES = ('store.py',)\n",
+            encoding="utf-8",
+        )
+        (package / "store.py").write_text("# synthetic", encoding="utf-8")
+        expected = hashlib.sha256(b"store.py# synthetic").hexdigest()
+        self.assertEqual(tool.fingerprint(self.root), expected)
+
+    def test_fingerprint_manifest_rejects_missing_nonliteral_and_outside_paths(self):
+        package = self.root / "src" / "auto_promotion"
+        package.mkdir(parents=True)
+        cases = (
+            "# old source without a manifest\n",
+            "FINGERPRINT_FILES = __import__('os').environ\n",
+            "FINGERPRINT_FILES = ('../secret.py',)\n",
+            "FINGERPRINT_FILES = " + repr((str(self.root / "outside.py"),)),
+            "FINGERPRINT_FILES = (True,)\n",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                (package / "runtime_identity.py").write_text(source, encoding="utf-8")
+                with patch.object(Path, "read_bytes", side_effect=AssertionError("must not read")):
+                    with self.assertRaises(ValueError):
+                        tool.fingerprint(self.root)
+
     def test_readonly_unicode_uri_never_exports_policy_or_changes_database(self):
         before = self.db_path.read_bytes()
         result = tool.database_evidence(self.db_path, "t", now=1800000000)

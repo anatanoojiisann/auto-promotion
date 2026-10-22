@@ -176,7 +176,7 @@ class BrowserBackend:
 
     def _run(self, operation, payload, checkpoint, authorize):
         self.step("home_navigation")
-        check_response(self.page.goto(HOME[self.platform], wait_until="domcontentloaded"))
+        self.navigate_home()
         self.step("identity_check")
         self.check_identity()
         if operation == "health":
@@ -201,6 +201,51 @@ class BrowserBackend:
         return (self.reddit_execute if self.platform == "reddit" else self.x_execute)(
             payload, checkpoint, authorize
         )
+
+    def navigate_home(self):
+        # Navigation may throw "Download is starting" before goto returns its
+        # HTTP response. Retain only the navigation status, never URLs/headers.
+        statuses = []
+
+        def observed(response):
+            if (
+                response.request.is_navigation_request()
+                and urlparse(response.url).hostname == urlparse(HOME[self.platform]).hostname
+                and isinstance(response.status, int)
+            ):
+                statuses.append(response.status)
+                del statuses[:-4]
+
+        def failure(status):
+            if status in {401, 403}:
+                return "BrowserNavigationAccessDenied"
+            if status == 429:
+                return "BrowserRateLimited"
+            if status is not None and status >= 500:
+                return "BrowserNavigationServerError"
+            return None
+
+        self.page.on("response", observed)
+        try:
+            try:
+                response = self.page.goto(HOME[self.platform], wait_until="domcontentloaded")
+            except Exception as exc:
+                code = failure(statuses[-1] if statuses else None)
+                if code is None:
+                    code = (
+                        "BrowserNavigationTimeout"
+                        if type(exc).__name__ == "TimeoutError"
+                        else "BrowserNavigationDownload"
+                        if "Download is starting" in str(exc)
+                        else "BrowserNavigationUnavailable"
+                    )
+                raise BackendError(code) from None
+            code = failure(response.status if response is not None else None)
+            if code:
+                raise BackendError(code)
+            return response
+        finally:
+            self.page.remove_listener("response", observed)
 
     def discover(self, policy):
         records = {}

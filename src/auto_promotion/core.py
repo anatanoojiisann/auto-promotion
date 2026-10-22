@@ -117,6 +117,16 @@ class Engine:
         if not row:
             raise NotFound("账号不存在")
         value = decode(row, "health")
+        from .health_checks import probe_key, state
+
+        value["connection_state"] = state(value, self.clock())
+        if (
+            value["mode"] == "live"
+            and value["connection_state"] == "healthy"
+            and value["health"].get("probe_key")
+            and value["health"]["probe_key"] != probe_key(value, self.store.path)
+        ):
+            value["connection_state"] = "unverified"
         value["capabilities"] = sorted(CAPABILITIES[value["platform"]])
         value["automatic_actions"] = automatic_actions(value)
         if value["platform"] == "x":
@@ -155,7 +165,7 @@ class Engine:
             except BackendError:
                 value["owned_target_id"] = ""
         value["writable"] = bool(
-            value["status"] == "healthy"
+            value["connection_state"] == "healthy"
             and not value["disabled"]
             and value["cooldown_until"] <= self.clock()
             and (value["mode"] == "simulation" or self.live_enabled)
@@ -250,26 +260,44 @@ class Engine:
     def call(self, account, operation, payload=None, task_id=None):
         from .target_checks import TargetChecks
 
-        checks = TargetChecks(self, account, operation, payload or {})
-        if checks.enabled and account["cooldown_until"] > self.clock():
-            return {
-                "allowed": False,
-                "verified": False,
-                "reason": "AccountCooldown",
-                "rate_limited": True,
-                "retry_after_seconds": max(1, int(account["cooldown_until"] - self.clock())),
-            }
-        cached = checks.read()
-        if cached is not None:
-            return cached
+        account = self.account(account["id"])
         route = route_for(account, (payload or {}).get("payload", {}))
         with self.lanes.acquire(account["id"], resource=route.resource):
+            # Another caller can record a FloodWait/disable while this caller is
+            # acquiring its lane. Never authorize a read with a stale account.
+            account = self.account(account["id"])
+            if route_for(account, (payload or {}).get("payload", {})) != route:
+                raise Conflict("账号连接已变化，请重新核验")
+            if (
+                account["platform"] == "telegram"
+                and account["mode"] == "live"
+                and (account["disabled"] or account["cooldown_until"] > self.clock())
+            ):
+                return {
+                    "allowed": False,
+                    "verified": False,
+                    "reason": "AccountDisabled" if account["disabled"] else "AccountCooldown",
+                    "account_retry_at": account["cooldown_until"],
+                }
+            checks = TargetChecks(self, account, operation, payload or {})
+            cached = checks.read()
+            if cached is not None:
+                return cached
             try:
                 result = self._call_unlocked(account, operation, payload, task_id)
             except Conflict as exc:
                 if not checks.enabled:
                     raise
                 result = checks.failure(getattr(exc, "safe_code", "TargetCheckUnavailable"))
+            if account["platform"] == "telegram" and (
+                result.get("rate_limited") or result.get("risk_warning")
+            ):
+                result = {
+                    **result,
+                    "account_retry_at": self.clock()
+                    + max(1, int(result.get("retry_after_seconds") or 3600)),
+                }
+                self.apply_cooldown(account["id"], result)
             checks.save(result)
             return result
 
@@ -359,30 +387,98 @@ class Engine:
         except sqlite3.Error as exc:
             logging.getLogger(__name__).warning("call audit unavailable: %s", type(exc).__name__)
 
-    def check_account(self, account_id):
+    def check_account(self, account_id, *, force=False):
+        from .health_checks import cached, probe_key
+
         account = self.account(account_id)
-        if (
-            account["platform"] in {"telegram", "discord", "tiktok"}
-            and account["cooldown_until"] > self.clock()
-        ):
+        if account["disabled"] or account["cooldown_until"] > self.clock():
             return account
+        if cached(account, self.clock(), probe_key(account, self.store.path), force=force):
+            return {**account, "health": {**account["health"], "probe_cached": True}}
+        try:
+            route = route_for(account)
+            with self.lanes.acquire(account_id, resource=route.resource):
+                return self._check_account_locked(account_id, force=force)
+        except AccountBusy:
+            current = self.account(account_id)
+            return {
+                **current,
+                "writable": False,
+                "connection_state": "busy",
+                "health": {**current["health"], "reason": "AccountBusy"},
+            }
+        except sqlite3.Error:
+            # A local database preparation failure is not an authorization loss.
+            # No retry of a provider call, and no attempt to write into a busy DB.
+            return {
+                **account,
+                "writable": False,
+                "connection_state": "temporary_unavailable",
+                "health": {**account["health"], "reason": "LocalDatabaseUnavailable"},
+            }
+
+    def _check_account_locked(self, account_id, *, force=False):
+        from .health_checks import cached, category, probe_key, probe_revision
+
+        account = self.account(account_id)
+        now = self.clock()
+        if account["disabled"] or account["cooldown_until"] > now:
+            return account
+        revision = probe_revision(account, self.store.path)
+        key = probe_key(account, self.store.path, revision=revision)
+        previous = account["health"]
+        if cached(account, now, key, force=force):
+            return {**account, "health": {**previous, "probe_cached": True}}
         try:
             result = self.call(account, "health")
         except AccountBusy:
-            return self.account(account_id)
-        except Conflict:
-            result = {"healthy": False, "reason": "connection_unavailable"}
+            return {**account, "writable": False, "connection_state": "busy"}
+        except Conflict as exc:
+            result = {
+                "healthy": False,
+                "reason": safe_code(getattr(exc, "safe_code", None), "connection_unavailable"),
+            }
+        if result.get("reason") == "AccountBusy":
+            return {
+                **account,
+                "writable": False,
+                "connection_state": "busy",
+                "health": {**account["health"], "reason": "AccountBusy"},
+            }
         # Health results are an allowlist; raw provider responses are not persisted.
         health = {
             key: result[key]
-            for key in ("healthy", "service_ready", "identity_verified", "permissions", "reason")
+            for key in (
+                "healthy",
+                "service_ready",
+                "identity_verified",
+                "permissions",
+                "reason",
+                "execution_step",
+                "exception_type",
+            )
             if key in result
         }
+        for field in ("reason", "execution_step", "exception_type"):
+            if field in health:
+                health[field] = safe_code(health[field], "unverified")
         observed_identity = result.get("account_identity")
         with self.store.connect(write=True) as db:
-            current = db.execute(
-                "SELECT identity_hash FROM accounts WHERE id=?", (account_id,)
-            ).fetchone()
+            current = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if (
+                not current
+                or (current["disabled"] and not result.get("risk_warning"))
+                or (current["cooldown_until"] > self.clock() and not result.get("account_retry_at"))
+                or probe_key(dict(current), self.store.path) != key
+            ):
+                # An old result cannot verify a changed connection/configuration.
+                observed = self.account(account_id)
+                return {
+                    **observed,
+                    "writable": False,
+                    "connection_state": "unverified",
+                    "health": {**observed["health"], "reason": "AccountConfigurationChanged"},
+                }
             identity_hash = current["identity_hash"]
             if health.get("identity_verified") and observed_identity:
                 observed_hash = digest([account["platform"], str(observed_identity)])
@@ -412,6 +508,33 @@ class Engine:
                 if health.get("healthy") and health.get("identity_verified")
                 else "unavailable"
             )
+            failures = (
+                0
+                if status == "healthy"
+                else min(5, int(previous.get("consecutive_failures", 0)) + 1)
+            )
+            health.update(
+                probe_state="healthy" if status == "healthy" else category(health.get("reason")),
+                consecutive_failures=failures,
+                next_check_at=now
+                + (15 if status == "healthy" else min(300, 30 * 2 ** (failures - 1))),
+                # Bind the returned identity to the ORIGINAL connection revision,
+                # never relabel an old result with freshly read metadata.
+                probe_key=probe_key(
+                    {**account, "identity_hash": identity_hash}, self.store.path, revision=revision
+                ),
+            )
+            if status == "healthy":
+                health["last_verified_at"] = now
+            elif previous.get("last_verified_at"):
+                health["last_verified_at"] = previous["last_verified_at"]
+            if probe_revision(account, self.store.path) != revision:
+                return {
+                    **self.account(account_id),
+                    "writable": False,
+                    "connection_state": "unverified",
+                    "health": {**previous, "reason": "AccountConfigurationChanged"},
+                }
             db.execute(
                 "UPDATE accounts SET status=?,health=?,checked_at=?,identity_hash=? WHERE id=?",
                 (status, canonical(health), self.clock(), identity_hash, account_id),
@@ -420,12 +543,25 @@ class Engine:
                 db.execute(
                     "UPDATE accounts SET cooldown_until=max(cooldown_until,?),disabled=max(disabled,?) WHERE id=?",
                     (
-                        self.clock() + max(1, int(result.get("retry_after_seconds") or 3600)),
+                        result.get("account_retry_at")
+                        or self.clock() + max(1, int(result.get("retry_after_seconds") or 3600)),
                         int(bool(result.get("risk_warning"))),
                         account_id,
                     ),
                 )
-            Store.audit(db, "account.checked", {"account_id": account_id, "status": status})
+            Store.audit(
+                db,
+                "account.checked",
+                {
+                    "account_id": account_id,
+                    "status": status,
+                    "connection_key": health["probe_key"],
+                    "probe": "performed",
+                    "reason": safe_code(health.get("reason"), "unverified"),
+                    "probe_state": health["probe_state"],
+                    "next_check_at": health["next_check_at"],
+                },
+            )
         return self.account(account_id)
 
     def disable_account(self, account_id, disabled):
@@ -449,7 +585,9 @@ class Engine:
 
     def apply_cooldown(self, account_id, result):
         if result.get("rate_limited") or result.get("risk_warning"):
-            until = self.clock() + max(1, int(result.get("retry_after_seconds") or 60))
+            until = result.get("account_retry_at") or self.clock() + max(
+                1, int(result.get("retry_after_seconds") or 60)
+            )
             with self.store.connect(write=True) as db:
                 db.execute(
                     "UPDATE accounts SET cooldown_until=max(cooldown_until,?) WHERE id=?",
@@ -1771,7 +1909,7 @@ class Engine:
 
     def _run_account_rows(self, rows, stopped):
         processed = []
-        checked = set()
+        checked = {}
         for row in rows:
             if row["state"] != "active":
                 self._skip(row["id"], "task_not_active")
@@ -1846,10 +1984,12 @@ class Engine:
                 continue
             if not manual and account["id"] not in checked:
                 # A fresh read-only health check before a live claim; simulation needs one too.
-                self.check_account(account["id"])
-                checked.add(account["id"])
+                checked[account["id"]] = self.check_account(account["id"], force=True)
+            if not manual and checked[account["id"]]["connection_state"] != "healthy":
+                self._skip(row["id"], "account_unhealthy")
+                continue
             account = self.account(row["account_id"])
-            if account["status"] != "healthy" or account["cooldown_until"] > self.clock():
+            if account["connection_state"] != "healthy" or account["cooldown_until"] > self.clock():
                 self._skip(
                     row["id"],
                     "account_cooldown"
@@ -2056,7 +2196,7 @@ class Engine:
         }
         account = self.account(row["account_id"])
         if (
-            account["platform"] in {"discord", "tiktok"}
+            account["platform"] in {"telegram", "discord", "tiktok"}
             and account["cooldown_until"] > self.clock()
         ):
             raise Conflict("账号仍在冷却，请稍后核对")
@@ -2474,13 +2614,21 @@ class Engine:
                     candidate=True,
                 )
                 continue
-            self.check_account(account["id"])
+            probe = self.check_account(account["id"], force=True)
+            if probe["connection_state"] != "healthy":
+                self._skip(candidate["id"], "account_unhealthy", candidate=True)
+                continue
             now = self.clock()
             with self.store.connect(write=True) as db:
                 row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
                 policy = self._integrity(db, row, "discovery_join")
                 a = db.execute("SELECT * FROM accounts WHERE id=?", (account["id"],)).fetchone()
                 c = db.execute("SELECT * FROM candidates WHERE id=?", (candidate["id"],)).fetchone()
+                from .health_checks import probe_key
+
+                if probe["health"].get("probe_key") != probe_key(dict(a), self.store.path):
+                    self._skip(candidate["id"], "account_unhealthy", db, candidate=True)
+                    continue
                 if (
                     row["state"] != "active"
                     or c["state"] != "not_attempted"

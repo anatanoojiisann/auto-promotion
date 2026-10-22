@@ -104,6 +104,20 @@ class TelegramBackend:
         self.client_factory = client_factory
 
     async def run(self, operation, payload, checkpoint, authorize):
+        # native_bridge has already loaded the durable account-local receipt.
+        # Without exact IDs no read can conclusively recover an uncertain send.
+        if operation == "verify":
+            receipt = payload.get("receipt") or payload.get("result") or {}
+            ids = receipt.get("message_ids")
+            if (
+                not isinstance(ids, list)
+                or not ids
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in ids
+                )
+            ):
+                return {"status": "unknown", "verified": False, "reason": "no_durable_receipt"}
         client = self.client_factory(self.label, self.settings)
         try:
             await client.connect()

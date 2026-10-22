@@ -5,6 +5,7 @@ schema initialization, task activation, receipt recovery, or platform requests.
 """
 
 import argparse
+import ast
 import collections
 import hashlib
 import http.client
@@ -87,17 +88,40 @@ def safe_error(exc):
 
 
 def fingerprint(root=ROOT):
-    digest = hashlib.sha256()
-    for name in (
-        "store.py",
-        "api.py",
-        "pool_runtime.py",
-        "native_bridge.py",
-        "service_host.py",
-        "backends/common.py",
+    package = (root / "src" / "auto_promotion").resolve()
+    # Read the literal manifest; never import or execute application modules.
+    source = (package / "runtime_identity.py").resolve()
+    if not source.is_relative_to(package):
+        raise ValueError("RuntimeSourceManifestInvalid")
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    manifest = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "FINGERPRINT_FILES"
+            for target in node.targets
+        )
+    ]
+    if len(manifest) != 1:
+        raise ValueError("RuntimeSourceManifestUnavailable")
+    names = ast.literal_eval(manifest[0])
+    if (
+        not isinstance(names, tuple)
+        or not 1 <= len(names) <= 32
+        or any(
+            not isinstance(name, str)
+            or len(name) > 100
+            or not name.endswith(".py")
+            or not (package / name).resolve().is_relative_to(package)
+            for name in names
+        )
     ):
+        raise ValueError("RuntimeSourceManifestInvalid")
+    digest = hashlib.sha256()
+    for name in names:
         digest.update(name.encode())
-        digest.update((root / "src" / "auto_promotion" / name).read_bytes())
+        digest.update((package / name).read_bytes())
     return digest.hexdigest()
 
 
@@ -129,7 +153,7 @@ def git_evidence(root=ROOT):
             dirty=bool(dirty),
             source_fingerprint=fingerprint(root),
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError, SyntaxError) as exc:
         return safe_error(exc)
 
 

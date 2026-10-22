@@ -919,6 +919,43 @@ async function cleanup() {
   assert.equal(originalDraft.items[0].payload.action, "post");
   assert.equal(originalDraft.items[0].payload.target_owned, true);
   assert.equal(originalDraft.items[0].attempt_id, null);
+  // Synthetic display evidence only; never change an account or a real cooldown.
+  let healthDisplay = "cooldown";
+  const healthRoute = async (route) => {
+    const response = await route.fetch();
+    const accounts = await response.json();
+    const account = accounts.find((a) => a.id === testAccount.id);
+    account.connection_state = healthDisplay;
+    account.status = healthDisplay === "cooldown" ? "healthy" : "unavailable";
+    account.cooldown_until =
+      healthDisplay === "cooldown" ? Date.now() / 1000 + 3600 : 0;
+    account.health = {
+      last_verified_at: Date.now() / 1000 - 60,
+      reason: "BrowserNavigationAccessDenied",
+      execution_step: "home_navigation",
+    };
+    await route.fulfill({ response, json: accounts });
+  };
+  await page.route("**/api/accounts", healthRoute);
+  await page.goto(base + "/#accounts");
+  // A hash-only navigation renders cached state. Reload to consume this fixture.
+  await page.reload();
+  await page.getByRole("heading", { name: "账号中心", exact: true }).waitFor();
+  let healthRow = page
+    .locator("tr")
+    .filter({ has: page.locator(`[data-check="${testAccount.id}"]`) });
+  await healthRow.getByText("冷却中", { exact: true }).waitFor();
+  assert.equal(await healthRow.locator(".badge.green").count(), 0);
+  healthDisplay = "navigation_blocked";
+  await page.reload();
+  await page.getByRole("heading", { name: "账号中心", exact: true }).waitFor();
+  healthRow = page
+    .locator("tr")
+    .filter({ has: page.locator(`[data-check="${testAccount.id}"]`) });
+  await healthRow.getByText("浏览器导航受阻", { exact: true }).waitFor();
+  assert.ok((await healthRow.innerText()).includes("不代表已退出登录"));
+  assert.ok((await healthRow.innerText()).includes("发送前仍重新核验"));
+  await page.unroute("**/api/accounts", healthRoute);
   fs.writeFileSync(
     "var/ui-test-result.json",
     JSON.stringify(
@@ -928,6 +965,8 @@ async function cleanup() {
         unexpected_conflict_responses: expectedConsole.length,
         checks: [
           "three_centers",
+          "cooldown_overrides_old_healthy",
+          "navigation_failure_is_not_logout",
           "instagram_connection_form",
           "x_connection_form",
           "discord_connection_form",
@@ -978,7 +1017,7 @@ async function cleanup() {
   );
   assert.deepEqual(errors, [], "browser errors");
   console.log(
-    "UI workflow passed; 43 checks; screenshots " +
+    "UI workflow passed; 45 checks; screenshots " +
       (process.env.AP_UI_SKIP_SCREENSHOTS ? "skipped" : "saved") +
       ".",
   );

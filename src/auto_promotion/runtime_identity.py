@@ -7,18 +7,24 @@ import sys
 import time
 from pathlib import Path
 
+FINGERPRINT_FILES = (
+    "store.py",
+    "api.py",
+    "pool_runtime.py",
+    "native_bridge.py",
+    "service_host.py",
+    "core.py",
+    "health_checks.py",
+    "backends/common.py",
+    "backends/telegram.py",
+    "backends/browser.py",
+)
+
 
 def capture_runtime(component):
     root = Path(__file__).resolve().parents[2]
     digest = hashlib.sha256()
-    for name in (
-        "store.py",
-        "api.py",
-        "pool_runtime.py",
-        "native_bridge.py",
-        "service_host.py",
-        "backends/common.py",
-    ):
+    for name in FINGERPRINT_FILES:
         path = Path(__file__).parent / name
         digest.update(name.encode())
         digest.update(path.read_bytes())

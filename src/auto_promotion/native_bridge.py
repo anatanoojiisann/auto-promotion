@@ -200,6 +200,7 @@ def dispatch(request):
                     "service_ready": False,
                     "identity_verified": False,
                     "reason": code,
+                    **exception_details(exc),
                 }
             if write:
                 result = {

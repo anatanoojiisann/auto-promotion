@@ -471,7 +471,7 @@ class ClaimTests(unittest.TestCase):
                 "reason": "FloodWaitError",
             },
         ):
-            checked = self.engine.check_account(self.account["id"])
+            checked = self.engine.check_account(self.account["id"], force=True)
         self.assertGreaterEqual(checked["cooldown_until"], time.time() + 85)
         with self.assertRaises(BackendError):
             verify_claim(self.request)
@@ -482,7 +482,7 @@ class ClaimTests(unittest.TestCase):
             "call",
             return_value={"risk_warning": True, "reason": "PeerFloodError"},
         ):
-            checked = self.engine.check_account(self.account["id"])
+            checked = self.engine.check_account(self.account["id"], force=True)
         self.assertTrue(checked["disabled"])
 
     def test_interrupted_provider_progress_and_reference_survive_lease_recovery(self):

@@ -249,6 +249,11 @@ class RuntimeReliabilityTests(unittest.TestCase):
     def test_repeated_preflight_calls_are_deferred_then_read_again(self):
         _, account = self.fixture.ready()
         account.update(platform="telegram", mode="live", identity_hash="synthetic")
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "UPDATE accounts SET platform='telegram',mode='live',identity_hash='synthetic' WHERE id=?",
+                (account["id"],),
+            )
         payload = {"payload": {"target": "@denied", "media": []}}
         with patch.object(
             self.engine,

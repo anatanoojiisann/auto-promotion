@@ -53,6 +53,13 @@ const statuses = {
   healthy: "已核验",
   unchecked: "未检查",
   unavailable: "需检查",
+  temporary_unavailable: "暂时探测失败",
+  navigation_blocked: "浏览器导航受阻",
+  authorization_required: "身份或授权需核验",
+  unverified: "尚未核验",
+  cooldown: "冷却中",
+  disabled: "已停用",
+  busy: "账号正在使用中",
   not_attempted: "待执行",
   executing: "执行中",
   confirmed: "已发布 · 已核验",
@@ -145,11 +152,25 @@ function badge(value) {
     value,
   )
     ? "green"
-    : ["unknown", "manual_attention", "missed", "paused", "unchecked"].includes(
-          value,
-        )
+    : [
+          "unknown",
+          "manual_attention",
+          "missed",
+          "paused",
+          "unchecked",
+          "temporary_unavailable",
+          "navigation_blocked",
+          "unverified",
+          "cooldown",
+          "disabled",
+        ].includes(value)
       ? "amber"
-      : ["failed_known", "unavailable", "rejected"].includes(value)
+      : [
+            "failed_known",
+            "unavailable",
+            "rejected",
+            "authorization_required",
+          ].includes(value)
         ? "red"
         : ["scheduled", "active", "executing"].includes(value)
           ? "blue"
@@ -504,6 +525,19 @@ function accountRows(mode) {
     hourly.className = "sub";
     hourly.textContent = `${account.hourly_limit} 条 / 小时`;
     control.closest("tr").cells[3].append(hourly);
+    const statusBadge = control.closest("tr").cells[1].querySelector(".badge");
+    if (statusBadge && account.connection_state) {
+      statusBadge.outerHTML = badge(account.connection_state);
+    }
+    if (account.health?.last_verified_at) {
+      const previous = document.createElement("span");
+      previous.className = "sub";
+      previous.textContent =
+        "最近身份核验 " +
+        fmt(account.health.last_verified_at) +
+        "；发送前仍重新核验";
+      control.closest("tr").cells[1].append(previous);
+    }
     if (account.status === "unavailable" && account.health?.reason) {
       const reason = document.createElement("span");
       reason.className = "sub";
@@ -512,8 +546,18 @@ function accountRows(mode) {
           DuplicatePlatformIdentity: "同一平台身份已由另一账号标签绑定",
           AccountIdentityChanged: "登录身份发生变化，请核对账号",
           AccountIdentityUnavailable: "无法核对原绑定身份",
+          BrowserNavigationAccessDenied:
+            "后台页面被拒绝（401/403），尚未到身份检查；不代表已退出登录",
+          BrowserNavigationDownload: "后台导航触发下载，尚未到身份检查",
+          BrowserNavigationTimeout: "后台页面导航超时，尚未到身份检查",
         }[account.health.reason] || account.health.reason;
       control.closest("tr").cells[1].append(reason);
+    }
+    if (account.health?.next_check_at > Date.now() / 1000) {
+      const retry = document.createElement("span");
+      retry.className = "sub";
+      retry.textContent = "探测最早刷新 " + fmt(account.health.next_check_at);
+      control.closest("tr").cells[1].append(retry);
     }
     const button = document.createElement("button");
     button.className = "text-button";
@@ -543,10 +587,12 @@ function accountRows(mode) {
           await refresh();
           accountRows(mode);
           toast(
-            r.status === "healthy"
-              ? "账号身份与连接已核验"
+            (r.connection_state || r.status) === "healthy"
+              ? r.health.probe_cached
+                ? "显示最近核验结果；发送前仍重新核验"
+                : "账号身份与连接已核验"
               : "服务或账号尚未通过核验：" + (r.health.reason || "unknown"),
-            r.status !== "healthy",
+            (r.connection_state || r.status) !== "healthy",
           );
         })),
   );
