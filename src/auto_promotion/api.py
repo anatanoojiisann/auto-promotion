@@ -37,7 +37,7 @@ from .growth_models import (
     InboxUpdate,
     StoreMetricImport,
 )
-from .interaction_models import CandidateAction, ConfigSave
+from .interaction_models import CandidateAction, ConfigSave, SourceImport
 from .interactions import Interactions
 from .legacy import inventory
 from .models import (
@@ -115,7 +115,16 @@ def create_app(
     growth = Growth(engine)
     task_tools = TaskTools(engine)
     tiktok = TikTokManager(engine)
-    interactions = Interactions(engine)
+    interactions = Interactions(
+        engine,
+        worker_available=lambda: (
+            bool(worker)
+            and all(
+                kind in background_tasks and not background_tasks[kind].done()
+                for kind in ("sender", "hf_schedule", *["hf_" + s for s in Interactions.stages])
+            )
+        ),
+    )
     report_worker = worker if report_worker is None else report_worker
     operator_token = token or os.getenv("AP_API_TOKEN")
     if not operator_token:
@@ -335,9 +344,25 @@ def create_app(
 
         return InteractionConfig().model_dump()
 
+    @app.get("/api/interactions/accounts")
+    def interaction_accounts():
+        return interactions.account_options()
+
     @app.post("/api/interactions")
     def interaction_save(value: ConfigSave):
         return interactions.save(value)
+
+    @app.post("/api/interactions/readiness")
+    def interaction_readiness(value: ConfigSave):
+        return interactions.readiness(value.config)
+
+    @app.get("/api/interactions/{policy_id}/import-options")
+    def interaction_import_options(policy_id: str):
+        return interactions.import_options(policy_id)
+
+    @app.post("/api/interactions/{policy_id}/imports")
+    def interaction_import(policy_id: str, value: SourceImport):
+        return interactions.import_sources(policy_id, value)
 
     @app.post("/api/interactions/simulate")
     def interaction_simulate():

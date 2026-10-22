@@ -805,7 +805,7 @@ async function renderTask(id) {
     `<div id="task-execution">${taskExecutionPanel(t)}</div>` +
     taskChannelPanel(t) +
     taskReadinessPanel(t) +
-    `<div class="steps"><span class="${discovery ? "done" : ""}"><b>1</b>发现政策</span><span class="${t.manifest ? "done" : ""}"><b>2</b>准备清单</span><span class="${started ? "done" : ""}"><b>3</b>开始发送</span><span class="${t.state === "completed" ? "done" : ""}"><b>4</b>执行核验</span></div><div class="detail-grid"><div class="detail-body"><div class="surface"><div class="section-header"><h2>执行清单 <span class="muted">${t.items.length}</span></h2>${!t.manifest && !started && !ended ? '<button id="edit-items" class="secondary compact">编辑执行项</button>' : ""}</div>${t.items.length ? t.items.map((item) => itemPreview(item)).join("") : empty("尚无执行项", "添加每项的目标、内容、媒体和时间，然后点击开始发送。")}</div><div class="surface mt-24"><div class="section-header"><h2>发现候选 <span class="muted">${t.candidates.length}</span></h2></div><div class="padded">${
+    `<div class="steps"><span class="${discovery ? "done" : ""}"><b>1</b>发现政策</span><span class="${t.manifest ? "done" : ""}"><b>2</b>准备清单</span><span class="${started ? "done" : ""}"><b>3</b>开始发送</span><span class="${t.state === "completed" ? "done" : ""}"><b>4</b>批次结果</span></div><div class="detail-grid"><div class="detail-body"><div class="surface"><div class="section-header"><h2>执行清单 <span class="muted">${t.items.length}</span></h2>${!t.manifest && !started && !ended ? '<button id="edit-items" class="secondary compact">编辑执行项</button>' : ""}</div>${t.items.length ? t.items.map((item) => itemPreview(item)).join("") : empty("尚无执行项", "添加每项的目标、内容、媒体和时间，然后点击开始发送。")}</div><div class="surface mt-24"><div class="section-header"><h2>发现候选 <span class="muted">${t.candidates.length}</span></h2></div><div class="padded">${
       discovery && !ended
         ? `<div class="actions">${t.account_snapshot
             .filter((a) =>
@@ -943,6 +943,11 @@ const executionSteps = {
   completed: "核验完成",
 };
 function taskExecutionBadge(t) {
+  if (t.state === "completed") {
+    const d = t.delivery_summary;
+    if (!d) return '<span class="badge amber">批次已结束 · 送达未验证</span>';
+    return `<span class="badge ${d.unknown || d.missed || d.unverified ? "amber" : ""}">批次已结束 · 已确认 ${d.confirmed} · 模拟 ${d.simulated} · 过窗未发 ${d.missed} · 未知 ${d.unknown}</span>`;
+  }
   const flow = t.readiness?.workflow;
   if (
     flow &&
@@ -962,9 +967,15 @@ function taskExecutionBadge(t) {
 function taskExecutionPanel(t) {
   const flow = t.readiness?.workflow;
   const progress = flow?.counts;
-  const workflow = flow
-    ? `<div class="banner" id="task-workflow"><div><strong>${esc(flow.label)}</strong><p>${esc(flow.message)}</p>${flow.next_at ? `<p>下一计划时间：${fmt(flow.next_at)} UTC+08:00</p>` : ""}${progress ? `<p>已核验发布 ${progress.verified_sent} / ${progress.planned} · 未尝试 ${progress.not_attempted} · 已核验入群 ${progress.membership_verified}</p>` : ""}</div></div>`
+  const delivery = t.delivery_summary;
+  const outcome = delivery
+    ? `<div class="banner" id="task-delivery"><div><strong>投递结果（批次结束不代表全部送达）</strong><p>真实已核验 ${delivery.confirmed} · 模拟 ${delivery.simulated} · 过窗未发送 ${delivery.missed} · 结果未知 ${delivery.unknown} · 明确失败 ${delivery.failed_known} · 证据未完整 ${delivery.unverified}</p><p>unknown 只读核验，禁止自动补发。</p></div></div>`
     : "";
+  const workflow =
+    outcome +
+    (flow
+      ? `<div class="banner" id="task-workflow"><div><strong>${esc(flow.label)}</strong><p>${esc(flow.message)}</p>${flow.next_at ? `<p>下一计划时间：${fmt(flow.next_at)} UTC+08:00</p>` : ""}${progress ? `<p>已核验发布 ${progress.verified_sent} / ${progress.planned} · 未尝试 ${progress.not_attempted} · 已核验入群 ${progress.membership_verified}</p>` : ""}</div></div>`
+      : "");
   if (!t.manifest) return workflow;
   const e = t.execution || { status: "unmonitored" };
   const messages = {

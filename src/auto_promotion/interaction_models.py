@@ -3,12 +3,13 @@
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from .models import Model
 
 
 class ScanSettings(Model):
+    source: Literal["x_api", "imported_results"] = "x_api"
     interval_seconds: int = Field(default=600, ge=30, le=604800)
     initial_lookback_seconds: int = Field(default=1800, ge=60, le=604800)
     overlap_seconds: int = Field(default=1200, ge=0, le=604800)
@@ -64,12 +65,20 @@ class GenerationSettings(Model):
 
 
 class PublishingSettings(Model):
+    enqueue_delay_min_seconds: int = Field(default=600, ge=0, le=86400)
+    enqueue_delay_max_seconds: int = Field(default=900, ge=0, le=86400)
     request_timeout_seconds: int = Field(default=30, ge=1, le=120)
     min_account_interval_seconds: int | None = Field(default=None, ge=0, le=86400)
     max_per_account_hour: int | None = Field(default=None, ge=1, le=20)
     max_per_account_day: int | None = Field(default=None, ge=1, le=300)
     retry_after_confirmed_not_submitted_seconds: int = Field(default=60, ge=1, le=86400)
     max_retries_after_confirmed_not_submitted: int = Field(default=1, ge=0, le=3)
+
+    @model_validator(mode="after")
+    def delay_range(self):
+        if self.enqueue_delay_max_seconds < self.enqueue_delay_min_seconds:
+            raise ValueError("入队等待上限不能小于下限")
+        return self
 
 
 class VerificationSettings(Model):
@@ -189,3 +198,33 @@ class CandidateAction(Model):
     account_id: str | None = None
     text: str | None = Field(default=None, max_length=20000)
     defer_until: float | None = None
+
+
+class ImportedSource(Model):
+    # Public data only. Permissions, model grades and coverage claims are not accepted.
+    id: str | None = Field(default=None, strict=True, pattern=r"^[0-9]{1,30}$")
+    url: str | None = Field(default=None, max_length=1000)
+    text: str | None = Field(default=None, min_length=1, max_length=30000)
+    legacy_candidate_id: str | None = Field(default=None, min_length=1, max_length=100)
+    author_id: str = Field(min_length=1, max_length=100)
+    source_event_at: float = Field(gt=0, allow_inf_nan=False)
+    context: str = Field(default="", max_length=50000)
+    context_status: Literal["complete", "missing", "inaccessible"] = "missing"
+    language: str = Field(default="unknown", max_length=30)
+
+    @field_validator("source_event_at", mode="before")
+    @classmethod
+    def timestamp_not_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("原帖时间必须是明确 UTC 时间戳")
+        return value
+
+    @model_validator(mode="after")
+    def public_source(self):
+        if not self.legacy_candidate_id and not (self.id and self.url and self.text):
+            raise ValueError("导入须有完整公开来源，或原候选引用及原帖元数据")
+        return self
+
+
+class SourceImport(Model):
+    sources: list[ImportedSource] = Field(min_length=1, max_length=100)

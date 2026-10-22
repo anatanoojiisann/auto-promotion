@@ -21,22 +21,38 @@ class DraftService:
         self.model = model if model is not None else os.getenv("AP_DRAFT_MODEL", "")
 
     def status(self):
-        return {"configured": bool(self.endpoint), "fallback": "imported_text_or_persona_template"}
+        error = None
+        try:
+            parsed = urlparse(self.endpoint)
+            if not self.endpoint:
+                error = "model_connection_unavailable"
+            elif (
+                parsed.username
+                or parsed.password
+                or not parsed.hostname
+                or parsed.scheme not in {"http", "https"}
+                or (
+                    parsed.scheme == "http"
+                    and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+                )
+            ):
+                error = "model_endpoint_invalid"
+            elif not isinstance(self.model, str) or not self.model.strip():
+                error = "model_identifier_missing"
+        except ValueError:
+            error = "model_endpoint_invalid"
+        return {
+            "configured": bool(self.endpoint),
+            "configuration_error": error,
+            "connectivity": "unverified",
+            "fallback": "imported_text_or_persona_template",
+        }
 
     def structured(self, purpose, instructions, data, *, timeout=60):
         """The same configured model transport, for evidence-bearing classification/validation."""
-        parsed = urlparse(self.endpoint)
-        if not self.endpoint:
-            raise Conflict("model_connection_unavailable")
-        if (
-            parsed.username
-            or parsed.password
-            or parsed.scheme not in {"http", "https"}
-            or (
-                parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
-            )
-        ):
-            raise Conflict("model_endpoint_invalid")
+        error = self.status()["configuration_error"]
+        if error:
+            raise Conflict(error)
         headers = {"Content-Type": "application/json"}
         if self.key:
             headers["Authorization"] = "Bearer " + self.key

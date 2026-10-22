@@ -1,5 +1,94 @@
 # 高频互动：实现、接入与运维
 
+## 官方 X API 自动扫描路线（本轮选定）
+
+自动路线固定使用 `scan.source=x_api`，第一个所选账号读 recent search；全部所选真实账号
+均须为官方 API 连接。HF 不回落到旧网页搜索或 Xtf。`AP_X_BACKEND` 精确等于 `legacy`
+会改变底层派发，所以启用检查、每轮扫描及最终提交均阻止此配置，返回
+`x_api_builtin_backend_required`；由操作者核对运行服务的环境并选 `builtin`，代码不自动改环境。
+工作台从 `GET /api/interactions/accounts` 读取本机能力，禁用不兼容的未选账号并显示修正建议；
+已选错误账号仍可取消勾选。保存设置保留原账号选择顺序，再追加新选项，避免按名称排序
+静默更换首个 reader；显式取消首个账号才改用下一位。服务端也检查所有账号，不能只让首个 scanner 通过。
+
+现场最小配置清单（本轮仅假客户端验证，以下现场值和权限均**未验证**）：
+
+| 项目 | 代码已有 | 操作者需核对/配置 |
+| --- | --- | --- |
+| 官方连接 | `backends/common.py:profile_path/read_profile` 按 `AP_ACCOUNTS_DIR`，默认 DB 同级 `accounts/x/<backend_label 的 SHA256 前32位>/credentials.json` 读取私有文件 | 由既有安全接入流程配置 `label`（匹配账号 `backend_label`）、`identity`、`connection_type=x_api`、`user_id`、OAuth 用户 `access_token`；发布的应用证据另需 `app_id`。不要把内容发到聊天、策略或日志。现有 X 浏览器登录表单不支持 API 凭据录入，本轮不新增凭据表单或创建令牌。 |
+| 账号登记与身份 | 原账号 DB、账号检查及 `GET /2/users/me` | 账号中心登记对应 `backend_label` 后，在另行授权的现场验收中核对实际 API 身份与 recent-search 权限。已配置不等于读取成功。 |
+| 扫描 | 官方 `/2/tweets/search/recent`、固定 UTC 窗口、字符串 ID、next_token 分页 | 选 `x_api`、正确账号/查询/读预算；保留重叠回看。当前 upper 仍是轮开始时间，不 sleep、不加 since_id；真实 API 时间窗接受情况尚未验收。 |
+| 模型 | `DraftService` 本地格式检查及分类/拟稿/校验调用 | 服务进程的 `AP_DRAFT_ENDPOINT`、`AP_DRAFT_MODEL`，供应商需要时由操作者安全配置 `AP_DRAFT_API_KEY`；本轮不证明外部模型可用。 |
+| 后台 | 原 CLI `serve --port 8780` 默认启动 worker，持久阶段队列和原发送池 | 按既有运维步骤启动，不能带 `--no-worker`/`--reports-only`；核对阶段协程与执行池，不只看端口/父心跳。此文档命令不授予当前任务启动服务或外发权限。 |
+| 策略与写保护 | 默认停用/dry_run；P0/P1 合格后沿原任务启动来源自动推进 | 操作者选择账号、事实和时间窗后显式启用正式路线。真实提交仍需 `AUTO_PROMOTION_LIVE_WRITES=1`、`AP_X_OWNER=auto-promotion`、global stop 未开启、账号健康、原云端授权或有效本地 authority、配额和冷却。代码不会为启用策略改这些开关。 |
+| 回复资格 | API 预检与最终提交沿用 `api_plan_evidence`、`automation_approval`、`recipient_intents` 绑定和有效期 | 现场提供真实合法证据；读取搜索不要求某目标的回复同意，搜索成功也不授予回复资格。缺写资格保持受阻，不改走浏览器、不加逐条审批。 |
+
+只有明确合法的 `meta.result_count`、匹配数量的 data、合法游标才接受搜索页；合法空中间页
+仍跟随 next_token，最后一页后才提交该查询水位。`{}`、缺 meta、畸形 data、部分 errors、
+后页失败均不能算完整空轮/P3；已存候选/分类工作保留。官方 `/i/web/status/<数字ID>`
+原帖链接可进入原发布队列，同时拒绝伪域、userinfo、query、fragment 和其他路径。
+
+`401` 报 `XAPIAuthenticationRejected`，`403` 报 `XAPIAccessDenied`，`429` 报
+`XAPIRateLimited`（可能是速率或用量上限）。API 中心和轮次均记录脱敏错误，不假报成功。
+搜索 429 的 `Retry-After`（秒或 HTTP-date）与 `x-rate-limit-reset` 分别解析后取较晚值，
+缺有效头时至少退避900秒，真实恢复时间未知。该 reader 的只读退避保存在原 meta 表，
+跨策略/服务重建和每一页边界复核，不换号绕过；到期不保证用量上限已恢复，也不自动付费。
+写请求结果、unknown、发送次数及回复资格合同不因读取错误分类而改变。
+
+`imported_results` 仅为已有结果的辅助人工交接，始终覆盖未知，不是本轮自动扫描来源。
+回归入口：`node scripts/test_offline.cjs test_interaction_x_api.py`；假 HTTP/模型与临时 DB
+覆盖官方响应到分类队列、原发布队列及一次冻结等待、分页失败/429/重启、最终渠道变更和
+unknown 一次性保护。没有真实 API、模型、登录、发送或 Windows 现场验收。
+
+## 2026-10-22 接入检查、人工来源与排期补充
+
+以下是代码行为与本地隔离验证范围，不代表现场账号已接通或真实回复已验收。
+
+- 未启用草稿和停用操作仍可保存。真实账号正式启用时检查所选扫描来源、
+  `AP_DRAFT_ENDPOINT` 的本地 URL 格式、非空 `AP_DRAFT_MODEL`，以及当前服务中 sender、
+  HF 协调和各阶段协程是否存活。缺项返回具体 blocker；探测异常为 `worker_unverified`。
+  `configured` 只说明本地配置存在，`model_connectivity=unverified` 不等于远端健康检查通过。
+  每轮 API 扫描再次检查；服务重启后丢失模型配置，即使 API 返回空页，也不能计完整空轮/P3。
+  P3评估也重新检查当前就绪状态，不凭配置失效前的五轮旧记录发出新评估/通知。
+  既有 `interaction-once` 在实际消费阶段队列的调用范围内标记 `worker=one_shot`，
+  调用结束即撤销；它不是持续后台健康证明，真正发送仍需要原持久发送器。
+  不会为检查而启用 worker、修改凭据、放开全局停止或平台 owner/live 开关。
+- `scan.source=x_api` 保持原官方 API 的时间窗、分页和完整覆盖要求。
+  `scan.source=imported_results` 是**已有采集结果人工导入**，不是实时浏览器扫描适配。
+  不会调用浏览器、按十分钟刷新旧网页来源或把有限搜索卡片当作完整覆盖。
+  旧浏览器发现代码仍存在，但本次没有开放网站自动化绕过 API/平台门禁。
+- 工作台选择人工导入来源后，点击“导入已有采集候选”，选择同项目已保存的公开 X 候选，
+  补充作者公开 ID、原帖 UTC 发布时间和上下文状态。正文与目标复用原记录，不能跨项目借用。
+  时间字段明确按 UTC 解析；未知原帖时间不能填写当前发现时间替代。
+  直接导入接口为 `POST /api/interactions/{policy_id}/imports`，请求 `sources` 最多100条；
+  公开数据包含字符串 `id`、`url`、`text`、`author_id`、有限 UTC `source_event_at`、
+  `context/context_status/language`，或 `legacy_candidate_id` 加原帖元数据。
+  未来时间、非有限值、数值事件 ID、权限/批准/分类/模拟覆盖字段均拒绝。
+  导入记录始终 `coverage_incomplete=1`，复用原分类和发布队列，但不更新 API 水位、
+  不挣完整空轮、不触发 P3；切换来源递增 count_epoch 并清零连续空轮。
+  导入不证明渠道、作者接收意愿或发送账号资格；P0/P1 仍须可信渠道重新核验后自动推进，
+  P2/P3 保留人工选择，不增加新的逐条审批程序。
+- 随机入队等待默认 `publishing.enqueue_delay_min_seconds=600`、
+  `enqueue_delay_max_seconds=900`，可显式配置，上限不得小于下限。
+  起点是候选首次向原发布队列转交、保留发布意图的写事务时刻；
+  `hf_enqueue_times` 保存一次抽样及最终 `not_before`，重复路由、配置改变、重启不重抽。
+  原 item 的 `scheduled_at/due_at` 使用冻结值，900秒投递容差从这个 due 起算；
+  恢复不会用当前时间滚动延长窗口。事务提交后、task/items/link 之间中断可找回同名原草稿，
+  明确尚未尝试且已过窗时关闭为 `enqueue_window_elapsed`；已存在尝试/unknown 优先保留核验。
+  已冻结的旧清单不重新排期。跨过候选 TTL 时关闭未提交项，不创建发送尝试或额度预留。
+  Engine/native 最终提交保护也读取 not_before；账号节奏、冷却、额度、全局停止及渠道检查照常有效，
+  最早排期不承诺精确发送时间。扫描600秒、入队600–900秒、账号最小间隔是三个独立参数。
+  PDF 的600–900秒要求是原 MD 之外的补充，本次明确采用以上默认值。
+- 批次 `completed` 表示生命周期结束，不表示全部投递成功。
+  后端 `delivery_summary` 与工作台分别显示真实核验 confirmed、模拟、missed、unknown、
+  failed_known 和证据未完整。历史分类使用冻结 task.mode 与回执/引用，不依赖当前账号模式。
+  unknown 不解锁意图、不换号补发，继续原只读核验；旧 completed 任务不会自动转为持续策略。
+
+本轮回归：`tests/test_interaction_readiness.py`、`tests/test_interaction_api.py`；
+可用 `node scripts/test_offline.cjs test_interaction_readiness.py` 运行合成故障回归，
+完整方法见 [测试说明](testing.md)。原合成流程显式把等待设为0测试原规则，新增假时钟用例独立覆盖
+默认600–900秒边界、重启、孤儿任务、过窗、unknown、额度与冷却。
+真实 API/模型健康、授权证据、媒体服务及效果归因仍需现场独立验收。
+
 2026-10-21；业务显示时区 Asia/Shanghai；数据库时间为 UTC 秒。
 
 ## 实际架构检查
@@ -159,9 +248,10 @@
 
 ## 真实连接核实与缺口
 
-已对本机配置做只读核实：五个真实 X 账号仍是 Chrome/Edge/Tabbit 浏览器连接，
-没有官方 API token、套餐证据、AI 回复机器人书面批准或绑定目标的接收意愿证据。
-`AP_DRAFT_ENDPOINT` 未配置；源码没有 Factory 客户端。因此本次没有向真实用户发送测试回复，
+2026-10-21 PDF 的历史现场快照记录五个真实 X 账号使用浏览器连接，未记录官方 API
+token、套餐证据、AI 回复机器人书面批准或绑定目标的接收意愿证据，且当时
+`AP_DRAFT_ENDPOINT` 未配置。这不是对当前现场配置的确认；源码没有 Factory 客户端。
+本轮没有读取或改变现场凭据，没有向真实用户发送测试回复，
 没有调用收费媒体，也没有把这些能力报告为已接通。
 
 官方连接代码使用已有私有账号配置 `credentials.json`，选择 `connection_type: x_api`，

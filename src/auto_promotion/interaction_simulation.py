@@ -118,6 +118,7 @@ def simulate():
         cfg = InteractionConfig(
             enabled=True,
             run_mode="live",
+            publishing={"enqueue_delay_min_seconds": 0, "enqueue_delay_max_seconds": 0},
             project_id="acceptance-simulation",
             account_ids=[account["id"]],
             queries=["synthetic"],

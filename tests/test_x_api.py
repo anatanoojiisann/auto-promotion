@@ -99,7 +99,9 @@ class XAPIContractTests(unittest.TestCase):
         self.assertNotEqual(self.api.eligibility(self.tweet, includes)["status"], "eligible")
 
     def test_fixed_search_window_cursor_and_string_ids_no_since_id(self):
-        self.http.responses = [{"data": [self.tweet], "meta": {"next_token": "page-2"}}]
+        self.http.responses = [
+            {"data": [self.tweet], "meta": {"result_count": 1, "next_token": "page-2"}}
+        ]
         result = self.api.discover(
             {
                 "high_frequency": True,

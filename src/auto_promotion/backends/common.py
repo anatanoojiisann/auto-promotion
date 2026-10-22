@@ -58,6 +58,36 @@ def read_profile(platform, label, *, accounts_dir=None):
         raise BackendError("InvalidAccountConfiguration") from None
 
 
+def x_api_channel(account):
+    """Local configuration evidence only; never probes API or grants reply permission."""
+    if account["mode"] == "simulation":
+        return {"transport": "simulation", "blockers": []}
+    blockers = []
+    backend = "legacy" if os.getenv("AP_X_BACKEND") == "legacy" else "builtin"
+    if backend == "legacy":
+        blockers.append("x_api_builtin_backend_required")
+    try:
+        settings = read_profile("x", account["backend_label"])
+    except BackendError:
+        settings = {}
+    official = settings.get("connection_type") == "x_api"
+    if not official:
+        blockers.append("x_api_account_required")
+    else:
+        if (
+            not isinstance(settings.get("access_token"), str)
+            or not settings["access_token"].strip()
+        ):
+            blockers.append("x_api_token_missing")
+        if not str(settings.get("user_id") or "").isdecimal():
+            blockers.append("x_api_user_id_missing")
+    return {
+        "transport": "x_api" if official and backend == "builtin" else "browser_or_unconfigured",
+        "backend": backend,
+        "blockers": blockers,
+    }
+
+
 def automatic_actions(account):
     """Account-local opt-in; existing X connections remain read-only by default."""
     if account["platform"] != "x" or account["mode"] != "live":

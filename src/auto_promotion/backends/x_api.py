@@ -9,6 +9,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -23,9 +24,10 @@ EXPANSIONS = "referenced_tweets.id,referenced_tweets.id.author_id,attachments.me
 
 
 class Rejected(BackendError):
-    def __init__(self, status):
+    def __init__(self, status, retry_after_seconds=900):
         super().__init__("XAPIRequestRejected")
         self.status = status
+        self.retry_after_seconds = retry_after_seconds
 
 
 class XHTTP:
@@ -62,7 +64,27 @@ class XHTTP:
         except HTTPError as exc:
             # Only explicit rejections prove a create request was not accepted.
             if exc.code in {400, 401, 403, 404, 422, 429}:
-                raise Rejected(exc.code) from None
+                delay = 900
+                if exc.code == 429:
+                    now = time.time()
+                    try:
+                        delay = max(
+                            delay, int(exc.headers.get("x-rate-limit-reset", "0")) - int(now)
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                    retry_after = exc.headers.get("Retry-After", "0")
+                    try:
+                        wait = int(retry_after)
+                    except (TypeError, ValueError, OverflowError):
+                        try:
+                            wait = int(parsedate_to_datetime(retry_after).timestamp() - now) + 1
+                        except (TypeError, ValueError, OverflowError, AttributeError):
+                            wait = 0
+                    delay = max(delay, wait)
+                exc.close()
+                raise Rejected(exc.code, delay) from None
+            exc.close()
             raise BackendError("XAPIOutcomeUnknown") from None
         except BackendError:
             raise
@@ -149,16 +171,63 @@ class XAPI:
         if payload.get("cursor"):
             params["next_token"] = payload["cursor"]
         # Intentionally no since_id: the overlap is a real time window, including older IDs.
-        response = self.http.request(
-            "GET", "tweets/search/recent", params=params, timeout=payload.get("timeout_seconds", 30)
-        )
+        try:
+            response = self.http.request(
+                "GET",
+                "tweets/search/recent",
+                params=params,
+                timeout=payload.get("timeout_seconds", 30),
+            )
+        except Rejected as exc:
+            return {
+                "candidates": [],
+                "coverage_complete": False,
+                "reason": {
+                    401: "XAPIAuthenticationRejected",
+                    403: "XAPIAccessDenied",
+                    429: "XAPIRateLimited",
+                }.get(exc.status, "XAPISearchRejected"),
+                "retry_after_seconds": exc.retry_after_seconds if exc.status == 429 else 0,
+            }
+        if not isinstance(response, dict):
+            raise BackendError("XAPISearchResponseInvalid")
         if response.get("errors"):
             return {"candidates": [], "coverage_complete": False, "reason": "XAPIPartialSearch"}
+        meta, data = response.get("meta"), response.get("data", [])
+        if (
+            not isinstance(meta, dict)
+            or type(meta.get("result_count")) is not int
+            or not isinstance(data, list)
+            or not 0 <= meta["result_count"] <= 100
+            or meta["result_count"] != len(data)
+            or (
+                "next_token" in meta
+                and (
+                    not isinstance(meta["next_token"], str)
+                    or not meta["next_token"]
+                    or len(meta["next_token"]) > 4096
+                )
+            )
+        ):
+            raise BackendError("XAPISearchResponseInvalid")
+        try:
+            if any(
+                not isinstance(t, dict)
+                or any(
+                    not isinstance(t.get(k), str) or not t[k]
+                    for k in ("id", "author_id", "text", "created_at")
+                )
+                or not t["id"].isascii()
+                or not t["id"].isdecimal()
+                for t in data
+            ):
+                raise ValueError
+            candidates = [self._source(t, response.get("includes", {})) for t in data]
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            raise BackendError("XAPISearchResponseInvalid") from None
         return {
-            "candidates": [
-                self._source(t, response.get("includes", {})) for t in response.get("data", [])
-            ],
-            "next_cursor": response.get("meta", {}).get("next_token"),
+            "candidates": candidates,
+            "next_cursor": meta.get("next_token"),
             "coverage_complete": True,
         }
 

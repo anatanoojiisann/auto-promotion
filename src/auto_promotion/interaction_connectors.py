@@ -46,15 +46,12 @@ class InteractionConnectors:
                 "discovery": "simulation",
                 "publishing": "simulation",
             }
-        from .backends.common import BackendError, read_profile
+        from .backends.common import x_api_channel
 
-        try:
-            settings = read_profile("x", account["backend_label"])
-        except BackendError:
-            settings = {}
-        official = settings.get("connection_type") == "x_api"
+        channel = x_api_channel(account)
+        official = channel["transport"] == "x_api" and not channel["blockers"]
         return {
-            "transport": "x_api" if official else "browser_or_unconfigured",
+            **channel,
             "discovery": "configured_unverified" if official else "coverage_unknown",
             "publishing": "requires_target_and_approval_evidence"
             if official
@@ -66,7 +63,10 @@ class InteractionConnectors:
     def discover(self, account, query, lower, upper, cursor, config):
         if account["mode"] != "live":
             return {"candidates": [], "next_cursor": None, "coverage_complete": True}
-        if self.capabilities(account)["transport"] != "x_api":
+        cap = self.capabilities(account)
+        if cap.get("blockers"):
+            raise Conflict(",".join(cap["blockers"]))
+        if cap["transport"] != "x_api":
             raise Conflict("channel_capability_unknown: bounded paginated API search required")
         return self.engine.call(
             account,
@@ -112,8 +112,13 @@ class InteractionConnectors:
                 "simulation_eligibility",
                 {"status": "eligible", "reasons": [], "evidence": ["simulation_only"]},
             )
-        if self.capabilities(account)["transport"] != "x_api":
-            return {"status": "unknown", "reasons": ["channel_capability_unknown"], "evidence": []}
+        cap = self.capabilities(account)
+        if cap.get("blockers") or cap["transport"] != "x_api":
+            return {
+                "status": "unknown",
+                "reasons": cap.get("blockers") or ["channel_capability_unknown"],
+                "evidence": [],
+            }
         result = self.engine.call(
             account,
             "preflight",
@@ -138,6 +143,9 @@ class InteractionConnectors:
             return candidate["source"].get(
                 "simulation_current", {"status": "valid", "source_hash": candidate["source_hash"]}
             )
+        cap = self.capabilities(account)
+        if cap.get("blockers") or cap["transport"] != "x_api":
+            raise Conflict(",".join(cap.get("blockers") or ["x_api_account_required"]))
         result = self.engine.call(
             account,
             "preflight",

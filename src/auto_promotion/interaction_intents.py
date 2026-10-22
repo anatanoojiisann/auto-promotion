@@ -81,12 +81,24 @@ def candidate_guard(db, item_id, now):
         return "strategy_paused_or_dry_run"
     if row["expires_at"] <= now:
         return "candidate_expired"
+    timing = db.execute(
+        "SELECT not_before FROM hf_enqueue_times WHERE candidate_id=?", (row["id"],)
+    ).fetchone()
+    if timing and now < timing[0]:
+        return "candidate_waiting_enqueue"
     if row["state"] not in {"READY", "PUBLISHING", "VERIFYING"}:
         return "candidate_not_ready"
     if row["priority"] not in {"P0", "P1"} and row["selected_version"] != row["version"]:
         return "manual_selection_required"
     if row["owner_account_id"] not in config["account_ids"]:
         return "account_authorization_revoked"
+    # Recheck actual dispatch and profile at the existing final submit boundary.
+    from .backends.common import x_api_channel
+
+    account = db.execute("SELECT * FROM accounts WHERE id=?", (row["owner_account_id"],)).fetchone()
+    channel = x_api_channel(dict(account))
+    if channel["blockers"]:
+        return channel["blockers"][0]
     if (
         config.get("account_pool_id")
         and not db.execute(

@@ -2,8 +2,10 @@
 
 import json
 import math
+import random
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .core import Conflict, NotFound
@@ -33,10 +35,23 @@ def within_hours(at, zone, hours):
 class Interactions:
     stages = ("scan", "classify", "generate", "media", "publish", "notify", "verify", "observe")
 
-    def __init__(self, engine, *, connectors=None):
+    def __init__(self, engine, *, connectors=None, worker_available=None):
         self.engine, self.store, self.clock = engine, engine.store, engine.clock
         self.io = connectors or InteractionConnectors(engine)
         self.queue = InteractionQueue(self.store, self.clock)
+        self.worker_available = worker_available or (lambda: False)
+        self.draw_delay = random.SystemRandom().randint
+        self._one_shot = False
+
+    @contextmanager
+    def one_shot_execution(self):
+        """The reviewed CLI actually consumes stages here; this is not daemon health."""
+        previous = self._one_shot
+        self._one_shot = True
+        try:
+            yield
+        finally:
+            self._one_shot = previous
 
     def policy(self, policy_id):
         row = self.store.one("SELECT * FROM hf_policies WHERE id=?", (policy_id,))
@@ -49,6 +64,10 @@ class Interactions:
         if not row:
             raise NotFound("候选不存在")
         candidate = decode(row, "source", "classification", "media_plan")
+        timing = self.store.one(
+            "SELECT * FROM hf_enqueue_times WHERE candidate_id=?", (candidate_id,)
+        )
+        candidate["not_before"] = timing["not_before"] if timing else None
         candidate["generations"] = self.store.rows(
             "SELECT id,version,kind,state,provider,provider_job_id,source,real_product_output,started_at,finished_at,estimated_cost,actual_cost FROM hf_generation WHERE candidate_id=? ORDER BY started_at",
             (candidate_id,),
@@ -74,6 +93,9 @@ class Interactions:
         ):
             raise Conflict("策略必须使用同平台、同模式账号")
         config = InteractionConfig.model_validate(config.model_dump())
+        readiness = self.readiness(config, accounts)
+        if config.enabled and config.run_mode == "live" and readiness["blockers"]:
+            raise Conflict("interaction_not_ready:" + ",".join(readiness["blockers"]))
         policy_id = "HF-" + digest([config.project_id, config.platform, config.policy_key])[:24]
         now = self.clock()
         with self.store.connect(write=True) as db:
@@ -95,6 +117,7 @@ class Interactions:
                     "account_ids",
                 )
                 reset = any(old[k] != config.model_dump()[k] for k in keys)
+                reset = reset or old["scan"].get("source", "x_api") != config.scan.source
                 epoch += int(reset)
                 db.execute(
                     "UPDATE hf_policies SET config=?,version=?,count_epoch=?,empty_streak=CASE WHEN ? THEN 0 ELSE empty_streak END,"
@@ -163,6 +186,96 @@ class Interactions:
             )
         return self.status(policy_id)
 
+    def readiness(self, config, accounts=None):
+        accounts = (
+            accounts
+            if accounts is not None
+            else [self.engine.account(a) for a in config.account_ids]
+        )
+        synthetic = bool(accounts) and all(a["mode"] == "simulation" for a in accounts)
+        caps = [self.io.capabilities(a) for a in accounts]
+        blockers = []
+        if not accounts:
+            blockers.append("accounts_missing")
+        if not synthetic and not all(c.get("model", {}).get("configured") is True for c in caps):
+            blockers.append("model_connection_unavailable")
+        if not synthetic:
+            for cap in caps:
+                error = cap.get("model", {}).get("configuration_error")
+                if (
+                    error in {"model_endpoint_invalid", "model_identifier_missing"}
+                    and error not in blockers
+                ):
+                    blockers.append(error)
+        try:
+            worker = (
+                "one_shot"
+                if self._one_shot
+                else ("running" if self.worker_available() is True else "unavailable")
+            )
+        except Exception:
+            worker = "unverified"
+        if not synthetic and worker not in {"running", "one_shot"}:
+            blockers.append("worker_" + worker)
+        choices = []
+        retry_at = 0
+        for account, cap in zip(accounts, caps):
+            reasons = list(cap.get("blockers", []))
+            if account["mode"] != "simulation" and cap.get("transport") != "x_api":
+                if "x_api_account_required" not in reasons:
+                    reasons.append("x_api_account_required")
+            choices.append(
+                {
+                    "account_id": account["id"],
+                    "transport": cap.get("transport"),
+                    "blockers": reasons,
+                }
+            )
+            if config.scan.source == "x_api":
+                for reason in reasons:
+                    if reason not in blockers:
+                        blockers.append(reason)
+        if config.scan.source == "x_api" and not synthetic:
+            if any(c.get("transport") != "x_api" for c in caps):
+                blockers.append("scan_source_unavailable")
+            if accounts:
+                retry_at = self._read_after(accounts[0]["id"])
+                if retry_at > self.clock():
+                    blockers.append("x_api_read_cooldown")
+        return {
+            "ready": not blockers,
+            "blockers": blockers,
+            "source": config.scan.source,
+            "coverage": "partial_manual_import"
+            if config.scan.source == "imported_results"
+            else "requires_complete_api_scan",
+            "worker": worker,
+            "model_connectivity": "unverified" if not synthetic else "simulation",
+            "simulation": synthetic,
+            "publishing": "requires_target_eligibility",
+            "accounts": choices,
+            "retry_at": retry_at if retry_at > self.clock() else None,
+        }
+
+    def account_options(self):
+        """Safe local selectors for the settings UI; no credential/identity export."""
+        return [
+            {
+                "id": a["id"],
+                "label": a["label"],
+                "mode": a["mode"],
+                "capabilities": self.io.capabilities(a),
+            }
+            for a in self.engine.accounts()
+            if a["platform"] == "x"
+        ]
+
+    def _read_after(self, account_id):
+        row = self.store.one(
+            "SELECT value FROM meta WHERE key=?", ("hf_x_read_after:" + account_id,)
+        )
+        return float(row["value"]) if row else 0
+
     def status(self, policy_id):
         policy = self.policy(policy_id)
         config = InteractionConfig.model_validate(policy["config"])
@@ -196,6 +309,8 @@ class Interactions:
         policy.update(
             {
                 "effective_accounts": effective,
+                "readiness": self.readiness(config, accounts),
+                "delivery_summary": self.delivery_summary(policy_id),
                 "routing": {
                     "P0": "auto",
                     "P1": "auto",
@@ -253,6 +368,114 @@ class Interactions:
             )
         return policy
 
+    def delivery_summary(self, policy_id):
+        from .delivery_summary import summarize
+
+        rows = self.store.rows(
+            "SELECT c.state,c.closed_reason,i.status,i.external_reference,i.result,t.mode FROM hf_candidates c "
+            "LEFT JOIN items i ON i.id=c.item_id LEFT JOIN tasks t ON t.id=i.task_id WHERE c.policy_id=?",
+            (policy_id,),
+        )
+        result = summarize([], "live")
+        result["closed_before_submission"] = 0
+        for row in rows:
+            if row["status"]:
+                item = {**row, "result": json.loads(row["result"])}
+                for key, count in summarize([item], row["mode"]).items():
+                    result[key] += count
+            elif row["state"] == "SIMULATED":
+                result["simulated"] += 1
+            elif row["state"] == "CLOSED":
+                result["closed_before_submission"] += 1
+        return result
+
+    def import_sources(self, policy_id, value):
+        policy = self.policy(policy_id)
+        config = InteractionConfig.model_validate(policy["config"])
+        if config.scan.source != "imported_results" or not config.account_ids:
+            raise Conflict("select_imported_results_source_first")
+        account, now = self.engine.account(config.account_ids[0]), self.clock()
+        from .interaction_intents import event_id
+
+        with self.store.connect(write=True) as db:
+            seq = db.execute(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM hf_scan_runs WHERE policy_id=?", (policy_id,)
+            ).fetchone()[0]
+            run_id = uid("import-")
+            db.execute(
+                "INSERT INTO hf_scan_runs(id,policy_id,seq,config_version,count_epoch,config,upper_at,started_at,deadline_at,state,coverage_incomplete,error) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'classifying',1,'manual_import_coverage_incomplete')",
+                (
+                    run_id,
+                    policy_id,
+                    seq,
+                    policy["version"],
+                    policy["count_epoch"],
+                    canonical(config.model_dump()),
+                    now,
+                    now,
+                    now + config.scan.round_deadline_seconds,
+                ),
+            )
+            run = db.execute("SELECT * FROM hf_scan_runs WHERE id=?", (run_id,)).fetchone()
+            for imported in value.sources:
+                source = imported.model_dump(exclude={"legacy_candidate_id"}, exclude_none=True)
+                if imported.legacy_candidate_id:
+                    legacy = db.execute(
+                        "SELECT c.payload,c.target,t.policy,a.platform FROM candidates c "
+                        "JOIN tasks t ON t.id=c.task_id JOIN accounts a ON a.id=c.account_id WHERE c.id=?",
+                        (imported.legacy_candidate_id,),
+                    ).fetchone()
+                    if (
+                        not legacy
+                        or legacy["platform"] != config.platform
+                        or (
+                            json.loads(legacy["policy"]).get("project_id", "default")
+                            != config.project_id
+                        )
+                    ):
+                        raise Conflict("legacy_source_scope_mismatch")
+                    payload = json.loads(legacy["payload"])
+                    if payload.get("is_public") is not True:
+                        raise Conflict("legacy_source_not_public")
+                    original = {
+                        "id": event_id(
+                            config.platform, {"action": "reply", "target": legacy["target"]}
+                        ),
+                        "url": legacy["target"],
+                        "text": payload["text"],
+                    }
+                    if any(k in source and source[k] != v for k, v in original.items()):
+                        raise Conflict("legacy_source_content_mismatch")
+                    source.update(original)
+                self._ingest(db, run, source, config, account)
+            Store.audit(
+                db,
+                "interaction.sources_imported",
+                {
+                    "policy_id": policy_id,
+                    "run_id": run_id,
+                    "count": len(value.sources),
+                    "coverage": "incomplete",
+                    "external_actions": 0,
+                },
+                now=now,
+            )
+        return {"run_id": run_id, "coverage_complete": False, "imported": len(value.sources)}
+
+    def import_options(self, policy_id):
+        config = InteractionConfig.model_validate(self.policy(policy_id)["config"])
+        return [
+            {"id": r["id"], "target": r["target"], "text": json.loads(r["payload"])["text"]}
+            for r in self.store.rows(
+                "SELECT c.id,c.target,c.payload,t.policy FROM candidates c "
+                "JOIN tasks t ON t.id=c.task_id JOIN accounts a ON a.id=c.account_id "
+                "WHERE a.platform=? AND COALESCE(json_extract(t.policy,'$.project_id'),'default')=? "
+                "AND json_extract(c.payload,'$.is_public')=1 ORDER BY c.id LIMIT 100",
+                (config.platform, config.project_id),
+            )
+        ]
+
     def candidates(self, policy_id, *, offset=0, limit=100):
         self.policy(policy_id)
         if not 0 <= offset or not 1 <= limit <= 500:
@@ -276,6 +499,8 @@ class Interactions:
     def trigger(self, policy_id, *, manual=False):
         policy, now = self.policy(policy_id), self.clock()
         config = InteractionConfig.model_validate(policy["config"])
+        if config.scan.source == "imported_results":
+            raise Conflict("manual_import_required:no_live_browser_scan")
         if not config.enabled:
             raise Conflict("策略已停用；请先启用或使用隔离模拟")
         with self.store.connect(write=True) as db:
@@ -336,9 +561,18 @@ class Interactions:
         now = self.clock()
         for policy in self.list():
             config = InteractionConfig.model_validate(policy["config"])
-            if config.enabled and policy["next_scan_at"] <= now:
+            if (
+                config.enabled
+                and config.scan.source != "imported_results"
+                and policy["next_scan_at"] <= now
+            ):
                 self.trigger(policy["id"])
+        self.sync_results()
         with self.store.connect(write=True) as db:
+            for candidate in db.execute(
+                "SELECT * FROM hf_candidates WHERE state='READY' AND item_id IS NULL"
+            ).fetchall():
+                self._recover_handoff(db, candidate)
             for run in db.execute(
                 "SELECT * FROM hf_scan_runs WHERE state IN ('collecting','classifying') AND deadline_at<=?",
                 (now,),
@@ -447,11 +681,30 @@ class Interactions:
         if not run or run["state"] != "collecting":
             return
         config = InteractionConfig.model_validate_json(run["config"])
+        readiness = self.readiness(config)
+        if readiness["blockers"]:
+            if readiness["retry_at"]:
+                with self.store.connect(write=True) as db:
+                    self.queue.guard(db, job)
+                    db.execute(
+                        "UPDATE hf_policies SET next_scan_at=MAX(next_scan_at,?) WHERE id=?",
+                        (readiness["retry_at"], run["policy_id"]),
+                    )
+            raise Conflict("interaction_not_ready:" + ",".join(readiness["blockers"]))
         account = self.engine.account(config.account_ids[0])
         for progress in self.store.rows(
             "SELECT * FROM hf_query_progress WHERE run_id=? AND complete=0", (run["id"],)
         ):
             while not progress["complete"]:
+                until = self._read_after(account["id"])
+                if until > self.clock():
+                    with self.store.connect(write=True) as db:
+                        self.queue.guard(db, job)
+                        db.execute(
+                            "UPDATE hf_policies SET next_scan_at=MAX(next_scan_at,?) WHERE id=?",
+                            (until, run["policy_id"]),
+                        )
+                    raise Conflict("x_api_read_cooldown")
                 if self.clock() >= run["deadline_at"]:
                     raise Conflict("round_deadline")
                 if progress["pages"] >= config.scan.max_pages_per_query:
@@ -469,6 +722,30 @@ class Interactions:
                     config,
                 )
                 if result.get("coverage_complete") is not True:
+                    reason = result.get("reason")
+                    if reason == "XAPIRateLimited":
+                        delay = result.get("retry_after_seconds", 900)
+                        delay = max(900, delay) if type(delay) is int and 0 < delay < 1e12 else 900
+                        until = max(self._read_after(account["id"]), self.clock() + delay)
+                        with self.store.connect(write=True) as db:
+                            self.queue.guard(db, job)
+                            db.execute(
+                                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) "
+                                "DO UPDATE SET value=CAST(MAX(CAST(value AS REAL),CAST(excluded.value AS REAL)) AS TEXT)",
+                                ("hf_x_read_after:" + account["id"], str(until)),
+                            )
+                            db.execute(
+                                "UPDATE hf_policies SET next_scan_at=MAX(next_scan_at,?) WHERE id=?",
+                                (until, run["policy_id"]),
+                            )
+                    if reason in {
+                        "XAPIRateLimited",
+                        "XAPIAuthenticationRejected",
+                        "XAPIAccessDenied",
+                        "XAPISearchRejected",
+                        "XAPIPartialSearch",
+                    }:
+                        raise Conflict(reason)
                     raise Conflict("coverage_incomplete:adapter_coverage_unknown")
                 cursor = result.get("next_cursor")
                 if cursor and cursor == progress["cursor"]:
@@ -858,9 +1135,18 @@ class Interactions:
 
     def assess_fallback(self):
         now = self.clock()
+        ready = {}
+        for policy in self.list():
+            config = InteractionConfig.model_validate(policy["config"])
+            ready[policy["id"]] = (policy["version"], self.readiness(config)["ready"])
         with self.store.connect(write=True) as db:
             for policy in db.execute("SELECT * FROM hf_policies").fetchall():
                 config = InteractionConfig.model_validate_json(policy["config"])
+                if (
+                    ready.get(policy["id"]) != (policy["version"], True)
+                    or config.scan.source == "imported_results"
+                ):
+                    continue
                 last = db.execute(
                     "SELECT state,count_epoch FROM hf_scan_runs WHERE policy_id=? ORDER BY seq DESC LIMIT 1",
                     (policy["id"],),
@@ -1635,6 +1921,75 @@ class Interactions:
             return
         return self.clock() + config.verification.backoff_seconds[0]
 
+    def _recover_handoff(self, db, candidate):
+        """Adopt only an existing attempted handoff, before considering TTL/pacing.
+
+        No platform call or new attempt is made. A conflicting orphan stays blocked.
+        """
+        task = db.execute(
+            "SELECT * FROM tasks WHERE name=? ORDER BY created_at LIMIT 1",
+            ("HF " + candidate["id"] + " v" + str(candidate["version"]),),
+        ).fetchone()
+        if not task:
+            return False
+        item = db.execute(
+            "SELECT * FROM items WHERE task_id=? ORDER BY position LIMIT 1", (task["id"],)
+        ).fetchone()
+        if not item or (item["status"] == "not_attempted" and not item["attempt_id"]):
+            return False
+        payload = json.loads(item["payload"])
+        source = (
+            candidate["source"]
+            if isinstance(candidate["source"], dict)
+            else json.loads(candidate["source"])
+        )
+        media = (
+            candidate["media_plan"]
+            if isinstance(candidate["media_plan"], dict)
+            else json.loads(candidate["media_plan"])
+        )
+        manifest = json.loads(task["manifest"]) if task["manifest"] else None
+        intent = db.execute(
+            "SELECT candidate_id,item_id FROM interaction_intents WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind='reply'",
+            (candidate["project_id"], candidate["platform"], candidate["source_event_id"]),
+        ).fetchone()
+        matches = (
+            intent
+            and intent["candidate_id"] == candidate["id"]
+            and intent["item_id"] in {None, item["id"]}
+            and item["account_id"] == candidate["owner_account_id"]
+            and payload.get("account_id") == candidate["owner_account_id"]
+            and payload.get("action") == "reply"
+            and payload.get("target") == source["url"]
+            and payload.get("text") == candidate["draft"]
+            and payload.get("media") == media.get("assets", [])
+            and digest(payload) == item["payload_hash"]
+            and manifest is not None
+            and digest(manifest) == task["manifest_hash"]
+            and payload in manifest.get("items", [])
+            and json.loads(task["policy"]).get("project_id", "default") == candidate["project_id"]
+        )
+        if not matches:
+            db.execute(
+                "UPDATE hf_candidates SET state='VERIFYING',block_reason='handoff_binding_unverified' WHERE id=?",
+                (candidate["id"],),
+            )
+            return True
+        db.execute(
+            "UPDATE hf_candidates SET task_id=?,item_id=?,state=?,block_reason='existing_attempt_recovered' WHERE id=?",
+            (
+                task["id"],
+                item["id"],
+                "PUBLISHING" if item["status"] == "executing" else "VERIFYING",
+                candidate["id"],
+            ),
+        )
+        db.execute(
+            "UPDATE interaction_intents SET item_id=? WHERE candidate_id=?",
+            (item["id"], candidate["id"]),
+        )
+        return True
+
     def _publish(self, job):
         candidate_id, version = job["reference_id"].split("|", 1)
         candidate = self.candidate(candidate_id)
@@ -1642,6 +1997,10 @@ class Interactions:
         config = InteractionConfig.model_validate(policy["config"])
         if candidate["version"] != int(version) or candidate["state"] != "READY":
             return
+        with self.store.connect(write=True) as db:
+            self.queue.guard(db, job)
+            if self._recover_handoff(db, candidate):
+                return
         account = self.engine.account(candidate["owner_account_id"])
         if candidate["expires_at"] <= self.clock():
             return
@@ -1705,6 +2064,46 @@ class Interactions:
             row = db.execute("SELECT * FROM hf_candidates WHERE id=?", (candidate_id,)).fetchone()
             if row["state"] != "READY" or row["version"] != candidate["version"]:
                 return
+            timing = db.execute(
+                "SELECT not_before FROM hf_enqueue_times WHERE candidate_id=?", (candidate_id,)
+            ).fetchone()
+            if not timing:
+                # The first durable handoff reserves a single draw. Never redraw on restart,
+                # duplicate routing, lease recovery or a definitive no-submit retry.
+                sampled_at = self.clock()
+                if candidate["item_id"]:
+                    # An already frozen manifest is immutable; upgrades never reschedule it.
+                    not_before = db.execute(
+                        "SELECT due_at FROM items WHERE id=?", (candidate["item_id"],)
+                    ).fetchone()[0]
+                    delay = 0
+                else:
+                    delay = self.draw_delay(
+                        config.publishing.enqueue_delay_min_seconds,
+                        config.publishing.enqueue_delay_max_seconds,
+                    )
+                    not_before = max(sampled_at + delay, account["cooldown_until"])
+                db.execute(
+                    "INSERT INTO hf_enqueue_times VALUES(?,?,?,?,?)",
+                    (candidate_id, sampled_at, delay, not_before, policy["version"]),
+                )
+            else:
+                not_before = timing[0]
+            scheduled_at = not_before
+            from .readiness import DELIVERY_GRACE_SECONDS
+
+            if self.clock() > scheduled_at + DELIVERY_GRACE_SECONDS:
+                db.execute(
+                    "UPDATE hf_candidates SET state='CLOSED',closed_reason='enqueue_window_elapsed',updated_at=? WHERE id=?",
+                    (self.clock(), candidate_id),
+                )
+                return
+            if scheduled_at >= candidate["expires_at"]:
+                db.execute(
+                    "UPDATE hf_candidates SET state='CLOSED',closed_reason='expires_before_enqueue',updated_at=? WHERE id=?",
+                    (self.clock(), candidate_id),
+                )
+                return
             intent = db.execute(
                 "SELECT * FROM interaction_intents WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind='reply'",
                 (config.project_id, config.platform, candidate["source_event_id"]),
@@ -1741,7 +2140,7 @@ class Interactions:
                         account_ids=[account["id"]],
                         policy={
                             "project_id": config.project_id,
-                            "starts_at": iso(self.clock() - 1),
+                            "starts_at": iso(min(self.clock(), scheduled_at) - 1),
                             "ends_at": iso(candidate["expires_at"]),
                             "min_interval": max(
                                 120 if account["mode"] == "live" else 0,
@@ -1770,7 +2169,7 @@ class Interactions:
                         target=candidate["source"]["url"],
                         text=candidate["draft"],
                         media=candidate["media_plan"].get("assets", []),
-                        scheduled_at=iso(self.clock()),
+                        scheduled_at=iso(scheduled_at),
                         recipient_id=candidate["source"].get("author_id", ""),
                     )
                 ],
@@ -1991,7 +2390,18 @@ class Interactions:
                 continue
             except Exception as exc:
                 # Do not log exception messages: providers may embed tokens or response bodies.
-                reason = str(exc) if isinstance(exc, Conflict) else type(exc).__name__
+                safe_code = getattr(exc, "safe_code", None)
+                reason = (
+                    safe_code
+                    if safe_code
+                    in {
+                        "XAPISearchResponseInvalid",
+                        "XAPITransportOutcomeUnknown",
+                        "XAPIOutcomeUnknown",
+                        "XAPITokenMissing",
+                    }
+                    else (str(exc) if isinstance(exc, Conflict) else type(exc).__name__)
+                )
                 if len(reason) > 120:
                     reason = type(exc).__name__
                 try:

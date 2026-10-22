@@ -336,6 +336,7 @@ class Engine:
         if (
             result.get("healthy") is False
             or result.get("allowed") is False
+            or (operation == "discover" and result.get("coverage_complete") is False)
             or (operation == "feedback" and result.get("verified") is not True)
         ):
             status = "error"
@@ -554,6 +555,9 @@ class Engine:
             s: sum(i["status"] == s for i in result["items"])
             for s in {i["status"] for i in result["items"]}
         }
+        from .delivery_summary import summarize
+
+        result["delivery_summary"] = summarize(result["items"], result["mode"])
         result["execution"] = Workers(self.store, self.clock).snapshot(
             task_id, live=result["mode"] == "live"
         )
@@ -1042,7 +1046,11 @@ class Engine:
             elif (
                 parsed.scheme != "https"
                 or parsed.hostname not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
-                or not re.fullmatch(r"/[A-Za-z0-9_]+/status/\d+/?", parsed.path)
+                or parsed.netloc != parsed.hostname
+                or parsed.query
+                or parsed.fragment
+                or parsed.params
+                or not re.fullmatch(r"/(?:[A-Za-z0-9_]+|i/web)/status/[0-9]+/?", parsed.path)
             ):
                 raise Conflict("X 目标必须是明确的帖子链接")
             if (

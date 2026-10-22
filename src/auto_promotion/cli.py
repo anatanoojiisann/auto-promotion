@@ -416,9 +416,10 @@ def main():
         from .interactions import Interactions
 
         service = Interactions(engine)
-        service.schedule()
-        result = [service.run_stage(stage) for stage in service.stages]
-        service.schedule()
+        with service.one_shot_execution():
+            service.schedule()
+            result = [service.run_stage(stage) for stage in service.stages]
+            service.schedule()
     elif args.command == "worker-once":
         with WorkerRun(engine.store, live_enabled=engine.live_enabled) as sender:
             sender.phase("executing")

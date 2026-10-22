@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS hf_candidates(
  UNIQUE(project_id,platform,source_event_id,action_kind)
 );
 CREATE INDEX IF NOT EXISTS hf_candidates_policy ON hf_candidates(policy_id,state,priority);
+CREATE TABLE IF NOT EXISTS hf_enqueue_times(
+ candidate_id TEXT PRIMARY KEY, sampled_at REAL NOT NULL, delay_seconds INTEGER NOT NULL,
+ not_before REAL NOT NULL, config_version INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS hf_scan_candidates(
  run_id TEXT NOT NULL,candidate_id TEXT NOT NULL,source_hash TEXT NOT NULL,
  state TEXT NOT NULL DEFAULT 'pending',priority TEXT,error TEXT,

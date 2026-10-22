@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -99,3 +100,83 @@ class InteractionAPITests(unittest.TestCase):
         self.assertEqual(
             self.client.post("/api/interactions", json={"config": self.config}).status_code, 422
         )
+
+    def test_live_enable_uses_current_worker_and_model_readiness_without_network(self):
+        service = self.app.state.interactions
+        with self.app.state.store.connect(write=True) as db:
+            db.execute("UPDATE accounts SET mode='live'")
+        service.io.capabilities = lambda account: {
+            "transport": "x_api",
+            "model": {"configured": False},
+        }
+        self.config.update(run_mode="live", enabled=False)
+        report = self.client.post("/api/interactions/readiness", json={"config": self.config})
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(report.json()["model_connectivity"], "unverified")
+        self.assertIn("worker_unavailable", report.json()["blockers"])
+        self.assertIn("model_connection_unavailable", report.json()["blockers"])
+        self.save()
+        self.config["enabled"] = True
+        response = self.client.post(
+            "/api/interactions", json={"config": self.config, "expected_version": 1}
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("worker_unavailable", response.text)
+
+    def test_account_options_reject_second_browser_account_and_never_export_private_profile(self):
+        engine, service = self.app.state.engine, self.app.state.interactions
+        first = self.config["account_ids"][0]
+        browser = engine.add_account(
+            AccountInput(platform="x", mode="simulation", label="browser", backend_label="browser")
+        )
+        with self.app.state.store.connect(write=True) as db:
+            db.execute("UPDATE accounts SET mode='live',min_interval=120")
+        service.worker_available = lambda: True
+        service.io.model.status = lambda: {"configured": True}
+
+        def profile(platform, label):
+            return {
+                "connection_type": "x_api" if label == "api-sim" else "browser",
+                "identity": "SENSITIVE_IDENTITY",
+                "user_id": "100",
+                "access_token": "TOKEN_CANARY",
+            }
+
+        with patch("auto_promotion.backends.common.read_profile", side_effect=profile):
+            response = self.client.get("/api/interactions/accounts")
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("CANARY", response.text)
+            self.assertNotIn("SENSITIVE_IDENTITY", response.text)
+            options = {a["id"]: a for a in response.json()}
+            self.assertEqual(options[first]["capabilities"]["blockers"], [])
+            self.assertIn(
+                "x_api_account_required", options[browser["id"]]["capabilities"]["blockers"]
+            )
+            self.config["account_ids"].append(browser["id"])
+            self.config["run_mode"] = "live"
+            result = self.client.post("/api/interactions", json={"config": self.config})
+            self.assertEqual(result.status_code, 409)
+            self.assertIn("x_api_account_required", result.text)
+
+    def test_import_route_keeps_partial_coverage_and_rejects_permission_fields(self):
+        self.config["scan"]["source"] = "imported_results"
+        policy = self.save()
+        event = {
+            k: v for k, v in source(2002, "P1", self.now).items() if not k.startswith("simulation_")
+        }
+        url = f"/api/interactions/{policy['id']}/imports"
+        self.assertEqual(
+            self.client.post(
+                url, json={"sources": [{**event, "coverage_complete": True}]}
+            ).status_code,
+            422,
+        )
+        result = self.client.post(url, json={"sources": [event]})
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.json()["coverage_complete"])
+        self.assertEqual(
+            self.client.post(f"/api/interactions/{policy['id']}/scan").status_code, 409
+        )
+        report = self.client.get(f"/api/interactions/{policy['id']}").json()
+        self.assertEqual(report["runs"][0]["coverage_incomplete"], 1)
+        self.assertEqual(report["empty_streak"], 0)

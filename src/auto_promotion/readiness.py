@@ -7,6 +7,7 @@ from .models import epoch
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "candidate_waiting_enqueue": "尚未到达首次入队等待截止时间，保持未尝试。",
     "facts_unverified": "当前草稿依赖的产品事实尚未核实或已经失效",
     "account_profile_mismatch": "语言或目标不符合发送账号资料",
     "interaction_already_claimed": "同一项目、目标事件的互动已由另一个任务占用",

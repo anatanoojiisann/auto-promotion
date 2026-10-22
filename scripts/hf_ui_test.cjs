@@ -57,17 +57,24 @@ import time
 from pathlib import Path
 from auto_promotion.core import Engine
 from auto_promotion.store import Store
-from auto_promotion.models import AccountInput
+from auto_promotion.models import AccountInput,TaskInput,CandidateInput
 from auto_promotion.interaction_models import InteractionConfig,ConfigSave
 from auto_promotion.interaction_simulation import OfflineRegistry,SimulationConnectors,source
 from auto_promotion.interactions import Interactions
 engine=Engine(Store(${JSON.stringify(db)}),OfflineRegistry(Path(${JSON.stringify(temp)})))
 a=engine.add_account(AccountInput(platform='x',mode='simulation',label='UI simulated X',backend_label='hf-ui'))
 engine.check_account(a['id'])
+secondary=engine.add_account(AccountInput(platform='x',mode='simulation',label='A UI secondary official',backend_label='hf-secondary'))
+engine.check_account(secondary['id'])
+browser=engine.add_account(AccountInput(platform='x',mode='simulation',label='UI browser cannot scan API',backend_label='hf-browser'))
+with engine.store.connect(write=True) as db:
+    db.execute("UPDATE accounts SET mode='live' WHERE id=?",(browser['id'],))
 io=SimulationConnectors(engine)
 s=Interactions(engine,connectors=io)
 now=time.time()
-cfg=InteractionConfig(project_id='ui-acceptance',enabled=True,account_ids=[a['id']],queries=['synthetic'],facts=[{'id':'demo-fact','text':'Synthetic fact','source':'simulation://fact','verified_at':now-10,'valid_until':now+86400}])
+legacy=engine.create_task(TaskInput(name='Saved public discovery',account_ids=[a['id']],policy={'project_id':'ui-acceptance','starts_at':__import__('datetime').datetime.fromtimestamp(now-1,__import__('datetime').timezone.utc).isoformat(),'ends_at':__import__('datetime').datetime.fromtimestamp(now+86400,__import__('datetime').timezone.utc).isoformat()}))
+engine.candidate(legacy['id'],CandidateInput(account_id=a['id'],target='https://x.com/example/status/9199',text='A saved public question from the same project',is_public=True))
+cfg=InteractionConfig(project_id='ui-acceptance',enabled=True,account_ids=[a['id'],secondary['id']],queries=['synthetic'],facts=[{'id':'demo-fact','text':'Synthetic fact','source':'simulation://fact','verified_at':now-10,'valid_until':now+86400}])
 p=s.save(ConfigSave(config=cfg))
 io.sources=[source(9101,'P2',now),source(9102,'P2',now)]
 s.trigger(p['id'],manual=True)
@@ -146,6 +153,20 @@ print(p['id'])
   );
   assert.equal(backend.filter((c) => c.state === "REVIEW_PENDING").length, 1);
   await page.getByRole("button", { name: "设置", exact: true }).click();
+  const incompatible = page
+    .locator(".hf-account")
+    .filter({ hasText: "UI browser cannot scan API" });
+  assert.equal(await incompatible.locator("input").isDisabled(), true);
+  assert.match(await incompatible.textContent(), /connection_type=x_api/);
+  assert.match(await incompatible.textContent(), /浏览器连接不能/);
+  const beforeSettings = await page.evaluate(
+    async (id) => api(`/interactions/${id}`),
+    id,
+  );
+  const domSelected = await page
+    .locator('#hf-settings-form [name="accounts"]:checked')
+    .evaluateAll((els) => els.map((e) => e.value));
+  assert.notDeepEqual(domSelected, beforeSettings.config.account_ids);
   await page.locator('#hf-settings-form [name="interval"]').fill("300");
   assert.match(await page.locator("#hf-calculation").textContent(), /25 分钟/);
   await page.getByRole("button", { name: "保存策略", exact: true }).click();
@@ -155,11 +176,59 @@ print(p['id'])
     id,
   );
   assert.equal(saved.config.scan.interval_seconds, 300);
+  assert.deepEqual(saved.config.account_ids, beforeSettings.config.account_ids);
   assert.equal(saved.version, 2);
   await page.getByRole("button", { name: "扫描一次", exact: true }).click();
   await page.waitForFunction(() =>
     document.body.textContent.includes("collecting"),
   );
+  assert.match(
+    await page.locator("#hf-readiness").textContent(),
+    /外部连接未验证/,
+  );
+  assert.match(
+    await page.locator("#hf-delivery").textContent(),
+    /结果未知.*禁止补发/,
+  );
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page
+    .locator(
+      `#hf-settings-form [name="accounts"][value="${saved.config.account_ids[0]}"]`,
+    )
+    .uncheck();
+  await page
+    .locator('#hf-settings-form [name="source"]')
+    .selectOption("imported_results");
+  await page.getByRole("button", { name: "保存策略", exact: true }).click();
+  await page.locator("#panel").waitFor({ state: "hidden" });
+  const afterRemoval = await page.evaluate(
+    async (id) => api(`/interactions/${id}`),
+    id,
+  );
+  assert.deepEqual(afterRemoval.config.account_ids, [
+    saved.config.account_ids[1],
+  ]);
+  await page.locator("#hf-import").click();
+  await page
+    .locator('#hf-import-form [name="author"]')
+    .fill("synthetic-public-author");
+  await page
+    .locator('#hf-import-form [name="eventTime"]')
+    .fill(new Date(Date.now() - 60000).toISOString().slice(0, 16));
+  await page.getByRole("button", { name: "导入已有结果", exact: true }).click();
+  await page.locator("#panel").waitFor({ state: "hidden" });
+  await page.waitForFunction(() =>
+    document
+      .querySelector("#main")
+      .textContent.includes("A saved public question from the same project"),
+  );
+  const imported = await page.evaluate(
+    async (id) => api(`/interactions/${id}`),
+    id,
+  );
+  assert.equal(imported.runs[0].coverage_incomplete, 1);
+  assert.equal(imported.empty_streak, 0);
+  assert.equal(await page.locator("#hf-scan").isDisabled(), true);
   fs.mkdirSync(path.join(root, "output/playwright"), { recursive: true });
   await page.screenshot({
     path: path.join(root, "output/playwright/hf-desktop.png"),
@@ -196,6 +265,10 @@ print(p['id'])
           "mobile_no_overflow",
           "isolated_e2e_modal",
           "no_browser_errors",
+          "backend_readiness_and_delivery_summary",
+          "saved_candidate_import_partial_coverage",
+          "official_api_account_selection_blocks_browser_with_action",
+          "reader_order_stable_until_explicit_removal",
         ],
       },
       null,
@@ -203,7 +276,7 @@ print(p['id'])
     ),
   );
   console.log(
-    "High-frequency UI passed; 9 checks; desktop/mobile screenshots saved.",
+    "High-frequency UI passed; 13 checks; desktop/mobile screenshots saved.",
   );
 })()
   .catch(async (e) => {
