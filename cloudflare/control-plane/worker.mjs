@@ -1,3 +1,4 @@
+import { DeviceControl } from "./device-control.mjs";
 import { DurableObject } from "cloudflare:workers";
 import {
   ControlKernel,
@@ -74,6 +75,137 @@ export class WorkspaceCoordinator extends DurableObject {
       const body = JSON.parse(rawBody);
       const nodeId = request.headers.get("X-Control-Node");
       const fenced = this.env.FALLBACK_NODE_ID;
+      if (path.startsWith("/v2/device/")) {
+        if (request.method !== "POST")
+          throw new ControlError("MethodNotAllowed", 405);
+        this.workflows; // Additive schema; no snapshot sync or legacy migration bypass.
+        const devices = new DeviceControl(this.kernel);
+        if (["/v2/device/register", "/v2/device/revoke"].includes(path)) {
+          if (request.headers.get("X-Control-Role") !== "operator")
+            throw new ControlError("Unauthorized", 403);
+          return Response.json(
+            path.endsWith("/revoke")
+              ? devices.revoke(body.node_id)
+              : devices.register(body),
+          );
+        }
+        if (request.headers.get("X-Control-Role") !== "node")
+          throw new ControlError("Unauthorized", 403);
+        const device = await devices.authenticate(request, path, body);
+        let value;
+        if (path === "/v2/device/prepare") {
+          let resolved = null;
+          if (typeof body.target === "string" && body.target.startsWith("@")) {
+            if (
+              !device.scope.targets.includes(body.target) ||
+              body.account_id !== device.scope.account_ids[0] ||
+              body.account_id !== this.env.TELEGRAM_EXECUTOR_ACCOUNT
+            )
+              throw new ControlError("DeviceTargetNotGranted", 403);
+            const r = await this.env.TELEGRAM_EXECUTOR.fetch(
+              "https://telegram-executor/internal",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  account_id: body.account_id,
+                  operation: "resolve_target",
+                  target: body.target,
+                }),
+              },
+            );
+            const result = await r.json();
+            if (!r.ok || !result.target)
+              throw new ControlError(
+                "TelegramTargetResolutionUnavailable",
+                409,
+              );
+            resolved = result.target;
+          }
+          value = await devices.prepare(device, body, resolved);
+        } else if (path === "/v2/device/status")
+          value = devices.status(device, body.plan_id);
+        else if (path === "/v2/device/cancel")
+          value = devices.cancel(device, body.plan_id);
+        else if (path === "/v2/device/start") {
+          const owned = devices.owned(device, body.plan_id);
+          const job = this.kernel.one(
+            "SELECT state,attempt_id FROM jobs WHERE id=?",
+            owned.job_id,
+          );
+          if (job.attempt_id || !["pending"].includes(job.state))
+            return Response.json(devices.status(device, body.plan_id));
+          const task = JSON.parse(
+            this.kernel.one(
+              "SELECT payload FROM tasks WHERE id=?",
+              owned.task_id,
+            ).payload,
+          );
+          if (
+            this.kernel.one("SELECT state FROM tasks WHERE id=?", owned.task_id)
+              .state === "cancelled"
+          )
+            throw new ControlError("DeviceTaskCancelled", 409);
+          this.deviceStarts ||= new Set();
+          if (this.deviceStarts.has(device.scope.account_ids[0]))
+            throw new ControlError("DeviceAccountStartBusy", 409);
+          this.deviceStarts.add(device.scope.account_ids[0]);
+          try {
+            task.state = "active";
+            this.kernel.tx(() => {
+              this.kernel.sql.exec(
+                "UPDATE tasks SET state='active',payload=? WHERE id=?",
+                canonical(task),
+                owned.task_id,
+              );
+              this.kernel.sql.exec(
+                "UPDATE workplans SET state='active' WHERE id=?",
+                body.plan_id,
+              );
+            });
+            const activated = await this.telegramNative.activate({
+              plan_id: body.plan_id,
+              source: "explicit_device_start",
+            });
+            if (!activated.activated)
+              return Response.json({
+                plan_id: body.plan_id,
+                state: "waiting_cooldown",
+                submitted: false,
+              });
+            this.telegramNative.link({
+              plan_id: body.plan_id,
+              step_id: "explicit:send",
+              job_id: owned.job_id,
+              source: "explicit_device_start",
+            });
+            value = await this.telegramNative.dispatch({
+              plan_id: body.plan_id,
+              step_id: "explicit:send",
+            });
+          } catch (error) {
+            const current = this.kernel.one(
+              "SELECT attempt_id,state FROM jobs WHERE id=?",
+              owned.job_id,
+            );
+            if (!current.attempt_id && current.state === "pending") {
+              this.kernel.sql.exec(
+                "UPDATE tasks SET state='paused' WHERE id=? AND state='active'",
+                owned.task_id,
+              );
+              this.kernel.sql.exec(
+                "UPDATE workplans SET state='paused' WHERE id=? AND state='active'",
+                body.plan_id,
+              );
+            }
+            throw error;
+          } finally {
+            this.deviceStarts.delete(device.scope.account_ids[0]);
+          }
+        } else throw new ControlError("NotFound", 404);
+        return Response.json(value);
+      }
+
       if (path === "/v1/standby-check") {
         if (
           request.headers.get("X-Control-Role") !== "node" ||
@@ -98,6 +230,22 @@ export class WorkspaceCoordinator extends DurableObject {
           headers: { "Cache-Control": "no-store" },
         });
       }
+      if (
+        !path.startsWith("/v2/") &&
+        this.kernel.one(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='device_tasks'",
+        ) &&
+        this.kernel.one(
+          "SELECT plan_id FROM device_tasks WHERE plan_id=? OR task_id=? OR job_id=? OR task_id=? OR job_id=?",
+          body.plan_id || body.id || "",
+          body.task_id || "",
+          body.job_id || "",
+          body.id || "",
+          body.id || "",
+        ) &&
+        path !== "/v1/executor/telegram/gate"
+      )
+        throw new ControlError("DeviceTaskRequiresOwnedRoute", 403);
       // The static deployment fence cannot disappear when storage is out of
       // writes. It also blocks old clients and other nodes on the online path.
       if (
@@ -279,6 +427,8 @@ export class WorkspaceCoordinator extends DurableObject {
               ? this.telegramReader.snapshot(body.id)
               : null,
             prepared_reply_pipeline: this.replyPipeline.snapshot(body.id),
+            telegram_executor_activation:
+              this.telegramNative.activationSnapshot(body.id),
           };
         else if (
           path === "/v1/workflow/node" &&

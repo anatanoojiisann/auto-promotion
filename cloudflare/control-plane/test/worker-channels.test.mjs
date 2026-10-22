@@ -26,6 +26,8 @@ test("production Worker enforces the fence on online and standby requests", asyn
           "telegram-workflow-reader.mjs",
           "telegram-reply-policy.mjs",
           "telegram-task-builder.mjs",
+          "device-control.mjs",
+          "telegram-target.mjs",
           "telegram-prepared-replies.mjs",
         ].map(async (name) => ({
           type: "ESModule",

@@ -1,5 +1,7 @@
+import { normalizeTelegramTarget } from "./telegram-target.mjs";
 import { ControlError, sha } from "./kernel.mjs";
 import { checkGeneratedTask } from "./telegram-task-builder.mjs";
+import { verifiedCooldownStart } from "./telegram-executor-bridge.mjs";
 export const TELEGRAM_NODE = "cloudflare-telegram";
 export async function signNativeGate(secret, raw) {
   const key = await crypto.subtle.importKey(
@@ -50,6 +52,14 @@ export class TelegramNativeGate {
       this.k.sql.exec(
         "CREATE TABLE workflow_native_links(plan_id TEXT NOT NULL,step_id TEXT NOT NULL,job_id TEXT NOT NULL UNIQUE,task_id TEXT NOT NULL,created_at REAL NOT NULL,PRIMARY KEY(plan_id,step_id))",
       );
+    if (
+      !this.k.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='telegram_activation_runtime'",
+      )
+    )
+      this.k.sql.exec(
+        "CREATE TABLE telegram_activation_runtime(plan_id TEXT PRIMARY KEY,source TEXT NOT NULL,enabled INTEGER NOT NULL,next_at REAL NOT NULL,state TEXT NOT NULL,last_error TEXT)",
+      );
   }
   plan(id) {
     const p = this.q.plan(id);
@@ -58,6 +68,14 @@ export class TelegramNativeGate {
       !p.definition.account_ids.includes(this.env.TELEGRAM_EXECUTOR_ACCOUNT)
     )
       throw new ControlError("ExecutorPlanNotActive", 403);
+    if (p.definition.device_id) {
+      const d = this.k.one(
+        "SELECT enabled,expires_at FROM control_devices WHERE id=?",
+        p.definition.device_id,
+      );
+      if (!d?.enabled || d.expires_at <= this.k.clock())
+        throw new ControlError("DeviceAuthorizationExpired", 403);
+    }
     return p;
   }
   async activate(body) {
@@ -67,6 +85,35 @@ export class TelegramNativeGate {
     if (this.k.settings().global_stop)
       throw new ControlError("ExecutionStopped");
     const account = this.env.TELEGRAM_EXECUTOR_ACCOUNT;
+    const tokenHash = await sha(this.env.TG_QUEUE_BRIDGE);
+    const prior = this.k.accountChannel(account);
+    if (
+      p.definition.device_id &&
+      (prior?.channel === "local" ||
+        (!prior && this.k.legacyLocalUntil > this.k.clock()))
+    )
+      throw new ControlError("DeviceRequiresExplicitChannelHandoff", 409);
+
+    const deferred = await verifiedCooldownStart(this.k, this.env);
+    if (deferred) {
+      this.plan(body.plan_id);
+      this.k.sql.exec(
+        "INSERT INTO telegram_activation_runtime VALUES(?,?,1,?,'waiting_cooldown',NULL) ON CONFLICT(plan_id) DO UPDATE SET enabled=1,next_at=excluded.next_at,state=excluded.state,last_error=NULL",
+        p.id,
+        body.source,
+        deferred.not_before,
+      );
+      this.k.event("workflow.telegram_activation_queued", p.id, {
+        source: body.source,
+        ...deferred,
+      });
+      return {
+        activated: false,
+        queued: true,
+        account_id: account,
+        ...deferred,
+      };
+    }
     const linkedTasks = this.k
       .rows(
         "SELECT DISTINCT task_id FROM workflow_native_links WHERE plan_id=?",
@@ -101,10 +148,24 @@ export class TelegramNativeGate {
     if (!reference) throw new ControlError("ExecutorReferenceTaskMissing");
     const task = JSON.parse(reference.payload),
       until = Date.parse(task.policy.ends_at) / 1000;
-    const prior = this.k.accountChannel(account);
+    this.plan(body.plan_id);
+    if (
+      this.k.one("SELECT state FROM tasks WHERE id=?", task.id)?.state !==
+      "active"
+    )
+      throw new ControlError("ExecutionStopped");
+    const changed = this.k
+      .rows(
+        "SELECT j.task_id FROM jobs j JOIN tasks t ON t.id=j.task_id JOIN accounts a ON a.id=j.account_id WHERE a.identity=(SELECT identity FROM accounts WHERE id=?) AND t.state='active' AND j.state IN ('pending','leased') AND j.expires_at>?",
+        account,
+        this.k.clock(),
+      )
+      .some((j) => !allowed.has(j.task_id));
+    if (changed)
+      throw new ControlError("ExecutorAccountHasOtherPendingTasks", 409);
     this.k.registerNode({
       id: TELEGRAM_NODE,
-      token_hash: await sha(this.env.TG_QUEUE_BRIDGE),
+      token_hash: tokenHash,
       pools: ["telegram.mtproto"],
       account_ids: [account],
     });
@@ -122,7 +183,38 @@ export class TelegramNativeGate {
       node_id: TELEGRAM_NODE,
       source: body.source,
     });
+    this.k.sql.exec(
+      "UPDATE telegram_activation_runtime SET enabled=0,state='active',last_error=NULL WHERE plan_id=?",
+      p.id,
+    );
     return { activated: true, node_id: TELEGRAM_NODE, account_id: account };
+  }
+  activationSnapshot(id) {
+    return (
+      this.k.one(
+        "SELECT plan_id,enabled,next_at,state,last_error FROM telegram_activation_runtime WHERE plan_id=?",
+        id,
+      ) || null
+    );
+  }
+  async resumeActivations() {
+    for (const row of this.k.rows(
+      "SELECT a.* FROM telegram_activation_runtime a JOIN workplans p ON p.id=a.plan_id WHERE a.enabled=1 AND a.next_at<=? AND p.state='active' AND json_extract(p.definition,'$.mode') IS NOT 'explicit_text' ORDER BY a.next_at LIMIT 2",
+      this.k.clock(),
+    )) {
+      try {
+        await this.activate({ plan_id: row.plan_id, source: row.source });
+      } catch (error) {
+        this.k.sql.exec(
+          "UPDATE telegram_activation_runtime SET next_at=?,state='waiting_configuration',last_error=? WHERE plan_id=? AND enabled=1",
+          this.k.clock() + 900,
+          error instanceof ControlError
+            ? error.message
+            : "ExecutorActivationUnavailable",
+          row.plan_id,
+        );
+      }
+    }
   }
   checkLink(planId, stepId, jobId) {
     const p = this.plan(planId),
@@ -169,6 +261,49 @@ export class TelegramNativeGate {
     )
       throw new ControlError("NativeWorkflowScopeMismatch", 403);
     checkGeneratedTask(this.k, p, j, task);
+    if (j.kind === "send" && data.payload.action === "send_text") {
+      const input = step.input;
+      if (p.definition.device_id) {
+        const device = this.k.one(
+          "SELECT enabled,expires_at,scope FROM control_devices WHERE id=?",
+          p.definition.device_id,
+        );
+        const owner = this.k.one(
+          "SELECT device_id FROM device_tasks WHERE plan_id=? AND job_id=?",
+          p.id,
+          j.id,
+        );
+        const scope = device && JSON.parse(device.scope);
+        if (
+          !device?.enabled ||
+          device.expires_at <= this.k.clock() ||
+          owner?.device_id !== p.definition.device_id ||
+          !scope.account_ids.includes(j.account_id) ||
+          !scope.targets.includes(input.grant_target || input.target)
+        )
+          throw new ControlError("DeviceAuthorizationExpired", 403);
+      }
+
+      if (
+        p.definition.mode !== "explicit_text" ||
+        step.stage !== "send" ||
+        !p.definition.native_job_ids.includes(j.id) ||
+        !p.definition.native_task_ids.includes(j.task_id) ||
+        !p.definition.account_ids.includes(j.account_id) ||
+        input.action !== "send_text" ||
+        input.account_id !== j.account_id ||
+        input.text !== data.payload.text ||
+        input.job_id !== j.id ||
+        input.manifest_hash !== task.manifest_hash ||
+        !task.manifest_hash ||
+        data.payload.reply_to != null ||
+        (data.payload.media || []).length ||
+        normalizeTelegramTarget(input.target) !== input.target ||
+        !(task.policy.target_allowlist || []).includes(input.target)
+      )
+        throw new ControlError("ExplicitTextScopeMismatch", 403);
+      return { p, step, j, data };
+    }
     if (j.kind === "send") {
       const reviewId = step.depends_on.find((id) =>
         id.endsWith(":reply_review"),
@@ -260,7 +395,10 @@ export class TelegramNativeGate {
       body.attempt_id,
     );
     let job = data;
-    if (j.kind === "send") {
+    if (j.kind === "send" && data.payload.action === "send_text") {
+      const checked = this.checkLink(link.plan_id, link.step_id, link.job_id);
+      job = { ...data, explicit_text: { ...checked.step.input } };
+    } else if (j.kind === "send") {
       const reviewId = this.checkLink(
         link.plan_id,
         link.step_id,
@@ -443,8 +581,9 @@ export class TelegramNativeGate {
   async tick() {
     if (!this.env.TG_QUEUE_BRIDGE || this.k.settings().global_stop)
       return { submitted: 0 };
+    await this.resumeActivations();
     const rows = this.k.rows(
-      "SELECT l.plan_id,l.step_id,l.job_id FROM workflow_native_links l JOIN jobs j ON j.id=l.job_id JOIN workplans p ON p.id=l.plan_id JOIN worksteps w ON w.plan_id=l.plan_id AND w.id=l.step_id WHERE p.state='active' AND j.state='pending' AND j.available_at<=? AND j.expires_at>? ORDER BY CASE WHEN json_extract(w.result,'$.dispatch_blocked') THEN 1 ELSE 0 END,j.available_at,l.created_at LIMIT 16",
+      "SELECT l.plan_id,l.step_id,l.job_id FROM workflow_native_links l JOIN jobs j ON j.id=l.job_id JOIN workplans p ON p.id=l.plan_id JOIN worksteps w ON w.plan_id=l.plan_id AND w.id=l.step_id WHERE p.state='active' AND json_extract(p.definition,'$.mode') IS NOT 'explicit_text' AND j.state='pending' AND j.available_at<=? AND j.expires_at>? ORDER BY CASE WHEN json_extract(w.result,'$.dispatch_blocked') THEN 1 ELSE 0 END,j.available_at,l.created_at LIMIT 16",
       this.k.clock(),
       this.k.clock(),
     );
