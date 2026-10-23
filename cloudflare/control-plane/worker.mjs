@@ -279,6 +279,8 @@ export class WorkspaceCoordinator extends DurableObject {
               ? this.telegramReader.snapshot(body.id)
               : null,
             prepared_reply_pipeline: this.replyPipeline.snapshot(body.id),
+            telegram_executor_activation:
+              this.telegramNative.activationSnapshot(body.id),
           };
         else if (
           path === "/v1/workflow/node" &&

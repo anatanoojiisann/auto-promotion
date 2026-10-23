@@ -56,6 +56,8 @@ const statuses = {
   temporary_unavailable: "暂时探测失败",
   navigation_blocked: "浏览器导航受阻",
   authorization_required: "身份或授权需核验",
+  verification_required: "需要人工验证",
+  restricted: "账号受限",
   unverified: "尚未核验",
   cooldown: "冷却中",
   disabled: "已停用",
@@ -550,10 +552,18 @@ function accountRows(mode) {
           DuplicatePlatformIdentity: "同一平台身份已由另一账号标签绑定",
           AccountIdentityChanged: "登录身份发生变化，请核对账号",
           AccountIdentityUnavailable: "无法核对原绑定身份",
+          BrowserVerificationRequired:
+            "需要人工完成人机验证，完成后重新检查并启动",
+          BrowserAccountRestricted:
+            "账号受到平台限制，请先在平台处理并重新检查",
+          AccountRestricted: "平台提示账号风险，请处理后重新检查",
           BrowserNavigationAccessDenied:
             "后台页面被拒绝（401/403），尚未到身份检查；不代表已退出登录",
           BrowserNavigationDownload: "后台导航触发下载，尚未到身份检查",
           BrowserNavigationTimeout: "后台页面导航超时，尚未到身份检查",
+          BrowserAccessDenied: "后台浏览器访问被网站拒绝，尚未核验账号登录状态",
+          BrowserLoginRequired:
+            "后台专用浏览器尚未登录，请在专用窗口完成账号登录",
         }[account.health.reason] || account.health.reason;
       control.closest("tr").cells[1].append(reason);
     }
@@ -788,6 +798,9 @@ function taskReadinessPanel(t) {
   const checks = t.readiness;
   if (!checks) return "";
   const messages = [
+    ...(checks.accounts || [])
+      .filter((a) => !a.ready)
+      .map((a) => `${a.label}：${a.message}`),
     ...checks.blockers.map((b) => b.message),
     ...checks.items.map((b) => {
       const item = t.items.find((i) => i.id === b.item_id);
@@ -797,8 +810,11 @@ function taskReadinessPanel(t) {
   const skips = [...t.items, ...t.candidates]
     .filter((i) => i.result?.skip_message)
     .map((i) => `${i.payload.target}：${i.result.skip_message}`);
-  if (!messages.length && !skips.length) return "";
   return `<div class="surface padded mt-20" id="task-readiness"><h2>执行前检查</h2>${
+    (checks.accounts || []).length
+      ? `<p class="help">启动和恢复前会检查每个账号；需要人工验证或受限的账号处理后才能启动。</p><ul>${checks.accounts.map((a) => `<li>${esc(a.label)}：${esc(statuses[a.state] || a.state)}${a.checked_at ? " · 最近检查 " + fmt(a.checked_at) : ""}</li>`).join("")}</ul>`
+      : ""
+  }${
     messages.length
       ? `<ul>${[...new Set(messages)].map((m) => `<li>${esc(m)}</li>`).join("")}</ul>`
       : ""
@@ -836,6 +852,16 @@ function taskChannelPanel(t) {
     })
     .join("");
   return `<div class="surface padded mt-20" id="task-channel"><h2>执行通道</h2><p>任务选择：${esc(labels[channel.requested] || "跟随默认")}${channel.requested === "inherit" ? "（当前默认：" + esc(labels[channel.default]) + "）" : ""}</p>${accounts ? "<ul>" + accounts + "</ul>" : '<p class="help">开始任务后确定账号的实际通道。</p>'}<p class="help">同一账号等待当前操作和回执完成后交接，其他账号独立执行。在线任务遇到连接问题时保持等待。</p></div>`;
+}
+
+async function taskControlRequest(id, action, body) {
+  try {
+    return await api(`/tasks/${id}/${action}`, "POST", body);
+  } catch (error) {
+    await refresh();
+    await renderTask(id);
+    throw error;
+  }
 }
 
 async function renderTask(id) {
@@ -877,7 +903,7 @@ async function renderTask(id) {
   $("#edit-items")?.addEventListener("click", () => itemEditor(t));
   $("#run-task")?.addEventListener("click", (e) =>
     busy(e.target, async () => {
-      const r = await api(`/tasks/${id}/start`, "POST");
+      const r = await taskControlRequest(id, "start");
       await refresh();
       await renderTask(id);
       toast(
@@ -889,7 +915,7 @@ async function renderTask(id) {
   );
   $("#pause-task")?.addEventListener("click", (e) =>
     busy(e.target, async () => {
-      await api(`/tasks/${id}/state`, "POST", {
+      await taskControlRequest(id, "state", {
         state: t.state === "paused" ? "active" : "paused",
       });
       await refresh();
@@ -937,7 +963,7 @@ async function renderTask(id) {
   );
   $("#join-candidates")?.addEventListener("click", (e) =>
     busy(e.target, async () => {
-      await api(`/tasks/${id}/join`, "POST");
+      await taskControlRequest(id, "join");
       await renderTask(id);
       toast("合格候选入群批次已处理");
     }),

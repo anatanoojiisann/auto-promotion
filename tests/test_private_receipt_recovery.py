@@ -425,6 +425,13 @@ class PrivateReceiptRecoveryTests(unittest.TestCase):
         self.assertTrue(final_receipts.valid_result({"status": "failed_known"}, "x", item))
 
     def test_x_confirmed_and_failed_known_recover_with_one_platform_call(self):
+        class IdentityAdapter(SimulationAdapter):
+            def call(self, account, operation, payload):
+                result = super().call(account, operation, payload)
+                if operation == "health":
+                    result["account_identity"] = "synthetic"
+                return result
+
         for outcome in ("confirmed", "failed_known"):
             with (
                 self.subTest(outcome=outcome),
@@ -440,7 +447,7 @@ class PrivateReceiptRecoveryTests(unittest.TestCase):
                 ),
             ):
                 store = Store(Path(directory) / "test.db")
-                registry = AdapterRegistry(Path(directory), overrides={"x": SimulationAdapter()})
+                registry = AdapterRegistry(Path(directory), overrides={"x": IdentityAdapter()})
                 engine = Engine(store, registry, live_enabled=True)
                 save_profile(
                     "x", "synthetic-x", {"identity": "synthetic", "automatic_actions": ["reply"]}
@@ -449,8 +456,6 @@ class PrivateReceiptRecoveryTests(unittest.TestCase):
                     AccountInput(platform="x", label="synthetic", backend_label="synthetic-x")
                 )
                 engine.check_account(account["id"])
-                with store.connect(write=True) as db:
-                    db.execute("UPDATE accounts SET identity_hash='synthetic-x-identity'")
                 now = time.time()
                 task = engine.create_task(
                     TaskInput(

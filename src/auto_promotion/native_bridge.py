@@ -11,7 +11,7 @@ import sys
 import time
 
 from .backends.common import BackendError, Receipts, account_lock, verify_claim
-from .execution_diagnostics import FIELDS, exception_details
+from .execution_diagnostics import FIELDS, browser_read_failure_reason, exception_details
 from .models import PLATFORMS, canonical
 from .store import Store
 
@@ -81,6 +81,8 @@ RESULT_FIELDS.update(
         "source_status",
         "actual_cost",
         "confirmed_not_submitted",
+        "rate_limit_remaining",
+        "rate_limit_reset_at",
     }
 )
 
@@ -195,6 +197,8 @@ def dispatch(request):
             if not isinstance(code, str) or not code.isidentifier():
                 code = "BackendError"
             if operation == "health":
+                if platform in {"x", "reddit"} and code == "Error":
+                    code = browser_read_failure_reason(exc, code)
                 return {
                     "healthy": False,
                     "service_ready": False,

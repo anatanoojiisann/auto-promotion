@@ -1,4 +1,5 @@
 import { ControlError, sha } from "./kernel.mjs";
+import { verifiedCooldownStart } from "./telegram-executor-bridge.mjs";
 const NODE = "cloudflare-telegram-reader";
 export class TelegramWorkflowReader {
   constructor(queue, env) {
@@ -38,9 +39,12 @@ export class TelegramWorkflowReader {
       !this.env.TG_QUEUE_BRIDGE
     )
       throw new ControlError("TelegramReaderSetupIncomplete", 409);
-    const health = await this.rpc("health");
-    if (!health.ok || health.result.identity_verified !== true)
-      throw new ControlError("ExecutorLoginNotVerified", 409);
+    const deferred = await verifiedCooldownStart(this.k, this.env);
+    if (!deferred) {
+      const health = await this.rpc("health");
+      if (!health.ok || health.result.identity_verified !== true)
+        throw new ControlError("ExecutorLoginNotVerified", 409);
+    }
     this.q.registerNode({
       id: NODE,
       token_hash: await sha("reader:" + this.env.TG_QUEUE_BRIDGE),
@@ -85,8 +89,10 @@ export class TelegramWorkflowReader {
       }
     });
     this.k.sql.exec(
-      "INSERT INTO telegram_reader_runtime(plan_id,enabled,next_at,state) VALUES(?,1,0,'queued') ON CONFLICT(plan_id) DO UPDATE SET enabled=1",
+      "INSERT INTO telegram_reader_runtime(plan_id,enabled,next_at,state) VALUES(?,1,?,?) ON CONFLICT(plan_id) DO UPDATE SET enabled=1,next_at=excluded.next_at,state=excluded.state",
       id,
+      deferred?.not_before || 0,
+      deferred ? "waiting_cooldown" : "queued",
     );
     this.k.event("workflow.telegram_reader_started", id, {
       source,
@@ -96,6 +102,8 @@ export class TelegramWorkflowReader {
       started: true,
       scope: "authenticated_telegram_reads",
       node_id: NODE,
+      ...(deferred || {}),
+      waiting_cooldown: !!deferred,
     };
   }
   snapshot(id) {

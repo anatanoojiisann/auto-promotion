@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from urllib.parse import urlparse
 
-from auto_promotion.backends.browser import BrowserBackend
+from auto_promotion.backends.browser import BrowserBackend, x_editor_text
 from auto_promotion.backends.common import BackendError
 
 
@@ -41,6 +41,10 @@ class OriginalPostBrowserTests(unittest.TestCase):
         self.upload_ready_at_submit = None
         self.author, self.parent, self.quoted = "brand", None, False
         self.draft, self.hide_media = "", False
+        self.hide_composer_switcher = False
+        self.composer_identity = "brand"
+        self.published_html = None
+        self.initial_attachment_count = 0
         self.saved, self.authorized = [], []
         self.item = {
             "action": "post",
@@ -98,12 +102,20 @@ class OriginalPostBrowserTests(unittest.TestCase):
             raise AssertionError("Unexpected mutation in fixture")
         switcher = '<button data-testid="SideNav_AccountSwitcher_Button">Brand @brand</button>'
         if path == "/compose/post":
+            style = ' style="visibility:hidden"' if self.hide_composer_switcher else ""
+            switcher = (
+                '<button data-testid="SideNav_AccountSwitcher_Button"'
+                + style
+                + ">Name @"
+                + self.composer_identity
+                + "</button>"
+            )
             route.fulfill(
-                content_type="text/html",
+                content_type="text/html; charset=utf-8",
                 body=switcher
                 + f"""<div role="dialog">
             <div contenteditable="true" data-testid="tweetTextarea_0">{self.draft}</div>
-            <div data-testid="attachments"></div><input type="file" multiple onchange="const a=document.querySelector('[data-testid=attachments]');a.innerHTML='<div role=progressbar></div>';setTimeout(()=>{{a.innerHTML=Array.from(this.files,()=>'<img>').join('');}},80)">
+            <div data-testid="attachments">{"<img>" * self.initial_attachment_count}</div><input type="file" multiple onchange="const a=document.querySelector('[data-testid=attachments]');a.innerHTML='<div role=progressbar></div>';setTimeout(()=>{{a.innerHTML=Array.from(this.files,()=>'<img>').join('');}},80)">
             <button data-testid="tweetButton" onclick="fetch('/CreateTweet',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{files:document.querySelector('input').files.length,ready:!document.querySelector('[role=progressbar]') && document.querySelectorAll('[data-testid=attachments] img').length===document.querySelector('input').files.length}})}})">Post</button></div>""",
             )
         elif path == "/brand/status/1234":
@@ -111,12 +123,12 @@ class OriginalPostBrowserTests(unittest.TestCase):
                 "" if self.hide_media else '<div data-testid="tweetPhoto"></div>' * self.uploads
             )
             route.fulfill(
-                content_type="text/html",
+                content_type="text/html; charset=utf-8",
                 body=switcher
-                + f"""<article data-testid="tweet"><div data-testid="User-Name">Name @{self.author}</div><a href="/brand/status/1234"><time datetime="2026-10-20T12:00:00Z">now</time></a><div data-testid="tweetText">{self.item["text"]}</div>{photos}</article>""",
+                + f"""<article data-testid="tweet"><div data-testid="User-Name">Name @{self.author}</div><a href="/brand/status/1234"><time datetime="2026-10-20T12:00:00Z">now</time></a><div data-testid="tweetText">{self.published_html if self.published_html is not None else self.item["text"]}</div>{photos}</article>""",
             )
         elif path == "/":
-            route.fulfill(content_type="text/html", body=switcher)
+            route.fulfill(content_type="text/html; charset=utf-8", body=switcher)
         else:
             raise AssertionError("Unexpected page: " + path)
 
@@ -143,6 +155,11 @@ class OriginalPostBrowserTests(unittest.TestCase):
         self.assertEqual(self.uploads, 1)
         self.assertTrue(self.upload_ready_at_submit)
 
+    def test_original_lines_are_entered_as_paragraphs_before_one_submit(self):
+        self.item["text"] = "First 🌍\n\n두 번째\n\nhttps://example.test/approved"
+        self.assertTrue(self.execute()["verified"])
+        self.assertEqual(self.posts, 1)
+
     def test_reply_or_quote_receipt_cannot_be_an_original_post(self):
         self.parent = "99"
         self.assertFalse(self.execute()["verified"])
@@ -167,12 +184,93 @@ class OriginalPostBrowserTests(unittest.TestCase):
         self.assertEqual(self.posts, 0)
         self.assertEqual(self.page.get_by_test_id("tweetTextarea_0").inner_text(), "user draft")
 
+    def test_empty_contenteditable_newline_is_cleared_before_exact_text(self):
+        self.draft = "\n"
+        result = self.execute()
+        self.assertTrue(result["verified"])
+        self.assertEqual(self.posts, 1)
+        self.assertEqual(len(self.authorized), 1)
+
+    def test_draft_blocks_keep_exact_blank_lines_without_rendered_extra_newlines(self):
+        self.page.goto("https://x.com/compose/post")
+        editor = self.page.get_by_test_id("tweetTextarea_0")
+        editor.evaluate(
+            "el => el.innerHTML = '<div data-block=true>First paragraph</div>' + "
+            "'<div data-block=true><br></div><div data-block=true>두 번째 문단</div>'"
+        )
+        approved = "First paragraph\n\n두 번째 문단"
+        self.assertNotEqual(editor.inner_text(), approved)
+        self.assertEqual(x_editor_text(editor), approved)
+
     def test_stop_after_preparation_prevents_any_submit(self):
         def stopped():
             raise BackendError("ExecutionStopped")
 
         result = self.execute(stopped)
         self.assertEqual(result["status"], "failed_known")
+        self.assertEqual(self.posts, 0)
+
+    def test_composer_overlay_keeps_the_exact_account_identity_check(self):
+        self.hide_composer_switcher = True
+        self.assertTrue(self.execute()["verified"])
+        self.assertEqual(self.posts, 1)
+
+    def test_hidden_composer_identity_mismatch_never_submits(self):
+        self.hide_composer_switcher = True
+        self.composer_identity = "other"
+        result = self.execute()
+        self.assertEqual(result["reason"], "BrowserIdentityMismatch")
+        self.assertEqual(self.posts, 0)
+
+    def test_public_text_uses_observed_expanded_link_and_emoji(self):
+        self.item["text"] = "Translation 🌍\n\nhttps://example.test/download?platform=android"
+        self.published_html = 'Translation <img alt="🌍">\n\n<a href="https://t.co/short" title="https://example.test/download?platform=android">example.test/download…</a>'
+        backend = BrowserBackend("x", "synthetic", self.context, self.page, {"identity": "brand"})
+        result = backend.verify(
+            {
+                "payload": self.item,
+                "receipt": {
+                    "external_reference": "https://x.com/brand/status/1234",
+                    "target_verified": True,
+                },
+            }
+        )
+        self.assertTrue(result["verified"])
+
+    def test_wrong_expanded_link_cannot_confirm(self):
+        self.item["text"] = "https://example.test/approved"
+        self.published_html = '<a href="https://t.co/short" title="https://example.test/other">example.test/approved</a>'
+        backend = BrowserBackend("x", "synthetic", self.context, self.page, {"identity": "brand"})
+        result = backend.verify(
+            {
+                "payload": self.item,
+                "receipt": {
+                    "external_reference": "https://x.com/brand/status/1234",
+                    "target_verified": True,
+                },
+            }
+        )
+        self.assertFalse(result["verified"])
+
+    def test_editor_emoji_images_keep_the_exact_approved_character(self):
+        self.page.goto("https://x.com/compose/post")
+        editor = self.page.get_by_test_id("tweetTextarea_0")
+        editor.evaluate(
+            "el => el.innerHTML = '<div data-block=true>Translate <img alt=🌍></div><div data-block=true><br></div><div data-block=true>Now</div>'"
+        )
+        self.assertEqual(x_editor_text(editor), "Translate 🌍\n\nNow")
+
+    def test_identical_approved_text_draft_is_preserved_and_submitted_once(self):
+        self.draft = self.item["text"]
+        self.assertTrue(self.execute()["verified"])
+        self.assertEqual(self.posts, 1)
+        self.assertEqual(len(self.authorized), 1)
+
+    def test_existing_media_is_never_reused_or_overwritten(self):
+        self.draft = self.item["text"]
+        self.initial_attachment_count = 1
+        result = self.execute()
+        self.assertEqual(result["reason"], "XComposerNotEmpty")
         self.assertEqual(self.posts, 0)
 
 

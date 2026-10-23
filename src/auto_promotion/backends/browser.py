@@ -7,6 +7,7 @@ import time
 from urllib.parse import quote, urlparse
 
 from ..models import epoch
+from .browser_status import check_status
 from .common import (
     BackendError,
     language_evidence,
@@ -16,6 +17,7 @@ from .common import (
     read_profile,
     save_profile,
 )
+from .x_text import EDITOR_TEXT_JS, TWEET_TEXT_JS
 
 HOME = {"reddit": "https://www.reddit.com", "x": "https://x.com"}
 
@@ -37,10 +39,58 @@ def launch_context(runtime, root, *, browser_channel="chromium", headless):
 def check_response(response):
     if response is not None and response.status == 429:
         raise BackendError("BrowserRateLimited")
+    if response is not None and response.status == 403:
+        raise BackendError("BrowserAccessDenied")
     return response
 
 
-def identity(platform, context, page):
+def navigate_home(page, platform, *, timeout):
+    """Classify only the platform's main document, including aborted navigations."""
+    document_status = None
+
+    def observe(response):
+        nonlocal document_status
+        if (
+            response.request.is_navigation_request()
+            and response.frame == page.main_frame
+            and urlparse(response.url).hostname == urlparse(HOME[platform]).hostname
+            and isinstance(response.status, int)
+        ):
+            document_status = response.status
+
+    def failure(status):
+        if status in {401, 403}:
+            return "BrowserNavigationAccessDenied"
+        if status == 429:
+            return "BrowserRateLimited"
+        if status is not None and status >= 500:
+            return "BrowserNavigationServerError"
+        return None
+
+    page.on("response", observe)
+    try:
+        try:
+            response = page.goto(HOME[platform], wait_until="domcontentloaded", timeout=timeout)
+        except Exception as exc:
+            code = failure(document_status)
+            if code is None:
+                code = (
+                    "BrowserNavigationTimeout"
+                    if type(exc).__name__ == "TimeoutError"
+                    else "BrowserNavigationDownload"
+                    if "Download is starting" in str(exc)
+                    else "BrowserNavigationUnavailable"
+                )
+            raise BackendError(code) from None
+        code = failure(response.status if response is not None else None)
+        if code:
+            raise BackendError(code)
+        return response
+    finally:
+        page.remove_listener("response", observe)
+
+
+def identity(platform, context, page, *, timeout=15000, composer_overlay=False):
     if platform == "reddit":
         response = context.request.get(HOME[platform] + "/api/me.json")
         check_response(response)
@@ -48,11 +98,43 @@ def identity(platform, context, page):
             raise BackendError("RedditIdentityUnavailable")
         return str(response.json().get("data", {}).get("name", "")).casefold()
     switcher = page.get_by_test_id("SideNav_AccountSwitcher_Button")
-    switcher.wait_for(timeout=15000)
-    handles = set(re.findall(r"@([A-Za-z0-9_]{1,15})\b", switcher.inner_text()))
+    try:
+        switcher.wait_for(state="attached" if composer_overlay else "visible", timeout=timeout)
+    except Exception:
+        # An accessible public landing page is a signed-out session, not a
+        # transport failure. Keep unknown failures and closed pages unchanged.
+        try:
+            signed_out = (
+                "/i/flow/login" in page.url
+                or page.get_by_role("heading", name="Happening now.", exact=True).is_visible()
+            )
+        except Exception:
+            signed_out = False
+        if signed_out:
+            raise BackendError("BrowserLoginRequired") from None
+        raise
+    switcher_text = switcher.text_content() if composer_overlay else switcher.inner_text()
+    handles = set(re.findall(r"@([A-Za-z0-9_]{1,15})\b", switcher_text or ""))
     if len(handles) != 1:
         raise BackendError("XIdentityUnavailable")
     return handles.pop().casefold()
+
+
+def save_browser_login(platform, label, observed, browser_channel, *, accounts_dir=None):
+    """Reconnect the same identity/channel without losing its local opt-ins."""
+    settings = {"identity": observed, "browser_channel": browser_channel}
+    root = profile_path(platform, label, accounts_dir=accounts_dir)
+    if (root / "credentials.json").is_file():
+        previous = read_profile(platform, label, accounts_dir=accounts_dir)
+        if previous["identity"] != observed:
+            raise BackendError("ChangedIdentityRequiresNewAccountLabel")
+        if previous.get("browser_channel", "chromium") == browser_channel:
+            settings.update(
+                (key, previous[key])
+                for key in ("automatic_actions", "browser_headless")
+                if key in previous
+            )
+    save_profile(platform, label, settings, accounts_dir=accounts_dir)
 
 
 def login(platform, label, *, browser_channel="chromium"):
@@ -76,9 +158,7 @@ def login(platform, label, *, browser_channel="chromium"):
             observed = identity(platform, context, page)
             if not observed or observed != expected:
                 raise BackendError("BrowserIdentityMismatch")
-            save_profile(
-                platform, label, {"identity": observed, "browser_channel": browser_channel}
-            )
+            save_browser_login(platform, label, observed, browser_channel)
             return {"platform": platform, "account": label, "authenticated": True}
         finally:
             context.close()
@@ -89,6 +169,14 @@ def visible_one(locator):
     if len(visible) != 1:
         raise BackendError("BrowserControlNotUnambiguouslyAvailable")
     return visible[0]
+
+
+def x_editor_text(editor):
+    return editor.evaluate(EDITOR_TEXT_JS)
+
+
+def x_tweet_text(locator):
+    return locator.evaluate(TWEET_TEXT_JS)
 
 
 def reddit_record(tree, identifier):
@@ -132,8 +220,21 @@ class BrowserBackend:
             "submission_started": self.submission_started,
         }
 
-    def check_identity(self):
-        observed = identity(self.platform, self.context, self.page)
+    def check_identity(self, *, timeout=15000, composer_overlay=False):
+        check_status(self.page)
+        try:
+            observed = identity(
+                self.platform,
+                self.context,
+                self.page,
+                timeout=timeout,
+                composer_overlay=composer_overlay,
+            )
+        except Exception:
+            # A challenge may appear while the identity control is loading.
+            check_status(self.page)
+            raise
+        check_status(self.page)
         if not observed or observed != self.settings["identity"]:
             raise BackendError("BrowserIdentityMismatch")
 
@@ -177,9 +278,15 @@ class BrowserBackend:
 
     def _run(self, operation, payload, checkpoint, authorize):
         self.step("home_navigation")
-        self.navigate_home()
+        read_timeout = (
+            45000
+            if operation in {"health", "preflight"}
+            or (operation == "execute" and payload.get("payload", {}).get("action") == "post")
+            else 15000
+        )
+        navigate_home(self.page, self.platform, timeout=read_timeout)
         self.step("identity_check")
-        self.check_identity()
+        self.check_identity(timeout=read_timeout)
         if operation == "health":
             from ..models import CAPABILITIES
 
@@ -206,51 +313,6 @@ class BrowserBackend:
         return (self.reddit_execute if self.platform == "reddit" else self.x_execute)(
             payload, checkpoint, authorize
         )
-
-    def navigate_home(self):
-        # Navigation may throw "Download is starting" before goto returns its
-        # HTTP response. Retain only the navigation status, never URLs/headers.
-        statuses = []
-
-        def observed(response):
-            if (
-                response.request.is_navigation_request()
-                and urlparse(response.url).hostname == urlparse(HOME[self.platform]).hostname
-                and isinstance(response.status, int)
-            ):
-                statuses.append(response.status)
-                del statuses[:-4]
-
-        def failure(status):
-            if status in {401, 403}:
-                return "BrowserNavigationAccessDenied"
-            if status == 429:
-                return "BrowserRateLimited"
-            if status is not None and status >= 500:
-                return "BrowserNavigationServerError"
-            return None
-
-        self.page.on("response", observed)
-        try:
-            try:
-                response = self.page.goto(HOME[self.platform], wait_until="domcontentloaded")
-            except Exception as exc:
-                code = failure(statuses[-1] if statuses else None)
-                if code is None:
-                    code = (
-                        "BrowserNavigationTimeout"
-                        if type(exc).__name__ == "TimeoutError"
-                        else "BrowserNavigationDownload"
-                        if "Download is starting" in str(exc)
-                        else "BrowserNavigationUnavailable"
-                    )
-                raise BackendError(code) from None
-            code = failure(response.status if response is not None else None)
-            if code:
-                raise BackendError(code)
-            return response
-        finally:
-            self.page.remove_listener("response", observed)
 
     def discover(self, policy):
         records = {}
@@ -606,25 +668,38 @@ class BrowserBackend:
             item["target"], self.settings["identity"]
         ):
             raise BackendError("XOwnedTargetRequired")
-        self.step("post_composer", False)
-        check_response(page.goto("https://x.com/compose/post", wait_until="domcontentloaded"))
-        self.check_identity()
-        editor = page.locator('[data-testid="tweetTextarea_0"]:visible')
-        editor.first.wait_for(state="visible", timeout=15000)
-        editor = visible_one(editor)
-        dialogs = page.locator('[role="dialog"]:visible').filter(has=editor)
-        composer = visible_one(dialogs) if dialogs.count() else page
-        if (
-            editor.inner_text()
-            or composer.locator(
-                '[data-testid="attachments"] img, [data-testid="attachments"] video'
-            ).count()
-        ):
+        self.step("post_composer_navigation", False)
+        check_response(
+            page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=45000)
+        )
+        self.step("post_composer_identity", False)
+        self.check_identity(timeout=45000, composer_overlay=True)
+        self.step("post_composer_editor", False)
+        dialogs = page.locator('[role="dialog"]:visible').filter(
+            has=page.get_by_test_id("tweetTextarea_0")
+        )
+        dialogs.first.wait_for(state="visible", timeout=45000)
+        composer = visible_one(dialogs)
+        editor = visible_one(composer.get_by_test_id("tweetTextarea_0"))
+        draft = x_editor_text(editor)
+        if (draft.strip() and draft != item["text"]) or composer.locator(
+            '[data-testid="attachments"] img, [data-testid="attachments"] video'
+        ).count():
             raise BackendError("XComposerNotEmpty")
+        if draft and draft != item["text"]:
+            editor.fill("")
         button = composer.get_by_test_id("tweetButton" if dialogs.count() else "tweetButtonInline")
-        editor.click()
-        editor.press_sequentially(item["text"])
-        if editor.inner_text() != item["text"]:
+        self.step("post_composer_text", False)
+        if draft != item["text"]:
+            editor.click()
+            editor.press("Control+A")
+            editor.press("Backspace")
+            for index, line in enumerate(item["text"].split("\n")):
+                if index:
+                    editor.press("Enter")
+                if line:
+                    editor.press_sequentially(line)
+        if x_editor_text(editor) != item["text"]:
             raise BackendError("ApprovedTextNotRetained")
         if item["media"]:
             self.step("attach_media", False)
@@ -638,8 +713,8 @@ class BrowserBackend:
             0, timeout=45000
         )
         expect(button).to_be_enabled(timeout=45000)
-        self.check_identity()
-        if editor.inner_text() != item["text"]:
+        self.check_identity(timeout=45000, composer_overlay=True)
+        if x_editor_text(editor) != item["text"]:
             raise BackendError("ApprovedTextNotRetained")
         self.step("submission_authorization", False)
         authorize()
@@ -752,7 +827,7 @@ class BrowserBackend:
                     {author.casefold() for author in authors} == {self.settings["identity"]}
                     and result.get("target_verified")
                     and (
-                        article.get_by_test_id("tweetText").inner_text()
+                        x_tweet_text(article.get_by_test_id("tweetText"))
                         if article.get_by_test_id("tweetText").count()
                         else ""
                     )

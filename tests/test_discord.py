@@ -5,6 +5,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -440,23 +441,6 @@ class DiscordWorkflowTests(unittest.TestCase):
                 policy={"starts_at": self.iso(self.now - 60), "ends_at": self.iso(self.now + 3600)},
             )
         )
-        self.engine.start_task(task["id"], sending=False)
-        self.engine.set_items(
-            task["id"],
-            [
-                ItemInput(
-                    account_id=live["id"],
-                    action="send_message",
-                    target=CHANNEL,
-                    text="exact",
-                    scheduled_at=self.iso(self.now - 1),
-                )
-            ],
-        )
-        task = self.engine.prepare(task["id"])
-        self.engine.start_task(task["id"])
-        self.engine.live_enabled = True
-        self.engine.set_stop(False)
 
         def platform_call(account, operation, payload):
             if operation == "health":
@@ -472,6 +456,24 @@ class DiscordWorkflowTests(unittest.TestCase):
             ),
             patch.object(self.engine.adapters, "call", side_effect=platform_call) as call,
         ):
+            # Health is checked on start as well as immediately before execution.
+            self.engine.start_task(task["id"], sending=False)
+            self.engine.set_items(
+                task["id"],
+                [
+                    ItemInput(
+                        account_id=live["id"],
+                        action="send_message",
+                        target=CHANNEL,
+                        text="exact",
+                        scheduled_at=self.iso(self.now - 1),
+                    )
+                ],
+            )
+            task = self.engine.prepare(task["id"])
+            self.engine.start_task(task["id"])
+            self.engine.live_enabled = True
+            self.engine.set_stop(False)
             self.assertEqual(self.engine.run_once(task["id"])["processed"][0]["status"], "blocked")
             count = call.call_count
             self.assertEqual(self.engine.run_once(task["id"])["processed"], [])
@@ -493,8 +495,9 @@ class DiscordConnectionTests(unittest.TestCase):
             AdapterRegistry(self.root, overrides={"discord": SimulationAdapter()}),
         )
         self.manager = ConnectionManager(self.engine)
-        thread = patch("auto_promotion.connections.threading.Thread")
-        thread.start()
+        # Suppress only connection workers, keeping the API's thread pool real.
+        thread = patch("auto_promotion.connections.threading", wraps=threading)
+        thread.start().Thread = MagicMock()
         self.addCleanup(thread.stop)
 
     def test_web_connection_registers_bot_without_enabling_external_writes(self):

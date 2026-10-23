@@ -11,7 +11,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ..models import epoch
+from .browser_status import STATUS_JS
 from .common import BackendError, language_evidence, observed_timestamp, owned_x_target
+from .x_text import EDITOR_TEXT_JS, TWEET_TEXT_JS
 
 
 def launcher_path():
@@ -99,7 +101,7 @@ def call(platform, settings, operation, payload=None, checkpoint=None, authorize
             preferred = [
                 tab
                 for tab in available
-                if urlparse(tab["url"]).path.strip("/").casefold() == expected
+                if urlparse(tab["url"]).path.strip("/").split("/")[0].casefold() == expected
             ]
         selected = preferred[0] if len(preferred) == 1 else None
         if selected is None and len(available) == 1:
@@ -110,19 +112,32 @@ def call(platform, settings, operation, payload=None, checkpoint=None, authorize
         if selected:
             arguments.extend(["--tab", str(selected["tabId"])])
         # Account menu and Profile are observed controls on the authenticated X UI.
-        code = r"""
-if (!/^https:\/\/(www\.)?x\.com\//.test(page.url())) {
-  await page.goto("https://x.com/home", {waitUntil: "domcontentloaded"});
+        code = (
+            "const readStatus = () => page.evaluate("
+            + STATUS_JS
+            + ");\n"
+            + r"""
+await page.goto("https://x.com/home", {waitUntil: "domcontentloaded"});
+let blocked_reason = await readStatus();
+if (blocked_reason) return {blocked_reason};
+const menu = page.getByTestId("SideNav_AccountSwitcher_Button");
+try {
+  await menu.waitFor({state: "attached", timeout: 45000});
+} catch (error) {
+  blocked_reason = await readStatus();
+  if (blocked_reason) return {blocked_reason};
+  throw error;
 }
-const menu = page.getByRole("button", {name: "Account menu", exact: true});
-await menu.waitFor({state: "visible", timeout: 15000});
-const text = await menu.innerText();
+blocked_reason = await readStatus();
+if (blocked_reason) return {blocked_reason};
+const text = await menu.textContent();
 const handles = [...new Set([...text.matchAll(/@([A-Za-z0-9_]{1,15})\b/g)]
   .map(m => m[1].toLowerCase()))];
-const profile = await page.getByRole("link", {name: "Profile", exact: true})
+const profile = await page.getByRole("link", {name: "Profile", exact: true, includeHidden: true})
   .getAttribute("href");
 return {handles, profile};
 """
+        )
         settled = False
         response = cli(arguments, instance, code=code)
         status = response.get("status")
@@ -138,6 +153,17 @@ return {handles, profile};
         if status != "succeeded":
             raise BackendError("TabbitIdentityUnavailable")
         observed = response.get("result", {}).get("value", {})
+        if observed.get("blocked_reason") in {
+            "BrowserVerificationRequired",
+            "BrowserAccountRestricted",
+        }:
+            return {
+                "healthy": False,
+                "service_ready": True,
+                "identity_verified": False,
+                "permissions": [],
+                "reason": observed["blocked_reason"],
+            }
         handles = observed.get("handles", [])
         verified = (
             handles == [expected] and str(observed.get("profile", "")).casefold() == "/" + expected
@@ -157,11 +183,18 @@ return {handles, profile};
                 raise BackendError("TabbitFinishIncomplete")
 
 
-IDENTITY_JS = r"""
+IDENTITY_JS = (
+    "const editorText = async locator => await locator.evaluate("
+    + EDITOR_TEXT_JS
+    + ");\n"
+    + "const tweetText = async locator => await locator.evaluate("
+    + TWEET_TEXT_JS
+    + ");\n"
+    + r"""
 async function checkIdentity() {
-  const menu = page.getByRole("button", {name: "Account menu", exact: true, includeHidden: true});
-  await menu.waitFor({state: "visible", timeout: 15000});
-  const handles = [...new Set([...(await menu.innerText()).matchAll(/@([A-Za-z0-9_]{1,15})\b/g)]
+  const menu = page.getByTestId("SideNav_AccountSwitcher_Button");
+  await menu.waitFor({state: "attached", timeout: 45000});
+  const handles = [...new Set([...(await menu.textContent()).matchAll(/@([A-Za-z0-9_]{1,15})\b/g)]
     .map(m => m[1].toLowerCase()))];
   const profile = await page.getByRole("link", {name: "Profile", exact: true, includeHidden: true}).getAttribute("href");
   assert(handles.length === 1 && handles[0] === expected && profile.toLowerCase() === "/" + expected,
@@ -183,6 +216,7 @@ async function composerControls() {
   return {editor, scope, button: scope.getByTestId(count === 1 ? "tweetButton" : "tweetButtonInline")};
 }
 """
+)
 
 
 def hf_discover(settings, payload):
@@ -321,8 +355,10 @@ return {url: observedUrl, posts};
 
 
 PREPARE_JS = r"""
-await page.goto(item.action === "post" ? "https://x.com/compose/post" : item.target, {waitUntil: "domcontentloaded"});
+await page.goto(item.action === "post" ? "https://x.com/compose/post" : item.target, {waitUntil: "domcontentloaded", timeout:45000});
 await checkIdentity();
+if (item.action === "post") await page.locator('[role="dialog"]:visible')
+  .filter({has:page.getByTestId("tweetTextarea_0")}).waitFor({state:"visible",timeout:45000});
 if (item.action === "reply") {
 const article = await targetArticle(item.target);
 const reply = article.getByTestId("reply").first();
@@ -335,14 +371,27 @@ await page.locator('[role="dialog"]:visible').filter({has:page.getByTestId("twee
   .waitFor({state:"visible", timeout:15000});
 }
 const {editor, scope, button} = await composerControls();
-await editor.waitFor({state: "visible", timeout: 15000});
-if (item.action === "post") assert((await editor.innerText()) === "" &&
-  await scope.locator('[data-testid="attachments"] img, [data-testid="attachments"] video').count() === 0, "XComposerNotEmpty");
-await editor.click();
-await editor.press("Control+A");
-await editor.press("Backspace");
-await editor.pressSequentially(item.text);
-await expect(editor).toHaveText(item.text);
+await editor.waitFor({state: "visible", timeout: 45000});
+if (item.action === "post") {
+  const draft = await editorText(editor);
+  assert((!draft.trim() || draft === item.text) &&
+    await scope.locator('[data-testid="attachments"] img, [data-testid="attachments"] video').count() === 0, "XComposerNotEmpty");
+  if (draft !== item.text) {
+    await editor.click(); await editor.press("Control+A"); await editor.press("Backspace");
+    const lines = item.text.split(String.fromCharCode(10));
+    for (let i=0;i<lines.length;i++) {
+      if (i) await editor.press("Enter");
+      if (lines[i]) await editor.pressSequentially(lines[i]);
+    }
+  }
+  assert(await editorText(editor) === item.text, "ApprovedTextNotRetained");
+} else {
+  await editor.click();
+  await editor.press("Control+A");
+  await editor.press("Backspace");
+  await editor.pressSequentially(item.text);
+  await expect(editor).toHaveText(item.text);
+}
 if (item.media.length) await scope.locator('input[type="file"]').setInputFiles(item.media.map(m => m.path));
 if (item.action === "post") {
   await expect(scope.locator('[data-testid="attachments"] img')).toHaveCount(item.media.length, {timeout:45000});
@@ -357,7 +406,8 @@ await checkIdentity();
 assert(page.url().split("?")[0] === item.target || page.url().includes("/compose/"), "XTargetChanged");
 if (item.action === "reply") await targetArticle(item.target);
 const {editor, button, scope} = await composerControls();
-await expect(editor).toHaveText(item.text);
+if (item.action === "post") assert(await editorText(editor) === item.text, "ApprovedTextNotRetained");
+else await expect(editor).toHaveText(item.text);
 if (item.action === "post") {
   await expect(scope.locator('[data-testid="attachments"] img')).toHaveCount(item.media.length);
   await expect(scope.locator('[data-testid="attachments"] [role="progressbar"]')).toHaveCount(0);
@@ -392,7 +442,7 @@ const showOriginal = article.getByRole("button", {name:"Show original", exact:tr
 if (await showOriginal.count() === 1) await showOriginal.click();
 const authors = [...new Set([...(await article.getByTestId("User-Name").first().innerText())
   .matchAll(/@([A-Za-z0-9_]{1,15})\b/g)].map(m => m[1].toLowerCase()))];
-const text = await article.getByTestId("tweetText").count() ? await article.getByTestId("tweetText").innerText() : "";
+const text = await article.getByTestId("tweetText").count() ? await tweetText(article.getByTestId("tweetText")) : "";
 const stamp = await article.locator("time").getAttribute("datetime");
 const mediaVerified = item.action !== "post" || await article.getByTestId("tweetPhoto").count() >= item.media.length;
 const verified = receipt.target_verified === true && authors.length === 1 && authors[0] === expected && text === item.text && mediaVerified && !!stamp;

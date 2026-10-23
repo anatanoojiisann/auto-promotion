@@ -24,7 +24,7 @@ from .backends.common import (
     x_post_weight,
 )
 from .dispatcher import AccountBusy, AccountLanes
-from .execution_diagnostics import FIELDS, safe_code
+from .execution_diagnostics import FIELDS, admission_failure_reason, safe_code
 from .models import (
     CAPABILITIES,
     AccountInput,
@@ -303,6 +303,7 @@ class Engine:
 
     def _call_unlocked(self, account, operation, payload=None, task_id=None):
         started = time.monotonic()
+        provider_invoked = False
         try:
             if operation in {"execute", "join"} and not (
                 account["mode"] == "simulation"
@@ -343,17 +344,45 @@ class Engine:
                         )
                         attempt_id = attempt["id"] if attempt else None
                     cloud.guard(getattr(self.adapters.context, "job", None), attempt_id)
+            provider_invoked = True
             result = self.adapters.call(account, operation, payload or {})
         except Exception as exc:
             # Never expose provider exceptions: they may include tokens, URLs or browser state.
+            outbound = (payload or {}).get("payload", {})
+            owned_post_admission_failed = (
+                not provider_invoked
+                and operation == "execute"
+                and account["platform"] == "x"
+                and isinstance(outbound, dict)
+                and outbound.get("action") == "post"
+                and outbound.get("target_owned") is True
+            )
+            error_code = (
+                admission_failure_reason(exc)
+                if owned_post_admission_failed
+                else getattr(exc, "safe_code", type(exc).__name__)
+            )
             self._log_call(
                 account["platform"],
                 operation,
                 "error",
                 started,
                 task_id,
-                getattr(exc, "safe_code", type(exc).__name__),
+                error_code,
+                "execution_admission" if owned_post_admission_failed else None,
             )
+            if owned_post_admission_failed:
+                # Authorization cannot submit a post. No adapter was invoked, so
+                # this new attempt has conclusive negative submission evidence.
+                # Keep it terminal and counted; never retry it automatically.
+                return {
+                    "status": "failed_known",
+                    "verified": False,
+                    "reason": error_code,
+                    "execution_step": "execution_admission",
+                    "submission_started": False,
+                    "confirmed_not_submitted": True,
+                }
             error = Conflict("平台调用未完成；请查看 API 中心的错误类型并核验连接")
             error.safe_code = safe_code(
                 getattr(exc, "safe_code", type(exc).__name__), "BackendError"
@@ -418,6 +447,7 @@ class Engine:
             }
 
     def _check_account_locked(self, account_id, *, force=False):
+        from .account_checks import normalize_health
         from .health_checks import cached, category, probe_key, probe_revision
 
         account = self.account(account_id)
@@ -445,6 +475,7 @@ class Engine:
                 "connection_state": "busy",
                 "health": {**account["health"], "reason": "AccountBusy"},
             }
+        result = normalize_health(result)
         # Health results are an allowlist; raw provider responses are not persisted.
         health = {
             key: result[key]
@@ -747,6 +778,9 @@ class Engine:
 
     def readiness(self, task):
         """Report every local prerequisite without checking a real account or sending."""
+        from .account_checks import summary
+
+        accounts = [summary(self.account(a), self.clock()) for a in task["account_ids"]]
         blockers = []
         if task["state"] != "active":
             blockers.append("task_not_active")
@@ -773,6 +807,8 @@ class Engine:
                         {"item_id": item["id"], "reason": reason, "message": REASONS[reason]}
                     )
         return {
+            "accounts": accounts,
+            "accounts_ready": all(a["ready"] for a in accounts),
             "blockers": [{"reason": r, "message": REASONS[r]} for r in blockers],
             "items": items,
             "workflow": task_workflow(task, blockers, items, self.clock()),
@@ -805,9 +841,42 @@ class Engine:
                 raise Conflict("执行项与已启动清单不一致")
         return policy
 
+    def _check_start_accounts(self, task, *, refresh=True):
+        """Check before taking the task's write transaction or reserving any work."""
+        from .account_checks import summary
+
+        checks = []
+        for account_id in task["account_ids"]:
+            account = self.account(account_id)
+            if account["mode"] == "live" or account["status"] == "unchecked":
+                # Explicit starts refresh positive observations. Failed probes
+                # retain their bounded backoff; cooldowns never trigger a probe.
+                account = self.check_account(account_id, force=refresh)
+            checks.append(summary(account, self.clock()))
+        with self.store.connect(write=True) as db:
+            Store.audit(db, "task.account_check", {"accounts": checks}, task["id"], self.clock())
+        blocked = [c for c in checks if not c["ready"]]
+        if blocked:
+            raise Conflict(
+                "启动前账号检查未通过："
+                + "；".join(c["label"] + "：" + c["message"] for c in blocked)
+            )
+
+    def _validate_start_accounts(self, task):
+        from .account_checks import summary
+
+        for account_id in json.loads(task["account_ids"]):
+            check = summary(self.account(account_id), self.clock())
+            if not check["ready"]:
+                raise Conflict("启动前账号状态已变化：" + check["label"] + "：" + check["message"])
+
     def start_task(self, task_id, *, source="client", actor="operator", sending=True):
         """Persist an explicit start; no approval phrases or approval rows are required."""
         task = self.task(task_id)
+        if task["state"] in {"cancelled", "completed"}:
+            raise Conflict("任务已结束")
+        if self.clock() >= epoch(task["policy"]["ends_at"]):
+            raise Conflict("任务执行窗口已过期，请创建新任务")
         for item in task["items"]:
             payload = {
                 k: v
@@ -815,6 +884,7 @@ class Engine:
                 if k not in {"position", "platform", "account_label"}
             }
             self.validate_item(task, ItemInput(**payload))
+        self._check_start_accounts(task, refresh=source != "scheduler")
         with self.store.connect(write=True) as db:
             task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if source == "scheduler" and (task["state"] != "active" or task["phase"] != "starting"):
@@ -822,6 +892,7 @@ class Engine:
             if task["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
             self._integrity(db, task, "discovery_join")
+            self._validate_start_accounts(task)
             from .interaction_intents import reserve_task_intents
 
             reserve_task_intents(db, task, self.clock())
@@ -1296,6 +1367,10 @@ class Engine:
         task = self.task(task_id)
         if not values or len(values) > 200:
             raise Conflict("每批需要 1–200 个执行项")
+        if task["policy"].get("user_daily_limit") == 3 and (
+            len(values) != 1 or values[0].action != "post" or not values[0].target_owned
+        ):
+            raise Conflict("三次尝试额度需要且只允许一条自有账号原创推文")
         if task["policy"].get("outbound_after_task_ids") and (
             len(values) != 1 or values[0].action != "post"
         ):
@@ -1434,13 +1509,18 @@ class Engine:
         )
 
     def change_state(self, task_id, state):
-        self.task(task_id)
+        task = self.task(task_id)
+        if state == "active":
+            if task["state"] in {"cancelled", "completed"}:
+                raise Conflict("已结束任务不可恢复")
+            self._check_start_accounts(task)
         with self.store.connect(write=True) as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row["state"] in {"cancelled", "completed"}:
                 raise Conflict("已结束任务不可恢复")
             if state == "active":
                 self._integrity(db, row, "discovery_join")
+                self._validate_start_accounts(row)
             db.execute(
                 "UPDATE tasks SET state=?,updated_at=? WHERE id=?", (state, self.clock(), task_id)
             )

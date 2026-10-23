@@ -42,6 +42,40 @@ class TabbitConnectionTests(unittest.TestCase):
         self.assertFalse(result["healthy"])
         self.assertIsNone(result["account_identity"])
 
+    def test_platform_notice_blocks_health_and_releases_the_read_only_check(self):
+        for reason in ("BrowserVerificationRequired", "BrowserAccountRestricted"):
+            with self.subTest(reason=reason):
+                response = {"status": "succeeded", "result": {"value": {"blocked_reason": reason}}}
+                with patch(
+                    "auto_promotion.backends.tabbit.cli",
+                    side_effect=[self.inventory, response, {"ok": True}],
+                ) as cli:
+                    result = call("x", self.settings, "health")
+                self.assertFalse(result["healthy"])
+                self.assertFalse(result["identity_verified"])
+                self.assertEqual(result["reason"], reason)
+                self.assertIn(
+                    'page.goto("https://x.com/home"', cli.call_args_list[1].kwargs["code"]
+                )
+                self.assertEqual(cli.call_args_list[-1].args[0][0], "finish")
+
+    def test_existing_profile_subroute_is_selected_among_other_tabs(self):
+        inventory = {
+            **self.inventory,
+            "tabs": [
+                {"state": "available", "tabId": 18, "url": "https://x.com/home"},
+                {"state": "available", "tabId": 19, "url": "https://x.com/brand/with_replies"},
+                {"state": "available", "tabId": 20, "url": "https://x.com/other/with_replies"},
+            ],
+        }
+        with patch(
+            "auto_promotion.backends.tabbit.cli",
+            side_effect=[inventory, self.response(), {"ok": True}],
+        ) as cli:
+            self.assertTrue(call("x", self.settings, "health")["identity_verified"])
+        self.assertIn("19", cli.call_args_list[1].args[0])
+        self.assertEqual(cli.call_args_list[-1].args[0][0], "finish")
+
     def test_profile_must_match_account_menu(self):
         response = self.response()
         response["result"]["value"]["profile"] = "/other"

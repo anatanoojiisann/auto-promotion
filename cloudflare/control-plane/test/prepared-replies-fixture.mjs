@@ -17,6 +17,7 @@ export async function fixture({
   let now = 1800000000,
     requests = [],
     writes = [];
+  const messageNotBefore = now + cooldown;
   const storage = {
     sql: {
       exec(sql, ...args) {
@@ -194,7 +195,13 @@ export async function fixture({
       requests.push(input.operation);
       if (input.operation === "status")
         return Response.json({
+          account_id: "a",
+          account_not_before: messageNotBefore,
           login_state: authorized ? "authorized" : "not_logged_in",
+          connection_status: authorized
+            ? "last_identity_verified"
+            : "unverified",
+          login_diagnostics: { persistence_verified: authorized },
           last_verified_at: authorized
             ? new Date(now * 1000).toISOString()
             : null,

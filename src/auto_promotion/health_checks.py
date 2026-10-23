@@ -1,4 +1,4 @@
-"""Bounded health-display probes; never authorization for a platform write."""
+"""Bounded read-only probes; execution still requires independent write guards."""
 
 import os
 from pathlib import Path
@@ -26,6 +26,8 @@ AUTH = {
     "TelegramLoginRequired",
     "TelegramIdentityMismatchOrRestricted",
     "BrowserIdentityMismatch",
+    "BrowserLoginRequired",
+    "TabbitIdentityMismatch",
     "AccountIdentityChanged",
     "AccountIdentityUnavailable",
     "DuplicatePlatformIdentity",
@@ -33,7 +35,6 @@ AUTH = {
     "SessionRevokedError",
     "SessionExpiredError",
     "UserDeactivatedError",
-    "UserDeactivatedBanError",
     "XAPIAuthenticationRejected",
 }
 NAVIGATION = {
@@ -43,9 +44,21 @@ NAVIGATION = {
     "BrowserNavigationUnavailable",
     "BrowserNavigationServerError",
 }
+VERIFICATION = {"BrowserVerificationRequired", "CaptchaRequired", "ChallengeRequired"}
+RESTRICTED = {
+    "BrowserAccountRestricted",
+    "AccountRestricted",
+    "UserRestrictedError",
+    "PeerFloodError",
+    "UserDeactivatedBanError",
+}
 
 
 def category(reason):
+    if reason in VERIFICATION:
+        return "verification_required"
+    if reason in RESTRICTED:
+        return "restricted"
     if reason in AUTH:
         return "authorization_required"
     if reason in NAVIGATION:

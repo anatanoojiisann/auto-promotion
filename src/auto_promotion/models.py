@@ -115,12 +115,16 @@ class Policy(Model):
     quota_snapshot: dict = Field(default_factory=dict)
     daily_limit: int = Field(default=5, ge=1, le=300)
     target_daily_limit: int = Field(default=3, ge=1, le=3)
-    user_daily_limit: int = Field(default=2, ge=1, le=2)
+    user_daily_limit: int = Field(default=2, ge=1, le=3)
     target_allowlist: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def window(self):
         ZoneInfo(self.timezone)
+        if self.user_daily_limit == 3 and not (
+            self.allow_owned_x_posts and self.execution_channel == "cloud" and self.daily_limit == 1
+        ):
+            raise ValueError("三次尝试额度仅用于每日一条的线上自有账号原创任务")
         if epoch(self.ends_at) <= epoch(self.starts_at):
             raise ValueError("结束时间必须晚于开始时间")
         if not self.languages:

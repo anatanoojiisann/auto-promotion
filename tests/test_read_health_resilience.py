@@ -213,6 +213,7 @@ class ReadHealthTests(unittest.TestCase):
                     Mock(
                         status=403,
                         url="https://x.com",
+                        frame=page.main_frame,
                         request=Mock(is_navigation_request=lambda: True),
                     )
                 )

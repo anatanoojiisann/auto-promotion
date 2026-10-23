@@ -41,6 +41,7 @@ jobs:
         run: |
           export AP_BROWSER_EXECUTABLE="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
           python -m unittest discover -s tests -p test_browser_contracts.py -v
+          python -m unittest discover -s tests -p test_browser_account_status.py -v
           python -m unittest discover -s tests -p test_x_post_browser.py -v
         env:
           AP_TEST_BROWSER_BACKENDS: '1'

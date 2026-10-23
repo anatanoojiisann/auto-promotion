@@ -1,6 +1,53 @@
 import { ControlError } from "./kernel.mjs";
 
 const PREFIX = "/v1/executor/telegram/";
+// Registration may be queued during a platform read/write wait once the
+// independent login has already proved identity and durable session recovery.
+// This function never calls a Telegram API operation through the actor.
+export async function verifiedCooldownStart(kernel, env) {
+  const account = kernel.one(
+    "SELECT identity FROM accounts WHERE id=?",
+    env.TELEGRAM_EXECUTOR_ACCOUNT,
+  );
+  if (!account) throw new ControlError("ExecutorAccountNotAssigned", 403);
+  const state = kernel.one(
+    "SELECT MAX(cooldown_until) cooldown_until,MAX(disabled) disabled FROM accounts WHERE identity=?",
+    account.identity,
+  );
+  if (state.disabled) throw new ControlError("ExecutionStopped");
+  if (state.cooldown_until <= kernel.clock()) return null;
+  const response = await env.TELEGRAM_EXECUTOR.fetch(
+    "https://telegram-executor/internal",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        account_id: env.TELEGRAM_EXECUTOR_ACCOUNT,
+        operation: "status",
+      }),
+    },
+  );
+  const status = await response.json();
+  const verifiedAt = Date.parse(status.last_verified_at) / 1000;
+  if (
+    !response.ok ||
+    status.account_id !== env.TELEGRAM_EXECUTOR_ACCOUNT ||
+    status.login_state !== "authorized" ||
+    status.login_diagnostics?.persistence_verified !== true ||
+    status.connection_status !== "last_identity_verified" ||
+    !Number.isFinite(verifiedAt) ||
+    verifiedAt > kernel.clock() + 60 ||
+    verifiedAt < kernel.clock() - 86400
+  )
+    throw new ControlError("ExecutorLoginNotVerified", 409);
+  const notBefore = Math.max(
+    state.cooldown_until,
+    Number(status.account_not_before || 0),
+  );
+  if (!Number.isFinite(notBefore))
+    throw new ControlError("InvalidAccountCooldown", 409);
+  return { not_before: notBefore, login_verified_at: status.last_verified_at };
+}
 export function executorRequestId(value) {
   return typeof value === "string" &&
     /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(

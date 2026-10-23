@@ -499,8 +499,11 @@ class EngineTests(unittest.TestCase):
         }
         t2 = self.start(self.task(), [self.item(target="@three")])
         self.engine.run_once(t2["id"])
-        t3 = self.start(self.task(), [self.item(target="@four")])
-        self.engine.run_once(t3["id"])
+        t3 = self.task()
+        self.engine.set_items(t3["id"], [self.item(target="@four")])
+        with self.assertRaisesRegex(Conflict, "冷却"):
+            self.engine.start_task(t3["id"])
+        self.assertEqual(self.engine.task(t3["id"])["state"], "draft")
         self.assertEqual(self.provider.sends, 2)
         self.assertGreater(
             self.engine.account(self.accounts["telegram"]["id"])["cooldown_until"], self.now

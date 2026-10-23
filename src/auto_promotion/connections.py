@@ -274,7 +274,13 @@ class ConnectionManager:
     def x_login(self, job_id, value, cancel):
         from playwright.sync_api import sync_playwright
 
-        from .backends.browser import HOME, check_response, identity, launch_context
+        from .backends.browser import (
+            HOME,
+            check_response,
+            identity,
+            launch_context,
+            save_browser_login,
+        )
 
         root = profile_path("x", value.backend_label, accounts_dir=self.accounts_dir)
         with sync_playwright() as runtime:
@@ -299,10 +305,11 @@ class ConnectionManager:
                         if observed != value.username:
                             raise BackendError("BrowserIdentityMismatch")
                         self.check_cancel(cancel)
-                        save_profile(
+                        save_browser_login(
                             "x",
                             value.backend_label,
-                            {"identity": observed, "browser_channel": value.browser_channel},
+                            observed,
+                            value.browser_channel,
                             accounts_dir=self.accounts_dir,
                         )
                         return {}

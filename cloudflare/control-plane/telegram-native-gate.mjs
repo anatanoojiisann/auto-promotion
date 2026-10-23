@@ -1,5 +1,6 @@
 import { ControlError, sha } from "./kernel.mjs";
 import { checkGeneratedTask } from "./telegram-task-builder.mjs";
+import { verifiedCooldownStart } from "./telegram-executor-bridge.mjs";
 export const TELEGRAM_NODE = "cloudflare-telegram";
 export async function signNativeGate(secret, raw) {
   const key = await crypto.subtle.importKey(
@@ -50,6 +51,14 @@ export class TelegramNativeGate {
       this.k.sql.exec(
         "CREATE TABLE workflow_native_links(plan_id TEXT NOT NULL,step_id TEXT NOT NULL,job_id TEXT NOT NULL UNIQUE,task_id TEXT NOT NULL,created_at REAL NOT NULL,PRIMARY KEY(plan_id,step_id))",
       );
+    if (
+      !this.k.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='telegram_activation_runtime'",
+      )
+    )
+      this.k.sql.exec(
+        "CREATE TABLE telegram_activation_runtime(plan_id TEXT PRIMARY KEY,source TEXT NOT NULL,enabled INTEGER NOT NULL,next_at REAL NOT NULL,state TEXT NOT NULL,last_error TEXT)",
+      );
   }
   plan(id) {
     const p = this.q.plan(id);
@@ -67,6 +76,25 @@ export class TelegramNativeGate {
     if (this.k.settings().global_stop)
       throw new ControlError("ExecutionStopped");
     const account = this.env.TELEGRAM_EXECUTOR_ACCOUNT;
+    const deferred = await verifiedCooldownStart(this.k, this.env);
+    if (deferred) {
+      this.k.sql.exec(
+        "INSERT INTO telegram_activation_runtime VALUES(?,?,1,?,'waiting_cooldown',NULL) ON CONFLICT(plan_id) DO UPDATE SET enabled=1,next_at=excluded.next_at,state=excluded.state,last_error=NULL",
+        p.id,
+        body.source,
+        deferred.not_before,
+      );
+      this.k.event("workflow.telegram_activation_queued", p.id, {
+        source: body.source,
+        ...deferred,
+      });
+      return {
+        activated: false,
+        queued: true,
+        account_id: account,
+        ...deferred,
+      };
+    }
     const linkedTasks = this.k
       .rows(
         "SELECT DISTINCT task_id FROM workflow_native_links WHERE plan_id=?",
@@ -122,7 +150,38 @@ export class TelegramNativeGate {
       node_id: TELEGRAM_NODE,
       source: body.source,
     });
+    this.k.sql.exec(
+      "UPDATE telegram_activation_runtime SET enabled=0,state='active',last_error=NULL WHERE plan_id=?",
+      p.id,
+    );
     return { activated: true, node_id: TELEGRAM_NODE, account_id: account };
+  }
+  activationSnapshot(id) {
+    return (
+      this.k.one(
+        "SELECT plan_id,enabled,next_at,state,last_error FROM telegram_activation_runtime WHERE plan_id=?",
+        id,
+      ) || null
+    );
+  }
+  async resumeActivations() {
+    for (const row of this.k.rows(
+      "SELECT a.* FROM telegram_activation_runtime a JOIN workplans p ON p.id=a.plan_id WHERE a.enabled=1 AND a.next_at<=? AND p.state='active' ORDER BY a.next_at LIMIT 2",
+      this.k.clock(),
+    )) {
+      try {
+        await this.activate({ plan_id: row.plan_id, source: row.source });
+      } catch (error) {
+        this.k.sql.exec(
+          "UPDATE telegram_activation_runtime SET next_at=?,state='waiting_configuration',last_error=? WHERE plan_id=? AND enabled=1",
+          this.k.clock() + 900,
+          error instanceof ControlError
+            ? error.message
+            : "ExecutorActivationUnavailable",
+          row.plan_id,
+        );
+      }
+    }
   }
   checkLink(planId, stepId, jobId) {
     const p = this.plan(planId),
@@ -443,6 +502,7 @@ export class TelegramNativeGate {
   async tick() {
     if (!this.env.TG_QUEUE_BRIDGE || this.k.settings().global_stop)
       return { submitted: 0 };
+    await this.resumeActivations();
     const rows = this.k.rows(
       "SELECT l.plan_id,l.step_id,l.job_id FROM workflow_native_links l JOIN jobs j ON j.id=l.job_id JOIN workplans p ON p.id=l.plan_id JOIN worksteps w ON w.plan_id=l.plan_id AND w.id=l.step_id WHERE p.state='active' AND j.state='pending' AND j.available_at<=? AND j.expires_at>? ORDER BY CASE WHEN json_extract(w.result,'$.dispatch_blocked') THEN 1 ELSE 0 END,j.available_at,l.created_at LIMIT 16",
       this.k.clock(),
