@@ -78,7 +78,7 @@ export class ExecutorCore {
       if (
         !current?.allowed ||
         current.lease_until <= this.clock() ||
-        current.job?.version !== gate.job.version
+        JSON.stringify(current.job) !== JSON.stringify(gate.job)
       )
         throw new Error("NativeQueueAuthorizationExpired");
     };

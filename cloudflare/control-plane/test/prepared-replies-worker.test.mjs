@@ -24,6 +24,8 @@ test("actual Worker accepts exact reply packets without a model and fences all p
     "telegram-workflow-reader.mjs",
     "telegram-reply-policy.mjs",
     "telegram-task-builder.mjs",
+    "device-control.mjs",
+    "telegram-target.mjs",
     "telegram-prepared-replies.mjs",
   ];
   const mf = new Miniflare(

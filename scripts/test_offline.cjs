@@ -34,6 +34,8 @@ let mf, child, timer;
         "telegram-prepared-replies.mjs",
         "telegram-reply-policy.mjs",
         "telegram-task-builder.mjs",
+        "device-control.mjs",
+        "telegram-target.mjs",
       ].map((name) => ({
         type: "ESModule",
         path: path.join(cloudRoot, name),

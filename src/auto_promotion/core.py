@@ -1323,6 +1323,16 @@ class Engine:
             ):
                 raise Conflict("Instagram 媒体需要可访问的 HTTPS 来源地址")
         if platform == "telegram":
+            if value.action == "send_text":
+                if (
+                    value.reply_to
+                    or value.media
+                    or not value.text.strip()
+                    or len(value.text) > 4096
+                ):
+                    raise Conflict("Explicit Telegram text cannot contain a reply or media")
+                if policy.get("execution_channel") != "cloud":
+                    raise Conflict("Explicit Telegram text requires the cloud device workflow")
             if value.action in {"send_file", "schedule_file"} and len(value.media) != 1:
                 raise Conflict("此 Telegram 动作需要一个媒体文件")
             if value.action in {"send_message", "schedule_message", "reply"} and value.media:

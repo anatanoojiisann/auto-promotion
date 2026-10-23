@@ -1,3 +1,7 @@
+import {
+  resolveSendPeer,
+  normalizeTelegramTarget,
+} from "./telegram-target.mjs";
 import { TelegramClient, Api } from "teleproto";
 import { StringSession } from "teleproto/sessions";
 import { Logger } from "teleproto/extensions";
@@ -217,8 +221,11 @@ export async function readOperation(client, operation, input) {
 }
 export async function submitOperation(client, job, checkpoint, authorize) {
   const item = job.payload;
-  const entity = await client.getEntity(item.target);
-  if (!entity.username || !entity.megagroup)
+  const plain = item.action === "send_text";
+  const entity = plain
+    ? await resolveSendPeer(client, item.target)
+    : await client.getEntity(item.target);
+  if (!plain && (!entity.username || !entity.megagroup))
     throw new Error("PublicDiscussionRequired");
   if (job.kind === "join") {
     if (await observedMember(client, entity))
@@ -253,6 +260,83 @@ export async function submitOperation(client, job, checkpoint, authorize) {
       verified,
       discussion_id: String(entity.id),
       external_reference: "telegram:membership:" + entity.id,
+    };
+  }
+  if (plain) {
+    if (
+      job.kind !== "send" ||
+      item.reply_to != null ||
+      (item.media || []).length ||
+      typeof item.text !== "string" ||
+      !item.text.trim() ||
+      item.text.length > 4096
+    )
+      throw new Error("InvalidExplicitText");
+    const intent = job.explicit_text;
+    if (
+      !intent ||
+      intent.target !== normalizeTelegramTarget(item.target) ||
+      intent.text !== item.text ||
+      intent.account_id !== job.account_id ||
+      !intent.manifest_hash
+    )
+      throw new Error("ExplicitTextAuthorizationRequired");
+    let participant;
+    if (entity.className === "Chat") {
+      const me = await client.getMe();
+      const full = await client.invoke(
+        new Api.messages.GetFullChat({ chatId: entity.id }),
+      );
+      participant = full.fullChat?.participants?.participants?.find(
+        (p) => String(p.userId) === String(me.id),
+      );
+    } else
+      participant = (await client.getParticipant(entity, "me"))?.participant;
+    const isMember =
+      members(participant) ||
+      [
+        "ChatParticipant",
+        "ChatParticipantAdmin",
+        "ChatParticipantCreator",
+      ].includes(participant?.className);
+    if (!isMember) throw new Error("MembershipNotVerified");
+    if (
+      entity.defaultBannedRights?.sendMessages ||
+      entity.defaultBannedRights?.sendPlain ||
+      entity.bannedRights?.sendMessages ||
+      entity.bannedRights?.sendPlain ||
+      participant?.bannedRights?.sendMessages ||
+      participant?.bannedRights?.sendPlain
+    )
+      throw new Error("TargetWriteForbidden");
+    await authorize();
+    await checkpoint({
+      status: "unknown",
+      verified: false,
+      submission_started: true,
+    });
+    const sent = await client.sendMessage(entity, {
+      message: item.text,
+      parseMode: false,
+      linkPreview: false,
+    });
+    const ids = sent?.id ? [sent.id] : [];
+    await checkpoint({ status: "unknown", verified: false, message_ids: ids });
+    if (!ids.length)
+      return { status: "unknown", verified: false, message_ids: [] };
+    const rows = await client.getMessages(entity, { ids });
+    const message = rows[0];
+    const verified =
+      message?.id === ids[0] &&
+      message.out === true &&
+      message.message === item.text &&
+      !message.replyTo?.replyToMsgId;
+    return {
+      status: verified ? "confirmed" : "unknown",
+      verified,
+      message_ids: ids,
+      discussion_id: String(entity.id),
+      external_reference: `telegram:${intent.target}:${ids[0]}`,
     };
   }
   if (

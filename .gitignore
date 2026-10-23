@@ -20,3 +20,7 @@ output/
 *.pem
 *.session*
 .DS_Store
+
+# Independent device secrets (DPAPI-encrypted, still private)
+*.dpapi
+*.pending

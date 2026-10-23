@@ -210,6 +210,13 @@ export class ControlKernel {
   }
   registerNode({ id, token_hash, pools, account_ids }) {
     if (
+      this.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='control_devices'",
+      ) &&
+      this.one("SELECT id FROM control_devices WHERE id=?", id)
+    )
+      throw new ControlError("DeviceNodeProtected", 409);
+    if (
       !/^[a-zA-Z0-9_.-]{1,100}$/.test(id) ||
       !/^[a-f0-9]{64}$/.test(token_hash) ||
       !Array.isArray(pools) ||
@@ -249,6 +256,24 @@ export class ControlKernel {
   }
   sync(snapshot) {
     safePayload(snapshot);
+    if (
+      this.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='device_tasks'",
+      )
+    ) {
+      for (const t of snapshot.tasks || [])
+        if (this.one("SELECT plan_id FROM device_tasks WHERE task_id=?", t.id))
+          throw new ControlError("DeviceTaskProtected", 409);
+      for (const j of snapshot.jobs || [])
+        if (
+          this.one(
+            "SELECT plan_id FROM device_tasks WHERE task_id=? OR job_id=?",
+            j.task_id,
+            j.id,
+          )
+        )
+          throw new ControlError("DeviceTaskProtected", 409);
+    }
     if (
       !Array.isArray(snapshot.accounts) ||
       !Array.isArray(snapshot.tasks) ||
@@ -633,6 +658,24 @@ export class ControlKernel {
         throw new ControlError("QuotaExceeded");
     }
   }
+  deviceJobAllowed(node, job) {
+    if (
+      !this.one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='device_tasks'",
+      )
+    )
+      return true;
+    const owner = this.one(
+      "SELECT d.enabled,d.expires_at FROM device_tasks t JOIN control_devices d ON d.id=t.device_id WHERE t.job_id=?",
+      job.id,
+    );
+    return (
+      !owner ||
+      (node.id === "cloudflare-telegram" &&
+        Boolean(owner.enabled) &&
+        owner.expires_at > this.clock())
+    );
+  }
   claim(node, pool, expectedId = null) {
     if (!node.pools.includes(pool))
       throw new ControlError("PoolNotAssigned", 403);
@@ -660,6 +703,7 @@ export class ControlKernel {
         expectedId,
       );
       for (const j of rows) {
+        if (!this.deviceJobAllowed(node, j)) continue;
         const data = JSON.parse(j.payload),
           task = JSON.parse(j.task_payload),
           account = JSON.parse(j.account_payload);
@@ -786,6 +830,8 @@ export class ControlKernel {
           this.one("SELECT payload FROM tasks WHERE id=?", j.task_id).payload,
         ),
         data = JSON.parse(j.payload);
+      if (!this.deviceJobAllowed(node, j))
+        throw new ControlError("DeviceJobRequiresNativeGate", 403);
       if (!this.cloudChannelAllowed(j.account_id, node, task))
         throw new ControlError("AccountChannelLocalActive");
       if (

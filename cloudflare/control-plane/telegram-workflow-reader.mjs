@@ -327,7 +327,7 @@ export class TelegramWorkflowReader {
           const rulesText =
             (r.about || "") + "\n" + r.pinned.map((m) => m.text).join("\n");
           const linkedRules =
-            /https?:\/\//.test(rulesText) && /rules|правил/i.test(rulesText);
+            /https?:\/\//.test(rulesText) && /rules|锌褉邪胁懈谢/i.test(rulesText);
           const completeRules =
             !r.pinned_truncated &&
             !r.forum_topics_unchecked &&

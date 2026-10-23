@@ -1,3 +1,4 @@
+import { resolveSendPeer } from "./telegram-target.mjs";
 import { DurableObject } from "cloudflare:workers";
 import {
   createClient,
@@ -206,6 +207,15 @@ export class TelegramExecutor extends DurableObject {
         throw new Error("TelegramIdentityMismatch");
       await this.ctx.storage.put("login_state", "authorized");
       await this.ctx.storage.delete("last_error");
+      if (op === "resolve_target") {
+        const entity = await resolveSendPeer(client, input.target);
+        return response({
+          target:
+            entity.className === "Channel"
+              ? "-100" + String(entity.id)
+              : "-" + String(entity.id),
+        });
+      }
       if (op === "execute") {
         phase = "native_execution";
         const core = new ExecutorCore({
