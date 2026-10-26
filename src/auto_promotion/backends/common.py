@@ -301,6 +301,16 @@ def verify_claim(request):
             or account["cooldown_until"] > time.time()
         ):
             raise BackendError("AccountNotWritable")
+        from ..read_cooldowns import x_read_until
+
+        if x_read_until(db, account) > time.time():
+            raise BackendError("AccountReadCooldown")
+        from ..account_blocks import active_block, read_private_stop
+
+        if read_private_stop(platform, request["account"]) or active_block(
+            db, account["id"], time.time()
+        ):
+            raise BackendError("AccountOutboundBlocked")
         task = db.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
         stop = db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()
         if not task or task["state"] != "active" or not stop or stop[0] != "0":

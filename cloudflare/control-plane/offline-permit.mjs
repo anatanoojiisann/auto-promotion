@@ -1,6 +1,6 @@
 // A pre-issued, signed checkpoint lets the fenced local owner continue when the
 // provider rejects even SELECT. It never extends beyond the next UTC reset.
-import { ControlError, sha } from "./kernel.mjs";
+import { accountBlockActive, ControlError, sha } from "./kernel.mjs";
 
 export async function controlProof(value, secret) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
@@ -31,6 +31,8 @@ export async function offlineCheck(permit, token, input, env, now = Date.now() /
     account = p.accounts.find(a => a.id === j.account_id);
     if (!account || !p.pools.includes(j.pool) || p.closed_jobs.includes(j.id))
       throw new ControlError("LocalChannelJobNotEligible", 409);
+    if (accountBlockActive(account.outbound_block_state, now))
+      throw new ControlError("AccountOutboundBlocked", 409);
     if (account.disabled || account.cooldown_until > now || account.next_at > now)
       throw new ControlError("ExecutionStopped", 409);
     if (!j.manual && account.mode === "live" && !account.allowed_actions.includes(j.action))

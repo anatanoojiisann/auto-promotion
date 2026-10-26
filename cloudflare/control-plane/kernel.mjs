@@ -58,9 +58,10 @@ export const LEGACY_SCHEMA = `
  CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,at REAL NOT NULL,kind TEXT NOT NULL,job_id TEXT,details TEXT NOT NULL);
 `;
 export class ControlError extends Error {
-  constructor(code, status = 409) {
+  constructor(code, status = 409, diagnostics = null) {
     super(code);
     this.status = status;
+    this.diagnostics = diagnostics;
   }
 }
 export function cloudFailure(error, now = Date.now()) {
@@ -109,6 +110,51 @@ function safePayload(value) {
       safePayload(v);
     }
 }
+const MANUAL_BLOCK_REASONS = new Set([
+  "x_challenge", "x_login_required", "x_account_restricted",
+  "telegram_speaking_restricted",
+  "account_guard_unavailable",
+]);
+export function accountBlockActive(block, now) {
+  return block?.state === "active" && (
+    MANUAL_BLOCK_REASONS.has(block.reason) || block.until == null || block.until > now
+  );
+}
+function mergeOutboundBlock(prior, incoming) {
+  if (incoming == null) return prior;
+  if (
+    !["active", "cleared"].includes(incoming.state) ||
+    !Number.isSafeInteger(incoming.generation) || incoming.generation < 1 ||
+    !Number.isFinite(incoming.since) || incoming.since < 0 ||
+    (!MANUAL_BLOCK_REASONS.has(incoming.reason) && incoming.reason !== "browser_page_anomaly") ||
+    (incoming.until != null && (!Number.isFinite(incoming.until) || incoming.until <= incoming.since)) ||
+    (incoming.state === "active" && incoming.reason === "browser_page_anomaly" && incoming.until == null)
+  ) throw new ControlError("InvalidAccountBlock", 400);
+  incoming = { ...incoming, until: MANUAL_BLOCK_REASONS.has(incoming.reason) ? null : incoming.until };
+  if (prior && incoming.generation < prior.generation) return prior;
+  if (incoming.state === "cleared") {
+    if (
+      (prior && incoming.generation <= prior.generation) ||
+      incoming.health_ok !== true ||
+      !Number.isFinite(incoming.health_checked_at) ||
+      incoming.health_checked_at < incoming.since
+    ) return prior;
+    return { ...incoming };
+  }
+  if (prior?.state === "cleared" && incoming.generation <= prior.generation)
+    return prior;
+  if (prior?.state === "active") {
+    if (MANUAL_BLOCK_REASONS.has(prior.reason) && !MANUAL_BLOCK_REASONS.has(incoming.reason))
+      return prior;
+    if (incoming.generation === prior.generation)
+      return {
+        ...incoming,
+        since: Math.min(prior.since, incoming.since),
+        until: prior.until == null || incoming.until == null ? null : Math.max(prior.until, incoming.until),
+      };
+  }
+  return { ...incoming };
+}
 export class ControlKernel {
   constructor(
     storage,
@@ -141,9 +187,12 @@ export class ControlKernel {
     )
       this.tx(() =>
         this.sql.exec(
-          "CREATE TABLE account_channels(identity TEXT PRIMARY KEY,account_id TEXT NOT NULL,channel TEXT NOT NULL,generation TEXT NOT NULL,until_at REAL NOT NULL,node_id TEXT NOT NULL,task_id TEXT NOT NULL,updated_at REAL NOT NULL)",
+          "CREATE TABLE account_channels(identity TEXT PRIMARY KEY,account_id TEXT NOT NULL,channel TEXT NOT NULL,generation TEXT NOT NULL,until_at REAL NOT NULL,node_id TEXT NOT NULL,task_id TEXT NOT NULL,updated_at REAL NOT NULL,store_id TEXT NOT NULL DEFAULT '')",
         ),
       );
+    const channelColumns = this.rows("PRAGMA table_info(account_channels)");
+    if (channelColumns.length && !channelColumns.some(c => c.name === "store_id"))
+      this.tx(() => this.sql.exec("ALTER TABLE account_channels ADD COLUMN store_id TEXT NOT NULL DEFAULT ''"));
   }
   rows(q, ...args) {
     return this.sql.exec(q, ...args).toArray();
@@ -305,13 +354,19 @@ export class ControlKernel {
         );
         if (prior && prior.identity !== a.identity)
           throw new ControlError("AccountIdentityChanged");
-        if (prior && prior.payload === canonical(a)) continue;
+        const block = mergeOutboundBlock(
+          prior ? JSON.parse(prior.payload).outbound_block_state : undefined,
+          a.outbound_block_state,
+        );
+        const normalized = { ...a };
+        if (block) normalized.outbound_block_state = block;
+        if (prior && prior.payload === canonical(normalized)) continue;
         this.sql.exec(
           "INSERT INTO accounts VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,next_at=MAX(accounts.next_at,excluded.next_at),cooldown_until=MAX(accounts.cooldown_until,excluded.cooldown_until),disabled=MAX(accounts.disabled,excluded.disabled)",
           a.id,
           a.identity,
           a.platform,
-          canonical(a),
+          canonical(normalized),
           a.next_at || 0,
           a.cooldown_until || 0,
           a.disabled ? 1 : 0,
@@ -355,7 +410,7 @@ export class ControlKernel {
           canonical(t),
         );
       }
-      for (const j of snapshot.jobs) {
+      for (const [jobIndex, j] of snapshot.jobs.entries()) {
         if (
           !j.id ||
           !POOLS.has(j.pool) ||
@@ -368,15 +423,9 @@ export class ControlKernel {
         )
           throw new ControlError("InvalidJob", 400);
         const prior = this.one("SELECT * FROM jobs WHERE id=?", j.id);
-        if (
-          prior &&
-          (prior.version !== j.version ||
-            prior.account_id !== j.account_id ||
-            prior.task_id !== j.task_id ||
-            prior.reference_id !== j.reference_id ||
-            prior.pool !== j.pool)
-        )
-          throw new ControlError("FrozenJobChanged");
+        const changedFields = prior ? ["version", "account_id", "task_id", "reference_id", "pool", "kind"].filter(key => prior[key] !== j[key]) : [];
+        if (changedFields.length)
+          throw new ControlError("FrozenJobChanged", 409, { conflict_index: jobIndex, changed_fields: changedFields });
         const state = TERMINAL.has(j.state)
           ? j.state
           : j.attempt_id
@@ -442,7 +491,8 @@ export class ControlKernel {
           e.at,
         );
       }
-      return { tasks: snapshot.tasks.length, jobs: snapshot.jobs.length };
+      return { tasks: snapshot.tasks.length, jobs: snapshot.jobs.length,
+        account_blocks: this.accountBlocks(snapshot.accounts.map(a => a.id)) };
     });
   }
   sweep() {
@@ -495,7 +545,7 @@ export class ControlKernel {
     );
     return account
       ? this.one(
-          "SELECT account_id,channel,generation,until_at,node_id,task_id FROM account_channels WHERE identity=?",
+          "SELECT account_id,channel,generation,until_at,node_id,task_id,store_id FROM account_channels WHERE identity=?",
           account.identity,
         ) || null
       : null;
@@ -507,6 +557,7 @@ export class ControlKernel {
       !/^[a-f0-9]{32}$/.test(input.generation) ||
       !Number.isFinite(input.until) ||
       input.until <= this.clock()
+      || (input.store_id !== undefined && (typeof input.store_id !== "string" || input.store_id.length > 128))
     )
       throw new ControlError("InvalidAccountChannel", 400);
     return this.tx(() => {
@@ -566,12 +617,20 @@ export class ControlKernel {
       }
       if (prior?.generation === input.generation) {
         if (
+          prior.account_id !== input.account_id || prior.store_id !== (input.store_id || "") ||
           prior.channel !== input.channel ||
           prior.node_id !== input.node_id ||
-          prior.until_at !== input.until ||
+          prior.until_at > input.until ||
           prior.task_id !== input.task_id
         )
           throw new ControlError("AccountChannelGenerationChanged");
+        if (prior.until_at < input.until) {
+          if (input.expected_generation !== prior.generation)
+            throw new ControlError("AccountChannelGenerationConflict");
+          this.sql.exec("UPDATE account_channels SET until_at=?,updated_at=? WHERE identity=? AND generation=?",
+            input.until, this.clock(), account.identity, prior.generation);
+          return { channel: this.accountChannel(input.account_id) };
+        }
         return { channel: prior };
       }
       if ((prior?.generation || null) !== (input.expected_generation || null))
@@ -585,7 +644,7 @@ export class ControlKernel {
       )
         throw new ControlError("AccountChannelHandoffBusy");
       this.sql.exec(
-        "INSERT INTO account_channels VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET account_id=excluded.account_id,channel=excluded.channel,generation=excluded.generation,until_at=excluded.until_at,node_id=excluded.node_id,task_id=excluded.task_id,updated_at=excluded.updated_at",
+        "INSERT INTO account_channels VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(identity) DO UPDATE SET account_id=excluded.account_id,channel=excluded.channel,generation=excluded.generation,until_at=excluded.until_at,node_id=excluded.node_id,task_id=excluded.task_id,updated_at=excluded.updated_at,store_id=excluded.store_id",
         account.identity,
         input.account_id,
         input.channel,
@@ -594,6 +653,7 @@ export class ControlKernel {
         input.node_id,
         input.task_id,
         this.clock(),
+        input.store_id || "",
       );
       this.event("account_channel_changed", null, {
         account_id: input.account_id,
@@ -607,7 +667,7 @@ export class ControlKernel {
     if (task.policy.execution_channel === "local") return false;
     const channel = this.accountChannel(accountId);
     if (channel)
-      return channel.channel === "cloud" && channel.node_id === node.id;
+      return channel.channel === "cloud" && channel.node_id === node.id && channel.until_at > this.clock();
     if (task.policy.execution_channel === "cloud") return false;
     return this.clock() >= this.legacyLocalUntil;
   }
@@ -676,6 +736,26 @@ export class ControlKernel {
         owner.expires_at > this.clock())
     );
   }
+  accountOutboundBlocked(identity) {
+    return this.rows("SELECT payload FROM accounts WHERE identity=?", identity).some((row) => {
+      const block = JSON.parse(row.payload).outbound_block_state;
+      return accountBlockActive(block, this.clock());
+    });
+  }
+  accountBlocks(accountIds = null) {
+    const allowed = accountIds ? new Set(accountIds) : null;
+    return this.rows("SELECT id,identity,payload FROM accounts WHERE json_extract(payload,'$.outbound_block_state') IS NOT NULL")
+      .filter(a => !allowed || allowed.has(a.id))
+      .map(a => {
+        const state = JSON.parse(a.payload).outbound_block_state;
+        const outbound_block_state = Object.fromEntries(
+          ["state", "reason", "since", "until", "generation", "health_checked_at", "health_ok"]
+            .filter(key => state[key] !== undefined).map(key => [key, state[key]])
+        );
+        return { account_id: a.id, identity: a.identity, outbound_block_state,
+          affected_tasks: this.rows("SELECT DISTINCT task_id FROM jobs WHERE account_id=? AND state IN ('pending','leased','unknown') AND expires_at>?", a.id, this.clock()).map(t => t.task_id) };
+      });
+  }
   claim(node, pool, expectedId = null) {
     if (!node.pools.includes(pool))
       throw new ControlError("PoolNotAssigned", 403);
@@ -714,6 +794,7 @@ export class ControlKernel {
         );
         if (
           !node.accounts.includes(j.account_id) ||
+          this.accountOutboundBlocked(j.identity) ||
           identityState.disabled ||
           identityState.cooldown_until > now ||
           this.accountNext(j.identity) > now ||
@@ -830,6 +911,8 @@ export class ControlKernel {
           this.one("SELECT payload FROM tasks WHERE id=?", j.task_id).payload,
         ),
         data = JSON.parse(j.payload);
+      if (this.accountOutboundBlocked(a.identity))
+        throw new ControlError("AccountOutboundBlocked");
       if (!this.deviceJobAllowed(node, j))
         throw new ControlError("DeviceJobRequiresNativeGate", 403);
       if (!this.cloudChannelAllowed(j.account_id, node, task))
@@ -972,6 +1055,54 @@ export class ControlKernel {
     return this.tx(() => {
       const j = this.leased(node, id, token, { late: true });
       if (
+        j.kind === "send" && ["leased", "unknown"].includes(j.state) &&
+        !JSON.parse(j.result).account_restriction &&
+        result.account_restriction === "telegram_speaking_restricted" &&
+        typeof result.discussion_id === "string" && /^-?[0-9]+$/.test(result.discussion_id)
+      ) {
+        const a = this.one("SELECT identity,payload FROM accounts WHERE id=?", j.account_id);
+        const previous = JSON.parse(a.payload).outbound_block_state;
+        const success = this.one(
+          "SELECT MAX(j.completed_at) at FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE a.identity=? AND j.state IN ('confirmed','scheduled')",
+          a.identity,
+        );
+        const after = Math.max(success.at || 0,
+          previous?.state === "cleared" ? previous.health_checked_at : 0);
+        const discussions = new Set(this.rows(
+          "SELECT json_extract(j.result,'$.discussion_id') discussion_id FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE a.identity=? AND j.id<>? AND j.completed_at>=? AND j.completed_at>? AND json_extract(j.result,'$.account_restriction')='telegram_speaking_restricted'",
+          a.identity, j.id, this.clock() - 900, after,
+        ).map(row => row.discussion_id).filter(Boolean));
+        discussions.add(result.discussion_id);
+        if (discussions.size >= 2) result = {
+          ...result,
+          account_block_reason: "telegram_speaking_restricted",
+          account_block_since: this.clock(),
+          account_block_until: null,
+          account_block_generation: previous?.state === "active" ? previous.generation : (previous?.generation || 0) + 1,
+        };
+      }
+      if (result.account_block_reason) {
+        const a = this.one("SELECT payload FROM accounts WHERE id=?", j.account_id);
+        const account = JSON.parse(a.payload);
+        const previous = account.outbound_block_state;
+        const generation = result.account_block_generation;
+        // A delayed unversioned receipt must never reactivate a cleared block.
+        if (Number.isSafeInteger(generation) || previous?.state !== "cleared") {
+          const incoming = {
+            state: "active",
+            reason: result.account_block_reason,
+            since: Number.isFinite(result.account_block_since) ? result.account_block_since : this.clock(),
+            until: result.account_block_until ?? null,
+            generation: Number.isSafeInteger(generation) ? generation : (previous?.generation || 1),
+          };
+          const merged = mergeOutboundBlock(previous, incoming);
+          if (canonical(merged) !== canonical(previous)) {
+            account.outbound_block_state = merged;
+            this.sql.exec("UPDATE accounts SET payload=? WHERE id=?", canonical(account), j.account_id);
+          }
+        }
+      }
+      if (
         TERMINAL.has(j.state) &&
         !["unknown", "scheduled", "pending_admin_approval"].includes(j.state)
       )
@@ -1055,6 +1186,7 @@ export class ControlKernel {
       unknown: this.rows(
         "SELECT id,task_id,reference_id,pool,attempt_id,result FROM jobs WHERE state='unknown' LIMIT 100",
       ),
+      account_blocks: this.accountBlocks(),
     };
   }
 }

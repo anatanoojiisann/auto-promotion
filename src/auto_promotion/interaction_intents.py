@@ -53,7 +53,7 @@ def event_id(platform, payload):
     return match[1] if match else None
 
 
-def claim_intent(db, account, task, payload, item_id, now):
+def intent_blocker(db, account, task, payload, item_id):
     if payload.get("execution_mode") == "manual":
         return None  # A handoff has not contacted the platform; confirmed manual evidence is read below.
     source_id = event_id(account["platform"], payload)
@@ -67,10 +67,15 @@ def claim_intent(db, account, task, payload, item_id, now):
         key,
     ).fetchone()
     if row and row[0] != item_id:
-        return "interaction_already_claimed"
+        owner = db.execute("SELECT task_id FROM items WHERE id=?", (row[0],)).fetchone()
+        return {
+            "reason": "interaction_already_claimed",
+            "blocked_by_item_id": row[0],
+            "blocked_by_task_id": owner[0] if owner else None,
+        }
     # Include receipts created before this additive migration, and unresolved manual evidence.
     for old in db.execute(
-        "SELECT i.id,i.account_id,i.status,i.external_reference,i.result,i.payload,t.policy FROM items i JOIN tasks t ON t.id=i.task_id "
+        "SELECT i.id,i.task_id,i.account_id,i.status,i.external_reference,i.result,i.payload,t.policy FROM items i JOIN tasks t ON t.id=i.task_id "
         "JOIN accounts a ON a.id=i.account_id WHERE a.platform=? AND i.id<>? AND "
         "(i.attempt_id IS NOT NULL OR i.status IN ('confirmed','executing','unknown','scheduled'))",
         (account["platform"], item_id),
@@ -96,7 +101,29 @@ def claim_intent(db, account, task, payload, item_id, now):
             scope_id(db, json.loads(old["policy"]).get("project_id", "default")) == project
             and event_id(account["platform"], json.loads(old["payload"])) == source_id
         ):
-            return "interaction_history_unresolved_or_published"
+            return {
+                "reason": "interaction_history_unresolved_or_published",
+                "blocked_by_item_id": old["id"],
+                "blocked_by_task_id": old["task_id"],
+            }
+    return None
+
+
+def claim_intent(db, account, task, payload, item_id, now):
+    """Final atomic check and claim; the early read-only gate never reserves."""
+    blocked = intent_blocker(db, account, task, payload, item_id)
+    if blocked:
+        return blocked["reason"]
+    source_id = event_id(account["platform"], payload)
+    if not source_id or payload.get("execution_mode") == "manual":
+        return None
+    policy = json.loads(task["policy"]) if isinstance(task["policy"], str) else task["policy"]
+    key = (
+        scope_id(db, policy.get("project_id", "default")),
+        account["platform"],
+        source_id,
+        "reply",
+    )
     db.execute(
         "INSERT OR IGNORE INTO interaction_intents(project_id,platform,source_event_id,action_kind,item_id,state,created_at) VALUES(?,?,?,?,?,'claimed',?)",
         (*key, item_id, now),

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import time
 from contextlib import ExitStack, asynccontextmanager
@@ -16,7 +17,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .adapters import AdapterRegistry
@@ -63,6 +64,7 @@ from .models import (
     PoolInput,
     TaskInput,
     TaskStateInput,
+    TelegramReadPolicy,
 )
 from .pools import Pools
 from .runtime_identity import capture_runtime
@@ -91,6 +93,11 @@ class Toggle(BaseModel):
 class DiscoverInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     account_id: str
+
+
+class ResumeAccountBlock(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    generation: int = Field(strict=True, gt=0)
 
 
 def create_app(
@@ -691,6 +698,42 @@ def create_app(
     @app.post("/api/accounts/{account_id}/check")
     def check(account_id: str):
         return engine.check_account(account_id)
+
+    @app.post("/api/accounts/{account_id}/outbound-block/check")
+    def check_account_block(account_id: str):
+        return engine.check_account_block(account_id)
+
+    @app.post("/api/accounts/{account_id}/outbound-block/resume")
+    def resume_account_block(account_id: str, value: ResumeAccountBlock):
+        return engine.resume_account_block(account_id, value.generation)
+
+    def telegram_read_response(value):
+        return {
+            "account_id": value["account_id"],
+            "policy": {key: value["policy"][key] for key in TelegramReadPolicy.model_fields},
+            "revision": value["revision"],
+        }
+
+    @app.get("/api/accounts/{account_id}/telegram-reads")
+    def telegram_reads(account_id: str):
+        return telegram_read_response(engine.telegram_read_policy(account_id))
+
+    @app.put("/api/accounts/{account_id}/telegram-reads")
+    def configure_telegram_reads(account_id: str, value: TelegramReadPolicy, request: Request):
+        revision = request.headers.get("if-match")
+        if revision is not None and (
+            not re.fullmatch(r"(?:0|[1-9][0-9]*)", revision)
+            or len(revision) > 19
+            or int(revision) > 2**63 - 1
+        ):
+            raise HTTPException(422, "InvalidReadPolicyRevision")
+        return telegram_read_response(
+            engine.configure_telegram_reads(
+                account_id,
+                value,
+                expected_revision=int(revision) if revision is not None else None,
+            )
+        )
 
     @app.get("/api/accounts/{account_id}/targets")
     def account_targets(account_id: str):

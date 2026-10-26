@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import re
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -208,7 +210,7 @@ class Statistics:
             "reply_basis": "other_users_direct_replies;received_by_reply_time;responded_by_publication_time",
         }
 
-    def record_feedback(self, item_id, event_id, occurred_at, *, is_self=False):
+    def record_feedback(self, item_id, event_id, occurred_at, *, is_self=False, _db=None):
         """Collector entry point: IDs only, no reply text or credentials are retained."""
         now = self.clock()
         when = publication_time(occurred_at, now)
@@ -216,7 +218,9 @@ class Statistics:
             raise ValueError("回复记录缺少有效标识或时间")
         if is_self:
             return False
-        with self.store.connect(write=True) as db:
+        with (
+            contextlib.nullcontext(_db) if _db is not None else self.store.connect(write=True)
+        ) as db:
             row = db.execute(
                 "SELECT a.platform,a.id account_id,i.payload,p.published_at FROM items i "
                 "JOIN accounts a ON a.id=i.account_id JOIN tasks t ON t.id=i.task_id "
@@ -242,7 +246,9 @@ class Statistics:
                 == 1
             )
 
-    def mark_feedback(self, item_id, checked_through, status, *, cursor=0, error_code=None):
+    def mark_feedback(
+        self, item_id, checked_through, status, *, cursor=0, error_code=None, _db=None
+    ):
         now = self.clock()
         if (
             status not in {"complete", "partial", "failed"}
@@ -254,7 +260,9 @@ class Statistics:
         error_code = safe_code(error_code, "feedback_unavailable") if error_code else None
         if status == "complete":
             error_code = None
-        with self.store.connect(write=True) as db:
+        with (
+            contextlib.nullcontext(_db) if _db is not None else self.store.connect(write=True)
+        ) as db:
             db.execute(
                 "INSERT INTO feedback_checks(item_id,checked_through,status,last_message_id,error_code) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(item_id) DO UPDATE SET checked_through=excluded.checked_through,"
@@ -262,6 +270,101 @@ class Statistics:
                 "error_code=excluded.error_code",
                 (item_id, checked_through, status, cursor, error_code),
             )
+
+    def save_feedback_page(
+        self,
+        item_id,
+        result,
+        *,
+        expected_cursor,
+        expected_identity=None,
+        expected_binding=None,
+        lane_owner=None,
+    ):
+        """One complete provider page and its resume cursor commit together."""
+        events = result.get("feedback_events", [])
+        cursor = result.get("feedback_cursor")
+        if (
+            result.get("read_page_complete") is False
+            or not isinstance(events, list)
+            or len(events) > 1000
+            or not isinstance(cursor, int)
+            or isinstance(cursor, bool)
+        ):
+            raise ValueError("feedback_page_incomplete")
+        with self.store.connect(write=True) as db:
+            previous = db.execute(
+                "SELECT last_message_id FROM feedback_checks WHERE item_id=?", (item_id,)
+            ).fetchone()
+            if (previous[0] if previous else 0) != expected_cursor:
+                raise ValueError("feedback_cursor_changed")
+            account = db.execute(
+                "SELECT a.id,a.identity_hash FROM accounts a JOIN items i ON i.account_id=a.id WHERE i.id=?",
+                (item_id,),
+            ).fetchone()
+            if lane_owner is not None:
+                lane = db.execute(
+                    "SELECT owner,expires_at FROM account_lanes WHERE account_id=?",
+                    (account["id"],),
+                ).fetchone()
+                if not lane or lane["owner"] != lane_owner or lane["expires_at"] <= time.time():
+                    raise ValueError("feedback_lane_lost")
+            if account["identity_hash"] != expected_identity:
+                raise ValueError("feedback_identity_changed")
+            if result.get("read_identity_verified") is True:
+                identity, peer = result.get("read_identity_hash"), result.get("read_peer_id")
+                if (
+                    not identity
+                    or (expected_identity and identity != expected_identity)
+                    or not isinstance(peer, str)
+                    or not re.fullmatch(r"-?[1-9][0-9]{0,19}", peer)
+                ):
+                    raise ValueError("feedback_identity_or_peer_unavailable")
+                if expected_identity is None:
+                    if db.execute(
+                        "SELECT 1 FROM accounts WHERE platform='telegram' AND identity_hash=? AND id<>?",
+                        (identity, account["id"]),
+                    ).fetchone():
+                        raise ValueError("DuplicatePlatformIdentity")
+                    db.execute(
+                        "UPDATE accounts SET identity_hash=? WHERE id=? AND identity_hash IS NULL",
+                        (identity, account["id"]),
+                    )
+                bound = db.execute(
+                    "SELECT * FROM telegram_read_cursors WHERE account_id=? AND identity_key='feedback' AND scope_key=?",
+                    (account["id"], item_id),
+                ).fetchone()
+                if (bound["revision"] if bound else None) != (
+                    expected_binding["revision"] if expected_binding else None
+                ):
+                    raise ValueError("feedback_binding_changed")
+                if bound and json.loads(bound["cursor"])["peer_id"] != peer:
+                    raise ValueError("feedback_peer_changed")
+                db.execute(
+                    "INSERT INTO telegram_read_cursors VALUES(?,'feedback',?,?,1,?) ON CONFLICT(account_id,identity_key,scope_key) DO UPDATE SET cursor=excluded.cursor,revision=telegram_read_cursors.revision+1,updated_at=excluded.updated_at",
+                    (
+                        account["id"],
+                        item_id,
+                        canonical({"identity_hash": identity, "peer_id": peer, "cursor": cursor}),
+                        self.clock(),
+                    ),
+                )
+            count = 0
+            for event in events:
+                if not isinstance(event, dict):
+                    raise ValueError("feedback_event_invalid")
+                count += self.record_feedback(
+                    item_id, event.get("event_id"), event.get("occurred_at"), _db=db
+                )
+            self.mark_feedback(
+                item_id,
+                result["feedback_checked_through"],
+                result["feedback_status"],
+                cursor=cursor,
+                error_code=result.get("reason"),
+                _db=db,
+            )
+        return count
 
     def reports(self, limit=30):
         if not 1 <= limit <= 100:

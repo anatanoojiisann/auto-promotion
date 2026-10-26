@@ -535,7 +535,16 @@ class FakeTelegram:
         return self.me
 
     async def get_entity(self, target):
-        return types.SimpleNamespace(id=10, username="public_group", megagroup=True)
+        from telethon import types as telegram_types
+
+        return telegram_types.Channel(
+            id=10,
+            title="Public",
+            photo=telegram_types.ChatPhotoEmpty(),
+            date=datetime.now(timezone.utc),
+            username="public_group",
+            megagroup=True,
+        )
 
     async def get_permissions(self, entity, participant):
         return types.SimpleNamespace(
@@ -818,6 +827,7 @@ class TelegramTests(unittest.TestCase):
                     "payload": {"target": "@public_group", "text": "approved", "media": []},
                     "result": {
                         "message_ids": [500],
+                        "message_chat_id": "-1000000000010",
                         "verified": True,
                         "status": "confirmed",
                         "published_at": now - 100,

@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 PLATFORMS = ("telegram", "reddit", "instagram", "x", "discord", "tiktok")
 CAPABILITIES = {
@@ -55,6 +55,15 @@ def epoch(value: str) -> float:
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class TelegramReadPolicy(Model):
+    requests_per_window: StrictInt = Field(default=120, ge=1, le=10000)
+    window_seconds: StrictInt = Field(default=3600, ge=60, le=86400)
+    scan_rpc_limit: StrictInt = Field(default=40, ge=1, le=1000)
+    messages_per_page: StrictInt = Field(default=100, ge=1, le=100)
+    groups_per_scan: StrictInt = Field(default=10, ge=1, le=100)
+    cache_ttl_seconds: StrictInt = Field(default=300, ge=0, le=3600)
 
 
 class AccountInput(Model):

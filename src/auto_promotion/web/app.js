@@ -205,19 +205,27 @@ function closePanel() {
 }
 $("#close-panel").onclick = closePanel;
 $("#panel").addEventListener("cancel", () => ++panelGeneration);
-function busy(button, fn, isCurrent = () => true) {
+const busyOperations = new WeakMap();
+function busy(button, fn, isCurrent) {
+  if (busyOperations.has(button)) return busyOperations.get(button);
+  const generation = panelGeneration;
+  const route = location.hash;
+  isCurrent ||= () => generation === panelGeneration && route === location.hash;
   const label = button.textContent;
   button.disabled = true;
   button.textContent = "处理中…";
-  return Promise.resolve()
+  const operation = Promise.resolve()
     .then(fn)
     .catch((e) => {
       if (isCurrent()) toast(e.message, true);
     })
     .finally(() => {
+      busyOperations.delete(button);
       button.disabled = false;
       if (button.textContent === "处理中…") button.textContent = label;
     });
+  busyOperations.set(button, operation);
+  return operation;
 }
 async function refresh() {
   [state.accounts, state.overview, state.tasks, state.connections] =
@@ -563,6 +571,21 @@ function accountRows(mode) {
       retry.textContent = "探测最早刷新 " + fmt(account.health.next_check_at);
       control.closest("tr").cells[1].append(retry);
     }
+    if (account.outbound_block) {
+      const blocked = document.createElement("div");
+      blocked.className = "sub";
+      blocked.textContent =
+        "外发已暂停：" +
+        outboundBlockReason(account.outbound_block.reason) +
+        "；自 " +
+        fmt(account.outbound_block.since);
+      control.closest("tr").cells[1].append(blocked);
+      const recover = document.createElement("button");
+      recover.className = "secondary compact";
+      recover.textContent = "处理外发暂停";
+      recover.onclick = () => accountBlockForm(account, mode);
+      control.insertAdjacentElement("beforebegin", recover);
+    }
     const button = document.createElement("button");
     button.className = "text-button";
     button.textContent = "编辑";
@@ -574,6 +597,16 @@ function accountRows(mode) {
     profile.onclick = () =>
       profileForm(account.id).catch((error) => toast(error.message, true));
     control.insertAdjacentElement("beforebegin", profile);
+    if (account.platform === "telegram") {
+      const reads = document.createElement("button");
+      reads.className = "text-button";
+      reads.textContent = "读取设置";
+      reads.onclick = () => {
+        if (reads.disabled) return;
+        busy(reads, () => telegramReadSettings(account));
+      };
+      control.insertAdjacentElement("beforebegin", reads);
+    }
     if (account.platform === "tiktok" && account.mode === "live") {
       const content = document.createElement("button");
       content.className = "text-button";
@@ -612,8 +645,186 @@ function accountRows(mode) {
         })),
   );
 }
+async function telegramReadSettings(account) {
+  const generation = openPanel(
+    "Telegram 读取设置",
+    '<p class="help">正在读取本机设置…</p>',
+  );
+  const isCurrent = () => generation === panelGeneration && $("#panel").open;
+  let settings;
+  try {
+    settings = await api(`/accounts/${account.id}/telegram-reads`);
+  } catch (error) {
+    if (isCurrent()) toast(error.message, true);
+    return;
+  }
+  if (!isCurrent()) return;
+  const fields = [
+    ["requests_per_window", "窗口读取预算", 1, 10000],
+    ["window_seconds", "预算窗口（秒）", 60, 86400],
+    ["scan_rpc_limit", "每轮扫描读取上限", 1, 1000],
+    ["messages_per_page", "每页消息数", 1, 100],
+    ["groups_per_scan", "每轮扫描群数", 1, 100],
+    ["cache_ttl_seconds", "内容缓存有效期（秒）", 0, 3600],
+  ];
+  $("#panel-content").innerHTML =
+    '<p class="help">此处设置本机内置执行器预算；旧外部 MCP 通道未覆盖；云端执行器需独立配置并独立统计，不跨设备合计限额。设置仅适用于此 Telegram 账号的本机读取，不改变已冻结的任务清单。读取预算不代表平台许可，也不保证不会受到平台限流。预算按本机记录的读取调用计数；消息条数不等于调用数，也不代表底层网络请求总数。必要身份与权限核验、账号冷却仍然生效。</p><form id="telegram-read-form"><div class="field-grid">' +
+    fields
+      .map(
+        ([key, label, min, max]) =>
+          `<div><label for="telegram-read-${key}">${label}</label><input id="telegram-read-${key}" name="${key}" type="number" min="${min}" max="${max}" step="1" value="${esc(settings.policy[key])}" required></div>`,
+      )
+      .join("") +
+    '</div><p class="help">缓存仅用于消息内容读取，不替代发言权限检查。保存仅更新本机设置，不检查连接、不登录、不启动任务。</p><p class="help">关闭窗口仅关闭表单；已提交的保存请求仍可能完成。</p><div class="form-error" role="alert"></div><div class="form-actions"><button type="submit">保存读取设置</button></div></form>';
+  $("#telegram-read-form input")?.focus();
+  let pending = false;
+  $("#telegram-read-form").onsubmit = (event) => {
+    event.preventDefault();
+    if (pending || !isCurrent()) return;
+    pending = true;
+    const form = new FormData(event.target);
+    const policy = Object.fromEntries(
+      fields.map(([key]) => [key, Number(form.get(key))]),
+    );
+    $("#panel-content .form-error").textContent = "";
+    busy(
+      event.submitter,
+      async () => {
+        await api(`/accounts/${account.id}/telegram-reads`, "PUT", policy, {
+          "If-Match": String(settings.revision),
+        });
+        if (!isCurrent()) return;
+        closePanel();
+        toast("Telegram 本机读取设置已保存");
+      },
+      isCurrent,
+    ).finally(() => {
+      pending = false;
+    });
+  };
+}
+function outboundBlockReason(reason) {
+  return (
+    {
+      x_challenge: "X 需要人工验证",
+      x_login_required: "X 登录需要人工检查",
+      x_account_restricted: "X 账号受到限制",
+      telegram_speaking_restricted: "Telegram 连续发言被拒绝，需确认限制范围",
+      browser_page_anomaly: "页面连续异常，暂时停止外发",
+      account_guard_unavailable: "本地阻断证据待恢复，外发已暂停",
+    }[reason] || reason
+  );
+}
+function accountBlockForm(account, mode) {
+  let block = account.outbound_block;
+  if (!block) return;
+  const generation = openPanel(
+    "处理账号外发暂停",
+    '<p id="outbound-block-reason"></p><p id="outbound-block-time" class="help"></p><p>受影响任务</p><ul id="outbound-block-tasks"></ul><p class="help">请先在平台上人工检查账号与限制范围，再运行只读检查。检查通过后，单独点击恢复后续外发。恢复不会重排结果未知、已尝试或已过期的任务，也不会切换发布通道。</p><p class="help">关闭窗口不会恢复外发；已经提交的检查或恢复请求仍可能完成。</p><p id="outbound-block-health" role="status">尚未执行恢复检查</p><div class="form-error" role="alert"></div><div class="form-actions"><button id="check-outbound-block" class="secondary">只读检查身份与页面</button><button id="resume-outbound-block" disabled>恢复后续外发</button></div>',
+  );
+  const isCurrent = () => generation === panelGeneration && $("#panel").open;
+  const checkButton = $("#check-outbound-block");
+  const resumeButton = $("#resume-outbound-block");
+  const health = $("#outbound-block-health");
+  let pending = false;
+  function details() {
+    $("#outbound-block-reason").textContent = outboundBlockReason(block.reason);
+    $("#outbound-block-time").textContent =
+      "暂停时间：" +
+      fmt(block.since) +
+      (block.until ? "；暂停到期时间：" + fmt(block.until) : "");
+    const tasks = $("#outbound-block-tasks");
+    tasks.replaceChildren();
+    for (const task of block.affected_tasks || []) {
+      const li = document.createElement("li");
+      li.textContent = typeof task === "object" ? task.name || task.id : task;
+      tasks.append(li);
+    }
+    if (!tasks.childElementCount) {
+      const li = document.createElement("li");
+      li.textContent = "该账号的后续外发任务";
+      tasks.append(li);
+    }
+  }
+  function updateAccount(updated) {
+    state.accounts = state.accounts.map((a) =>
+      a.id === updated.id ? updated : a,
+    );
+    if (location.hash.startsWith("#accounts") && $("#account-list"))
+      accountRows(mode);
+  }
+  details();
+  checkButton.onclick = () => {
+    if (pending || !isCurrent()) return;
+    pending = true;
+    resumeButton.disabled = true;
+    $("#panel-content .form-error").textContent = "";
+    busy(
+      checkButton,
+      async () => {
+        const updated = await api(
+          `/accounts/${account.id}/outbound-block/check`,
+          "POST",
+        );
+        if (!isCurrent()) return;
+        updateAccount(updated);
+        block = updated.outbound_block;
+        if (!block) {
+          closePanel();
+          toast("账号暂停状态已变化，请重新检查账号列表");
+          return;
+        }
+        details();
+        health.textContent = block.health_ok
+          ? "只读检查通过：" +
+            fmt(block.health_checked_at) +
+            "。可显式恢复后续外发。"
+          : "只读检查未通过，账号外发仍暂停。请人工检查后重新验证。";
+        resumeButton.disabled = !block.health_ok;
+      },
+      isCurrent,
+    ).finally(() => {
+      pending = false;
+    });
+  };
+  resumeButton.onclick = () => {
+    if (pending || resumeButton.disabled || !isCurrent()) return;
+    pending = true;
+    checkButton.disabled = true;
+    $("#panel-content .form-error").textContent = "";
+    busy(
+      resumeButton,
+      async () => {
+        try {
+          const updated = await api(
+            `/accounts/${account.id}/outbound-block/resume`,
+            "POST",
+            { generation: block.generation },
+          );
+          if (!isCurrent()) return;
+          updateAccount(updated);
+          closePanel();
+          toast("账号后续外发已恢复；结果未知、已尝试及已过期任务保持原状态");
+        } catch (error) {
+          if (isCurrent()) {
+            health.textContent = "恢复未完成，请重新运行只读检查。";
+            block = { ...block, health_ok: false };
+          }
+          throw error;
+        }
+      },
+      isCurrent,
+    ).finally(() => {
+      pending = false;
+      if (isCurrent()) {
+        checkButton.disabled = false;
+        resumeButton.disabled = !block.health_ok;
+      }
+    });
+  };
+}
 function editAccountForm(account) {
-  openPanel(
+  const generation = openPanel(
     "编辑账号",
     `<form id="edit-account-form"><p class="help">平台与本机账号标签保持不变。已被未结束任务使用的账号需先结束旧任务。</p><div class="field-grid"><div class="full"><label>显示名称<input name="label" value="${esc(account.label)}" required maxlength="80"></label></div><div><label>每日限额<input name="daily_limit" type="number" value="${account.daily_limit}" min="1" max="300" required></label></div><div><label>每小时限额<input name="hourly_limit" type="number" value="${account.hourly_limit}" min="1" max="20" required></label></div><div><label>最小间隔（秒）<input name="min_interval" type="number" value="${account.min_interval}" min="${account.mode === "live" ? 120 : 0}" max="86400" required></label></div></div><div class="form-actions"><button type="submit">保存账号</button></div></form>`,
   );
@@ -627,14 +838,17 @@ function editAccountForm(account) {
         hourly_limit: Number(form.get("hourly_limit")),
         min_interval: Number(form.get("min_interval")),
       });
-      $("#panel").close();
+      if (generation !== panelGeneration || !$("#panel").open) return;
+      closePanel();
+      const closedGeneration = panelGeneration;
       await refresh();
+      if (closedGeneration !== panelGeneration) return;
       renderAccounts();
     });
   };
 }
 function accountForm() {
-  openPanel(
+  const generation = openPanel(
     "添加平台账号",
     `<form id="account-form"><div class="field-grid"><div><label for="platform">平台</label><select id="platform" name="platform">${Object.entries(
       names,
@@ -657,8 +871,11 @@ function accountForm() {
         min_interval: Number(form.get("min_interval")),
         hourly_limit: 3,
       });
-      $("#panel").close();
+      if (generation !== panelGeneration || !$("#panel").open) return;
+      closePanel();
+      const closedGeneration = panelGeneration;
       await refresh();
+      if (closedGeneration !== panelGeneration) return;
       renderAccounts();
       toast("账号已登记，可开始连接检查");
     });
@@ -715,7 +932,7 @@ function taskForm() {
     return;
   }
   const now = Date.now();
-  openPanel(
+  const generation = openPanel(
     "创建推广任务",
     `<form id="task-form"><div class="field-grid"><div class="full"><label for="task-name">任务名称</label><input id="task-name" name="name" required placeholder="例如：AI 视频创作者互动 · 第一批"></div><fieldset class="full"><legend>选择执行账号</legend>${state.accounts.map((a) => `<label class="checkbox-label"><input type="checkbox" name="accounts" value="${a.id}">${esc(a.label)} · ${names[a.platform]} · ${a.mode === "simulation" ? "模拟" : "真实"}</label>`).join("")}</fieldset><div class="full"><label for="queries">发现主题（每行一个）</label><textarea id="queries" name="queries" placeholder="AI video creation" rows="2"></textarea></div><div><label for="required">必需关键词（逗号分隔）</label><input id="required" name="required" placeholder="AI, video"></div><div><label for="blocked">排除关键词（逗号分隔）</label><input id="blocked" name="blocked" placeholder="airdrop, giveaway"></div><div><label for="starts">执行开始时间</label><input id="starts" name="starts" type="datetime-local" value="${isoLocal(now)}" required></div><div><label for="ends">执行结束时间</label><input id="ends" name="ends" type="datetime-local" value="${isoLocal(now + 86400000)}" required></div><div><label for="languages">允许语言</label><input id="languages" name="languages" value="en, zh" required></div><div><label for="candidates">最多候选数</label><input id="candidates" name="candidates" type="number" min="1" max="200" value="20" required></div><div><label for="task-daily">每日外发限额</label><input id="task-daily" name="daily" type="number" value="5" min="1" max="100" required></div><div><label for="task-interval">最小间隔（秒）</label><input id="task-interval" name="interval" type="number" value="120" min="0" required></div></div><details><summary>更多发现边界</summary><div class="field-grid"><div><label>最低成员数<input name="min_members" type="number" value="0" min="0"></label></div><div><label>最低活跃度<input name="min_activity" type="number" value="0" min="0"></label></div><div><label>最低置信度<input name="confidence" type="number" value="0.8" min="0.5" max="1" step="0.05"></label></div><div><label>最多 Telegram 入群数<input name="max_joins" type="number" value="0" min="0" max="20"></label></div><div class="full"><label>目标白名单（每行一个，空白表示使用发现政策）<textarea name="targets" rows="2"></textarea></label></div></div></details><p class="help">仅公开目标。输入时间使用浏览器本地时区，保存时转换为明确的 UTC 时间；任务详情统一显示北京时间。</p><div class="form-actions"><button type="submit">创建任务</button></div></form>`,
   );
@@ -770,8 +987,11 @@ function taskForm() {
           target_allowlist: split("targets"),
         },
       });
-      $("#panel").close();
+      if (generation !== panelGeneration || !$("#panel").open) return;
+      closePanel();
+      const closedGeneration = panelGeneration;
       await refresh();
+      if (closedGeneration !== panelGeneration) return;
       location.hash = "tasks/" + task.id;
     });
   };
@@ -791,7 +1011,13 @@ function taskReadinessPanel(t) {
     ...checks.blockers.map((b) => b.message),
     ...checks.items.map((b) => {
       const item = t.items.find((i) => i.id === b.item_id);
-      return `${item?.payload.target || "目标"}：${b.message}`;
+      const owner = [
+        b.blocked_by_task_id ? "占用任务 " + b.blocked_by_task_id : "",
+        b.blocked_by_item_id ? "占用项目 " + b.blocked_by_item_id : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return `${item?.payload.target || "目标"}：${b.message}${owner ? "（" + owner + "）" : ""}`;
     }),
   ];
   const skips = [...t.items, ...t.candidates]
@@ -838,9 +1064,48 @@ function taskChannelPanel(t) {
   return `<div class="surface padded mt-20" id="task-channel"><h2>执行通道</h2><p>任务选择：${esc(labels[channel.requested] || "跟随默认")}${channel.requested === "inherit" ? "（当前默认：" + esc(labels[channel.default]) + "）" : ""}</p>${accounts ? "<ul>" + accounts + "</ul>" : '<p class="help">开始任务后确定账号的实际通道。</p>'}<p class="help">同一账号等待当前操作和回执完成后交接，其他账号独立执行。在线任务遇到连接问题时保持等待。</p></div>`;
 }
 
+const taskStartOperations = new Map();
+let taskRenderGeneration = 0;
+function startTaskFromUI(id, button) {
+  if (taskStartOperations.has(id)) return taskStartOperations.get(id);
+  const generation = panelGeneration;
+  const isCurrent = () =>
+    location.hash === "#tasks/" + id &&
+    generation === panelGeneration &&
+    !$("#panel").open;
+  const operation = busy(
+    button,
+    async () => {
+      const result = await api(`/tasks/${id}/start`, "POST");
+      if (!isCurrent()) return;
+      await refresh();
+      if (!isCurrent()) return;
+      const current = await renderTask(id);
+      if (!current || !isCurrent()) return;
+      const processed = result.execution_result?.processed || [];
+      toast(
+        processed.length
+          ? `本轮处理 ${processed.length} 项；${current.readiness.workflow.message}`
+          : current.readiness.workflow.message,
+      );
+    },
+    isCurrent,
+  ).finally(() => {
+    taskStartOperations.delete(id);
+    const control = $("#run-task");
+    if (location.hash === "#tasks/" + id && control) control.disabled = false;
+  });
+  taskStartOperations.set(id, operation);
+  return operation;
+}
 async function renderTask(id) {
+  const generation = ++taskRenderGeneration;
+  const isCurrent = () =>
+    generation === taskRenderGeneration &&
+    location.hash === "#tasks/" + id &&
+    !$("#panel").open;
   const t = await api("/tasks/" + id);
-  if (location.hash !== "#tasks/" + id) return;
+  if (!isCurrent()) return;
   state.current = t;
   const discovery = true;
   const started = ["starting", "ready"].includes(t.phase);
@@ -871,21 +1136,12 @@ async function renderTask(id) {
               "",
             )}<button class="secondary compact" id="add-candidate">录入候选</button>${t.policy.max_joins ? '<button class="secondary compact" id="join-candidates">开始入群</button>' : ""}</div>`
         : ""
-    }${t.candidates.length ? '<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>候选目标</th><th>资格判断</th><th>原因</th></tr></thead><tbody>' + t.candidates.map((c) => `<tr><td>${esc(c.target)}</td><td>${badge(c.decision)}</td><td>${esc(c.reasons.join(" · ") || "通过发现政策")}<span class="sub">${esc(c.state)}</span>${["unknown", "pending_admin_approval", "joined", "already_joined"].includes(c.state) ? `<button class="text-button" data-join-reconcile="${c.id}">只读核对入群</button>` : ""}</td></tr>`).join("") + "</tbody></table></div>" : '<p class="muted mt-14">搜索结果先经过资格筛选，低置信度候选会被记录为拒绝。</p>'}</div></div><div class="surface mt-24"><div class="section-header"><h2>任务日志</h2></div><div class="padded" id="task-audit">正在读取…</div></div></div><aside class="detail-aside"><div class="surface padded"><h2>任务范围</h2><details><summary>查看完整范围</summary><p class="help">账号：${t.account_snapshot.map((a) => esc(a.label) + " (" + names[a.platform] + ")").join("、")}</p><pre>${esc(JSON.stringify(t.policy, null, 2))}</pre></details>${t.manifest ? `<details><summary>查看发送清单</summary><pre>${esc(JSON.stringify(t.manifest, null, 2))}</pre></details>` : '<p class="help">点击开始发送时自动固定清单，无需审批或确认短语。</p>'}</div><div class="surface padded mt-20"><h2>执行控制</h2><p class="help">${state.overview.global_stop ? "全局执行已暂停。请使用顶部开关恢复。" : "任务启动后按计划时间执行。"}</p><div class="actions mt-14">${!ended ? `<button id="run-task" class="compact">${t.items.length ? "开始发送" : t.policy.max_joins ? "开始入群" : "开始任务"}</button><button class="secondary compact" id="pause-task">${t.state === "paused" ? "恢复任务" : "暂停任务"}</button><button class="danger compact" id="cancel-task">取消任务</button>` : ""}</div><p class="native-note">停止本地任务不会撤回已经提交给 Telegram 的原生排期。</p></div></aside></div>`;
+    }${t.candidates.length ? '<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>候选目标</th><th>资格判断</th><th>原因</th></tr></thead><tbody>' + t.candidates.map((c) => `<tr><td>${esc(c.target)}</td><td>${badge(c.decision)}</td><td>${esc(c.reasons.join(" · ") || "通过发现政策")}<span class="sub">${esc(c.state)}</span>${["unknown", "pending_admin_approval", "joined", "already_joined"].includes(c.state) ? `<button class="text-button" data-join-reconcile="${c.id}">只读核对入群</button>` : ""}</td></tr>`).join("") + "</tbody></table></div>" : '<p class="muted mt-14">搜索结果先经过资格筛选，低置信度候选会被记录为拒绝。</p>'}</div></div><div class="surface mt-24"><div class="section-header"><h2>任务日志</h2></div><div class="padded" id="task-audit">正在读取…</div></div></div><aside class="detail-aside"><div class="surface padded"><h2>任务范围</h2><details><summary>查看完整范围</summary><p class="help">账号：${t.account_snapshot.map((a) => esc(a.label) + " (" + names[a.platform] + ")").join("、")}</p><pre>${esc(JSON.stringify(t.policy, null, 2))}</pre></details>${t.manifest ? `<details><summary>查看发送清单</summary><pre>${esc(JSON.stringify(t.manifest, null, 2))}</pre></details>` : '<p class="help">点击开始发送时自动固定清单，无需审批或确认短语。</p>'}</div><div class="surface padded mt-20"><h2>执行控制</h2><p class="help">${state.overview.global_stop ? "全局执行已暂停。请使用顶部开关恢复。" : "任务启动后按计划时间执行。"}</p><div class="actions mt-14">${!ended ? `<button id="run-task" class="compact" ${taskStartOperations.has(id) ? "disabled" : ""}>${t.items.length ? "开始发送" : t.policy.max_joins ? "开始入群" : "开始任务"}</button><button class="secondary compact" id="pause-task">${t.state === "paused" ? "恢复任务" : "暂停任务"}</button><button class="danger compact" id="cancel-task">取消任务</button>` : ""}</div><p class="native-note">停止本地任务不会撤回已经提交给 Telegram 的原生排期。</p></div></aside></div>`;
   bindTaskTools(t);
   $("#refresh-task").onclick = () => renderTask(id);
   $("#edit-items")?.addEventListener("click", () => itemEditor(t));
   $("#run-task")?.addEventListener("click", (e) =>
-    busy(e.target, async () => {
-      const r = await api(`/tasks/${id}/start`, "POST");
-      await refresh();
-      await renderTask(id);
-      toast(
-        r.execution_result.processed.length
-          ? `本轮处理 ${r.execution_result.processed.length} 项`
-          : r.readiness.workflow.message,
-      );
-    }),
+    startTaskFromUI(id, e.currentTarget),
   );
   $("#pause-task")?.addEventListener("click", (e) =>
     busy(e.target, async () => {
@@ -911,7 +1167,7 @@ async function renderTask(id) {
             `/items/${b.dataset.reconcile}/reconcile`,
             "POST",
           );
-          await renderTask(id);
+          if (!(await renderTask(id))) return;
           toast(
             r.verified ? "只读核验完成" : "尚未取得可确认结果；不会自动重发",
           );
@@ -931,15 +1187,13 @@ async function renderTask(id) {
           await api(`/tasks/${id}/discover`, "POST", {
             account_id: b.dataset.discover,
           });
-          await renderTask(id);
-          toast("候选已筛选并记录");
+          if (await renderTask(id)) toast("候选已筛选并记录");
         })),
   );
   $("#join-candidates")?.addEventListener("click", (e) =>
     busy(e.target, async () => {
       await api(`/tasks/${id}/join`, "POST");
-      await renderTask(id);
-      toast("合格候选入群批次已处理");
+      if (await renderTask(id)) toast("合格候选入群批次已处理");
     }),
   );
   document.querySelectorAll("[data-join-reconcile]").forEach(
@@ -947,13 +1201,12 @@ async function renderTask(id) {
       (b.onclick = () =>
         busy(b, async () => {
           await api(`/candidates/${b.dataset.joinReconcile}/reconcile`, "POST");
-          await renderTask(id);
-          toast("已只读核对成员状态；不会重新入群");
+          if (await renderTask(id)) toast("已只读核对成员状态；不会重新入群");
         })),
   );
   $("#add-candidate")?.addEventListener("click", () => candidateForm(t));
   const logs = await api("/audit?task_id=" + encodeURIComponent(id));
-  if (state.current?.id === id && $("#task-audit"))
+  if (isCurrent() && state.current?.id === id && $("#task-audit"))
     $("#task-audit").innerHTML = logs.length
       ? logs
           .slice(0, 25)
@@ -963,6 +1216,7 @@ async function renderTask(id) {
           )
           .join("")
       : "暂无记录";
+  return isCurrent() ? t : undefined;
 }
 function itemPreview(i) {
   const p = i.payload;
@@ -1016,6 +1270,10 @@ function taskExecutionBadge(t) {
 }
 function taskExecutionPanel(t) {
   const flow = t.readiness?.workflow;
+  const service = flow?.service_observation;
+  const observation = service
+    ? `<p>本任务同步观测：${service.task_scope_failed ? "当前同步失败（" + esc(service.task_state) + "）" : service.task_scope_usable ? "近期同步成功" : "尚无有效的近期同步证据"}${service.task_at ? " · " + fmt(service.task_at) : ""}。状态观测不替代提交前授权。</p>${service.task_scope_failed && service.task_retry_at ? `<p>本任务同步重试时间：${fmt(service.task_retry_at)} UTC+08:00</p>` : ""}${service.global_state && service.global_state !== "connected" ? `<p>${service.historical_conflict ? "全局历史同步仍有冲突，已与本任务近期同步分开显示" : "全局服务观测：" + esc(service.global_state)}${service.global_at ? " · " + fmt(service.global_at) : ""}</p>` : ""}`
+    : "";
   const progress = flow?.counts;
   const delivery = t.delivery_summary;
   const outcome = delivery
@@ -1024,7 +1282,7 @@ function taskExecutionPanel(t) {
   const workflow =
     outcome +
     (flow
-      ? `<div class="banner" id="task-workflow"><div><strong>${esc(flow.label)}</strong><p>${esc(flow.message)}</p>${flow.next_at ? `<p>下一计划时间：${fmt(flow.next_at)} UTC+08:00</p>` : ""}${progress ? `<p>已核验发布 ${progress.verified_sent} / ${progress.planned} · 未尝试 ${progress.not_attempted} · 已核验入群 ${progress.membership_verified}</p>` : ""}</div></div>`
+      ? `<div class="banner" id="task-workflow"><div><strong>${esc(flow.label)}</strong><p>${esc(flow.message)}</p>${flow.next_at ? `<p>${flow.next_at_kind === "service_retry" ? "下次服务检查" : "下一计划时间"}：${fmt(flow.next_at)} UTC+08:00</p>` : ""}${flow.schedule_next_at && (flow.next_at_kind === "service_retry" || flow.schedule_next_at !== flow.next_at) ? `<p>原定下一计划时间：${fmt(flow.schedule_next_at)} UTC+08:00</p>` : ""}${observation}${progress ? `<p>已核验发布 ${progress.verified_sent} / ${progress.planned} · 未尝试 ${progress.not_attempted} · 已核验入群 ${progress.membership_verified}</p>` : ""}</div></div>`
       : "");
   if (!t.manifest) return workflow;
   const e = t.execution || { status: "unmonitored" };
@@ -1050,9 +1308,16 @@ setInterval(async () => {
     return;
   executionPolling = true;
   const id = location.hash.slice(7);
+  const renderGeneration = taskRenderGeneration;
+  const viewGeneration = panelGeneration;
+  const isCurrent = () =>
+    location.hash === "#tasks/" + id &&
+    renderGeneration === taskRenderGeneration &&
+    viewGeneration === panelGeneration &&
+    !$("#panel").open;
   try {
     const task = await api("/tasks/" + id);
-    if (location.hash === "#tasks/" + id && $("#task-execution")) {
+    if (isCurrent() && $("#task-execution")) {
       const previous = state.current;
       const changed =
         previous?.phase !== task.phase ||
@@ -1079,7 +1344,7 @@ setInterval(async () => {
         $("#prepare").disabled = !task.readiness.workflow.can_prepare;
     }
   } catch (_) {
-    if ($("#task-execution"))
+    if (isCurrent() && $("#task-execution"))
       $("#task-execution").textContent =
         "执行状态暂时无法刷新，请检查本机服务。";
   } finally {
@@ -1142,7 +1407,7 @@ function itemEditor(t) {
         ? { ...blank(), ...t.reply_context, action: "reply" }
         : blank(),
     );
-  openPanel("编辑执行清单", "");
+  const generation = openPanel("编辑执行清单", "");
   function targetField(p, n) {
     if (
       state.accounts.find((a) => a.id === p.account_id).platform === "x" &&
@@ -1300,7 +1565,16 @@ function itemEditor(t) {
           collect();
           const n = Number(button.dataset.discordTargets),
             p = items[n];
-          const result = await api(`/accounts/${p.account_id}/targets`);
+          const accountId = p.account_id;
+          const result = await api(`/accounts/${accountId}/targets`);
+          if (
+            generation !== panelGeneration ||
+            !$("#panel").open ||
+            !button.isConnected ||
+            items[n] !== p ||
+            p.account_id !== accountId
+          )
+            return;
           const targets = result.targets.filter(
             (c) =>
               !t.policy.target_allowlist.length ||
@@ -1437,6 +1711,12 @@ function itemEditor(t) {
               body: f,
             });
             const m = await response.json();
+            if (
+              generation !== panelGeneration ||
+              !$("#panel").open ||
+              !el.isConnected
+            )
+              return;
             if (!response.ok) throw Error(m.error);
             const currentItem = items[Number(el.dataset.upload)];
             if (
@@ -1451,7 +1731,12 @@ function itemEditor(t) {
             currentItem.media.push(m);
             draw();
           } catch (e) {
-            toast(e.message, true);
+            if (
+              generation === panelGeneration &&
+              $("#panel").open &&
+              el.isConnected
+            )
+              toast(e.message, true);
           }
         }),
     );
@@ -1469,7 +1754,8 @@ function itemEditor(t) {
       busy(e.submitter, async () => {
         collect();
         await api(`/tasks/${t.id}/items`, "PUT", items);
-        $("#panel").close();
+        if (generation !== panelGeneration || !$("#panel").open) return;
+        closePanel();
         await renderTask(t.id);
       });
     };
@@ -1477,7 +1763,7 @@ function itemEditor(t) {
   draw();
 }
 function manualForm(item) {
-  openPanel(
+  const generation = openPanel(
     "登记人工发布结果",
     `<p class="help">先核对任务文本，再在平台手动发布。登记后不会自动重试。</p><div class="item-text">${esc(item.payload.text)}</div><form id="manual-form"><label>平台上实际发布的完整文本<textarea name="text" required></textarea></label><label>Instagram 公开链接<input name="url" type="url" required></label><label class="checkbox-label"><input name="verified" type="checkbox">已在平台页面核验发布结果</label><div class="form-actions"><button>保存结果</button></div></form>`,
   );
@@ -1490,13 +1776,14 @@ function manualForm(item) {
         external_reference: f.get("url"),
         verified: f.has("verified"),
       });
-      $("#panel").close();
+      if (generation !== panelGeneration || !$("#panel").open) return;
+      closePanel();
       await renderTask(item.task_id);
     });
   };
 }
 function candidateForm(t) {
-  openPanel(
+  const generation = openPanel(
     "录入发现候选",
     `<form id="candidate-form"><div class="field-grid"><div><label>账号<select name="account_id">${t.account_snapshot.map((a) => `<option value="${a.id}">${esc(a.label)}</option>`).join("")}</select></label></div><div><label>目标<input name="target" required></label></div><div class="full"><label>标题<input name="title"></label></div><div class="full"><label>上下文<textarea name="text"></textarea></label></div><div><label>语言<input name="language" value="en" required></label></div><div><label>证据置信度<input name="confidence" type="number" value="0.8" min="0" max="1" step="0.05" required></label></div><div><label>成员数<input name="members" type="number" value="0" min="0"></label></div><div><label>活跃度<input name="activity" type="number" value="0" min="0"></label></div></div><div class="form-actions"><button>筛选并保存</button></div></form>`,
   );
@@ -1515,7 +1802,8 @@ function candidateForm(t) {
         activity: Number(f.get("activity")),
         is_public: true,
       });
-      $("#panel").close();
+      if (generation !== panelGeneration || !$("#panel").open) return;
+      closePanel();
       await renderTask(t.id);
     });
   };

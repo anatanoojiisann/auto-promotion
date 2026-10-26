@@ -485,7 +485,7 @@ export class TelegramNativeGate {
       );
       if (
         response.status === 409 &&
-        ["waiting_cooldown", "waiting_account_lock"].includes(result.status) &&
+        ["waiting_cooldown", "waiting_account_lock", "waiting_read_budget"].includes(result.status) &&
         result.phase === "pre_execution" &&
         result.native_authorized === false &&
         result.submission_started === false &&

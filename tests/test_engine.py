@@ -160,7 +160,9 @@ class EngineTests(unittest.TestCase):
         self.engine.set_stop(False)
         result = self.engine.start_and_run(task["id"], source="client")
         self.assertEqual(result["manifest_hash"], frozen)
-        self.assertEqual(result["execution_result"]["processed"][0]["status"], "confirmed")
+        self.assertTrue(result["execution_result"]["already_started"])
+        self.assertEqual(result["execution_result"]["processed"], [])
+        self.assertEqual(self.provider.sends, 0)
         self.engine.run_cycle()
         self.assertEqual(self.provider.sends, 1)
 

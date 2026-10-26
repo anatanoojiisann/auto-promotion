@@ -298,6 +298,7 @@ export class WorkspaceCoordinator extends DurableObject {
         )
           throw new ControlError("LocalControlSourceRequired", 403);
       }
+      const localStoreId = body.local_store_id;
       delete body.local_store_id;
       let result;
       if (path === "/internal/public-research") {
@@ -458,7 +459,7 @@ export class WorkspaceCoordinator extends DurableObject {
         else if (path === "/v1/account-channel" && request.method === "POST") {
           if (fenced && body.node_id !== fenced)
             throw new ControlError("LocalChannelRequiresSingleNode", 403);
-          result = this.kernel.setAccountChannel(body);
+          result = this.kernel.setAccountChannel({ ...body, store_id: localStoreId || "" });
         } else throw new ControlError("NotFound", 404);
       } else {
         const node = this.kernel.node(
@@ -473,10 +474,11 @@ export class WorkspaceCoordinator extends DurableObject {
             throw new ControlError("JobNotAssigned", 403);
           result = { channel: this.kernel.accountChannel(body.account_id) };
         } else if (path === "/v1/heartbeat" && request.method === "POST")
-          result = { ready: true, node_id: node.id };
+          result = { ready: true, node_id: node.id, account_blocks: this.kernel.accountBlocks(node.accounts) };
         else if (path === "/v1/claim" && request.method === "POST")
           result = {
             job: this.kernel.claim(node, body.pool, body.expected_id || null),
+            account_blocks: this.kernel.accountBlocks(node.accounts),
           };
         else if (path === "/v1/job" && request.method === "POST") {
           this.kernel.sweep();
@@ -526,7 +528,8 @@ export class WorkspaceCoordinator extends DurableObject {
           },
         });
       return Response.json(
-        { error: e instanceof ControlError ? e.message : "ControlPlaneError" },
+        { error: e instanceof ControlError ? e.message : "ControlPlaneError",
+          ...(e instanceof ControlError && e.message === "FrozenJobChanged" ? { conflict: e.diagnostics } : {}) },
         { status: e.status || 500, headers: { "Cache-Control": "no-store" } },
       );
     }

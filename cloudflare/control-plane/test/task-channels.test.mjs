@@ -106,6 +106,7 @@ function fixture() {
       account_id: s.a.id,
       task_id: s.t.id,
       node_id: "node",
+      store_id: "synthetic-store",
       channel,
       expected_generation: expected,
       generation,
@@ -219,6 +220,20 @@ test("handoff is idempotent, requires the current generation and preserves attem
   const reopened = new ControlKernel(f.storage, { clock: () => 1800000181 });
   assert.equal(reopened.accountChannel("a").channel, "local");
   assert.equal(reopened.claim(f.node, "x.edge", first.j.id), null);
+});
+
+test("same-generation renewal is monotone and bound to the original store and tuple", () => {
+  const f = fixture(), s = f.seed("renew", "a", "local");
+  const first = f.handoff(s, "local", null, "1".repeat(32), 1800000050);
+  const renewed = f.k.setAccountChannel({ account_id: "a", task_id: s.t.id, node_id: "node",
+    store_id: "synthetic-store", channel: "local", generation: first.channel.generation,
+    expected_generation: first.channel.generation, until: 1800000100 });
+  assert.equal(renewed.channel.until_at, 1800000100);
+  assert.equal(renewed.channel.store_id, "synthetic-store");
+  assert.throws(() => f.k.setAccountChannel({ account_id: "a", task_id: s.t.id, node_id: "node",
+    store_id: "wrong-store", channel: "local", generation: first.channel.generation,
+    expected_generation: first.channel.generation, until: 1800000150 }), /AccountChannelGenerationChanged/);
+  assert.throws(() => f.handoff(s, "local", first.channel.generation, first.channel.generation, 1800000090), /AccountChannelGenerationChanged/);
 });
 
 test("channel ownership spans identity aliases and local expiry does not reopen online claims", () => {

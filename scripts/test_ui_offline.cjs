@@ -10,6 +10,9 @@ const suites = {
   pools: "pool_ui_test.cjs",
   interactions: "hf_ui_test.cjs",
   faults: "ui_fault_test.cjs",
+  blocks: "account_block_ui_test.cjs",
+  telegram_reads: "telegram_read_ui_test.cjs",
+  task_start: "task_start_ui_test.cjs",
 };
 const selected = process.argv.slice(2);
 if (!selected.length) selected.push("main", "pools");

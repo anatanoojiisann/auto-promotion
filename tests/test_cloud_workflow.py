@@ -74,7 +74,11 @@ class CloudWorkflowTests(unittest.TestCase):
         self.assertEqual(self.workflow()["status"], "ready")
 
     def test_local_fallback_is_displayed_without_changing_schedule_or_stop(self):
-        self.task["execution"]["pools"]["channel"] = {"active": "local", "until": self.now + 7200}
+        self.task["execution"]["pools"]["channel"] = {
+            "active": "local",
+            "until": self.now + 7200,
+            "valid_for_task": True,
+        }
         original = copy.deepcopy(self.task)
         self.assertIn("本地通道", self.workflow()["label"])
         self.assertEqual(self.workflow(["global_stop"])["status"], "global_stop")
@@ -82,6 +86,10 @@ class CloudWorkflowTests(unittest.TestCase):
         self.assertEqual(self.workflow()["status"], "waiting_schedule")
         self.task["items"][0]["due_at"] = self.now
         self.assertEqual(self.task, original)
+
+    def test_unvalidated_global_local_state_is_not_task_authority(self):
+        self.task["execution"]["pools"]["channel"] = {"active": "local", "until": self.now + 7200}
+        self.assertEqual(self.workflow()["status"], "waiting_execution_service")
 
     def test_expired_or_stopped_tasks_keep_their_status(self):
         self.assertEqual(self.workflow(["global_stop"])["status"], "global_stop")

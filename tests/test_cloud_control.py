@@ -2,10 +2,13 @@ import hashlib
 import io
 import json
 import os
+import shutil
+import subprocess
 import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
@@ -28,6 +31,166 @@ class CloudClientTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.engine, self.store = self.fixture.engine, self.fixture.store
+
+    def test_remote_block_import_is_identity_bound_and_requires_local_recovery(self):
+        _, account = self.fixture.ready()
+        mirrored = export_snapshot(self.engine)["accounts"][0]
+        cloud = CloudControl("http://127.0.0.1:8791", operator_token="test")
+        state = {
+            "state": "active",
+            "reason": "x_challenge",
+            "since": self.engine.clock(),
+            "until": None,
+            "generation": 4,
+            "health_ok": True,
+            "health_checked_at": self.engine.clock(),
+        }
+        response = {
+            "account_blocks": [
+                {"account_id": account["id"], "identity": "wrong", "outbound_block_state": state}
+            ]
+        }
+        cloud.import_account_blocks(self.engine, response)
+        self.assertIsNone(self.engine.account(account["id"])["outbound_block"])
+        response["account_blocks"][0]["identity"] = mirrored["identity"]
+        cloud.import_account_blocks(self.engine, response)
+        block = self.engine.account(account["id"])["outbound_block"]
+        self.assertEqual(block["generation"], 4)
+        self.assertFalse(block["health_ok"])
+        cloud.import_account_blocks(self.engine, response)
+        self.assertEqual(self.engine.account(account["id"])["outbound_block"]["generation"], 4)
+
+    def test_heartbeat_response_imports_cloud_only_block_without_new_network_request(self):
+        _, account = self.fixture.ready()
+        mirrored = export_snapshot(self.engine)["accounts"][0]
+        response = {
+            "ready": True,
+            "account_blocks": [
+                {
+                    "account_id": account["id"],
+                    "identity": mirrored["identity"],
+                    "affected_tasks": ["remote-task"],
+                    "outbound_block_state": {
+                        "state": "active",
+                        "reason": "x_challenge",
+                        "since": self.engine.clock(),
+                        "until": None,
+                        "generation": 3,
+                    },
+                }
+            ],
+        }
+        cloud = CloudControl("http://127.0.0.1:8791", node_id="synthetic", node_token="test")
+        CloudJournal(self.engine, cloud)
+        with patch(
+            "auto_promotion.cloud_control.urlopen",
+            return_value=io.BytesIO(json.dumps(response).encode()),
+        ) as transport:
+            cloud.request("/v1/heartbeat", {})
+        self.assertEqual(transport.call_count, 1)
+        block = self.engine.account(account["id"])["outbound_block"]
+        self.assertEqual(block["generation"], 3)
+        self.assertIn("remote-task", block["affected_tasks"])
+
+    def test_snapshot_exports_versioned_block_tombstone_without_health_identity(self):
+        _, account = self.fixture.ready()
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "INSERT INTO account_blocks(account_id,state,reason,since,until_at,generation,"
+                "details,health_checked_at,health_ok,health_identity_hash,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    account["id"],
+                    "cleared",
+                    "x_challenge",
+                    self.engine.clock() - 20,
+                    None,
+                    2,
+                    "{}",
+                    self.engine.clock(),
+                    1,
+                    "private-health-identity",
+                    self.engine.clock(),
+                ),
+            )
+        exported = export_snapshot(self.engine)["accounts"][0]
+        self.assertEqual(exported["outbound_block_state"]["state"], "cleared")
+        self.assertEqual(exported["outbound_block_state"]["generation"], 2)
+        self.assertTrue(exported["outbound_block_state"]["health_ok"])
+        self.assertNotIn("private-health-identity", json.dumps(exported))
+
+    def test_real_explicit_resume_exports_cloud_accepted_clear_generation(self):
+        from auto_promotion.account_blocks import observe
+
+        _, account = self.fixture.ready()
+        health = {"healthy": True, "identity_verified": True, "account_identity": "synthetic"}
+        with patch.object(self.engine, "call", return_value=health):
+            self.engine.check_account(account["id"], force=True)
+        with self.store.connect(write=True) as db:
+            observe(
+                db,
+                account["id"],
+                {"account_block_reason": "x_challenge"},
+                now=self.engine.clock(),
+                operation="preflight",
+            )
+        active = export_snapshot(self.engine)["accounts"][0]["outbound_block_state"]
+        with patch.object(self.engine, "call", return_value=health):
+            checked = self.engine.check_account_block(account["id"])
+        self.assertTrue(checked["outbound_block"]["health_ok"])
+        self.engine.resume_account_block(account["id"], active["generation"])
+        cleared = export_snapshot(self.engine)["accounts"][0]["outbound_block_state"]
+        self.assertEqual(cleared["state"], "cleared")
+        self.assertGreater(cleared["generation"], active["generation"])
+        self.assertIs(cleared["health_ok"], True)
+        self.assertGreaterEqual(cleared["health_checked_at"], cleared["since"])
+        node = shutil.which("node")
+        if (
+            node
+            and subprocess.run(
+                [node, "-e", "require('node:sqlite')"],
+                capture_output=True,
+                timeout=10,
+            ).returncode
+            == 0
+        ):
+            # Consume the actual Python resume/export payload in the production
+            # Worker kernel, rather than hand-building a purported clear proof.
+            script = """
+import { DatabaseSync } from 'node:sqlite';
+import { ControlKernel } from './cloudflare/control-plane/kernel.mjs';
+let input=''; for await (const part of process.stdin) input+=part;
+const {active,cleared,account}=JSON.parse(input), db=new DatabaseSync(':memory:');
+const storage={sql:{exec(q,...a){
+  if(q.includes('CREATE TABLE')){db.exec(q);return {toArray:()=>[]};}
+  const s=db.prepare(q), rows=s.columns().length?s.all(...a):(s.run(...a),[]);
+  return {toArray:()=>rows};
+}},transactionSync(fn){db.exec('BEGIN');try{const r=fn();db.exec('COMMIT');return r;}
+catch(e){db.exec('ROLLBACK');throw e;}}};
+const k=new ControlKernel(storage,{clock:()=>1800000000});
+const sync=b=>k.sync({accounts:[{...account,outbound_block_state:b}],tasks:[],jobs:[]});
+sync(active);const blocked=k.accountOutboundBlocked(account.identity);
+sync(cleared);const resumed=!k.accountOutboundBlocked(account.identity);
+sync(active);const staleIgnored=!k.accountOutboundBlocked(account.identity);
+process.stdout.write(JSON.stringify({blocked,resumed,staleIgnored}));
+"""
+            result = subprocess.run(
+                [node, "--input-type=module", "-e", script],
+                input=json.dumps(
+                    {
+                        "active": active,
+                        "cleared": cleared,
+                        "account": export_snapshot(self.engine)["accounts"][0],
+                    }
+                ),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                cwd=Path(__file__).resolve().parents[1],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout), {"blocked": True, "resumed": True, "staleIgnored": True}
+            )
 
     def test_delta_sync_sends_each_definition_once_and_skips_unchanged(self):
         self.fixture.ready()

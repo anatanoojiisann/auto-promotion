@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import quotas
+from .account_blocks import FIELDS as BLOCK_FIELDS
 from .backends.common import (
     BackendError,
     automatic_action_allowed,
@@ -39,10 +40,13 @@ from .models import (
 )
 from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_blocker
 from .routing import route_for
+from .runtime_identity import result_runtime
 from .statistics import ZONE, Statistics, publication_time, record_publication
 from .store import Store, decode
 from .task_dependencies import publication_schedule
 from .workers import Workers
+
+RUNTIME = result_runtime("engine")
 
 
 class Conflict(Exception):
@@ -116,6 +120,9 @@ class Engine:
         row = self.store.one("SELECT * FROM accounts WHERE id=?", (account_id,))
         if not row:
             raise NotFound("账号不存在")
+        from .account_blocks import recover_private_stop
+
+        recover_private_stop(self.store, row, now=self.clock())
         value = decode(row, "health")
         from .health_checks import probe_key, state
 
@@ -164,8 +171,13 @@ class Engine:
                 )
             except BackendError:
                 value["owned_target_id"] = ""
+        from .account_blocks import active_block
+
+        with self.store.connect() as db:
+            value["outbound_block"] = active_block(db, account_id, self.clock())
         value["writable"] = bool(
-            value["connection_state"] == "healthy"
+            not value["outbound_block"]
+            and value["connection_state"] == "healthy"
             and not value["disabled"]
             and value["cooldown_until"] <= self.clock()
             and (value["mode"] == "simulation" or self.live_enabled)
@@ -268,21 +280,82 @@ class Engine:
             account = self.account(account["id"])
             if route_for(account, (payload or {}).get("payload", {})) != route:
                 raise Conflict("账号连接已变化，请重新核验")
+            if account["platform"] == "x":
+                from .read_cooldowns import x_read_until
+
+                with self.store.connect() as db:
+                    retry_at = x_read_until(db, account)
+                if retry_at > self.clock():
+                    return self._observe_telegram_read(
+                        account,
+                        operation,
+                        task_id,
+                        {
+                            "healthy": False,
+                            "service_ready": False,
+                            "identity_verified": False,
+                            "allowed": False,
+                            "verified": False,
+                            "coverage_complete": False,
+                            "candidates": [],
+                            "reason": "XReadCooldown",
+                            "rate_limited": True,
+                            "read_state": "rate_limited",
+                            "retry_after_seconds": max(1, int(retry_at - self.clock())),
+                            "account_retry_at": retry_at,
+                            "cooldown_source": "persisted_x_read_cooldown",
+                            "read_primary_request_count": 0,
+                            "read_primary_response_count": 0,
+                            "read_observation_source": "local_cooldown_no_request",
+                        },
+                    )
             if (
                 account["platform"] == "telegram"
                 and account["mode"] == "live"
                 and (account["disabled"] or account["cooldown_until"] > self.clock())
             ):
+                return self._observe_telegram_read(
+                    account,
+                    operation,
+                    task_id,
+                    {
+                        "allowed": False,
+                        "verified": False,
+                        "reason": "AccountDisabled" if account["disabled"] else "AccountCooldown",
+                        "account_retry_at": account["cooldown_until"],
+                        "cooldown_source": "persisted_account_cooldown",
+                        "read_state": "cooldown",
+                        "read_rpc_used": 0,
+                        "read_rpc_count_source": "local_cooldown_no_rpc",
+                        "read_rpc_wire_attempts": None,
+                        "read_rpc_internal_retries": None,
+                    },
+                )
+            if operation in {"execute", "join"} and account["outbound_block"]:
                 return {
-                    "allowed": False,
+                    "status": "failed_known",
                     "verified": False,
-                    "reason": "AccountDisabled" if account["disabled"] else "AccountCooldown",
-                    "account_retry_at": account["cooldown_until"],
+                    "confirmed_not_submitted": True,
+                    "reason": "AccountOutboundBlocked",
+                    "account_block_reason": account["outbound_block"]["reason"],
+                }
+            if account["platform"] == "telegram" and operation not in {"execute", "join"}:
+                from .health_checks import probe_revision
+
+                policy = self.telegram_read_policy(account["id"])
+                payload = {
+                    **(payload or {}),
+                    "read_policy": policy["policy"],
+                    "read_policy_context": {
+                        "database": self.store.path,
+                        "account_id": account["id"],
+                    },
+                    "read_connection_revision": probe_revision(account, self.store.path),
                 }
             checks = TargetChecks(self, account, operation, payload or {})
             cached = checks.read()
             if cached is not None:
-                return cached
+                return self._observe_telegram_read(account, operation, task_id, cached)
             try:
                 result = self._call_unlocked(account, operation, payload, task_id)
             except Conflict as exc:
@@ -298,8 +371,77 @@ class Engine:
                     + max(1, int(result.get("retry_after_seconds") or 3600)),
                 }
                 self.apply_cooldown(account["id"], result)
+            if account["platform"] == "x" and result.get("rate_limited"):
+                from .read_cooldowns import record_x_read_cooldown
+
+                with self.store.connect(write=True) as db:
+                    retry_at = record_x_read_cooldown(db, account, result, self.clock())
+                result = {
+                    **result,
+                    "account_retry_at": retry_at,
+                    "cooldown_source": "x_read_rate_limit",
+                }
+            from .account_blocks import observe
+
+            if any(key in result for key in BLOCK_FIELDS) or operation == "execute":
+                with self.store.connect(write=True) as db:
+                    observe(
+                        db,
+                        account["id"],
+                        result,
+                        now=self.clock(),
+                        operation=operation,
+                        payload=payload,
+                        task_id=task_id,
+                    )
             checks.save(result)
+            return self._observe_telegram_read(account, operation, task_id, result)
+
+    def _observe_telegram_read(self, account, operation, task_id, result):
+        if account["platform"] == "x":
+            from .read_cooldowns import observe_x_read
+
+            try:
+                observe_x_read(self.store, account["id"], task_id, operation, result, self.clock())
+            except (sqlite3.Error, TypeError, ValueError, OverflowError):
+                logging.getLogger(__name__).warning("Read diagnostics unavailable")
             return result
+        if account["platform"] != "telegram":
+            return result
+        if "read_rpc_used" not in result:
+            result = {
+                **result,
+                "read_rpc_used": None,
+                "read_rpc_wire_attempts": None,
+                "read_rpc_internal_retries": None,
+                "read_rpc_count_source": "unavailable_legacy"
+                if os.getenv("AP_TELEGRAM_BACKEND") == "legacy"
+                else "unavailable",
+            }
+        from .telegram_reading import read_diagnostics
+
+        observed = {
+            **read_diagnostics(result),
+            **{key: result[key] for key in BLOCK_FIELDS if key in result},
+            **({"reason": safe_code(result["reason"])} if result.get("reason") else {}),
+        }
+        # Consumer tokens remain in their private durable stores, never in the
+        # diagnostic stream. Only aggregate categories and safe scalar evidence.
+        observed.pop("read_cursor_next", None)
+        try:
+            with self.store.connect(write=True) as db:
+                db.execute(
+                    "INSERT INTO telegram_read_observations(account_id,task_id,operation,observed_at,result) VALUES(?,?,?,?,?)",
+                    (account["id"], task_id, operation, self.clock(), canonical(observed)),
+                )
+                db.execute(
+                    "DELETE FROM telegram_read_observations WHERE account_id=? AND id NOT IN "
+                    "(SELECT id FROM telegram_read_observations WHERE account_id=? ORDER BY id DESC LIMIT 1000)",
+                    (account["id"], account["id"]),
+                )
+        except sqlite3.Error:
+            logging.getLogger(__name__).warning("Telegram read diagnostics unavailable")
+        return result
 
     def _call_unlocked(self, account, operation, payload=None, task_id=None):
         started = time.monotonic()
@@ -343,7 +485,7 @@ class Engine:
                         )
                         attempt_id = attempt["id"] if attempt else None
                     cloud.guard(getattr(self.adapters.context, "job", None), attempt_id)
-            result = self.adapters.call(account, operation, payload or {})
+            result = {**RUNTIME, **self.adapters.call(account, operation, payload or {})}
         except Exception as exc:
             # Never expose provider exceptions: they may include tokens, URLs or browser state.
             self._log_call(
@@ -357,6 +499,15 @@ class Engine:
             error = Conflict("平台调用未完成；请查看 API 中心的错误类型并核验连接")
             error.safe_code = safe_code(
                 getattr(exc, "safe_code", type(exc).__name__), "BackendError"
+            )
+            from .execution_diagnostics import exception_details
+
+            details = exception_details(exc)
+            error.read_diagnostics = details
+            error.rpc_counts = details.get("rpc_counts")
+            error.rpc_count_source = details.get("rpc_count_source")
+            self._observe_telegram_read(
+                account, operation, task_id, {"reason": error.safe_code, **details}
             )
             raise error from None
         outcome = result.get("status")
@@ -387,18 +538,20 @@ class Engine:
         except sqlite3.Error as exc:
             logging.getLogger(__name__).warning("call audit unavailable: %s", type(exc).__name__)
 
-    def check_account(self, account_id, *, force=False):
+    def check_account(self, account_id, *, force=False, recovery=False):
         from .health_checks import cached, probe_key
 
         account = self.account(account_id)
         if account["disabled"] or account["cooldown_until"] > self.clock():
             return account
-        if cached(account, self.clock(), probe_key(account, self.store.path), force=force):
+        if not recovery and cached(
+            account, self.clock(), probe_key(account, self.store.path), force=force
+        ):
             return {**account, "health": {**account["health"], "probe_cached": True}}
         try:
             route = route_for(account)
             with self.lanes.acquire(account_id, resource=route.resource):
-                return self._check_account_locked(account_id, force=force)
+                return self._check_account_locked(account_id, force=force, recovery=recovery)
         except AccountBusy:
             current = self.account(account_id)
             return {
@@ -417,7 +570,7 @@ class Engine:
                 "health": {**account["health"], "reason": "LocalDatabaseUnavailable"},
             }
 
-    def _check_account_locked(self, account_id, *, force=False):
+    def _check_account_locked(self, account_id, *, force=False, recovery=False):
         from .health_checks import cached, category, probe_key, probe_revision
 
         account = self.account(account_id)
@@ -427,7 +580,7 @@ class Engine:
         revision = probe_revision(account, self.store.path)
         key = probe_key(account, self.store.path, revision=revision)
         previous = account["health"]
-        if cached(account, now, key, force=force):
+        if not recovery and cached(account, now, key, force=force):
             return {**account, "health": {**previous, "probe_cached": True}}
         try:
             result = self.call(account, "health")
@@ -562,6 +715,116 @@ class Engine:
                     "next_check_at": health["next_check_at"],
                 },
             )
+        return self.account(account_id)
+
+    def telegram_read_policy(self, account_id):
+        from .telegram_reading import read_policy_context
+
+        account = self.account(account_id)
+        if account["platform"] != "telegram":
+            raise Conflict("读取设置仅适用于 Telegram 账号")
+        return {
+            "account_id": account_id,
+            **read_policy_context({"database": self.store.path, "account_id": account_id}),
+        }
+
+    def configure_telegram_reads(self, account_id, value, *, expected_revision=None):
+        self.telegram_read_policy(account_id)
+        with self.store.connect(write=True) as db:
+            row = db.execute(
+                "SELECT revision FROM telegram_read_settings WHERE account_id=?", (account_id,)
+            ).fetchone()
+            revision = row[0] if row else 0
+            if expected_revision != revision and not (expected_revision is None and revision == 0):
+                raise Conflict("读取设置已变化，请刷新后重试")
+            db.execute(
+                "INSERT INTO telegram_read_settings VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET "
+                "payload=excluded.payload,revision=excluded.revision,updated_at=excluded.updated_at",
+                (account_id, canonical(value.model_dump()), revision + 1, self.clock()),
+            )
+            Store.audit(
+                db,
+                "telegram.read_settings_updated",
+                {"account_id": account_id, "revision": revision + 1},
+                now=self.clock(),
+            )
+        return self.telegram_read_policy(account_id)
+
+    def check_account_block(self, account_id):
+        """Explicit read-only probe; does not clear a stop or modify any item."""
+        from .account_blocks import active_block
+
+        account = self.account(account_id)
+        with self.lanes.acquire(account_id, resource=route_for(account, {}).resource):
+            with self.store.connect() as db:
+                block = active_block(db, account_id, self.clock())
+            if not block:
+                raise Conflict("账号没有待处理的外发暂停")
+            account = self.account(account_id)
+            original_identity = account["identity_hash"]
+            checked = self.check_account(account_id, force=True, recovery=True)
+            healthy = bool(
+                original_identity
+                and checked["identity_hash"] == original_identity
+                and checked["connection_state"] == "healthy"
+                and checked["health"].get("identity_verified")
+                and not checked["disabled"]
+                and checked["cooldown_until"] <= self.clock()
+            )
+            with self.store.connect(write=True) as db:
+                db.execute(
+                    "UPDATE account_blocks SET health_checked_at=?,health_ok=?,health_identity_hash=? "
+                    "WHERE account_id=? AND state='active' AND generation=?",
+                    (
+                        self.clock(),
+                        int(healthy),
+                        original_identity,
+                        account_id,
+                        block["generation"],
+                    ),
+                )
+        return self.account(account_id)
+
+    def resume_account_block(self, account_id, generation):
+        """A fresh matching probe and explicit generation are mandatory."""
+        from .account_blocks import active_block
+        from .health_checks import probe_key
+
+        account = self.account(account_id)
+        with self.lanes.acquire(account_id, resource=route_for(account, {}).resource):
+            now = self.clock()
+            with self.store.connect(write=True) as db:
+                block = active_block(db, account_id, now)
+                row = db.execute(
+                    "SELECT * FROM account_blocks WHERE account_id=?", (account_id,)
+                ).fetchone()
+                current = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+                if (
+                    not block
+                    or str(block["generation"]) != str(generation)
+                    or not row["health_ok"]
+                    or row["health_checked_at"] is None
+                    or not 0 <= now - row["health_checked_at"] <= 300
+                    or not row["health_identity_hash"]
+                    or row["health_identity_hash"] != current["identity_hash"]
+                    or current["disabled"]
+                    or current["cooldown_until"] > now
+                    or current["status"] != "healthy"
+                    or json.loads(current["health"]).get("probe_key")
+                    != probe_key(dict(current), self.store.path)
+                ):
+                    raise Conflict("请先完成当前账号身份健康检查，再显式恢复")
+                db.execute(
+                    "UPDATE account_blocks SET state='cleared',generation=generation+1,updated_at=? WHERE account_id=?",
+                    (now, account_id),
+                )
+                db.execute("DELETE FROM account_block_events WHERE account_id=?", (account_id,))
+                Store.audit(
+                    db,
+                    "account.outbound_resumed",
+                    {"account_id": account_id, "generation": row["generation"] + 1},
+                    now=now,
+                )
         return self.account(account_id)
 
     def disable_account(self, account_id, disabled):
@@ -765,12 +1028,42 @@ class Engine:
             for item in task["items"]:
                 if item["status"] != "not_attempted":
                     continue
-                reason = dependency_reason or telegram_blocker(
-                    db, raw_task, item["payload"], item["due_at"]
+                from .interaction_intents import intent_blocker
+
+                sender = db.execute(
+                    "SELECT * FROM accounts WHERE id=?", (item["account_id"],)
+                ).fetchone()
+                blocked = (
+                    intent_blocker(db, sender, raw_task, item["payload"], item["id"])
+                    if sender
+                    else None
+                )
+                from .account_blocks import active_block
+
+                account_reason = None
+                if sender:
+                    if sender["disabled"]:
+                        account_reason = "account_disabled"
+                    elif active_block(db, sender["id"], self.clock()):
+                        account_reason = "account_outbound_blocked"
+                    elif sender["cooldown_until"] > self.clock():
+                        account_reason = "account_cooldown"
+                    elif sender["status"] != "healthy":
+                        account_reason = "account_unhealthy"
+                reason = (
+                    account_reason
+                    or dependency_reason
+                    or (blocked["reason"] if blocked else None)
+                    or telegram_blocker(db, raw_task, item["payload"], item["due_at"])
                 )
                 if reason:
                     items.append(
-                        {"item_id": item["id"], "reason": reason, "message": REASONS[reason]}
+                        {
+                            "item_id": item["id"],
+                            "reason": reason,
+                            "message": REASONS[reason],
+                            **(blocked if blocked and reason == blocked["reason"] else {}),
+                        }
                     )
         return {
             "blockers": [{"reason": r, "message": REASONS[r]} for r in blockers],
@@ -805,9 +1098,101 @@ class Engine:
                 raise Conflict("执行项与已启动清单不一致")
         return policy
 
-    def start_task(self, task_id, *, source="client", actor="operator", sending=True):
-        """Persist an explicit start; no approval phrases or approval rows are required."""
+    def _already_active_start(
+        self, task_id, *, sending=True, source="client", include_starting=False
+    ):
+        """Idempotency is local state, never a cached platform authorization."""
+        if source == "scheduler":
+            return False
+        with self.store.connect() as db:
+            task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                raise NotFound("任务不存在")
+            if task["state"] != "active" or not (
+                task["phase"] == "ready"
+                or include_starting
+                and task["phase"] == "starting"
+                or not sending
+                and task["phase"] in {"discovered", "starting"}
+            ):
+                return False
+            self._integrity(db, task, "outbound" if task["phase"] == "ready" else "discovery_join")
+            from .health_checks import AUTH, probe_key
+
+            local_task = {
+                "account_ids": json.loads(task["account_ids"]),
+                "policy": json.loads(task["policy"]),
+            }
+            for row in db.execute("SELECT payload FROM items WHERE task_id=?", (task_id,)):
+                payload = {
+                    key: value
+                    for key, value in json.loads(row["payload"]).items()
+                    if key not in {"position", "platform", "account_label"}
+                }
+                account = self.account(payload["account_id"])
+                if account["health"].get("reason") in AUTH or (
+                    account["mode"] == "live"
+                    and account["health"].get("probe_key")
+                    and account["health"]["probe_key"] != probe_key(account, self.store.path)
+                ):
+                    raise Conflict("账号身份或连接已变化，请重新核验")
+                self.validate_item(local_task, ItemInput(**payload), account=account)
+            if self.clock() >= epoch(json.loads(task["policy"])["ends_at"]):
+                raise Conflict("任务执行窗口已过期，请创建新任务")
+            if task["campaign_id"]:
+                campaign = db.execute(
+                    "SELECT state FROM campaigns WHERE id=?", (task["campaign_id"],)
+                ).fetchone()
+                if not campaign or campaign[0] in {"paused", "cancelled", "completed"}:
+                    raise Conflict("活动已暂停或结束，请先恢复活动")
+            return True
+
+    def _duplicate_start_response(self, task_id):
         task = self.task(task_id)
+        runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
+        task["execution_result"] = {
+            "joins": [],
+            "processed": [],
+            "already_started": True,
+            "queued": bool(runtime and runtime["value"] == "pooled"),
+        }
+        return task
+
+    def _start_stop_revision(self, task_id, db=None):
+        query = "SELECT COALESCE(MAX(id),0) n FROM audit WHERE task_id=? AND kind IN ('task.paused','task.cancelled')"
+        row = (
+            db.execute(query, (task_id,)).fetchone()
+            if db is not None
+            else self.store.one(query, (task_id,))
+        )
+        return row[0] if db is not None else row["n"]
+
+    def start_task(
+        self,
+        task_id,
+        *,
+        source="client",
+        actor="operator",
+        sending=True,
+        _transition=None,
+        _expected_stop_revision=None,
+    ):
+        """Persist an explicit start; no approval phrases or approval rows are required."""
+        stop_revision = (
+            self._start_stop_revision(task_id)
+            if _expected_stop_revision is None
+            else _expected_stop_revision
+        )
+        if self._already_active_start(task_id, sending=sending, source=source):
+            if _transition is not None:
+                _transition["changed"] = False
+            return self.task(task_id)
+        task = self.task(task_id)
+        initial_items = [
+            (item["id"], item["payload_hash"], digest(item["payload"])) for item in task["items"]
+        ]
+        initial_policy = task["policy_hash"]
+        initial_manifest = task["manifest_hash"]
         for item in task["items"]:
             payload = {
                 k: v
@@ -815,13 +1200,31 @@ class Engine:
                 if k not in {"position", "platform", "account_label"}
             }
             self.validate_item(task, ItemInput(**payload))
+        initial_state = task["state"]
         with self.store.connect(write=True) as db:
             task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if self._start_stop_revision(task_id, db) != stop_revision or (
+                task["state"] == "paused" and initial_state != "paused"
+            ):
+                raise Conflict("任务在开始请求期间已暂停或结束，请刷新后再操作")
             if source == "scheduler" and (task["state"] != "active" or task["phase"] != "starting"):
                 raise Conflict("任务已暂停或启动状态已变化")
             if task["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
             self._integrity(db, task, "discovery_join")
+            current_items = [
+                (row["id"], row["payload_hash"], digest(json.loads(row["payload"])))
+                for row in db.execute(
+                    "SELECT id,payload_hash,payload FROM items WHERE task_id=? ORDER BY position",
+                    (task_id,),
+                )
+            ]
+            if (
+                current_items != initial_items
+                or task["policy_hash"] != initial_policy
+                or (initial_manifest and task["manifest_hash"] != initial_manifest)
+            ):
+                raise Conflict("开始请求期间清单或配置已变化，请刷新后再开始")
             from .interaction_intents import reserve_task_intents
 
             reserve_task_intents(db, task, self.clock())
@@ -832,11 +1235,19 @@ class Engine:
                 if not campaign or campaign[0] in {"paused", "cancelled", "completed"}:
                     raise Conflict("活动已暂停或结束，请先恢复活动")
             if task["state"] == "active" and (
-                task["phase"] == "ready" or (task["phase"] == "starting" and not sending)
+                task["phase"] == "ready"
+                or (
+                    task["phase"] == "starting"
+                    and (not sending or _transition is not None and source != "scheduler")
+                )
             ):
+                if _transition is not None:
+                    _transition["changed"] = False
                 if task["phase"] == "ready":
                     self._integrity(db, task, "outbound")
             else:
+                if _transition is not None:
+                    _transition["changed"] = True
                 if self.clock() >= epoch(json.loads(task["policy"])["ends_at"]):
                     raise Conflict("任务执行窗口已过期，请创建新任务")
                 rows = db.execute(
@@ -1049,10 +1460,18 @@ class Engine:
         from .campaigns import Campaigns
         from .workers import WorkerRun
 
+        stop_revision = self._start_stop_revision(task_id)
+        if self._already_active_start(task_id, source=source, include_starting=True):
+            return self._duplicate_start_response(task_id)
         task = self.task(task_id)
         if task.get("campaign_id"):
             Campaigns(self).populate(task_id)
-        self.start_task(task_id, source=source)
+        transition = {}
+        self.start_task(
+            task_id, source=source, _transition=transition, _expected_stop_revision=stop_revision
+        )
+        if transition.get("changed") is False:
+            return self._duplicate_start_response(task_id)
         runtime = self.store.one("SELECT value FROM meta WHERE key='execution_runtime'")
         if runtime and runtime["value"] == "pooled":
             from .queue_store import JobQueue
@@ -1689,6 +2108,10 @@ class Engine:
                 return self._skip(item_id, "account_disabled", db)
             if account["status"] != "healthy":
                 return self._skip(item_id, "account_unhealthy", db)
+            from .account_blocks import active_block
+
+            if active_block(db, account["id"], now):
+                return self._skip(item_id, "account_outbound_blocked", db)
             if account["cooldown_until"] > now:
                 return self._skip(item_id, "account_cooldown", db)
             if account["next_at"] > now or (
@@ -2009,6 +2432,14 @@ class Engine:
                     row["id"], "account_disabled" if account["disabled"] else "account_cooldown"
                 )
                 continue
+            from .interaction_intents import intent_blocker
+
+            with self.store.connect() as db:
+                blocked = intent_blocker(db, account, task, json.loads(row["payload"]), row["id"])
+            if blocked:
+                self._skip(row["id"], blocked["reason"])
+                processed.append({"item_id": row["id"], "status": "blocked", **blocked})
+                continue
             from .target_checks import TargetChecks
 
             deferred = TargetChecks(
@@ -2142,6 +2573,7 @@ class Engine:
                 "platform_status",
             )
             + FIELDS
+            + BLOCK_FIELDS
             if k in result
         }
         safe["status"] = status
@@ -2214,7 +2646,7 @@ class Engine:
             self._mark_completed(db, claim["task_id"])
         return safe
 
-    def reconcile(self, item_id):
+    def reconcile(self, item_id, *, read_scan_rpc_limit=None):
         row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
         if not row:
             raise NotFound("执行项不存在")
@@ -2235,7 +2667,12 @@ class Engine:
             and account["cooldown_until"] > self.clock()
         ):
             raise Conflict("账号仍在冷却，请稍后核对")
+        if read_scan_rpc_limit is not None:
+            payload["read_scan_rpc_limit"] = read_scan_rpc_limit
         result = self.call(account, "verify", payload, row["task_id"])
+        from .telegram_reading import read_diagnostics
+
+        reads = read_diagnostics(result)
         self.apply_cooldown(account["id"], result)
         if not result.get("verified"):
             if account["platform"] == "tiktok":
@@ -2250,15 +2687,27 @@ class Engine:
                         (canonical({**json.loads(row["result"]), **progress}), item_id),
                     )
                 return {"status": row["status"], **progress}
-            return {"status": row["status"], "reason": "not_conclusively_verified"}
+            return {"status": row["status"], "reason": "not_conclusively_verified", **reads}
         # Reconciliation never turns an item back into a retryable state.
         with self.store.connect(write=True) as db:
             db.execute(
                 "UPDATE items SET status='unknown' WHERE id=? AND status='scheduled'", (item_id,)
             )
-        return self.finish(payload, result)
+        return {**self.finish(payload, result), **reads}
 
-    def collect_feedback(self, item_id):
+    def collect_feedback(self, item_id, *, read_scan_rpc_limit=None):
+        row = self.store.one("SELECT account_id FROM items WHERE id=?", (item_id,))
+        if not row:
+            raise Conflict("回复采集需要已核验的发布结果")
+        account = self.account(row["account_id"])
+        with self.lanes.acquire(
+            account["id"], resource=route_for(account, {}).resource
+        ) as lane_owner:
+            return self._collect_feedback_locked(
+                item_id, read_scan_rpc_limit=read_scan_rpc_limit, lane_owner=lane_owner
+            )
+
+    def _collect_feedback_locked(self, item_id, *, read_scan_rpc_limit=None, lane_owner=None):
         row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
         if not row or row["status"] != "confirmed":
             raise Conflict("回复采集需要已核验的发布结果")
@@ -2269,6 +2718,13 @@ class Engine:
             raise Conflict("账号仍在冷却，请稍后采集回复")
         check = self.store.one("SELECT * FROM feedback_checks WHERE item_id=?", (item_id,))
         statistics = Statistics(self.store, clock=self.clock)
+        binding = self.store.one(
+            "SELECT * FROM telegram_read_cursors WHERE account_id=? AND identity_key='feedback' AND scope_key=?",
+            (account["id"], item_id),
+        )
+        binding_value = json.loads(binding["cursor"]) if binding else None
+        if binding_value and binding_value["identity_hash"] != account.get("identity_hash"):
+            raise Conflict("TelegramFeedbackIdentityChanged")
         try:
             result = self.call(
                 account,
@@ -2277,7 +2733,13 @@ class Engine:
                     "item_id": item_id,
                     "payload": json.loads(row["payload"]),
                     "result": json.loads(row["result"]),
-                    "feedback_cursor": check["last_message_id"] if check else 0,
+                    "feedback_cursor": binding_value["cursor"] if binding_value else 0,
+                    **({"read_peer_id": binding_value["peer_id"]} if binding_value else {}),
+                    **(
+                        {"read_scan_rpc_limit": read_scan_rpc_limit}
+                        if read_scan_rpc_limit is not None
+                        else {}
+                    ),
                 },
                 row["task_id"],
             )
@@ -2293,23 +2755,32 @@ class Engine:
                     "item_id": item_id,
                     "status": "failed",
                     "reason": safe_code(result.get("reason"), "feedback_unverified"),
+                    "read_rpc_used": result.get("read_rpc_used"),
                 }
-            count = 0
-            for event in result.get("feedback_events", []):
-                count += statistics.record_feedback(
-                    item_id, event["event_id"], event["occurred_at"]
+            if "read_identity_verified" in result and (
+                result.get("read_identity_verified") is not True
+                or (
+                    account.get("identity_hash")
+                    and result.get("read_identity_hash") != account["identity_hash"]
                 )
-            statistics.mark_feedback(
+            ):
+                raise Conflict("TelegramFeedbackIdentityChanged")
+            count = statistics.save_feedback_page(
                 item_id,
-                result["feedback_checked_through"],
-                result["feedback_status"],
-                cursor=result["feedback_cursor"],
-                error_code=result.get("reason"),
+                result,
+                expected_cursor=check["last_message_id"] if check else 0,
+                expected_identity=account.get("identity_hash"),
+                expected_binding=binding,
+                lane_owner=lane_owner,
             )
             return {
                 "item_id": item_id,
                 "status": result["feedback_status"],
                 "new_replies": count,
+                "read_rpc_used": result.get("read_rpc_used"),
+                "read_complete": result.get(
+                    "read_complete", result["feedback_status"] == "complete"
+                ),
                 **({"reason": safe_code(result["reason"])} if result.get("reason") else {}),
             }
         except Exception as exc:
@@ -2321,41 +2792,183 @@ class Engine:
             )
             raise
 
-    def collect_statistics(self):
-        """Read existing Telegram publications and feedback once per reporting boundary."""
+    def collect_statistics(self, *, max_items=100):
+        """Resume fair read-only rounds; persist completion only after every page."""
+        if (
+            not isinstance(max_items, int)
+            or isinstance(max_items, bool)
+            or not 1 <= max_items <= 1000
+        ):
+            raise ValueError("InvalidStatisticsReadLimit")
         now = self.clock()
         local = datetime.fromtimestamp(now, ZONE)
         midnight = local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         slot = midnight + max(h for h in (0, 3, 6, 9, 12, 15, 18, 20, 21) if h <= local.hour) * 3600
+        owner = uuid.uuid4().hex
         with self.store.connect(write=True) as db:
-            previous = db.execute(
-                "SELECT value FROM meta WHERE key='statistics_collection_slot'"
+            if db.execute(
+                "SELECT 1 FROM telegram_statistics_rounds WHERE owner IS NOT NULL AND lease_until>?",
+                (now,),
+            ).fetchone():
+                return {"processed": [], "complete": False, "reason": "statistics_collection_busy"}
+            row = db.execute(
+                "SELECT * FROM telegram_statistics_rounds WHERE slot=?", (slot,)
             ).fetchone()
-            if previous and float(previous[0]) >= slot:
-                return {"processed": []}
+            if not row:
+                items = [
+                    r[0]
+                    for r in db.execute(
+                        "SELECT i.id FROM items i JOIN accounts a ON a.id=i.account_id JOIN tasks t ON t.id=i.task_id "
+                        "WHERE a.platform='telegram' AND a.mode='live' AND t.mode='live' "
+                        "AND i.status IN ('confirmed','scheduled','unknown') ORDER BY i.due_at,i.id"
+                    )
+                ]
+                db.execute(
+                    "INSERT INTO telegram_statistics_rounds(slot,items,updated_at) VALUES(?,?,?)",
+                    (slot, canonical(items), now),
+                )
+                db.executemany(
+                    "INSERT INTO telegram_statistics_progress(slot,item_id) VALUES(?,?)",
+                    [(slot, item) for item in items],
+                )
             db.execute(
-                "INSERT INTO meta VALUES('statistics_collection_slot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(slot),),
+                "UPDATE telegram_statistics_rounds SET owner=?,lease_until=?,updated_at=? WHERE slot=?",
+                (owner, now + 600, now, slot),
             )
-        processed = []
-        rows = self.store.rows(
-            "SELECT i.id,i.status,i.due_at FROM items i JOIN accounts a ON a.id=i.account_id "
-            "JOIN tasks t ON t.id=i.task_id WHERE a.platform='telegram' AND a.mode='live' AND t.mode='live' "
-            "AND i.status IN ('confirmed','scheduled','unknown') AND a.cooldown_until<=? ORDER BY i.due_at",
-            (now,),
-        )
-        for row in rows:
-            try:
-                if row["status"] in {"scheduled", "unknown"} and row["due_at"] <= now:
-                    self.reconcile(row["id"])
-                if (
-                    self.store.one("SELECT status FROM items WHERE id=?", (row["id"],))["status"]
-                    == "confirmed"
-                ):
-                    processed.append(self.collect_feedback(row["id"]))
-            except Exception:
-                processed.append({"item_id": row["id"], "status": "unavailable"})
-        return {"processed": processed}
+            # retry_at rotates failed/partial work behind untouched work, including
+            # newer rounds. A permanently unavailable target cannot starve others.
+            pending = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT p.slot,p.item_id,i.account_id,i.status,i.due_at FROM telegram_statistics_progress p "
+                    "JOIN items i ON i.id=p.item_id WHERE p.complete=0 AND p.retry_at<=? AND p.slot<=? "
+                    "ORDER BY p.retry_at,p.slot,i.due_at,p.item_id",
+                    (now, slot),
+                )
+            ]
+        processed, seen, calls, rpc_used = [], set(), {}, {}
+        try:
+            for entry in pending:
+                if len(processed) >= max_items:
+                    break
+                item_id, account_id = entry["item_id"], entry["account_id"]
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                account = self.account(account_id)
+                policy = self.telegram_read_policy(account_id)["policy"]
+                if calls.get(account_id, 0) >= policy["groups_per_scan"]:
+                    continue
+                used = rpc_used.get(account_id, 0)
+                if used is None or used >= policy["scan_rpc_limit"]:
+                    continue
+                if account["disabled"] or account["cooldown_until"] > self.clock():
+                    with self.store.connect(write=True) as db:
+                        db.execute(
+                            "UPDATE telegram_statistics_progress SET retry_at=? WHERE item_id=? AND complete=0",
+                            (max(account["cooldown_until"], self.clock() + 60), item_id),
+                        )
+                    continue
+                result, completed = None, False
+                try:
+                    if (
+                        entry["status"] in {"scheduled", "unknown"}
+                        and entry["due_at"] <= self.clock()
+                    ):
+                        verification = self.reconcile(
+                            item_id, read_scan_rpc_limit=policy["scan_rpc_limit"] - used
+                        )
+                        amount = verification.get("read_rpc_used")
+                        if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
+                            result = {
+                                "item_id": item_id,
+                                "status": "pending_verification",
+                                "read_rpc_used": None,
+                            }
+                        else:
+                            used += amount
+                            rpc_used[account_id] = used
+                    current = self.store.one("SELECT status FROM items WHERE id=?", (item_id,))
+                    if (
+                        result is None
+                        and used < policy["scan_rpc_limit"]
+                        and current
+                        and current["status"] == "confirmed"
+                    ):
+                        result = self.collect_feedback(
+                            item_id, read_scan_rpc_limit=policy["scan_rpc_limit"] - used
+                        )
+                        completed = (
+                            result["status"] == "complete"
+                            and result.get("read_complete") is not False
+                        )
+                    elif result is None:
+                        result = {
+                            "item_id": item_id,
+                            "status": "pending_verification",
+                            "read_rpc_used": 0,
+                        }
+                except Exception as exc:
+                    result = {
+                        "item_id": item_id,
+                        "status": "unavailable",
+                        "reason": safe_code(getattr(exc, "safe_code", type(exc).__name__)),
+                    }
+                calls[account_id] = calls.get(account_id, 0) + 1
+                amount = result.get("read_rpc_used")
+                rpc_used[account_id] = (
+                    used + amount
+                    if isinstance(amount, int) and not isinstance(amount, bool) and amount >= 0
+                    else None
+                )
+                processed.append(result)
+                with self.store.connect(write=True) as db:
+                    lease = db.execute(
+                        "SELECT owner FROM telegram_statistics_rounds WHERE slot=?", (slot,)
+                    ).fetchone()
+                    if not lease or lease[0] != owner:
+                        break
+                    db.execute(
+                        "UPDATE telegram_statistics_progress SET complete=?,retry_at=? WHERE item_id=? AND slot<=? AND complete=0",
+                        (
+                            int(completed),
+                            self.clock() + (1 if result.get("status") == "partial" else 60),
+                            item_id,
+                            slot,
+                        ),
+                    )
+                    db.execute(
+                        "UPDATE telegram_statistics_rounds SET lease_until=?,next_position=next_position+1 WHERE slot=? AND owner=?",
+                        (self.clock() + 600, slot, owner),
+                    )
+            with self.store.connect(write=True) as db:
+                db.execute(
+                    "UPDATE telegram_statistics_rounds SET complete=1 WHERE slot<=? AND NOT EXISTS "
+                    "(SELECT 1 FROM telegram_statistics_progress p WHERE p.slot=telegram_statistics_rounds.slot AND p.complete=0)",
+                    (slot,),
+                )
+                done = bool(
+                    db.execute(
+                        "SELECT complete FROM telegram_statistics_rounds WHERE slot=?", (slot,)
+                    ).fetchone()[0]
+                )
+                if done:
+                    db.execute(
+                        "INSERT INTO meta VALUES('statistics_collection_slot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(slot),),
+                    )
+            return {
+                "processed": processed,
+                "complete": done,
+                "slot": slot,
+                "read_rpc_used_by_account": rpc_used,
+            }
+        finally:
+            with self.store.connect(write=True) as db:
+                db.execute(
+                    "UPDATE telegram_statistics_rounds SET owner=NULL,lease_until=0 WHERE slot=? AND owner=?",
+                    (slot, owner),
+                )
 
     def manual_outcome(self, item_id, value):
         row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
@@ -2407,7 +3020,7 @@ class Engine:
             self._mark_completed(db, row["task_id"])
         return result
 
-    def candidate(self, task_id, value: CandidateInput):
+    def candidate(self, task_id, value: CandidateInput, *, _db=None):
         task = self.task(task_id)
         if value.account_id not in task["account_ids"]:
             raise Conflict("候选账号超出任务范围")
@@ -2439,7 +3052,9 @@ class Engine:
         if p["target_allowlist"] and value.target not in p["target_allowlist"]:
             reasons.append("target_boundary")
         decision = "rejected" if reasons else "qualified"
-        with self.store.connect(write=True) as db:
+        with (
+            contextlib.nullcontext(_db) if _db is not None else self.store.connect(write=True)
+        ) as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             self._integrity(db, row, "discovery_join")
             if row["state"] in {"paused", "cancelled", "completed"}:
@@ -2511,21 +3126,118 @@ class Engine:
         task = self.task(task_id)
         if account_id not in task["account_ids"]:
             raise Conflict("账号不在任务内")
-        with self.store.connect() as db:
-            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-            self._integrity(db, row, "discovery_join")
-            if row["state"] in {"paused", "cancelled", "completed"}:
-                raise Conflict("任务已暂停或结束")
         account = self.account(account_id)
         if "discover" not in CAPABILITIES[account["platform"]]:
             raise Conflict("该平台请通过候选录入接入")
-        result = self.call(account, "discover", {"policy": task["policy"]}, task_id)
-        decisions = []
-        for candidate in result.get("candidates", [])[: task["policy"]["max_candidates"]]:
-            decisions.append(
-                self.candidate(task_id, CandidateInput(**{**candidate, "account_id": account_id}))
+        from .health_checks import probe_revision
+        from .telegram_reading import read_diagnostics
+
+        with self.lanes.acquire(account_id, resource=route_for(account, {}).resource) as lane_owner:
+            account, task = self.account(account_id), self.task(task_id)
+            with self.store.connect() as db:
+                row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+                self._integrity(db, row, "discovery_join")
+                if row["state"] in {"paused", "cancelled", "completed"}:
+                    raise Conflict("任务已暂停或结束")
+            revision = probe_revision(account, self.store.path)
+            identity_key = digest([account_id, account.get("identity_hash"), revision])
+            scope = digest(["telegram_discovery_v1", task_id, task["policy"]])
+            previous = (
+                self.store.one(
+                    "SELECT * FROM telegram_read_cursors WHERE account_id=? AND identity_key=? AND scope_key=?",
+                    (account_id, identity_key, scope),
+                )
+                if account["platform"] == "telegram"
+                else None
             )
-        return {"decisions": decisions, "source_note": result.get("source_note", "")}
+            if previous is None and account["platform"] == "telegram":
+                old = self.store.one(
+                    "SELECT cursor FROM telegram_read_cursors WHERE account_id=? AND scope_key=? ORDER BY updated_at DESC LIMIT 1",
+                    (account_id, scope),
+                )
+                if old and not json.loads(old["cursor"]).get("complete", False):
+                    return {
+                        "decisions": [],
+                        "read_complete": False,
+                        "read_page_complete": False,
+                        "read_state": "scope_changed",
+                        "reason": "TelegramDiscoveryScopeChanged",
+                        "source_note": "连接或身份已变化；旧扫描保留。请创建新任务重新扫描群目录。",
+                    }
+            if len(task["candidates"]) >= task["policy"]["max_candidates"]:
+                return {
+                    "decisions": [],
+                    "read_complete": False,
+                    "read_state": "candidate_limit",
+                    "source_note": "已达到任务候选上限；后续目录尚未扫描。",
+                }
+            payload = {"policy": task["policy"]}
+            if previous:
+                payload["read_cursor"] = json.loads(previous["cursor"])
+            result = self.call(account, "discover", payload, task_id)
+            values = [
+                CandidateInput(**{**value, "account_id": account_id})
+                for value in result.get("candidates", [])
+            ]
+            if len(values) > task["policy"]["max_candidates"]:
+                raise Conflict("DiscoveryPageTooLarge")
+            live_telegram = account["mode"] == "live" and account["platform"] == "telegram"
+            if live_telegram and "read_identity_verified" in result:
+                if result.get("read_identity_verified") is not True or (
+                    account.get("identity_hash")
+                    and result.get("read_identity_hash") != account["identity_hash"]
+                ):
+                    raise Conflict("TelegramReadIdentityChanged")
+                if result.get("read_page_complete") is not True:
+                    return {
+                        "decisions": [],
+                        "source_note": result.get("source_note", ""),
+                        **read_diagnostics(result),
+                    }
+                if not isinstance(result.get("read_cursor_next"), dict):
+                    raise Conflict("TelegramReadCursorUnavailable")
+            with self.store.connect(write=True) as db:
+                lane = db.execute(
+                    "SELECT owner,expires_at FROM account_lanes WHERE account_id=?", (account_id,)
+                ).fetchone()
+                if not lane or lane["owner"] != lane_owner or lane["expires_at"] <= time.time():
+                    raise Conflict("TelegramReadLaneLost")
+                current = dict(
+                    db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+                )
+                current_task = db.execute(
+                    "SELECT policy FROM tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                if (
+                    current["identity_hash"] != account.get("identity_hash")
+                    or probe_revision(current, self.store.path) != revision
+                    or json.loads(current_task[0]) != task["policy"]
+                ):
+                    raise Conflict("TelegramReadScopeChanged")
+                if account["platform"] == "telegram":
+                    old = db.execute(
+                        "SELECT revision FROM telegram_read_cursors WHERE account_id=? AND identity_key=? AND scope_key=?",
+                        (account_id, identity_key, scope),
+                    ).fetchone()
+                    if (old[0] if old else None) != (previous["revision"] if previous else None):
+                        raise Conflict("TelegramReadCursorChanged")
+                decisions = [self.candidate(task_id, value, _db=db) for value in values]
+                if result.get("read_cursor_next") is not None and account["platform"] == "telegram":
+                    db.execute(
+                        "INSERT INTO telegram_read_cursors VALUES(?,?,?,?,1,?) ON CONFLICT(account_id,identity_key,scope_key) DO UPDATE SET cursor=excluded.cursor,revision=telegram_read_cursors.revision+1,updated_at=excluded.updated_at",
+                        (
+                            account_id,
+                            identity_key,
+                            scope,
+                            canonical(result["read_cursor_next"]),
+                            self.clock(),
+                        ),
+                    )
+            return {
+                "decisions": decisions,
+                "source_note": result.get("source_note", ""),
+                **read_diagnostics(result),
+            }
 
     def run_joins(self, task_id):
         task = self.task(task_id)

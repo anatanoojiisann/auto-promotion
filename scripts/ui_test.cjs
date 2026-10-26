@@ -90,6 +90,7 @@ async function cleanup() {
 
 (async () => {
   const base = await startServer();
+  assert.equal(new URL(base).hostname, "127.0.0.1");
   browser = await chromium.launch({
     channel: process.env.AP_UI_BROWSER_CHANNEL || undefined,
     headless: true,
@@ -98,6 +99,21 @@ async function cleanup() {
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1050 },
   });
+  const runSimulationTick = (id) =>
+    page.evaluate(async (taskId) => {
+      const health = await fetch("/health").then((r) => r.json());
+      const task = await fetch(`/api/tasks/${taskId}`).then((r) => r.json());
+      if (health.live_writes !== false || task.mode !== "simulation")
+        throw Error(
+          "Fixture scheduler requires simulation with live writes disabled",
+        );
+      const response = await fetch(`/api/tasks/${taskId}/run`, {
+        method: "POST",
+        headers: { "X-AP-Client": "local-ui" },
+      });
+      if (!response.ok) throw Error("Simulation scheduler tick failed");
+      return response.json();
+    }, id);
   const errors = [];
   const expectedConsole = [];
   page.on("pageerror", (e) => errors.push(e.message));
@@ -451,12 +467,21 @@ async function cleanup() {
   );
   const global = page.locator("#global-stop");
   if ((await global.innerText()).includes("恢复")) await global.click();
-  await Promise.all([
+  const [repeatedStart] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().endsWith("/start") && r.request().method() === "POST",
     ),
     page.getByRole("button", { name: "开始发送", exact: true }).click(),
   ]);
+  const repeated = await repeatedStart.json();
+  assert.equal(repeated.mode, "simulation");
+  assert.equal(repeated.execution_result.already_started, true);
+  assert.deepEqual(repeated.execution_result.processed, []);
+  // This isolated --no-worker service has no scheduler. Simulate its next
+  // tick explicitly; repeated Start is now a read-only idempotent operation.
+  const tick = await runSimulationTick(monitoredTaskId);
+  assert.equal(tick.processed.length, 1);
+  await page.locator("#refresh-task").click();
   await page
     .locator(".item-preview .badge")
     .filter({ hasText: "已发布 · 已核验" })
@@ -564,12 +589,18 @@ async function cleanup() {
   const discordStop = page.locator("#global-stop");
   if ((await discordStop.innerText()).includes("恢复"))
     await discordStop.click();
-  await Promise.all([
+  const [repeatedDiscordStart] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().endsWith("/start") && r.request().method() === "POST",
     ),
     page.getByRole("button", { name: "开始发送", exact: true }).click(),
   ]);
+  const repeatedDiscord = await repeatedDiscordStart.json();
+  assert.equal(repeatedDiscord.mode, "simulation");
+  assert.equal(repeatedDiscord.execution_result.already_started, true);
+  assert.deepEqual(repeatedDiscord.execution_result.processed, []);
+  assert.equal((await runSimulationTick(discordTask.id)).processed.length, 1);
+  await page.locator("#refresh-task").click();
   await page
     .locator(".item-preview .badge")
     .filter({ hasText: "已发布 · 已核验" })

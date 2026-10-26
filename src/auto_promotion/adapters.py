@@ -192,6 +192,11 @@ class AdapterRegistry:
                 if isinstance(code, str) and code.isidentifier() and len(code) < 80
                 else "BackendError"
             )
+            from .telegram_reading import read_diagnostics
+
+            error.read_diagnostics = read_diagnostics(result)
+            error.rpc_counts = result.get("rpc_counts")
+            error.rpc_count_source = result.get("rpc_count_source")
             raise error
         return result
 

@@ -35,7 +35,7 @@ function bindTaskTools(task) {
 }
 
 function saveTemplateForm(task) {
-  openPanel(
+  const generation = openPanel(
     "保存任务模板",
     `<form id="save-template-form"><label for="template-name">模板名称</label><input id="template-name" name="name" value="${esc(task.name)}" maxlength="160" required><label for="template-description">用途说明</label><textarea id="template-description" name="description" maxlength="2000" rows="3" placeholder="例如：AI 视频创作者的公开讨论互动"></textarea><p class="help">保存发现主题、筛选规则、间隔、顺序和限额。下次重新选择账号、日期和目标，创建新的草稿任务。</p><p class="help">原任务的启动状态、具体内容、已尝试结果和目标白名单不进入模板。</p><div class="form-actions"><button type="submit">保存模板</button></div></form>`,
   );
@@ -48,7 +48,8 @@ function saveTemplateForm(task) {
         name: values.get("name"),
         description: values.get("description"),
       });
-      $("#panel").close();
+      if (generation !== panelGeneration || !$("#panel").open) return;
+      closePanel();
       toast("模板已保存，下次可从任务模板创建草稿");
     });
   };

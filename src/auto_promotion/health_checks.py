@@ -21,6 +21,8 @@ TRANSIENT = {
     "BackendError",
     "connection_unavailable",
     "LocalDatabaseUnavailable",
+    "TelegramReadBudgetExceeded",
+    "TelegramReadBudgetUnavailable",
 }
 AUTH = {
     "TelegramLoginRequired",

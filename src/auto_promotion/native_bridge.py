@@ -10,10 +10,14 @@ import sqlite3
 import sys
 import time
 
+from .account_blocks import FIELDS as BLOCK_FIELDS
 from .backends.common import BackendError, Receipts, account_lock, verify_claim
 from .execution_diagnostics import FIELDS, exception_details
 from .models import PLATFORMS, canonical
+from .runtime_identity import result_runtime
 from .store import Store
+
+RUNTIME = result_runtime("native_bridge")
 
 OPERATIONS = {
     "health",
@@ -70,8 +74,10 @@ RESULT_FIELDS = {
     "next_cursor",
     "has_more",
     "mutation_accepted",
+    "message_chat_id",
 }
 RESULT_FIELDS.update(FIELDS)
+RESULT_FIELDS.update(BLOCK_FIELDS)
 RESULT_FIELDS.add("progress_mirror_deferred")
 RESULT_FIELDS.update(
     {
@@ -118,13 +124,69 @@ def dispatch(request):
             else:
                 payload["receipt"] = receipt.read(key) or payload.get("result", {})
 
+        pending_guard = {}
+
         def checkpoint(result):
+            nonlocal pending_guard
+            guard_evidence = any(
+                field in result
+                for field in ("account_block_reason", "account_restriction", "browser_page_anomaly")
+            )
+            event = None
+            if guard_evidence:
+                from .account_blocks import clear_private_stop, observe, save_private_stop
+
+                pending_guard = result
+                journal_saved = central_saved = False
+                try:
+                    event = save_private_stop(platform, label, result)
+                    journal_saved = True
+                except (OSError, sqlite3.Error):
+                    result["progress_mirror_deferred"] = True
+                if receipt:
+                    try:
+                        receipt.save(key, {**(receipt.read(key) or {}), **result})
+                    except (OSError, sqlite3.Error):
+                        result["progress_mirror_deferred"] = True
+                if request.get("database") and request.get("account_id"):
+                    try:
+                        with Store(request["database"], initialize=False).connect(write=True) as db:
+                            observe(
+                                db,
+                                request["account_id"],
+                                result,
+                                now=time.time(),
+                                operation=operation,
+                                payload=payload,
+                                task_id=payload.get("task_id"),
+                            )
+                        central_saved = True
+                    except (OSError, sqlite3.Error):
+                        result["progress_mirror_deferred"] = True
+                if not journal_saved and not central_saved:
+                    # No code can promise restart durability while every guard
+                    # store is unwritable. Keep an explicit stop for the caller.
+                    result["guard_persistence_failed"] = True
+                    result["account_block_reason"] = "account_guard_unavailable"
+                if receipt:
+                    try:
+                        receipt.save(key, {**(receipt.read(key) or {}), **result})
+                    except (OSError, sqlite3.Error):
+                        result["progress_mirror_deferred"] = True
+                if central_saved and event:
+                    try:
+                        clear_private_stop(platform, label, event)
+                    except OSError:
+                        result["progress_mirror_deferred"] = True
+                return
             if receipt:
                 receipt.save(key, {**(receipt.read(key) or {}), **result})
             # Keep progress visible even if the provider is terminated before returning.
             if write and operation == "execute" and request.get("database"):
                 details = {
-                    k: result[k] for k in FIELDS + ("external_reference", "reason") if k in result
+                    k: result[k]
+                    for k in FIELDS + BLOCK_FIELDS + ("external_reference", "reason")
+                    if k in result
                 }
                 mirror = Store(request["database"], initialize=False)
                 mirror.lock_timeout = 0.2
@@ -173,7 +235,30 @@ def dispatch(request):
             if platform == "telegram":
                 from .backends.telegram import call
 
-                result = call(label, operation, payload, checkpoint, authorize)
+                backend_payload = dict(payload)
+                if request.get("database") and request.get("account_id"):
+                    from .health_checks import probe_revision
+                    from .telegram_reading import read_policy_context
+
+                    context = {
+                        "database": request["database"],
+                        "account_id": request["account_id"],
+                        "backend_label": label,
+                    }
+                    policy = read_policy_context(context)
+                    with Store(request["database"], initialize=False).connect() as db:
+                        account = dict(
+                            db.execute(
+                                "SELECT * FROM accounts WHERE id=?", (request["account_id"],)
+                            ).fetchone()
+                        )
+                    context["identity_hash"] = account["identity_hash"]
+                    backend_payload.update(
+                        read_policy=policy["policy"],
+                        read_policy_context=context,
+                        read_connection_revision=probe_revision(account, request["database"]),
+                    )
+                result = call(label, operation, backend_payload, checkpoint, authorize)
             elif platform == "instagram":
                 from .backends.instagram import call
 
@@ -205,13 +290,27 @@ def dispatch(request):
             if write:
                 result = {
                     **(receipt.read(key) or {}),
-                    "status": "unknown",
+                    **pending_guard,
+                    "status": pending_guard.get("status", "unknown"),
                     "verified": False,
-                    "reason": code,
+                    "reason": pending_guard.get("reason", code),
                     **exception_details(exc),
                 }
             else:
-                raise BackendError(code) from None
+                error = BackendError(code)
+                details = exception_details(exc)
+                error.rpc_counts = details.get("rpc_counts")
+                error.rpc_count_source = details.get("rpc_count_source")
+                error.read_diagnostics = {key: details[key] for key in FIELDS if key in details}
+                raise error from None
+        result = {**RUNTIME, **result}
+        if write:
+            progress_fields = {
+                field: value
+                for field, value in (receipt.read(key) or {}).items()
+                if field in FIELDS
+            }
+            result = {**progress_fields, **result}
         result = {key: value for key, value in result.items() if key in RESULT_FIELDS}
         if operation == "verify" and result.get("verified") is True:
             checkpoint(result)
@@ -228,6 +327,7 @@ def dispatch(request):
                     platform == "tiktok" and result.get("verified") is True
                 ):
                     result["status"] = "unknown"
+                    result.pop("confirmed_not_submitted", None)
             checkpoint(result)
             if operation == "execute" and receipt_binding:
                 from .models import digest
@@ -266,7 +366,8 @@ def main():
         result = {
             "bridge_error": code
             if isinstance(code, str) and code.isidentifier()
-            else "BackendError"
+            else "BackendError",
+            **exception_details(exc),
         }
     print(json.dumps(result, ensure_ascii=True))
 

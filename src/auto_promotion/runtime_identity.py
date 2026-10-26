@@ -8,6 +8,12 @@ import time
 from pathlib import Path
 
 FINGERPRINT_FILES = (
+    "account_blocks.py",
+    "read_cooldowns.py",
+    "interaction_intents.py",
+    "queue_store.py",
+    "task_channels.py",
+    "cloud_control.py",
     "store.py",
     "api.py",
     "pool_runtime.py",
@@ -17,7 +23,20 @@ FINGERPRINT_FILES = (
     "health_checks.py",
     "backends/common.py",
     "backends/telegram.py",
+    "backends/telegram_reads.py",
+    "models.py",
+    "telegram_reading.py",
+    "adapters.py",
+    "execution_diagnostics.py",
+    "target_checks.py",
+    "campaigns.py",
+    "growth.py",
+    "statistics.py",
     "backends/browser.py",
+    "backends/tabbit.py",
+    "backends/browser_use.py",
+    "interactions.py",
+    "readiness.py",
 )
 
 
@@ -48,4 +67,13 @@ def capture_runtime(component):
         "python": sys.version.split()[0],
         "git_commit_at_start": commit,
         "source_fingerprint": digest.hexdigest(),
+    }
+
+
+def result_runtime(component):
+    observed = capture_runtime(component)
+    return {
+        "runtime_git_commit_at_start": observed["git_commit_at_start"],
+        "runtime_source_fingerprint": observed["source_fingerprint"],
+        "runtime_started_at": observed["started_at"],
     }

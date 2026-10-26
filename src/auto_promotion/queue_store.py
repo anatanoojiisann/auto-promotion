@@ -324,7 +324,57 @@ class JobQueue:
         ).fetchone()
         return {"status": candidate["state"], "attempted": bool(attempted)} if candidate else None
 
+    def _intent_block(self, db, job):
+        if job["kind"] != "send":
+            return None
+        from .interaction_intents import intent_blocker
+
+        item = db.execute(
+            "SELECT payload,status,attempt_id FROM items WHERE id=?", (job["reference_id"],)
+        ).fetchone()
+        if not item or item["status"] != "not_attempted" or item["attempt_id"]:
+            return None
+        account = db.execute("SELECT * FROM accounts WHERE id=?", (job["account_id"],)).fetchone()
+        task = db.execute("SELECT * FROM tasks WHERE id=?", (job["task_id"],)).fetchone()
+        return intent_blocker(db, account, task, json.loads(item["payload"]), job["reference_id"])
+
+    def _wait_for_intent(self, db, job, blocked, now):
+        previous = json.loads(job["result"])
+        result = {
+            "wait_reason": blocked["reason"],
+            **{k: v for k, v in blocked.items() if k != "reason"},
+        }
+        if any(previous.get(k) != v for k, v in result.items()):
+            self.engine._skip(job["reference_id"], blocked["reason"], db)
+        db.execute(
+            "UPDATE execution_jobs SET state='pending',available_at=?,owner=NULL,lease_until=0,updated_at=?,result=? WHERE id=?",
+            (max(now + 60, job["available_at"]), now, canonical(result), job["id"]),
+        )
+
+    def _refresh_intent_waits(self, db, pool, now):
+        # Only dependency changes wake these waits early. No browser/health work,
+        # no reservation release, and no attempted/unknown item is requeued.
+        for job in db.execute(
+            "SELECT j.* FROM execution_jobs j JOIN tasks t ON t.id=j.task_id JOIN items i ON i.id=j.reference_id "
+            "WHERE j.pool=? AND j.kind='send' AND j.state='pending' AND t.state='active' "
+            "AND i.status='not_attempted' AND i.attempt_id IS NULL AND j.expires_at>? "
+            "AND json_extract(j.result,'$.wait_reason') IN ('interaction_already_claimed','interaction_history_unresolved_or_published')",
+            (pool, now),
+        ).fetchall():
+            if self._intent_block(db, job) is None:
+                due = db.execute(
+                    "SELECT due_at FROM items WHERE id=?", (job["reference_id"],)
+                ).fetchone()
+                db.execute(
+                    "UPDATE execution_jobs SET available_at=?,result='{}',updated_at=? WHERE id=? AND state='pending'",
+                    (max(now, due[0]), now, job["id"]),
+                )
+
     def claim(self, pool, owner, lease_seconds=90):
+        from .account_blocks import recover_private_stop
+
+        for account in self.store.rows("SELECT * FROM accounts WHERE mode='live'"):
+            recover_private_stop(self.store, account, now=self.clock())
         self.recover()
         now = self.clock()
         limits = self.engine.execution_settings()
@@ -345,12 +395,14 @@ class JobQueue:
                 "ON j.kind='send' AND i.id=j.reference_id WHERE j.pool=? "
                 "AND j.state='pending' AND j.available_at<=? AND t.state='active' "
                 "AND a.disabled=0 AND a.cooldown_until<=? AND a.next_at<=? "
+                "AND NOT EXISTS(SELECT 1 FROM account_blocks b WHERE b.account_id=a.id "
+                "AND b.state='active' AND (b.until_at IS NULL OR b.until_at>?)) "
                 "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' "
                 "AND busy.lease_until>? AND busy.account_id=j.account_id) "
                 "AND NOT EXISTS(SELECT 1 FROM account_lanes lane "
                 "WHERE lane.account_id=j.account_id AND lane.expires_at>?)"
             )
-            params = [pool, now, now, now, now, now]
+            params = [pool, now, now, now, now, now, now]
             from .execution_channels import local_account_scope
 
             accounts = local_account_scope(db, now)
@@ -373,6 +425,7 @@ class JobQueue:
                 " ORDER BY CASE WHEN j.kind='send' THEN 0 ELSE 1 END,a.next_at,"
                 "j.available_at,COALESCE(i.position,0),j.id LIMIT 64"
             )
+            self._refresh_intent_waits(db, pool, now)
             rows = db.execute(sql, params).fetchall()
             for row in rows:
                 from .task_channels import handoff_blocks
@@ -392,6 +445,10 @@ class JobQueue:
                     "SELECT phase,policy FROM tasks WHERE id=?", (row["task_id"],)
                 ).fetchone()
                 if (row["kind"] == "send" and task["phase"] != "ready") or now >= row["expires_at"]:
+                    continue
+                blocked = self._intent_block(db, row)
+                if blocked:
+                    self._wait_for_intent(db, row, blocked, now)
                     continue
                 route = json.loads(row["route"])
                 account = db.execute(
@@ -471,8 +528,16 @@ class JobQueue:
     def settle(self, job, error=None):
         now = self.clock()
         with self.store.connect(write=True) as db:
+            current = db.execute("SELECT * FROM execution_jobs WHERE id=?", (job["id"],)).fetchone()
+            if not current or current["owner"] != job["owner"] or current["state"] != "leased":
+                return current["state"] if current else "cancelled"
             source = self._source(db, job)
             state = source["status"] if source else "cancelled"
+            if state == "not_attempted" and not source["attempted"]:
+                blocked = self._intent_block(db, current)
+                if blocked:
+                    self._wait_for_intent(db, current, blocked, now)
+                    return "pending"
             if state == "executing" or (state == "not_attempted" and source["attempted"]):
                 state = "unknown"
             delay = now + (30 if error else 5)
@@ -522,7 +587,13 @@ class JobQueue:
         )
         cloud = self.store.one("SELECT value FROM meta WHERE key='cloud_control_health'")
         from .execution_channels import enabled, read_state
+        from .task_channels import task_local_scope_valid
 
+        cloud_value = json.loads(cloud["value"]) if cloud else {"state": "not_configured"}
+        if task_id:
+            from .cloud_control import task_scope_health
+
+            cloud_value["task_scope"] = task_scope_health(self.engine, task_id)
         return {
             "jobs": rows,
             "account_channels": self.store.rows(
@@ -531,10 +602,13 @@ class JobQueue:
             "cloud_receipts_pending": self.store.one("SELECT COUNT(*) n FROM cloud_receipt_outbox")[
                 "n"
             ],
-            "cloud": json.loads(cloud["value"]) if cloud else {"state": "not_configured"},
+            "cloud": cloud_value,
             "channel": {
                 "policy": "cloud_then_local" if enabled(self.store) else "cloud_only",
                 **read_state(self.store),
+                "valid_for_task": task_local_scope_valid(self.engine, task_id)
+                if task_id
+                else False,
             },
             "cloud_settings_pending": bool(
                 self.store.one("SELECT value FROM meta WHERE key='cloud_pending_settings'")

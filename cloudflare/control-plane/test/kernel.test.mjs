@@ -129,6 +129,134 @@ test("unchanged snapshots do not rewrite account or task rows", () => {
   assert.equal(f.db.prepare("SELECT total_changes() n").get().n, before);
 });
 
+test("frozen conflict exposes field names and batch index while preserving unknown attempts", () => {
+  const f = fixture(), s = f.seed();
+  f.db.prepare("UPDATE jobs SET state='unknown',attempt_id='previous-attempt' WHERE id=?").run(s.j.id);
+  s.j.version = "SENSITIVE_FROZEN_VALUE";
+  s.j.pool = "x.playwright";
+  let conflict;
+  try { f.k.sync(s.snapshot); } catch (error) { conflict = error; }
+  assert.equal(conflict.message, "FrozenJobChanged");
+  assert.deepEqual(conflict.diagnostics, { conflict_index: 0, changed_fields: ["version", "pool"] });
+  assert.equal(JSON.stringify(conflict.diagnostics).includes("SENSITIVE_FROZEN_VALUE"), false);
+  assert.equal(f.k.one("SELECT state,attempt_id FROM jobs WHERE id=?", s.j.id).state, "unknown");
+  assert.equal(f.k.one("SELECT state,attempt_id FROM jobs WHERE id=?", s.j.id).attempt_id, "previous-attempt");
+});
+
+test("account manual block fences claim, restart and leased final authorization", () => {
+  const f = fixture();
+  const s = f.seed();
+  const node = f.node();
+  const lease = f.k.claim(node, "x.edge", s.j.id);
+  s.a.outbound_block_state = {
+    state: "active", reason: "x_challenge", since: 1800000000,
+    until: null, generation: 1,
+  };
+  f.k.sync(s.snapshot);
+  assert.throws(() => f.k.authorize(node, s.j.id, lease.lease_token, "attempt"), /AccountOutboundBlocked/);
+  f.k.complete(node, s.j.id, lease.lease_token, { state: "pending" });
+  const restarted = new ControlKernel(f.storage, { clock: () => 1800000001 });
+  assert.equal(restarted.claim(node, "x.edge", s.j.id), null);
+});
+
+test("receipt journal guard failure remains a durable manual account block", () => {
+  const f = fixture();
+  const s = f.seed();
+  const node = f.node();
+  const lease = f.k.claim(node, "x.edge", s.j.id);
+  f.k.complete(node, s.j.id, lease.lease_token, { state: "unknown", result: {
+    account_block_reason: "account_guard_unavailable", account_block_since: 1800000000,
+    account_block_generation: 1,
+  } });
+  assert.equal(f.k.accountOutboundBlocked("x:one"), true);
+});
+
+test("snapshot omission and stale clear cannot remove an account block", () => {
+  const f = fixture();
+  const s = f.seed();
+  const node = f.node();
+  s.a.outbound_block_state = { state: "active", reason: "x_challenge", since: 1800000000, until: null, generation: 2 };
+  f.k.sync(s.snapshot);
+  delete s.a.outbound_block_state;
+  f.k.sync(s.snapshot);
+  assert.equal(f.k.claim(node, "x.edge", s.j.id), null);
+  s.a.outbound_block_state = { state: "cleared", reason: "x_challenge", since: 1800000000, until: null, generation: 2, health_ok: true, health_checked_at: 1800000000 };
+  f.k.sync(s.snapshot);
+  assert.equal(f.k.claim(node, "x.edge", s.j.id), null);
+  s.a.outbound_block_state.generation = 3;
+  f.k.sync(s.snapshot);
+  assert.ok(f.k.claim(node, "x.edge", s.j.id));
+});
+
+test("receipt block is independent of send outcome and old receipts cannot undo recovery", () => {
+  const f = fixture();
+  const s = f.seed();
+  const node = f.node();
+  const lease = f.k.claim(node, "x.edge", s.j.id);
+  f.k.authorize(node, s.j.id, lease.lease_token, "attempt");
+  f.k.complete(node, s.j.id, lease.lease_token, { state: "unknown", attempt_id: "attempt", result: {
+    account_block_reason: "x_challenge", account_block_since: 1800000000,
+    account_block_generation: 1,
+  } });
+  assert.equal(f.k.one("SELECT state FROM jobs WHERE id=?", s.j.id).state, "unknown");
+  assert.equal(JSON.parse(f.k.one("SELECT payload FROM accounts WHERE id='a'").payload).outbound_block_state?.reason, "x_challenge");
+  s.a.outbound_block_state = { state: "cleared", reason: "x_challenge", since: 1800000000, until: null, generation: 2, health_ok: true, health_checked_at: 1800000001 };
+  f.k.sync(s.snapshot);
+  f.k.complete(node, s.j.id, lease.lease_token, { state: "unknown", attempt_id: "attempt", result: { account_block_reason: "x_challenge", account_block_since: 1800000000, account_block_generation: 1 } });
+  const account = JSON.parse(f.k.one("SELECT payload FROM accounts WHERE id='a'").payload);
+  assert.equal(account.outbound_block_state.state, "cleared");
+  assert.equal(account.outbound_block_state.generation, 2);
+  assert.equal(f.k.one("SELECT state FROM jobs WHERE id=?", s.j.id).state, "unknown");
+});
+
+test("bounded page anomaly expires without labeling a challenge", () => {
+  const f = fixture();
+  const s = f.seed();
+  const node = f.node();
+  s.a.outbound_block_state = { state: "active", reason: "browser_page_anomaly", since: 1800000000, until: 1800000060, generation: 1 };
+  f.k.sync(s.snapshot);
+  assert.equal(f.k.claim(node, "x.edge", s.j.id), null);
+  f.advance(61);
+  assert.ok(f.k.claim(node, "x.edge", s.j.id));
+});
+
+test("two distinct Telegram speaking rejections pause account without permanent disable", () => {
+  const f = fixture();
+  const node = f.node();
+  function reject(id, discussion) {
+    const s = f.seed({ id, pool: "telegram.mtproto", identity: "telegram:one" });
+    const lease = f.k.claim(node, "telegram.mtproto", s.j.id);
+    assert.ok(lease);
+    f.k.authorize(node, s.j.id, lease.lease_token, "attempt-" + id);
+    f.k.complete(node, s.j.id, lease.lease_token, { state: "failed_known", attempt_id: "attempt-" + id, result: {
+      reason: "TelegramSpeakingRestricted", account_restriction: "telegram_speaking_restricted", discussion_id: discussion,
+    } });
+  }
+  reject("one-group", "123");
+  reject("same-group", "123");
+  assert.equal(f.k.accountOutboundBlocked("telegram:one"), false);
+  reject("other-group", "456");
+  assert.equal(f.k.accountOutboundBlocked("telegram:one"), true);
+  assert.equal(f.k.one("SELECT disabled FROM accounts WHERE id='a'").disabled, 0);
+  const next = f.seed({ id: "later-group", pool: "telegram.mtproto", identity: "telegram:one" });
+  assert.equal(f.k.claim(node, "telegram.mtproto", next.j.id), null);
+});
+
+test("successful Telegram sends break the sequence of speaking rejections", () => {
+  const f = fixture(), node = f.node();
+  for (const [id, outcome] of [["before", "failed_known"], ["success", "confirmed"], ["after", "failed_known"]]) {
+    const s = f.seed({ id, pool: "telegram.mtproto", identity: "telegram:one" });
+    const lease = f.k.claim(node, "telegram.mtproto", s.j.id);
+    f.k.authorize(node, s.j.id, lease.lease_token, "attempt-" + id);
+    f.k.complete(node, s.j.id, lease.lease_token, { state: outcome, attempt_id: "attempt-" + id,
+      result: outcome === "confirmed" ? { verified: true, external_reference: "telegram:synthetic:1" } : {
+        account_restriction: "telegram_speaking_restricted", discussion_id: id === "before" ? "123" : "456",
+      } });
+    f.advance(1);
+  }
+  assert.equal(f.k.accountOutboundBlocked("telegram:one"), false);
+});
+
 test("legacy unfrozen placeholders can freeze without changing attempted jobs", () => {
   const f = fixture();
   const s = f.seed();

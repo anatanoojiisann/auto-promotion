@@ -53,6 +53,11 @@ def call(platform, settings, operation):
         "identity_verified": verified,
         "account_identity": expected if verified else None,
         "permissions": [],
+        "read_observed_at": observed_at
+        if type(observed_at) in {int, float} and math.isfinite(observed_at)
+        else None,
+        "read_observation_source": "browser_use_manual_identity",
+        "live_probe": False,
         "reason": (
             "browser_use_recent_identity_observation" if verified else "BrowserUseRecheckRequired"
         ),

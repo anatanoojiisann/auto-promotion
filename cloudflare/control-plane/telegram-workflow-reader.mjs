@@ -14,8 +14,28 @@ export class TelegramWorkflowReader {
       this.k.sql.exec(
         "CREATE TABLE telegram_reader_runtime(plan_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,next_at REAL NOT NULL,lease_until REAL NOT NULL DEFAULT 0,runs INTEGER NOT NULL DEFAULT 0,reads INTEGER NOT NULL DEFAULT 0,last_run REAL NOT NULL DEFAULT 0,state TEXT NOT NULL)",
       );
+    const columns = new Set(this.k.rows("PRAGMA table_info(telegram_reader_runtime)").map(c => c.name));
+    for (const [name, type] of Object.entries({
+      rpc_counts: "TEXT NOT NULL DEFAULT '{}'", last_read_state: "TEXT",
+      last_read_observed_at: "TEXT", cooldown_source: "TEXT",
+    })) if (!columns.has(name)) this.k.sql.exec(`ALTER TABLE telegram_reader_runtime ADD COLUMN ${name} ${type}`);
   }
-  async rpc(operation, input = {}) {
+  readPolicy() {
+    let configured;
+    try { configured = JSON.parse(this.env.TG_READ_POLICY_JSON || "{}"); }
+    catch { throw new ControlError("InvalidTelegramReadPolicy", 400); }
+    const defaults = { requests_per_window: 120, window_seconds: 3600, scan_rpc_limit: 40,
+      messages_per_page: 100, groups_per_scan: 10, cache_ttl_seconds: 300 };
+    const result = Object.fromEntries(Object.entries(defaults).map(([key, fallback]) =>
+      [key, Number.isSafeInteger(configured[key]) && configured[key] >= (key === "cache_ttl_seconds" ? 0 : 1) ? configured[key] : fallback]));
+    result.groups_per_scan = Math.min(100, result.groups_per_scan);
+    result.messages_per_page = Math.min(100, result.messages_per_page);
+    result.window_seconds = result.window_seconds >= 60 ? Math.min(86400, result.window_seconds) : defaults.window_seconds;
+    return result;
+  }
+  async rpc(operation, input = {}, remaining = null) {
+    const policy = this.readPolicy();
+    if (remaining != null) policy.scan_rpc_limit = Math.min(policy.scan_rpc_limit, remaining);
     const r = await this.env.TELEGRAM_EXECUTOR.fetch(
       "https://telegram-executor/internal",
       {
@@ -23,6 +43,7 @@ export class TelegramWorkflowReader {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...input,
+          read_policy: policy,
           operation,
           account_id: this.env.TELEGRAM_EXECUTOR_ACCOUNT,
         }),
@@ -109,7 +130,7 @@ export class TelegramWorkflowReader {
   snapshot(id) {
     return (
       this.k.one(
-        "SELECT plan_id,enabled,next_at,runs,reads,last_run,state FROM telegram_reader_runtime WHERE plan_id=?",
+        "SELECT plan_id,enabled,next_at,runs,reads,reads AS executor_read_operations,last_run,state,rpc_counts,last_read_state,last_read_observed_at,cooldown_source FROM telegram_reader_runtime WHERE plan_id=?",
         id,
       ) || null
     );
@@ -123,10 +144,13 @@ export class TelegramWorkflowReader {
     return { stopped: true };
   }
   async tick() {
-    const out = [];
+    const out = []; let claimed = 0;
+    const policy = this.readPolicy(), limit = policy.groups_per_scan;
+    let remaining = policy.scan_rpc_limit;
     for (const rt of this.k.rows(
-      "SELECT * FROM telegram_reader_runtime WHERE enabled=1",
+      "SELECT * FROM telegram_reader_runtime WHERE enabled=1 ORDER BY last_run,next_at,plan_id",
     )) {
+      if (claimed >= limit || remaining <= 0) break;
       const now = this.k.clock();
       if (
         rt.next_at > now ||
@@ -136,9 +160,10 @@ export class TelegramWorkflowReader {
       )
         continue;
       this.k.sql.exec(
-        "UPDATE telegram_reader_runtime SET lease_until=?,next_at=?,state='running' WHERE plan_id=?",
+        "UPDATE telegram_reader_runtime SET lease_until=?,next_at=?,last_run=?,state='running' WHERE plan_id=?",
         now + 150,
         now + 900,
+        now,
         rt.plan_id,
       );
       const account = this.k.one(
@@ -167,6 +192,7 @@ export class TelegramWorkflowReader {
         );
         continue;
       }
+      claimed++;
       try {
         let reply, nativeJob, receiptSource, reconcileReceipt;
         if (work.stage === "goal_check")
@@ -176,6 +202,7 @@ export class TelegramWorkflowReader {
               verified_interacted_groups: this.q.status(rt.plan_id, {
                 limit: 1,
               }).verified_interacted_groups,
+              rpc_counts: {},
             },
           };
         else if (["receipt_verify", "follow_up"].includes(work.stage)) {
@@ -199,17 +226,23 @@ export class TelegramWorkflowReader {
                 message_ids: stored.message_ids,
                 message_id: stored.message_ids[0],
               },
+              remaining,
             );
-        } else reply = await this.rpc(work.stage, work.input);
+        } else reply = await this.rpc(work.stage, work.input, remaining);
         const r = reply.result;
+        const countsKnown = r.rpc_counts && typeof r.rpc_counts === "object" && !Array.isArray(r.rpc_counts) &&
+          Object.values(r.rpc_counts).every(value => Number.isSafeInteger(value) && value >= 0);
+        if (countsKnown) remaining = Math.max(0, remaining - Object.entries(r.rpc_counts)
+          .reduce((sum, [category, count]) => category === "mutation" ? sum : sum + count, 0));
+        else remaining = 0; // Unknown counts never become zero-cost work for later plans.
         let result;
-        if (!reply.ok) {
+        if (!reply.ok || r.read_complete === false) {
           result = {
             verdict: "defer",
-            reason: r.reason || r.status || "TelegramReadUnavailable",
+            reason: r.read_incomplete_reason || r.reason || r.status || "TelegramReadUnavailable",
             evidence: [],
           };
-          if (r.retry_after_seconds)
+          if (r.retry_after_seconds && (r.rate_limited || r.risk_warning))
             this.k.sql.exec(
               "UPDATE accounts SET cooldown_until=MAX(cooldown_until,?) WHERE identity=(SELECT identity FROM accounts WHERE id=?)",
               now + r.retry_after_seconds,
@@ -411,6 +444,15 @@ export class TelegramWorkflowReader {
               ],
             };
         }
+        result.read_diagnostics = Object.fromEntries([
+          "read_state", "read_complete", "read_observed_at", "read_cursor_next", "rpc_counts",
+          "rpc_count_method", "read_rpc_network_attempts", "read_rpc_retries", "read_budget_scope", "cooldown_source",
+          "read_result_scope", "read_cursor_scope", "read_sample_truncated", "read_sample_messages",
+          "read_sample_limits", "read_cache_hits", "read_fresh_samples", "read_fresh_sources",
+          "read_policy_effective", "read_budget_state",
+          "read_cache_skipped_oversize",
+        ].filter(key => r[key] !== undefined).map(key => [key, r[key]]));
+        if (!countsKnown) Object.assign(result.read_diagnostics, { rpc_counts: null, rpc_count_method: "unavailable" });
         this.q.finish(
           { id: NODE },
           {
@@ -423,8 +465,10 @@ export class TelegramWorkflowReader {
           reconcileReceipt,
         );
         this.k.sql.exec(
-          "UPDATE telegram_reader_runtime SET lease_until=0,runs=runs+1,reads=reads+1,last_run=?,state=CASE WHEN enabled=1 THEN 'waiting_schedule' ELSE 'stopped' END WHERE plan_id=?",
+          "UPDATE telegram_reader_runtime SET lease_until=0,runs=runs+1,reads=reads+1,last_run=?,state=CASE WHEN enabled=1 THEN 'waiting_schedule' ELSE 'stopped' END,rpc_counts=?,last_read_state=?,last_read_observed_at=?,cooldown_source=? WHERE plan_id=?",
           this.k.clock(),
+          JSON.stringify(countsKnown ? r.rpc_counts : null), r.read_state || null,
+          r.read_observed_at || null, r.cooldown_source || null,
           rt.plan_id,
         );
         out.push({
@@ -433,8 +477,9 @@ export class TelegramWorkflowReader {
           verdict: result.verdict,
         });
       } catch {
+        remaining = 0; // The executor may have consumed the entire remaining budget before response loss.
         this.k.sql.exec(
-          "UPDATE telegram_reader_runtime SET lease_until=0,runs=runs+1,state='waiting_retry' WHERE plan_id=?",
+          "UPDATE telegram_reader_runtime SET lease_until=0,runs=runs+1,state='waiting_retry',rpc_counts='null',last_read_state='incomplete',last_read_observed_at=NULL,cooldown_source=NULL WHERE plan_id=?",
           rt.plan_id,
         );
       }

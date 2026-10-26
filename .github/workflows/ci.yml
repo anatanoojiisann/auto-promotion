@@ -42,6 +42,8 @@ jobs:
           export AP_BROWSER_EXECUTABLE="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
           python -m unittest discover -s tests -p test_browser_contracts.py -v
           python -m unittest discover -s tests -p test_x_post_browser.py -v
+          python -m unittest discover -s tests -p test_x_browser_safety.py -v
+          python -m unittest discover -s tests -p test_browser_read_observations.py -v
         env:
           AP_TEST_BROWSER_BACKENDS: '1'
       - run: npm run format:check
@@ -55,6 +57,9 @@ jobs:
       - run: npm run test:ui:interactions
         env:
           AUTO_PROMOTION_PYTHON: python
+      - run: npm run test:ui:blocks
+      - run: npm run test:ui:telegram-reads
+      - run: npm run test:ui:task-start
 
   cloud-control:
     runs-on: ubuntu-latest

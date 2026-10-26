@@ -223,7 +223,12 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.provider.sends, 0)
         self.engine.set_stop(False)
         result = await self.call("start_task", task_id=task["id"])
-        self.assertEqual(result["execution_result"]["processed"][0]["status"], "confirmed")
+        self.assertTrue(result["execution_result"]["already_started"])
+        self.assertEqual(result["execution_result"]["processed"], [])
+        self.assertEqual(self.provider.sends, 0)
+        # A repeated Start is not a scheduler tick. Only this isolated fake
+        # worker consumes the already-authorized task after stop is released.
+        self.engine.run_cycle()
         self.assertEqual(self.provider.sends, 1)
         with self.assertRaises(ToolError):
             await self.call("start_task", task_id=task["id"])

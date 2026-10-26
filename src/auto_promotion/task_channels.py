@@ -5,12 +5,13 @@ locally before any server request; lost responses never reopen its old channel.
 """
 
 import json
+import math
 import os
 import socket
 import uuid
 
 from .cloud_control import CloudControl, CloudJournal, CloudUnavailable
-from .models import epoch
+from .models import canonical, epoch
 from .store import Store
 
 
@@ -67,12 +68,14 @@ def valid_context(db, context, *, now):
     if not context or not context.get("task_channel"):
         return False
     row = db.execute(
-        "SELECT a.*,j.owner job_owner,j.state job_state,j.lease_until,t.policy,c.owner claim_owner,"
+        "SELECT a.*,j.owner job_owner,j.state job_state,j.task_id job_task_id,j.lease_until,t.policy,c.owner claim_owner,"
         "c.generation claim_generation,c.channel claim_channel FROM execution_jobs j "
         "JOIN account_task_channels a ON a.account_id=j.account_id "
         "JOIN task_channel_claims c ON c.job_id=j.id JOIN tasks t ON t.id=j.task_id WHERE j.id=?",
         (context.get("id"),),
     ).fetchone()
+    bound = channel_binding(db, row["account_id"]) if row else {}
+    store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
     return bool(
         row
         and row["state"] == "ready"
@@ -83,6 +86,12 @@ def valid_context(db, context, *, now):
         and row["channel"] == row["claim_channel"] == context.get("channel")
         and requested(json.loads(row["policy"])) in {"inherit", context.get("channel")}
         and (row["channel"] == "cloud" or row["until_at"] > now)
+        and store
+        and store[0] == context.get("store_id")
+        and binding_matches(row, bound, context.get("node_id"), context.get("store_id"))
+        and context.get("account_id") == row["account_id"]
+        and context.get("task_id") == row["job_task_id"]
+        and original_fence_valid(db, bound, now, row["job_task_id"])
     )
 
 
@@ -90,6 +99,205 @@ def guard_context(engine, context):
     with engine.store.connect() as db:
         if not valid_context(db, context, now=engine.clock()):
             raise CloudUnavailable("TaskChannelClaimExpired")
+
+
+def safe_channel_code(value):
+    return (
+        value
+        if isinstance(value, str) and value.isidentifier() and len(value) <= 100
+        else "TaskChannelUnavailable"
+    )
+
+
+def owns_job(db, job, now):
+    row = db.execute("SELECT * FROM execution_jobs WHERE id=?", (job["id"],)).fetchone()
+    return bool(
+        row
+        and row["owner"] == job["owner"]
+        and row["state"] == "leased"
+        and row["lease_until"] > now
+        and row["account_id"] == job["account_id"]
+        and row["task_id"] == job["task_id"]
+        and row["version"] == job["version"]
+    )
+
+
+def channel_binding(db, account_id):
+    row = db.execute(
+        "SELECT value FROM meta WHERE key=?", ("account_channel_binding:" + account_id,)
+    ).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+def save_binding(db, value):
+    db.execute(
+        "INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("account_channel_binding:" + value["account_id"], canonical(value)),
+    )
+
+
+def binding_matches(row, value, node_id, store_id):
+    return bool(
+        row
+        and value
+        and value.get("node_id") == node_id
+        and value.get("store_id") == store_id
+        and all(
+            value.get(k) == row[k]
+            for k in ("account_id", "task_id", "generation", "channel", "until_at")
+        )
+    )
+
+
+def original_fence_valid(db, value, now, task_id):
+    if value.get("fence_source") == "cloud_acknowledged":
+        return value.get("until_at", 0) > now
+    if value.get("fence_source") == "standalone":
+        required = db.execute(
+            "SELECT value FROM meta WHERE key='cloud_control_required'"
+        ).fetchone()
+        return not (required and required[0] == "1") and not os.getenv("AP_CLOUD_CONTROL_URL")
+    if value.get("fence_source") != "legacy":
+        return False
+    state = db.execute("SELECT value FROM meta WHERE key='execution_channel'").fetchone()
+    scope = db.execute("SELECT value FROM meta WHERE key='local_channel_authority'").fetchone()
+    setting = db.execute("SELECT value FROM meta WHERE key='execution_channel_policy'").fetchone()
+    state, scope = json.loads(state[0]) if state else {}, json.loads(scope[0]) if scope else {}
+    return bool(
+        setting
+        and setting[0] == "cloud_then_local"
+        and scope
+        and state.get("active") == "local"
+        and state.get("authorization") == "local_queue"
+        and state.get("generation") == value.get("legacy_generation")
+        and state.get("until", 0) >= value.get("until_at", 0) > now
+        and state.get("node_id") == value.get("node_id")
+        and state.get("store_id") == value.get("store_id")
+        and value.get("account_id") in state.get("account_ids", [])
+        and sorted(scope.get("account_ids", [])) == sorted(state.get("account_ids", []))
+        and (not state.get("through_task_ids") or task_id in state["through_task_ids"])
+    )
+
+
+def ack_matches(observed, expected):
+    return bool(
+        observed
+        and all(
+            observed.get(key) == expected[key]
+            for key in (
+                "account_id",
+                "node_id",
+                "store_id",
+                "task_id",
+                "generation",
+                "channel",
+                "until_at",
+            )
+        )
+    )
+
+
+def transition_current(db, job, authority, now):
+    row = db.execute(
+        "SELECT * FROM account_task_channels WHERE account_id=?", (job["account_id"],)
+    ).fetchone()
+    bound = channel_binding(db, job["account_id"])
+    return bool(
+        owns_job(db, job, now)
+        and row
+        and row["state"] == "handoff"
+        and row["generation"] == authority["generation"]
+        and bound.get("transition") == authority.get("transition")
+        and bound.get("owner") == job["owner"]
+    )
+
+
+def record_channel_failure(engine, job, error, *, authority=None, context=None, handoff=False):
+    if getattr(error, "channel_failure_recorded", False):
+        return
+    generation = authority.get("generation") if authority else (context or {}).get("generation")
+    if not generation:
+        return
+    now = engine.clock()
+    delay = getattr(error, "retry_after_seconds", None)
+    delay = delay if isinstance(delay, (int, float)) and math.isfinite(delay) and delay > 0 else 30
+    with engine.store.connect(write=True) as db:
+        if not owns_job(db, job, now):
+            return
+        if handoff and not transition_current(db, job, authority, now):
+            return
+        row = db.execute(
+            "SELECT * FROM account_task_channels WHERE account_id=?", (job["account_id"],)
+        ).fetchone()
+        if not row or row["generation"] != generation:
+            return
+        db.execute(
+            "UPDATE account_task_channels SET error=?,retry_at=MAX(retry_at,?) WHERE account_id=? AND generation=? AND state=?",
+            (
+                safe_channel_code(
+                    str(error) if isinstance(error, CloudUnavailable) else type(error).__name__
+                ),
+                now + delay,
+                job["account_id"],
+                generation,
+                "handoff" if handoff else "ready",
+            ),
+        )
+    error.channel_failure_recorded = True
+
+
+def task_local_scope_valid(engine, task_id):
+    """Display evidence only; provider claims and final authorization remain mandatory."""
+    from .execution_channels import independent_scope, read_state
+
+    now = engine.clock()
+    with engine.store.connect() as db:
+        task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
+        if not task or not store:
+            return False
+        policy = json.loads(task["policy"])
+        if (
+            task["state"] != "active"
+            or requested(policy) == "cloud"
+            or epoch(policy["ends_at"]) <= now
+        ):
+            return False
+        accounts = json.loads(task["account_ids"])
+        node = os.getenv("AP_NODE_ID", socket.gethostname())
+        explicit = True
+        for account in accounts:
+            row = db.execute(
+                "SELECT * FROM account_task_channels WHERE account_id=?", (account,)
+            ).fetchone()
+            bound = channel_binding(db, account)
+            if not (
+                row
+                and row["state"] == "ready"
+                and row["channel"] == "local"
+                and row["until_at"] > now
+                and binding_matches(row, bound, node, store[0])
+                and original_fence_valid(db, bound, now, task_id)
+            ):
+                explicit = False
+                break
+        if explicit and accounts:
+            return True
+        authority = independent_scope(db)
+    state = read_state(engine.store)
+    return bool(
+        authority
+        and state.get("authorization") == "local_queue"
+        and state.get("active") == "local"
+        and state.get("reason") in {"explicit_user_local", "CloudWriteQuotaExceeded"}
+        and state.get("until", 0) > now
+        and state.get("node_id") == node
+        and state.get("store_id") == store[0]
+        and state.get("generation")
+        and set(accounts) <= set(state.get("account_ids", []))
+        and sorted(state.get("account_ids", [])) == sorted(authority.get("account_ids", []))
+        and (not state.get("through_task_ids") or task_id in state["through_task_ids"])
+    )
 
 
 def snapshot(engine, task):
@@ -147,63 +355,87 @@ class TaskChannelRouter:
 
         now = self.engine.clock()
         task = self.store.one("SELECT policy FROM tasks WHERE id=?", (job["task_id"],))
+        if not task:
+            raise CloudUnavailable("TaskChannelTaskMissing")
         policy = json.loads(task["policy"])
-        channel = effective(self.engine, policy)
-        until = epoch(policy["ends_at"])
+        channel, until = effective(self.engine, policy), epoch(policy["ends_at"])
+        if until <= now:
+            raise CloudUnavailable("TaskChannelWindowExpired")
         cloud = CloudControl.configured()
         node_id = cloud.node_id if cloud else os.getenv("AP_NODE_ID", socket.gethostname())
         store_id = binding(self.engine)
-        prior = self.store.one(
-            "SELECT * FROM account_task_channels WHERE account_id=?", (job["account_id"],)
-        )
-        if prior and prior["retry_at"] > now:
-            raise CloudUnavailable(prior["error"] or "TaskChannelHandoffPending")
-        with self.store.connect() as db:
-            if handoff_blocks(db, prior, job["task_id"], now):
-                raise CloudUnavailable("TaskChannelHandoffPending")
-        if prior and prior["state"] == "handoff" and prior["task_id"] == job["task_id"]:
-            channel, until = prior["channel"], prior["until_at"]
         if cloud and self.store.one(
             "SELECT 1 FROM cloud_receipt_outbox WHERE json_extract(lease,'$.account_id')=? LIMIT 1",
             (job["account_id"],),
         ):
             CloudJournal(self.engine, cloud).flush(account_id=job["account_id"])
-        reusable = bool(
-            prior
-            and prior["state"] == "ready"
-            and prior["channel"] == channel
-            and (channel == "cloud" or prior["until_at"] >= until)
-        )
-        if reusable:
-            generation = prior["generation"]
-            if channel == "cloud":
-                if not cloud:
-                    raise CloudUnavailable("CloudControlConfigurationMissing")
-                cloud.sync(self.engine, task_ids=[job["task_id"]])
-        else:
-            with self.store.connect(write=True) as db:
-                current = db.execute(
-                    "SELECT * FROM execution_jobs WHERE id=?", (job["id"],)
-                ).fetchone()
-                if not current or current["owner"] != job["owner"] or current["lease_until"] <= now:
-                    raise CloudUnavailable("PersistentJobClaimExpired")
+        with self.store.connect(write=True) as db:
+            if not owns_job(db, job, self.engine.clock()):
+                raise CloudUnavailable("PersistentJobClaimExpired")
+            prior = db.execute(
+                "SELECT * FROM account_task_channels WHERE account_id=?", (job["account_id"],)
+            ).fetchone()
+            prior = dict(prior) if prior else None
+            if prior and prior["retry_at"] > now:
+                raise CloudUnavailable(
+                    safe_channel_code(prior["error"] or "TaskChannelHandoffPending"),
+                    retry_after_seconds=max(1, math.ceil(prior["retry_at"] - now)),
+                )
+            if handoff_blocks(db, prior, job["task_id"], now):
+                raise CloudUnavailable("TaskChannelHandoffPending")
+            old_binding = channel_binding(db, job["account_id"])
+            bound = binding_matches(prior, old_binding, node_id, store_id)
+            reusable = bool(
+                prior
+                and prior["state"] == "ready"
+                and bound
+                and prior["channel"] == channel
+                and prior["until_at"] >= until
+                and original_fence_valid(db, old_binding, now, job["task_id"])
+                and not (old_binding.get("fence_source") == "standalone" and cloud)
+            )
+            if reusable:
+                generation = prior["generation"]
+                authority = old_binding
+            else:
                 if db.execute(
-                    "SELECT 1 FROM execution_jobs WHERE account_id=? AND state='leased' "
-                    "AND lease_until>? AND id<>?",
+                    "SELECT 1 FROM execution_jobs WHERE account_id=? AND state='leased' AND lease_until>? AND id<>?",
                     (job["account_id"], now, job["id"]),
                 ).fetchone():
                     raise CloudUnavailable("TaskChannelHandoffBusy")
                 if db.execute(
-                    "SELECT 1 FROM cloud_receipt_outbox r JOIN execution_jobs j ON j.id=r.job_id "
-                    "WHERE j.account_id=? LIMIT 1",
-                    (job["account_id"],),
+                    "SELECT 1 FROM cloud_receipt_outbox WHERE json_extract(lease,'$.account_id')=? OR job_id IN "
+                    "(SELECT id FROM execution_jobs WHERE account_id=?) LIMIT 1",
+                    (job["account_id"], job["account_id"]),
                 ).fetchone():
                     raise CloudUnavailable("LocalChannelReceiptPending")
-                generation = (
-                    prior["generation"]
-                    if prior and prior["state"] == "handoff" and prior["task_id"] == job["task_id"]
-                    else uuid.uuid4().hex
+                recovering = bool(
+                    prior
+                    and prior["state"] == "handoff"
+                    and prior["task_id"] == job["task_id"]
+                    and bound
                 )
+                if recovering:
+                    channel, until, generation = (
+                        prior["channel"],
+                        prior["until_at"],
+                        prior["generation"],
+                    )
+                else:
+                    generation = uuid.uuid4().hex
+                authority = {
+                    "generation": generation,
+                    "account_id": job["account_id"],
+                    "node_id": node_id,
+                    "store_id": store_id,
+                    "task_id": job["task_id"],
+                    "channel": channel,
+                    "until_at": until,
+                    "owner": job["owner"],
+                    "job_id": job["id"],
+                    "transition": uuid.uuid4().hex,
+                    "fence_source": "pending",
+                }
                 db.execute(
                     "INSERT INTO account_task_channels VALUES(?,?,?,?,?,'handoff','pending',?,NULL,0) "
                     "ON CONFLICT(account_id) DO UPDATE SET channel=excluded.channel,generation=excluded.generation,"
@@ -211,37 +443,59 @@ class TaskChannelRouter:
                     "updated_at=excluded.updated_at,error=NULL,retry_at=0",
                     (job["account_id"], channel, generation, until, job["task_id"], now),
                 )
-                Store.audit(
-                    db,
-                    "execution.account_handoff_started",
-                    {"account_id": job["account_id"], "channel": channel, "generation": generation},
-                    job["task_id"],
-                    now,
-                )
-            try:
+                save_binding(db, authority)
+                if not recovering:
+                    Store.audit(
+                        db,
+                        "execution.account_handoff_started",
+                        {
+                            "account_id": job["account_id"],
+                            "channel": channel,
+                            "generation": generation,
+                        },
+                        job["task_id"],
+                        now,
+                    )
+        try:
+            if reusable:
+                if channel == "cloud":
+                    if not cloud:
+                        raise CloudUnavailable("CloudControlConfigurationMissing")
+                    cloud.flush_settings(self.engine)
+                    cloud.sync(self.engine, task_ids=[job["task_id"]])
+            else:
                 required = self.store.one(
                     "SELECT value FROM meta WHERE key='cloud_control_required'"
                 )
                 legacy = read_state(self.store)
                 legacy_fence = (
-                    not prior
-                    and channel == "local"
+                    channel == "local"
                     and independent_active(self.engine)
                     and job["account_id"] in legacy.get("account_ids", [])
                     and legacy.get("until", 0) >= until
+                    and legacy.get("store_id") == store_id
+                    and legacy.get("node_id") == node_id
                 )
                 standalone = not cloud and not (required and required["value"] == "1")
                 if channel == "local" and (legacy_fence or standalone):
                     fence_source = "legacy" if legacy_fence else "standalone"
+                    if legacy_fence:
+                        authority["legacy_generation"] = legacy.get("generation")
                 else:
                     if not cloud:
                         raise CloudUnavailable("CloudControlConfigurationMissing")
-                    # The server may already have accepted this generation before
-                    # a response was lost. Read it before any new transition.
                     observed = cloud.request(
                         "/v1/account-channel/status", {"account_id": job["account_id"]}
                     ).get("channel")
-                    if not (observed and observed.get("generation") == generation):
+                    if not ack_matches(observed, authority):
+                        if observed and observed.get("generation") == generation:
+                            shorter = {**authority, "until_at": observed.get("until_at")}
+                            if not (
+                                ack_matches(observed, shorter)
+                                and isinstance(observed.get("until_at"), (int, float))
+                                and self.engine.clock() < observed["until_at"] < until
+                            ):
+                                raise CloudUnavailable("TaskChannelHandoffUnverified")
                         cloud.flush_settings(self.engine)
                         CloudJournal(self.engine, cloud).flush(account_id=job["account_id"])
                         cloud.sync(self.engine, task_ids=self.handoff_tasks(job, prior))
@@ -261,17 +515,17 @@ class TaskChannelRouter:
                             },
                             operator=True,
                         ).get("channel")
-                    if (
-                        not observed
-                        or observed.get("generation") != generation
-                        or observed.get("channel") != channel
-                    ):
+                    if not ack_matches(observed, authority):
                         raise CloudUnavailable("TaskChannelHandoffUnverified")
                     fence_source = "cloud_acknowledged"
                 with self.store.connect(write=True) as db:
+                    if not transition_current(db, job, authority, self.engine.clock()):
+                        raise CloudUnavailable("PersistentJobClaimExpired")
+                    authority["fence_source"] = fence_source
+                    save_binding(db, authority)
                     db.execute(
-                        "UPDATE account_task_channels SET state='ready',fence_source=?,updated_at=?,"
-                        "error=NULL,retry_at=0 WHERE account_id=? AND generation=?",
+                        "UPDATE account_task_channels SET state='ready',fence_source=?,updated_at=?,error=NULL,retry_at=0 "
+                        "WHERE account_id=? AND generation=? AND state='handoff'",
                         (fence_source, self.engine.clock(), job["account_id"], generation),
                     )
                     Store.audit(
@@ -285,14 +539,11 @@ class TaskChannelRouter:
                         job["task_id"],
                         self.engine.clock(),
                     )
-            except Exception as exc:
-                code = str(exc) if isinstance(exc, CloudUnavailable) else type(exc).__name__
-                with self.store.connect(write=True) as db:
-                    db.execute(
-                        "UPDATE account_task_channels SET error=?,retry_at=? WHERE account_id=? AND generation=?",
-                        (code, self.engine.clock() + 30, job["account_id"], generation),
-                    )
-                raise
+        except Exception as exc:
+            exc.channel_generation = generation
+            exc.channel_transition = authority.get("transition")
+            record_channel_failure(self.engine, job, exc, authority=authority, handoff=not reusable)
+            raise
         context = {
             "id": job["id"],
             "owner": job["owner"],
@@ -301,18 +552,17 @@ class TaskChannelRouter:
             "generation": generation,
             "node_id": node_id,
             "store_id": store_id,
+            "account_id": job["account_id"],
+            "task_id": job["task_id"],
         }
         with self.store.connect(write=True) as db:
-            current = db.execute(
-                "SELECT owner,state,lease_until FROM execution_jobs WHERE id=?", (job["id"],)
-            ).fetchone()
-            if (
-                not current
-                or current["owner"] != job["owner"]
-                or current["state"] != "leased"
-                or current["lease_until"] <= self.engine.clock()
-            ):
+            if not owns_job(db, job, self.engine.clock()):
                 raise CloudUnavailable("PersistentJobClaimExpired")
+            current = db.execute(
+                "SELECT * FROM account_task_channels WHERE account_id=?", (job["account_id"],)
+            ).fetchone()
+            if not current or current["state"] != "ready" or current["generation"] != generation:
+                raise CloudUnavailable("TaskChannelClaimExpired")
             db.execute(
                 "INSERT INTO task_channel_claims VALUES(?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET "
                 "owner=excluded.owner,generation=excluded.generation,channel=excluded.channel",
