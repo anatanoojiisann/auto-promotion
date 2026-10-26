@@ -1,7 +1,9 @@
 """Shared opportunities and campaign plans. Planning never starts execution."""
 
+import contextlib
 import json
 import sqlite3
+import time
 import uuid
 from collections import defaultdict
 
@@ -18,9 +20,11 @@ class Campaigns:
         self.engine, self.store, self.clock = engine, engine.store, engine.clock
         self.pools = Pools(engine)
 
-    def import_content(self, values, *, preserve_review=False):
+    def import_content(self, values, *, preserve_review=False, _db=None):
         imported, updated, duplicates = [], 0, 0
-        with self.store.connect(write=True) as db:
+        with (
+            contextlib.nullcontext(_db) if _db is not None else self.store.connect(write=True)
+        ) as db:
             for value in values:
                 payload = value.model_dump()
                 key = content_key(payload)
@@ -81,29 +85,132 @@ class Campaigns:
             "duplicates": duplicates,
         }
 
-    def collect_telegram_content(self, account_id, target, limit=200):
+    def collect_telegram_content(self, account_id, target, limit=200, *, read_scan_rpc_limit=None):
         from .core import RISK
+        from .health_checks import probe_revision
+        from .routing import route_for
+        from .telegram_reading import content_scope, read_diagnostics
 
         account = self.engine.account(account_id)
+        if account["platform"] != "telegram":
+            raise Conflict("请选择 Telegram 账号")
         if (
-            account["platform"] != "telegram"
-            or account["disabled"]
-            or account["cooldown_until"] > self.clock()
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
+            or RISK.search(target)
         ):
-            raise Conflict("请选择可用且不在冷却中的 Telegram 账号")
-        if not 1 <= limit <= 1000 or RISK.search(target):
             raise Conflict("读取范围无效")
-        result = self.engine.call(account, "content", {"target": target, "limit": limit})
-        self.engine.apply_cooldown(account_id, result)
-        if result.get("rate_limited") or result.get("healthy") is False:
-            raise Conflict("读取未完成；请核对账号或等待冷却")
-        values = [OpportunityInput.model_validate(v) for v in result.get("content_items", [])]
-        imported = (
-            self.import_content(values, preserve_review=True)
-            if values
-            else {"ids": [], "imported": 0, "updated": 0, "duplicates": 0}
-        )
-        return {**imported, "truncated": bool(result.get("truncated"))}
+        with self.engine.lanes.acquire(
+            account_id, resource=route_for(account, {}).resource
+        ) as lane_owner:
+            account = self.engine.account(account_id)
+            if account["disabled"] or account["cooldown_until"] > self.clock():
+                raise Conflict("请选择可用且不在冷却中的 Telegram 账号")
+            revision = probe_revision(account, self.store.path)
+            identity_key, scope = content_scope(account, revision, target, limit)
+            previous = self.store.one(
+                "SELECT * FROM telegram_read_cursors WHERE account_id=? AND identity_key=? AND scope_key=?",
+                (account_id, identity_key, scope),
+            )
+            if previous is None:
+                # A connection-only change may re-sign a registered numeric token
+                # after fresh identity/peer checks. Never silently bootstrap recent.
+                previous = self.store.one(
+                    "SELECT * FROM telegram_read_cursors WHERE account_id=? AND scope_key=? ORDER BY updated_at DESC LIMIT 1",
+                    (account_id, scope),
+                )
+            envelope = json.loads(previous["cursor"]) if previous else None
+            if envelope and envelope.get("identity_hash") != account.get("identity_hash"):
+                raise Conflict("TelegramReadCursorIdentityChanged")
+            payload = {"target": target, "limit": limit}
+            if read_scan_rpc_limit is not None:
+                payload["read_scan_rpc_limit"] = read_scan_rpc_limit
+            if envelope:
+                payload["read_cursor"] = envelope["cursor"]
+            result = self.engine.call(account, "content", payload)
+            self.engine.apply_cooldown(account_id, result)
+            if result.get("rate_limited") or result.get("healthy") is False:
+                raise Conflict("读取未完成；请核对账号或等待冷却")
+            if account["mode"] == "live":
+                if result.get("read_identity_verified") is not True or not result.get(
+                    "read_identity_hash"
+                ):
+                    raise Conflict("TelegramReadIdentityUnavailable")
+                if (
+                    account.get("identity_hash")
+                    and result["read_identity_hash"] != account["identity_hash"]
+                ):
+                    raise Conflict("TelegramReadIdentityChanged")
+                if result.get("read_page_complete") is not True:
+                    return {
+                        "ids": [],
+                        "imported": 0,
+                        "updated": 0,
+                        "duplicates": 0,
+                        "truncated": True,
+                        **read_diagnostics(result),
+                    }
+                if not isinstance(result.get("read_cursor_next"), dict):
+                    raise Conflict("TelegramReadCursorUnavailable")
+            values = [OpportunityInput.model_validate(v) for v in result.get("content_items", [])]
+            with self.store.connect(write=True) as db:
+                lane = db.execute(
+                    "SELECT owner,expires_at FROM account_lanes WHERE account_id=?", (account_id,)
+                ).fetchone()
+                if not lane or lane["owner"] != lane_owner or lane["expires_at"] <= time.time():
+                    raise Conflict("TelegramReadLaneLost")
+                current = dict(
+                    db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+                )
+                if (
+                    current["identity_hash"] != account.get("identity_hash")
+                    or probe_revision(current, self.store.path) != revision
+                ):
+                    raise Conflict("TelegramReadConnectionChanged")
+                if previous:
+                    old = db.execute(
+                        "SELECT revision FROM telegram_read_cursors WHERE account_id=? AND identity_key=? AND scope_key=?",
+                        (account_id, previous["identity_key"], scope),
+                    ).fetchone()
+                    if not old or old[0] != previous["revision"]:
+                        raise Conflict("TelegramReadCursorChanged")
+                identity = account.get("identity_hash") or result.get("read_identity_hash")
+                if account["mode"] == "live" and not account.get("identity_hash"):
+                    if db.execute(
+                        "SELECT 1 FROM accounts WHERE platform='telegram' AND identity_hash=? AND id<>?",
+                        (identity, account_id),
+                    ).fetchone():
+                        raise Conflict("DuplicatePlatformIdentity")
+                    db.execute(
+                        "UPDATE accounts SET identity_hash=? WHERE id=? AND identity_hash IS NULL",
+                        (identity, account_id),
+                    )
+                imported = self.import_content(values, preserve_review=True, _db=db)
+                if result.get("read_cursor_next") is not None:
+                    bound = {**account, "identity_hash": identity}
+                    new_key, _ = content_scope(bound, revision, target, limit)
+                    envelope = {"cursor": result["read_cursor_next"], "identity_hash": identity}
+                    current_cursor = db.execute(
+                        "SELECT revision FROM telegram_read_cursors WHERE account_id=? AND identity_key=? AND scope_key=?",
+                        (account_id, new_key, scope),
+                    ).fetchone()
+                    expected = (
+                        previous["revision"]
+                        if previous and previous["identity_key"] == new_key
+                        else None
+                    )
+                    if (current_cursor[0] if current_cursor else None) != expected:
+                        raise Conflict("TelegramReadCursorChanged")
+                    db.execute(
+                        "INSERT INTO telegram_read_cursors VALUES(?,?,?,?,1,?) ON CONFLICT(account_id,identity_key,scope_key) DO UPDATE SET cursor=excluded.cursor,revision=telegram_read_cursors.revision+1,updated_at=excluded.updated_at",
+                        (account_id, new_key, scope, canonical(envelope), self.clock()),
+                    )
+            return {
+                **imported,
+                "truncated": bool(result.get("truncated")),
+                **read_diagnostics(result),
+            }
 
     def content(self, *, offset=0, limit=100, platform=None):
         self._page(offset, limit)

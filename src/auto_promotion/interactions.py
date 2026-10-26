@@ -1050,14 +1050,43 @@ class Interactions(InteractionSchedule, JointInteractions):
                 run["id"] + "|" + candidate_id + "|" + hashed,
             )
 
+    @staticmethod
+    def _release_owned_intent(db, candidate_id, expected_item_id):
+        """A late cleanup may retire only the exact item it observed."""
+        row = db.execute(
+            "SELECT item_id FROM interaction_intents WHERE candidate_id=?", (candidate_id,)
+        ).fetchone()
+        if row and row[0] is not None and row[0] != expected_item_id:
+            raise Conflict("interaction_intent_owner_changed")
+        if expected_item_id:
+            item = db.execute(
+                "SELECT status,attempt_id,result FROM items WHERE id=?", (expected_item_id,)
+            ).fetchone()
+            if (
+                item
+                and (item["attempt_id"] or item["status"] not in {"not_attempted", "cancelled"})
+                and not (
+                    item["status"] == "failed_known"
+                    and json.loads(item["result"]).get("confirmed_not_submitted") is True
+                )
+            ):
+                raise Conflict("submitted_intent_cannot_be_replaced")
+        db.execute(
+            "UPDATE interaction_intents SET item_id=NULL,state='reserved' WHERE candidate_id=? AND item_id IS ?",
+            (candidate_id, expected_item_id),
+        )
+
     def _retire_unsubmitted(self, db, row):
         if not row["item_id"]:
             return
-        item = db.execute(
-            "SELECT attempt_id,status FROM items WHERE id=?", (row["item_id"],)
+        current = db.execute(
+            "SELECT item_id,task_id FROM hf_candidates WHERE id=?", (row["id"],)
         ).fetchone()
-        if item and item["attempt_id"]:
-            raise Conflict("submitted_intent_cannot_be_replaced")
+        if current and (
+            current["item_id"] != row["item_id"] or current["task_id"] != row["task_id"]
+        ):
+            raise Conflict("interaction_intent_owner_changed")
+        self._release_owned_intent(db, row["id"], row["item_id"])
         db.execute(
             "UPDATE tasks SET state='cancelled',updated_at=? WHERE id=?",
             (self.clock(), row["task_id"]),
@@ -1068,10 +1097,6 @@ class Interactions(InteractionSchedule, JointInteractions):
         )
         db.execute(
             "DELETE FROM quota_reservations WHERE item_id=? AND state='reserved'", (row["item_id"],)
-        )
-        db.execute(
-            "UPDATE interaction_intents SET item_id=NULL,state='reserved' WHERE candidate_id=?",
-            (row["id"],),
         )
 
     def _quality(self, classification, source, config):
@@ -1744,10 +1769,7 @@ class Interactions(InteractionSchedule, JointInteractions):
                             "DELETE FROM quota_reservations WHERE item_id=? AND state='reserved'",
                             (row["item_id"],),
                         )
-                        db.execute(
-                            "UPDATE interaction_intents SET item_id=NULL,state='reserved' WHERE candidate_id=?",
-                            (candidate_id,),
-                        )
+                        self._release_owned_intent(db, candidate_id, row["item_id"])
                     db.execute(
                         "UPDATE hf_candidates SET item_id=NULL,task_id=NULL WHERE id=?",
                         (candidate_id,),
@@ -2641,10 +2663,7 @@ class Interactions(InteractionSchedule, JointInteractions):
                             "UPDATE hf_candidates SET state='READY',version=version+1,selected_version=CASE WHEN selected_version=version THEN version+1 ELSE NULL END,task_id=NULL,item_id=NULL,verification_started_at=NULL,verification_polls=0,block_reason='confirmed_not_submitted_retry' WHERE id=?",
                             (row["id"],),
                         )
-                        db.execute(
-                            "UPDATE interaction_intents SET state='reserved',item_id=NULL WHERE candidate_id=?",
-                            (row["id"],),
-                        )
+                        self._release_owned_intent(db, row["id"], row["item_id"])
                         self.queue.put(
                             db,
                             "publish",

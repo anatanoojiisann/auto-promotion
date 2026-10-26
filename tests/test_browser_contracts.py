@@ -8,7 +8,6 @@ from unittest.mock import patch
 from urllib.parse import urlparse
 
 from auto_promotion.backends.browser import BrowserBackend
-from auto_promotion.backends.common import BackendError
 
 
 @unittest.skipUnless(
@@ -268,20 +267,20 @@ class XBrowserTests(unittest.TestCase):
 
     def test_ambiguous_target_never_submits(self):
         self.duplicate_target = True
-        with self.assertRaises(BackendError):
-            self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "failed_known")
+        self.assertTrue(result["confirmed_not_submitted"])
         self.assertEqual((self.posts, self.checks), (0, 0))
 
     def test_rate_limit_returns_cooldown_without_resubmission(self):
         self.post_limited = True
         result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
         self.assertTrue(result["rate_limited"])
-        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["status"], "failed_known")
+        self.assertTrue(result["confirmed_rejected"])
         self.assertEqual(self.posts, 1)
 
     def test_dropped_submission_response_records_step_and_submission_boundary(self):
-        from playwright.sync_api import TimeoutError
-
         self.post_dropped = True
         expect_response = self.page.expect_response
         with patch.object(
@@ -289,8 +288,10 @@ class XBrowserTests(unittest.TestCase):
             "expect_response",
             side_effect=lambda predicate, timeout: expect_response(predicate, timeout=500),
         ):
-            with self.assertRaises(TimeoutError) as captured:
-                self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
         self.assertEqual(self.posts, 1)
-        self.assertEqual(captured.exception.execution_step, "submission_response")
-        self.assertTrue(captured.exception.submission_started)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["execution_step"], "submission_response")
+        self.assertTrue(result["submission_started"])

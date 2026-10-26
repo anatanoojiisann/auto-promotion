@@ -1,12 +1,14 @@
 """Local execution blockers; these checks never contact or authorize a platform."""
 
 import json
+import math
 
 from .models import epoch
 
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "account_outbound_blocked": "账号外发已暂停，请在账号中心处理原因并检查恢复",
     "execution_account_mismatch": "发送清单账号与当前执行归属不一致，已阻止提交",
     "conversation_owner_mismatch": "P0 执行账号必须与原会话账号一致",
     "joint_priority_not_dispatched": "联合策略仅处理已确认的 P0/P1 需求",
@@ -76,13 +78,85 @@ def task_workflow(task, blockers, item_blockers, now):
         ),
     }
 
-    def step(status, label, message, action=None, next_at=None):
+    schedule_at = (
+        max(
+            epoch(task["policy"]["starts_at"]),
+            min(
+                now
+                if i["payload"]["action"] in {"schedule_message", "schedule_file"}
+                else i["due_at"]
+                for i in pending
+            ),
+            task["next_at"],
+        )
+        if pending
+        else None
+    )
+    pools = task.get("execution", {}).get("pools", {})
+    cloud, channel = pools.get("cloud", {}), pools.get("channel", {})
+    scope = cloud.get("task_scope") or {}
+
+    def timestamp(value):
+        return value if type(value) in {int, float} and math.isfinite(value) else None
+
+    observed_at = timestamp(scope.get("at"))
+    expires_at = timestamp(scope.get("expires_at"))
+    global_at = timestamp(cloud.get("at"))
+    bound_scope = bool(
+        scope.get("scope") == "task"
+        and bool(task.get("id"))
+        and scope.get("task_id") == task["id"]
+        and scope.get("valid_for_task") is True
+        and observed_at is not None
+        and 0 <= now - observed_at <= 300
+        and expires_at is not None
+        and expires_at > now
+    )
+    scoped = bool(
+        bound_scope and scope.get("state") == "connected" and scope.get("execution_ready") is True
+    )
+    scope_failed = bool(
+        bound_scope
+        and scope.get("state")
+        and (scope.get("state") != "connected" or scope.get("execution_ready") is False)
+    )
+    # A newer, bound sync can explain an older full-history conflict. It is
+    # presentation evidence only; claim and final authorization still recheck.
+    historical_conflict = bool(
+        scoped
+        and cloud.get("state") == "FrozenJobChanged"
+        and global_at is not None
+        and global_at < observed_at
+    )
+    local_until = timestamp(channel.get("until"))
+    fallback = bool(
+        channel.get("active") == "local"
+        and channel.get("valid_for_task") is True
+        and local_until is not None
+        and local_until > now
+    )
+
+    def step(status, label, message, action=None, next_at=None, next_at_kind=None):
         return {
             "status": status,
             "label": label,
             "message": message,
             "next_action": action,
             "next_at": next_at,
+            "next_at_kind": next_at_kind,
+            "schedule_next_at": schedule_at if schedule_at and schedule_at > now else None,
+            "service_observation": {
+                "global_state": cloud.get("state"),
+                "global_at": global_at,
+                "task_state": scope.get("state"),
+                "task_at": observed_at,
+                "task_scope_usable": scoped,
+                "task_scope_failed": scope_failed,
+                "task_retry_at": timestamp(scope.get("retry_at")) if scope_failed else None,
+                "historical_conflict": historical_conflict,
+            }
+            if task["mode"] == "live" and cloud
+            else None,
             "can_prepare": bool(task["items"] and not item_blockers and not task["manifest_hash"]),
             "counts": counts,
         }
@@ -118,6 +192,19 @@ def task_workflow(task, blockers, item_blockers, now):
     )
     if expired:
         return step("expired", "执行时间已过期", REASONS["delivery_window_elapsed"])
+    if task["phase"] in {"starting", "ready"}:
+        for reason in (
+            "global_stop",
+            "live_writes_disabled",
+            "account_disabled",
+            "account_outbound_blocked",
+            "account_unhealthy",
+            "account_cooldown",
+            "activity_limit",
+            "delivery_limit",
+        ):
+            if reason in blockers:
+                return step(reason, REASONS[reason], REASONS[reason])
     if not task["items"]:
         return step(
             "prepare_items",
@@ -178,16 +265,11 @@ def task_workflow(task, blockers, item_blockers, now):
         )
     if not task["manifest_hash"]:
         return step("starting", "正在准备发送", "任务已启动，调度器将自动固定清单并继续发送。")
-    for reason in ("global_stop", "live_writes_disabled"):
-        if reason in blockers:
-            return step(reason, REASONS[reason], REASONS[reason])
     if pending:
-        cloud = task.get("execution", {}).get("pools", {}).get("cloud", {})
-        channel = task.get("execution", {}).get("pools", {}).get("channel", {})
-        fallback = channel.get("active") == "local" and channel.get("until", 0) > now
         if (
             task["mode"] == "live"
             and not fallback
+            and not historical_conflict
             and cloud.get("state")
             and (cloud["state"] != "connected" or cloud.get("execution_ready") is False)
         ):
@@ -197,6 +279,7 @@ def task_workflow(task, blockers, item_blockers, now):
                     "等待备用通道初始化",
                     "双通道已配置；首次检查需要等待服务器额度恢复，之后额度耗尽时会自动使用本地通道。",
                     next_at=cloud.get("retry_at"),
+                    next_at_kind="service_retry",
                 )
             return step(
                 "waiting_execution_service",
@@ -205,23 +288,24 @@ def task_workflow(task, blockers, item_blockers, now):
                 if cloud["state"] == "CloudWriteQuotaExceeded"
                 else "云端授权服务暂不可用，调度器恢复连接后检查原有时间窗与尚未尝试的项目。",
                 next_at=cloud.get("retry_at"),
+                next_at_kind="service_retry",
             )
-        next_at = max(
-            epoch(task["policy"]["starts_at"]),
-            min(
-                now
-                if i["payload"]["action"] in {"schedule_message", "schedule_file"}
-                else i["due_at"]
-                for i in pending
-            ),
-            task["next_at"],
-        )
+        if task["mode"] == "live" and not fallback and scope_failed:
+            return step(
+                "waiting_execution_service",
+                "等待本任务同步恢复",
+                "本任务同步未完成；全局连接状态不能证明本任务已就绪，原有排期保持不变。",
+                next_at=timestamp(scope.get("retry_at")),
+                next_at_kind="service_retry",
+            )
+        next_at = schedule_at
         if next_at > now:
             return step(
                 "waiting_schedule",
                 "等待计划时间",
                 "任务已启动，到达计划时间并满足间隔后执行。",
                 next_at=next_at,
+                next_at_kind="schedule",
             )
         return step(
             "ready",

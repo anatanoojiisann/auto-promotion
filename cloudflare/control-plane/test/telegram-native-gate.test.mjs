@@ -503,7 +503,7 @@ test("bounded native scans make progress past more blocked heads than the scan l
 });
 
 test("explicit executor cooldown or account lock before authorization stays pending", async () => {
-  for (const reason of ["waiting_cooldown", "waiting_account_lock"]) {
+  for (const reason of ["waiting_cooldown", "waiting_account_lock", "waiting_read_budget"]) {
     const f = await sendFixture();
     let calls = 0;
     f.env.TELEGRAM_EXECUTOR.fetch = async (url, request) => {

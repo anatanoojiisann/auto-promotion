@@ -39,6 +39,40 @@ CREATE TABLE IF NOT EXISTS accounts(
  disabled INTEGER NOT NULL DEFAULT 0, identity_hash TEXT,
  UNIQUE(platform,backend_label,mode)
 );
+CREATE TABLE IF NOT EXISTS account_blocks(
+ account_id TEXT PRIMARY KEY REFERENCES accounts(id),state TEXT NOT NULL,reason TEXT NOT NULL,
+ since REAL NOT NULL,until_at REAL,generation INTEGER NOT NULL,details TEXT NOT NULL,
+ health_checked_at REAL,health_ok INTEGER NOT NULL DEFAULT 0,health_identity_hash TEXT,updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_block_events(
+ id TEXT PRIMARY KEY,account_id TEXT NOT NULL REFERENCES accounts(id),reason TEXT NOT NULL,
+ at REAL NOT NULL,target_key TEXT NOT NULL,task_id TEXT
+);
+CREATE TABLE IF NOT EXISTS execution_read_observations(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,task_id TEXT,
+ operation TEXT NOT NULL,at REAL NOT NULL,result TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_read_observations(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,task_id TEXT,
+ operation TEXT NOT NULL,observed_at REAL NOT NULL,result TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_read_settings(
+ account_id TEXT PRIMARY KEY REFERENCES accounts(id),payload TEXT NOT NULL,
+ revision INTEGER NOT NULL,updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_read_cursors(
+ account_id TEXT NOT NULL REFERENCES accounts(id),identity_key TEXT NOT NULL,scope_key TEXT NOT NULL,
+ cursor TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL,
+ PRIMARY KEY(account_id,identity_key,scope_key)
+);
+CREATE TABLE IF NOT EXISTS telegram_statistics_rounds(
+ slot REAL PRIMARY KEY,items TEXT NOT NULL,next_position INTEGER NOT NULL DEFAULT 0,
+ owner TEXT,lease_until REAL NOT NULL DEFAULT 0,complete INTEGER NOT NULL DEFAULT 0,updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_statistics_progress(
+ slot REAL NOT NULL,item_id TEXT NOT NULL,complete INTEGER NOT NULL DEFAULT 0,retry_at REAL NOT NULL DEFAULT 0,
+ PRIMARY KEY(slot,item_id)
+);
 CREATE TABLE IF NOT EXISTS tasks(
  id TEXT PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL, account_ids TEXT NOT NULL,
  account_snapshot TEXT NOT NULL, policy TEXT NOT NULL, policy_hash TEXT NOT NULL,

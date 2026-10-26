@@ -29,7 +29,7 @@ export function createClient(session, env) {
     },
   );
 }
-export function safeError(error) {
+export function safeError(error, receipt) {
   const code = String(
     error?.errorMessage || error?.name || "TelegramExecutorError",
   );
@@ -47,15 +47,38 @@ export function safeError(error) {
     "CloudSessionPersistenceRequired",
   ]);
   if (known.has(error?.message)) return { reason: error.message };
+  if (error?.message === "TelegramReadBudgetExceeded") {
+    const accepted = receipt?.message_ids?.length || receipt?.external_reference;
+    const unsubmitted = !accepted && error.mutationStarted !== true;
+    return { reason: "TelegramReadBudgetExceeded", failure_class: "read_budget",
+      cooldown_source: "local_read_budget", retry_after_seconds: error.retryAfter,
+      ...(error.readDiagnostics || {}),
+      ...(receipt ? { status: unsubmitted ? "failed_known" : "unknown", verified: false,
+        confirmed_not_submitted: unsubmitted, ...(unsubmitted ? { submission_started: false } : {}) } : {}),
+    };
+  }
+  if (/^(USER_BANNED_IN_CHANNEL|UserBannedInChannelError)$/.test(code)) {
+    const accepted = receipt?.message_ids?.length || receipt?.external_reference;
+    return {
+      reason: "TelegramSpeakingRestricted",
+      failure_class: "restricted",
+      account_restriction: "telegram_speaking_restricted",
+      ...(receipt ? { status: accepted ? "unknown" : "failed_known", verified: false,
+        confirmed_not_submitted: !accepted && receipt.submission_started !== true,
+        confirmed_rejected: !accepted && receipt.submission_started === true } : {}),
+    };
+  }
   if (/PEER_FLOOD|USER_RESTRICTED|USER_BANNED/.test(code))
     return {
       reason: "TelegramRiskRestriction",
+      cooldown_source: "telegram_rpc_restriction",
       risk_warning: true,
       retry_after_seconds: 86400,
     };
   if (/FLOOD|SLOWMODE/.test(code))
     return {
       reason: "TelegramCooldown",
+      cooldown_source: "telegram_rpc_wait",
       rate_limited: true,
       retry_after_seconds: Math.max(60, Number(error.seconds) || 3600),
     };
@@ -95,7 +118,10 @@ async function observedMember(client, entity) {
     throw e;
   }
 }
-export async function readOperation(client, operation, input) {
+export async function readOperation(client, operation, input, read = null) {
+  if (read) return read.execute(client, operation, input, () => readOperation(client, operation, input));
+  if (operation === "verify" && (!Array.isArray(input.message_ids) || input.message_ids.length !== 1 || !Number.isSafeInteger(input.message_ids[0]) || input.message_ids[0] < 1))
+    return { status: "unknown", verified: false, reason: "DurableMessageIdsRequired" };
   if (operation === "health")
     return { status: "healthy", identity_verified: true };
   if (operation === "discover") {
@@ -240,6 +266,7 @@ export async function submitOperation(client, job, checkpoint, authorize) {
       status: "unknown",
       verified: false,
       submission_started: true,
+      discussion_id: String(entity.id),
     });
     try {
       await client.invoke(
@@ -314,6 +341,7 @@ export async function submitOperation(client, job, checkpoint, authorize) {
       status: "unknown",
       verified: false,
       submission_started: true,
+      discussion_id: String(entity.id),
     });
     const sent = await client.sendMessage(entity, {
       message: item.text,
@@ -394,6 +422,7 @@ export async function submitOperation(client, job, checkpoint, authorize) {
     status: "unknown",
     verified: false,
     submission_started: true,
+    discussion_id: String(entity.id),
   });
   const sent = await client.sendMessage(entity, {
     message: item.text,

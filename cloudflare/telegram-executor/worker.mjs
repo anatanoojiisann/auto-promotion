@@ -11,6 +11,7 @@ import { ExecutorCore, preExecutionDeferral } from "./executor-core.mjs";
 import { authorizeNative } from "./native-authorization.mjs";
 import { QrLoginController } from "./qr-login-controller.mjs";
 import { requestId } from "./qr-login-diagnostics.mjs";
+import { TelegramReadPolicy, TelegramReadBudgetExceeded } from "./telegram-read-policy.mjs";
 
 function response(value, status = 200) {
   return Response.json(value, {
@@ -82,6 +83,10 @@ export class TelegramExecutor extends DurableObject {
     const input = await request.json(),
       op = input.operation;
     input.request_id = requestId(request.headers?.get("X-AP-Request-ID"));
+    if (op === "verify" && (!Array.isArray(input.message_ids) || input.message_ids.length !== 1 || !Number.isSafeInteger(input.message_ids[0]) || input.message_ids[0] < 1))
+      return response({ status: "unknown", verified: false, reason: "DurableMessageIdsRequired",
+        rpc_counts: {}, read_complete: false, read_state: "incomplete",
+        read_rpc_network_attempts: null, read_rpc_retries: null });
     if (op === "status") {
       const login = await this.login.view();
       return response({
@@ -182,6 +187,7 @@ export class TelegramExecutor extends DurableObject {
         {
           ...preExecutionDeferral(input, "waiting_cooldown", cooldown),
           reason: "AccountCooldown",
+          cooldown_source: storedCooldown >= accountNotBefore ? "stored_account_cooldown" : "configured_account_not_before",
         },
         409,
       );
@@ -189,10 +195,22 @@ export class TelegramExecutor extends DurableObject {
       return response(preExecutionDeferral(input, "waiting_account_lock"), 409);
     this.busy = true;
     let discardSession = false;
-    let client,
+    let client, read,
       phase = "create_client";
     try {
       client = createClient(await this.session(), this.env);
+      if (["health", "discover", "inspect", "membership_verify", "verify", "read_context", "resolve_target", "execute"].includes(op)) {
+        let policy;
+        try { policy = JSON.parse(this.env.TG_READ_POLICY_JSON || "{}"); }
+        catch { throw new Error("InvalidTelegramReadPolicy"); }
+        read = new TelegramReadPolicy(this.ctx.storage, {
+          accountId: this.env.TG_ACCOUNT_ID,
+          identity: this.env.TG_EXPECTED_ID,
+          revision: (await this.ctx.storage.get("login_generation")) || 0,
+          policy, requested: input.read_policy || {},
+        });
+        read.instrument(client);
+      }
       phase = "connect";
       await client.connect();
       phase = "identity_check";
@@ -207,16 +225,22 @@ export class TelegramExecutor extends DurableObject {
         throw new Error("TelegramIdentityMismatch");
       await this.ctx.storage.put("login_state", "authorized");
       await this.ctx.storage.delete("last_error");
+      if (read && ["execute", "resolve_target"].includes(op)) {
+        read.fresh++; read.observed.push(read.clock());
+      }
       if (op === "resolve_target") {
+        read.category = "read";
         const entity = await resolveSendPeer(client, input.target);
         return response({
           target:
             entity.className === "Channel"
               ? "-100" + String(entity.id)
               : "-" + String(entity.id),
+          ...read.diagnostics(),
         });
       }
       if (op === "execute") {
+        read.category = "read";
         phase = "native_execution";
         const core = new ExecutorCore({
           store: this.ctx.storage,
@@ -226,12 +250,12 @@ export class TelegramExecutor extends DurableObject {
             submitOperation(client, job, checkpoint, revalidate),
         });
         const outcome = await core.execute(input);
-        if (outcome.retry_after_seconds && !outcome.from_durable_receipt)
+        if (outcome.retry_after_seconds && (outcome.rate_limited || outcome.risk_warning) && !outcome.from_durable_receipt)
           await this.ctx.storage.put(
             "cooldown_until",
             Date.now() / 1000 + outcome.retry_after_seconds,
           );
-        return response(outcome);
+        return response({ ...outcome, ...read.diagnostics(outcome.failure_class === "read_budget") });
       }
       if (
         ![
@@ -245,8 +269,23 @@ export class TelegramExecutor extends DurableObject {
       )
         throw new Error("UnsupportedExecutorOperation");
       phase = "authenticated_read";
-      return response(await readOperation(client, op, input));
+      return response(await readOperation(client, op, input, read));
     } catch (error) {
+      if (error instanceof TelegramReadBudgetExceeded) {
+        if (op === "execute") {
+          const saved = await this.ctx.storage.get("receipt:" + input.job_id);
+          if (saved) {
+            if (saved.job_version !== input.version || saved.account_id !== input.account_id || saved.attempt_id !== input.attempt_id)
+              return response({ status: "unknown", verified: false, reason: "FrozenExecutorReceiptChanged" }, 409);
+            return response({ ...saved, from_durable_receipt: true, replayed: false, ...read.diagnostics(true) });
+          }
+          return response({ ...preExecutionDeferral(input, "waiting_read_budget", Date.now()/1000 + error.retryAfter),
+            cooldown_source: "local_read_budget", confirmed_not_submitted: true, ...read.diagnostics(true) }, 409);
+        }
+        return response({ status: "incomplete", reason: "TelegramReadBudgetExceeded",
+          cooldown_source: "local_read_budget", retry_after_seconds: error.retryAfter,
+          identity_verified: false, ...read.diagnostics(true) });
+      }
       const safe = safeError(error);
       await this.ctx.storage.put("last_error", { phase, ...safe });
       if (safe.reason === "TelegramTwoStepLoginRequired")
@@ -266,8 +305,9 @@ export class TelegramExecutor extends DurableObject {
           "cooldown_until",
           Date.now() / 1000 + safe.retry_after_seconds,
         );
-      return response({ status: "unavailable", ...safe }, 409);
+      return response({ status: "unavailable", ...safe, ...(read ? read.diagnostics(true) : {}) }, 409);
     } finally {
+      if (read && client) read.restore(client);
       if (client) {
         try {
           const s = client.session.save();

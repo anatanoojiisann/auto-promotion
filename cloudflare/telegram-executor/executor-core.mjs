@@ -87,7 +87,7 @@ export class ExecutorCore {
       await checkpoint(result);
       return latest;
     } catch (error) {
-      await checkpoint(this.classifyError(error));
+      await checkpoint(this.classifyError(error, latest));
       return latest;
     }
   }

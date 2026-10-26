@@ -123,6 +123,7 @@ class ReadHealthTests(unittest.TestCase):
                 "rate_limited": account["id"] == self.a["id"],
                 "retry_after_seconds": 3600,
                 "reason": "FloodWaitError",
+                "read_rpc_used": 1,  # observed synthetic logical attempt
             }
 
         with patch.object(f.provider, "call", side_effect=backend):

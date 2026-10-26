@@ -79,8 +79,16 @@ class FeedbackCollectionTests(unittest.TestCase):
         self.assertEqual(self.engine.collect_statistics()["processed"], [])
         self.provider.call.assert_not_called()
         self.now += 200
+        self.provider.call.return_value = {
+            "verified": True,
+            "feedback_events": [],
+            "feedback_cursor": 0,
+            "feedback_status": "complete",
+            "feedback_checked_through": self.now,
+        }
+        self.assertEqual(len(self.engine.collect_statistics()["processed"]), 1)
         self.assertEqual(self.engine.collect_statistics()["processed"], [])
-        self.provider.call.assert_not_called()
+        self.assertEqual(self.provider.call.call_count, 1)
 
     def test_error_messages_are_not_saved_as_diagnostics(self):
         self.provider.call.return_value = {"verified": False, "reason": "token=private detail"}

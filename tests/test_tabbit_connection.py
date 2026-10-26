@@ -339,10 +339,6 @@ class TabbitConnectionTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         cli.assert_not_called()
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_high_frequency_discover_observes_without_submitting(self):
         response = {
             "status": "succeeded",
@@ -381,7 +377,7 @@ if __name__ == "__main__":
         self.assertFalse(result["coverage_complete"])
         self.assertEqual(result["candidates"][0]["url"], "https://x.com/i/web/status/123456")
         program = cli.call_args_list[1].kwargs["code"]
-        self.assertIn("checkReadOnlyIdentity();", program)
+        self.assertIn("await identity();", program)
         self.assertIn("primaryColumn", program)
         self.assertNotIn("button.click()", program)
         self.assertNotIn("CreateTweet", program)
@@ -411,3 +407,7 @@ if __name__ == "__main__":
             )
         self.assertEqual(result["candidates"], [])
         self.assertNotIn("--tab", cli.call_args_list[1].args[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

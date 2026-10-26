@@ -27,7 +27,7 @@ from .models import canonical
 from .queue_store import JobQueue, executor_task_ids, job_scope
 from .routing import POOLS
 from .store import Store
-from .task_channels import TaskChannelRouter, managed, pending_managed
+from .task_channels import TaskChannelRouter, managed, pending_managed, record_channel_failure
 
 
 class PoolScheduler:
@@ -221,7 +221,22 @@ class PoolScheduler:
             self.cloud.flush_settings(self.engine)
             CloudJournal(self.engine, self.cloud).flush()
             if returning or now - self.last_sync >= 15:
-                self.cloud.sync(self.engine, force=returning)
+                if returning:
+                    # Returning from the legacy global fallback still reconciles
+                    # every prior outcome before releasing its fence.
+                    self.cloud.sync(self.engine, force=True)
+                else:
+                    # Stops, account restrictions and the global quota ledger
+                    # propagate without replaying unrelated frozen job bodies.
+                    self.cloud.sync(self.engine, metadata_only=True)
+                    for task in self.engine.store.rows(
+                        "SELECT id FROM tasks WHERE state='active' ORDER BY id"
+                    ):
+                        try:
+                            self.cloud.sync(self.engine, task_ids=[task["id"]])
+                        except CloudUnavailable as exc:
+                            if str(exc) not in {"FrozenJobChanged", "FrozenTaskChanged"}:
+                                raise
                 self.last_sync = now
             use_cloud(self.engine)
             self._cloud_health("connected")
@@ -436,11 +451,7 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                 error = exc
                 if isinstance(exc, CloudUnavailable) and is_managed:
                     try:
-                        with engine.store.connect(write=True) as db:
-                            db.execute(
-                                "UPDATE account_task_channels SET error=?,retry_at=? WHERE account_id=?",
-                                (str(exc), engine.clock() + 30, job["account_id"]),
-                            )
+                        record_channel_failure(engine, job, exc, context=context)
                     except sqlite3.Error as persistence_error:
                         worker_error(engine, owner, persistence_error)
                 if isinstance(exc, CloudUnavailable) and not local and not is_managed:

@@ -5,18 +5,32 @@ import hashlib
 import html
 import io
 import json
+import math
+import re
 import uuid
 import zipfile
 from collections import Counter
 from datetime import datetime
 
+from .account_blocks import FIELDS as BLOCK_FIELDS
 from .core import Conflict, NotFound
 from .execution_diagnostics import safe_code
 from .models import Policy, TaskInput, canonical
+from .read_cooldowns import FIELDS as X_READ_FIELDS
 from .statistics import ZONE
 from .store import Store, decode
+from .telegram_reading import READ_FIELDS
 
-ACCOUNT_FIELDS = ("id", "platform", "label", "mode", "daily_limit", "hourly_limit", "min_interval")
+ACCOUNT_FIELDS = (
+    "id",
+    "platform",
+    "label",
+    "mode",
+    "daily_limit",
+    "hourly_limit",
+    "min_interval",
+    "outbound_block",
+)
 ITEM_FIELDS = (
     "account_id",
     "account_label",
@@ -40,26 +54,31 @@ ITEM_FIELDS = (
     "tiktok_options",
 )
 RESULT_FIELDS = (
-    "status",
-    "verified",
-    "external_reference",
-    "scheduled",
-    "active",
-    "published_at",
-    "message_ids",
-    "scheduled_message_ids",
-    "lookup_message_ids",
-    "can_send",
-    "outbound_eligible_at_utc",
-    "retry_after_seconds",
-    "step_started_at",
-    "submission_started",
-    "skipped_at",
-    "skip_reason",
-    "publish_id",
-    "post_ids",
-    "comment_id",
-    "platform_status",
+    (
+        "status",
+        "verified",
+        "external_reference",
+        "scheduled",
+        "active",
+        "published_at",
+        "message_ids",
+        "message_chat_id",
+        "scheduled_message_ids",
+        "lookup_message_ids",
+        "can_send",
+        "outbound_eligible_at_utc",
+        "retry_after_seconds",
+        "step_started_at",
+        "submission_started",
+        "skipped_at",
+        "skip_reason",
+        "publish_id",
+        "post_ids",
+        "comment_id",
+        "platform_status",
+    )
+    + READ_FIELDS
+    + X_READ_FIELDS
 )
 AUDIT_FIELDS = (
     "channel",
@@ -127,7 +146,69 @@ def diagnostics(value):
 
 
 def safe_result(value):
-    return {**pick(value, RESULT_FIELDS), **diagnostics(value)}
+    result = {
+        **pick(
+            value, tuple(key for key in RESULT_FIELDS if key not in READ_FIELDS + X_READ_FIELDS)
+        ),
+        **diagnostics(value),
+    }
+    for key in READ_FIELDS + X_READ_FIELDS:
+        if key not in value or key == "read_cursor_next":
+            continue
+        entry = value[key]
+        if key == "read_resource_failures" and isinstance(entry, dict):
+            result[key] = {
+                safe_code(name, "resource_error"): count
+                for name, count in entry.items()
+                if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 1000000
+            }
+        elif key in {"read_identity_hash", "read_page_fingerprint"}:
+            if isinstance(entry, str) and re.fullmatch(r"[a-f0-9]{64}", entry):
+                result[key] = entry
+        elif key == "read_peer_id":
+            if isinstance(entry, str) and re.fullmatch(r"-?[1-9][0-9]{0,19}", entry):
+                result[key] = entry
+        elif entry is None or isinstance(entry, (bool, int)):
+            result[key] = entry
+        elif isinstance(entry, float) and math.isfinite(entry):
+            result[key] = entry
+        elif isinstance(entry, str):
+            result[key] = safe_code(entry, "details_omitted")
+    for field in BLOCK_FIELDS:
+        if field not in value:
+            continue
+        entry = value[field]
+        if field == "rpc_counts":
+            if isinstance(entry, dict):
+                result[field] = {
+                    key: count
+                    for key, count in entry.items()
+                    if key
+                    in {
+                        "mutation",
+                        "identity",
+                        "permissions",
+                        "discovery",
+                        "history",
+                        "entity",
+                        "other",
+                    }
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count >= 0
+                }
+        elif field in {
+            "runtime_git_commit_at_start",
+            "runtime_source_fingerprint",
+            "account_block_event_id",
+        }:
+            if entry is None or isinstance(entry, str) and re.fullmatch(r"[a-f0-9]{32,64}", entry):
+                result[field] = entry
+        elif isinstance(entry, str):
+            result[field] = safe_code(entry, "details_omitted")
+        elif entry is None or isinstance(entry, (bool, int, float)):
+            result[field] = entry
+    return result
 
 
 def item_payload(value):
@@ -335,6 +416,14 @@ class TaskTools:
             coverage = rows(
                 "SELECT f.* FROM feedback_checks f JOIN items i ON i.id=f.item_id WHERE i.task_id=?"
             )
+        from .account_blocks import active_block
+
+        with self.store.connect() as db:
+            account_blocks = [
+                {"account_id": account_id, **block}
+                for account_id in json.loads(raw["account_ids"])
+                if (block := active_block(db, account_id, self.clock()))
+            ]
         return {
             "schema_version": 1,
             "exported_at": datetime.fromtimestamp(self.clock(), ZONE).isoformat(),
@@ -351,6 +440,31 @@ class TaskTools:
             "publication_evidence": publications,
             "feedback_events": feedback,
             "feedback_checks": coverage,
+            "account_blocks": account_blocks,
+            "execution_read_observations": [
+                {
+                    "account_id": row["account_id"],
+                    "operation": row["operation"],
+                    "at": row["at"],
+                    "result": safe_result(json.loads(row["result"])),
+                }
+                for row in self.store.rows(
+                    "SELECT * FROM execution_read_observations WHERE (task_id=? OR task_id IS NULL) AND account_id IN (SELECT value FROM json_each(?)) ORDER BY id DESC LIMIT 1000",
+                    (task_id, raw["account_ids"]),
+                )
+            ],
+            "telegram_read_observations": [
+                {
+                    "account_id": row["account_id"],
+                    "operation": row["operation"],
+                    "observed_at": row["observed_at"],
+                    "result": safe_result(json.loads(row["result"])),
+                }
+                for row in self.store.rows(
+                    "SELECT * FROM telegram_read_observations WHERE (task_id=? OR task_id IS NULL) AND account_id IN (SELECT value FROM json_each(?)) ORDER BY id DESC LIMIT 1000",
+                    (task_id, raw["account_ids"]),
+                )
+            ],
             "summary": {
                 "item_count": len(items),
                 "candidate_count": len(candidates),
@@ -365,7 +479,7 @@ class TaskTools:
             },
             "notes": [
                 "这是任务证据快照，不能导入为审批或发送权限。媒体包含文件名及哈希，不包含媒体文件或本机路径。",
-                "仅包含关联该任务的日志；全局开关事件、共享发送进程及其他任务不在包内。",
+                "任务日志及其账号不带任务标记的脱敏读取观测；其他任务的日志不在包内。读取计数是逻辑调用尝试，SDK内部重试及底层网络次数不可用时不计为零。",
                 "未知和排期状态保留；已观察回复数量不能代替覆盖完整的回复率。",
             ],
         }

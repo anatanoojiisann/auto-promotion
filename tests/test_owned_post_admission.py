@@ -15,6 +15,7 @@ class OwnedPostAdmissionTests(unittest.TestCase):
             ),
             store=Mock(one=Mock(return_value={"value": "1"})),
             _log_call=Mock(),
+            _observe_telegram_read=Mock(),
         )
 
     def invoke(self, probe, cloud, *, action="post"):

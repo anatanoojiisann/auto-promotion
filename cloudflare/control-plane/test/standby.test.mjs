@@ -1,8 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LEGACY_SCHEMA } from "../kernel.mjs";
+import { LEGACY_SCHEMA, sha } from "../kernel.mjs";
 import { standbyCheck } from "../standby.mjs";
+import { issuePermit, offlineCheck } from "../offline-permit.mjs";
 
 function fixture() {
   const db = new DatabaseSync(":memory:");
@@ -36,6 +37,35 @@ test("standby works with the legacy schema without migrations, heartbeats or wri
   assert.equal(result.node_id, "only-node");
   assert.deepEqual(result.attempts, []);
   assert.ok(f.queries.every(q => q.startsWith("SELECT ")));
+});
+
+test("read-only standby keeps a persisted account block", () => {
+  const f = fixture();
+  const a = JSON.parse(f.db.prepare("SELECT payload FROM accounts WHERE id='a'").get().payload);
+  a.outbound_block_state = { state: "active", reason: "x_challenge", since: f.now, until: null, generation: 1 };
+  f.db.prepare("UPDATE accounts SET payload=? WHERE id='a'").run(JSON.stringify(a));
+  assert.throws(() => f.check(), /AccountOutboundBlocked/);
+  const checkpoint = f.check({ input: { store_id: "only-db" } }).checkpoint;
+  assert.equal(checkpoint.accounts[0].outbound_block_state.reason, "x_challenge");
+});
+
+test("a blocked identity alias cannot use standby or its actual signed offline checkpoint", async () => {
+  const f = fixture();
+  const token = "synthetic-node", hash = await sha(token);
+  f.input.job.action = "reply";
+  f.db.prepare("UPDATE nodes SET token_hash=?").run(hash);
+  const account = { id: "a", identity: "x:one", mode: "live", allowed_actions: ["reply"] };
+  f.db.prepare("UPDATE accounts SET payload=? WHERE id='a'").run(JSON.stringify(account));
+  const alias = { ...account, id: "alias", outbound_block_state: {
+    state: "active", reason: "x_challenge", since: f.now, until: null, generation: 1,
+  } };
+  f.db.prepare("INSERT INTO accounts VALUES(?,?,?,?,0,0,0)").run("alias", "x:one", "x", JSON.stringify(alias));
+  assert.throws(() => f.check({ token: hash }), /LocalChannelIdentityAliases/);
+  const checkpoint = f.check({ token: hash, input: { store_id: "only-db" } }).checkpoint;
+  assert.equal(checkpoint.accounts[0].identity_aliases, 2);
+  const env = { OPERATOR_TOKEN: "synthetic-operator", FALLBACK_NODE_ID: "only-node", FALLBACK_STORE_ID: "only-db" };
+  const permit = await issuePermit(checkpoint, env.OPERATOR_TOKEN);
+  await assert.rejects(offlineCheck(permit, token, f.input, env, f.now), /LocalChannelIdentityAliases/);
 });
 
 test("standby requires matching deployment fence, registered node and token", () => {

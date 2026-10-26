@@ -108,6 +108,10 @@ async function screenshots(page) {
 
 (async () => {
   if (!base) base = await startSimulationService();
+  assert.ok(
+    ["127.0.0.1", "localhost"].includes(new URL(base).hostname),
+    "Fixture scheduler requires loopback service",
+  );
   browser = await chromium.launch({
     channel: process.env.AP_UI_BROWSER_CHANNEL || undefined,
     headless: true,
@@ -289,7 +293,15 @@ async function screenshots(page) {
       ),
       page.getByRole("button", { name: "开始发送", exact: true }).click(),
     ]);
-    assert.equal((await response).status(), 200);
+    const repeatedResponse = await response;
+    assert.equal(repeatedResponse.status(), 200);
+    const repeated = await repeatedResponse.json();
+    assert.equal(repeated.mode, "simulation");
+    assert.equal(repeated.execution_result.already_started, true);
+    assert.deepEqual(repeated.execution_result.processed, []);
+    // The temporary service runs without a worker. Advance only its
+    // synthetic scheduler; duplicate Start must not run the task again.
+    await call(`/tasks/${task.id}/run`, "POST");
     const sent = await read(`/tasks/${task.id}`);
     assert.ok(
       sent.items.length > 0 &&

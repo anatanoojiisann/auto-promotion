@@ -548,10 +548,18 @@ class Growth:
         return next(f for f in self.feeds() if f["id"] == identifier)
 
     def poll_feeds(self):
-        completed = 0
-        for feed in self.feeds():
+        completed, read_used, read_calls = 0, {}, {}
+        for feed in sorted(self.feeds(), key=lambda value: (value["next_at"], value["id"])):
             p, now = feed["payload"], self.clock()
             if not p["enabled"] or feed["next_at"] > now:
+                continue
+            policy = self.engine.telegram_read_policy(p["account_id"])["policy"]
+            used = read_used.get(p["account_id"], 0)
+            if (
+                used is None
+                or used >= policy["scan_rpc_limit"]
+                or read_calls.get(p["account_id"], 0) >= policy["groups_per_scan"]
+            ):
                 continue
             with self.store.connect(write=True) as db:
                 if not db.execute(
@@ -561,24 +569,43 @@ class Growth:
                     continue
             try:
                 result = Campaigns(self.engine).collect_telegram_content(
-                    p["account_id"], p["target"], p["limit"]
+                    p["account_id"],
+                    p["target"],
+                    p["limit"],
+                    read_scan_rpc_limit=policy["scan_rpc_limit"] - used,
                 )
-                status = "complete"
-                completed += 1
+                status = (
+                    "partial"
+                    if result.get("read_complete") is False or result.get("truncated")
+                    else "complete"
+                )
+                completed += int(status == "complete")
             except Exception:
                 result, status = {"reason": "content_read_incomplete"}, "needs_check"
+            amount = result.get("read_rpc_used")
+            read_used[p["account_id"]] = (
+                used + amount
+                if isinstance(amount, int) and not isinstance(amount, bool) and amount >= 0
+                else None
+            )
+            read_calls[p["account_id"]] = read_calls.get(p["account_id"], 0) + 1
             with self.store.connect(write=True) as db:
                 db.execute(
                     "UPDATE content_feeds SET next_at=?,last_at=?,status=?,result=?,lease_until=0 WHERE id=?",
                     (
-                        self.clock() + p["interval_seconds"],
+                        self.clock()
+                        + (
+                            max(1, result.get("read_retry_after_seconds") or 1)
+                            if status == "partial"
+                            else p["interval_seconds"]
+                        ),
                         self.clock(),
                         status,
                         canonical(result),
                         feed["id"],
                     ),
                 )
-        return {"completed": completed}
+        return {"completed": completed, "read_rpc_used_by_account": read_used}
 
     def readiness(self, *, worker=False, report_worker=False):
         accounts = self.engine.accounts()

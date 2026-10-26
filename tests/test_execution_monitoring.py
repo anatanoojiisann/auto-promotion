@@ -112,15 +112,18 @@ class MonitoringTests(unittest.TestCase):
         page.goto.side_effect = [None, TimeoutError("must-not-leak-cookie")]
         backend = BrowserBackend("x", "local", Mock(), page, {"identity": "brand"})
         with patch.object(backend, "check_identity"):
-            with self.assertRaises(TimeoutError) as captured:
-                backend.run(
-                    "execute",
-                    {"payload": {"target": "https://x.com/a/status/1", "action": "reply"}},
-                    Mock(),
-                    Mock(),
-                )
-        self.assertEqual(captured.exception.execution_step, "target_navigation")
-        self.assertFalse(captured.exception.submission_started)
+            result = backend.run(
+                "execute",
+                {"payload": {"target": "https://x.com/a/status/1", "action": "reply"}},
+                Mock(),
+                Mock(),
+            )
+        self.assertEqual(result["execution_step"], "target_navigation")
+        self.assertFalse(result["submission_started"])
+        self.assertEqual(result["status"], "failed_known")
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertEqual(result["failure_class"], "page_anomaly")
+        self.assertNotIn("must-not-leak-cookie", str(result))
 
     def test_api_sender_lifecycle_waits_for_inflight_operation(self):
         app = create_app(

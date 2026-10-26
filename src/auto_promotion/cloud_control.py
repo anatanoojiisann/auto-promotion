@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import socket
 import ssl
@@ -17,8 +18,85 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from . import quotas
-from .models import canonical, epoch
+from .models import canonical, digest, epoch
 from .routing import ExecutionRoute, route_for
+
+
+def _scope_signature(engine, task_id):
+    from .health_checks import probe_revision
+
+    task = engine.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        return None
+    accounts = [
+        engine.store.one(
+            "SELECT id,platform,backend_label,mode,identity_hash,status,disabled,daily_limit,hourly_limit,min_interval FROM accounts WHERE id=?",
+            (key,),
+        )
+        for key in json.loads(task["account_ids"])
+    ]
+    stopped = engine.store.one("SELECT value FROM meta WHERE key='global_stop'")
+    return digest(
+        [
+            task["policy_hash"],
+            task["manifest_hash"],
+            task["state"],
+            task["phase"],
+            accounts,
+            [probe_revision(account, engine.store.path) for account in accounts if account],
+            engine.execution_settings(),
+            engine.live_enabled,
+            stopped["value"] if stopped else "1",
+        ]
+    )
+
+
+def _scope_destination(engine, url, node_id):
+    store = engine.store.one("SELECT value FROM meta WHERE key='execution_store_id'")
+    return digest([url.rstrip("/"), node_id, store["value"] if store else None])
+
+
+def task_scope_health(engine, task_id, *, cloud=None):
+    """Fresh bound sync observation for display, never a write authorization."""
+    row = engine.store.one("SELECT value FROM meta WHERE key=?", ("cloud_task_health:" + task_id,))
+    if not row:
+        return {
+            "scope": "task",
+            "task_id": task_id,
+            "valid_for_task": False,
+            "execution_ready": False,
+        }
+    value = json.loads(row["value"])
+    url = cloud.url if cloud else os.getenv("AP_CLOUD_CONTROL_URL", "")
+    node = cloud.node_id if cloud else os.getenv("AP_NODE_ID")
+    now = engine.clock()
+    valid = bool(
+        url
+        and value.get("task_signature") == _scope_signature(engine, task_id)
+        and value.get("destination") == _scope_destination(engine, url, node)
+        and isinstance(value.get("at"), (int, float))
+        and 0 <= now - value["at"] <= 300
+        and value.get("expires_at", 0) > now
+    )
+    return {
+        key: value[key]
+        for key in (
+            "scope",
+            "task_id",
+            "state",
+            "at",
+            "execution_ready",
+            "expires_at",
+            "revision",
+            "retry_at",
+            "diagnostics",
+        )
+        if key in value
+    } | {
+        "valid_for_task": valid,
+        "execution_ready": bool(valid and value.get("execution_ready")),
+        **({"invalid_reason": "scope_or_observation_changed"} if not valid else {}),
+    }
 
 
 def _safe_transport_cause(error):
@@ -116,6 +194,12 @@ class CloudControl:
             "/v1/executor/telegram/login-poll": "login_poll",
             "/v1/executor/telegram/status": "status",
             "/v1/executor/telegram/read": "read",
+            "/v1/sync": "snapshot_sync",
+            "/v1/account-channel/status": "channel_status",
+            "/v1/account-channel": "channel_handoff",
+            "/v1/claim": "job_claim",
+            "/v1/authorize": "job_authorize",
+            "/v1/heartbeat": "heartbeat",
         }.get(path, "cloud_request")
         result = {
             "schema": 1,
@@ -252,6 +336,9 @@ class CloudControl:
                     payload=result,
                     context=data,
                 )
+                engine = getattr(self, "_block_engine", None)
+                if engine is not None:
+                    self.import_account_blocks(engine, result)
                 return result
         except HTTPError as exc:
             # Provider responses and URLs may contain secrets. Only expose our allowlisted code.
@@ -262,15 +349,17 @@ class CloudControl:
                 if code == "CloudRequestRejected" and details.get("error_code") == 1101:
                     code = "CloudWorkerException"
                 retry = details.get("retry_after_seconds")
+                conflict = details.get("conflict")
             except Exception as decode_error:
                 code = "CloudRequestRejected"
                 retry = None
+                conflict = None
                 parse_error = decode_error
             finally:
                 exc.close()
             if not isinstance(code, str) or not code.isidentifier() or len(code) > 100:
                 code = "CloudRequestRejected"
-            if not isinstance(retry, (int, float)) or not 1 <= retry <= 90000:
+            if not isinstance(retry, (int, float)) or not math.isfinite(retry) or retry <= 0:
                 retry = None
             diagnostic = self._request_diagnostic(
                 request_id,
@@ -282,6 +371,23 @@ class CloudControl:
                 parse_error=parse_error,
                 context=data,
             )
+            if code == "FrozenJobChanged" and isinstance(conflict, dict):
+                index, fields = conflict.get("conflict_index"), conflict.get("changed_fields")
+                if (
+                    isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and index >= 0
+                    and isinstance(fields, list)
+                    and all(
+                        field
+                        in {"version", "account_id", "task_id", "reference_id", "pool", "kind"}
+                        for field in fields
+                    )
+                ):
+                    diagnostic["sync_conflict"] = {
+                        "conflict_index": index,
+                        "changed_fields": fields,
+                    }
             raise CloudUnavailable(
                 code, retry_after_seconds=retry, diagnostics=diagnostic
             ) from None
@@ -357,9 +463,139 @@ class CloudControl:
             },
         )
 
-    def sync(self, engine, *, force=False, task_ids=None):
+    def sync(self, engine, *, force=False, task_ids=None, metadata_only=False):
         from .execution_channels import binding
 
+        binding(engine)
+        selected = sorted(set(task_ids or [])) if task_ids is not None else None
+        if selected is not None:
+            for task_id in selected:
+                saved = engine.store.one(
+                    "SELECT value FROM meta WHERE key=?", ("cloud_task_health:" + task_id,)
+                )
+                previous = json.loads(saved["value"]) if saved else {}
+                if (
+                    previous.get("task_signature") == _scope_signature(engine, task_id)
+                    and previous.get("destination")
+                    == _scope_destination(engine, self.url, self.node_id)
+                    and previous.get("state") != "connected"
+                    and previous.get("retry_at", 0) > engine.clock()
+                ):
+                    raise CloudUnavailable(
+                        previous["state"], retry_after_seconds=previous["retry_at"] - engine.clock()
+                    )
+        scope = "metadata" if metadata_only else "task" if selected is not None else "full"
+        contexts = []
+        keys = selected if selected is not None else [scope]
+        for key in keys:
+            token = uuid.uuid4().hex
+            generation_key = "cloud_sync_observation:" + (
+                "task:" + key if scope == "task" else scope
+            )
+            signature = _scope_signature(engine, key) if scope == "task" else None
+            task = (
+                engine.store.one("SELECT policy FROM tasks WHERE id=?", (key,))
+                if scope == "task"
+                else None
+            )
+            contexts.append(
+                (
+                    key,
+                    token,
+                    generation_key,
+                    signature,
+                    epoch(json.loads(task["policy"])["ends_at"]) if task else engine.clock() + 300,
+                )
+            )
+            with engine.store.connect(write=True) as db:
+                db.execute(
+                    "INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (generation_key, token),
+                )
+        try:
+            result = self._sync(engine, force=force, task_ids=selected, metadata_only=metadata_only)
+        except Exception as error:
+            self._observe_sync(
+                engine, scope, contexts, error=error, revision=getattr(error, "sync_revision", None)
+            )
+            raise
+        if not result.get("unchanged"):
+            self._observe_sync(engine, scope, contexts, revision=result.get("revision"))
+        return {
+            **result,
+            "scope": scope,
+            **({"task_ids": selected} if selected is not None else {}),
+        }
+
+    def _observe_sync(self, engine, scope, contexts, error=None, revision=None):
+        now = engine.clock()
+        for key, token, generation_key, signature, deadline in contexts:
+            if scope == "task" and signature != _scope_signature(engine, key):
+                continue
+            code = (
+                str(error)
+                if isinstance(error, CloudUnavailable)
+                else type(error).__name__
+                if error
+                else "connected"
+            )
+            code = (
+                code
+                if isinstance(code, str) and code.isidentifier() and len(code) <= 100
+                else "CloudSyncUnavailable"
+            )
+            delay = getattr(error, "retry_after_seconds", None)
+            if error and not (
+                isinstance(delay, (int, float)) and math.isfinite(delay) and delay > 0
+            ):
+                delay = 30
+            value = {
+                "scope": scope,
+                "state": code,
+                "at": now,
+                "execution_ready": error is None,
+                "expires_at": min(deadline, now + 300),
+                "task_signature": signature,
+                "destination": _scope_destination(engine, self.url, self.node_id),
+                **({"task_id": key} if scope == "task" else {}),
+                **({"retry_at": now + delay} if error else {}),
+            }
+            value["revision"] = revision
+            if error and isinstance(getattr(error, "diagnostics", None), dict):
+                value["diagnostics"] = {
+                    field: error.diagnostics[field]
+                    for field in (
+                        "request_id",
+                        "http_status",
+                        "elapsed_ms",
+                        "sync_scope",
+                        "sync_revision",
+                        "sync_batch_section",
+                        "sync_record_hash",
+                        "sync_conflict",
+                    )
+                    if field in error.diagnostics
+                }
+            with engine.store.connect(write=True) as db:
+                current = db.execute(
+                    "SELECT value FROM meta WHERE key=?", (generation_key,)
+                ).fetchone()
+                if not current or current[0] != token:
+                    continue
+                health_key = (
+                    "cloud_task_health:" + key
+                    if scope == "task"
+                    else "cloud_" + scope + "_sync_health"
+                )
+                db.execute(
+                    "INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (health_key, canonical(value)),
+                )
+
+    def _sync(self, engine, *, force=False, task_ids=None, metadata_only=False):
+        from .execution_channels import binding
+
+        self._block_engine = engine
         destination = hashlib.sha256(self.url.encode()).hexdigest()
         acknowledged = {
             (r["section"], r["record_id"]): r["digest"]
@@ -384,6 +620,8 @@ class CloudControl:
                 snapshot["accounts"] = [a for a in snapshot["accounts"] if a["id"] in accounts]
                 snapshot["jobs"] = [j for j in snapshot["jobs"] if j["task_id"] in selected]
                 # Retain the whole recent ledger: global limits span all tasks.
+            if metadata_only:
+                snapshot["jobs"] = []
             return snapshot
 
         snapshot = snapshot_for_scope()
@@ -437,7 +675,29 @@ class CloudControl:
                 payload[section] = [r[2] for r in batch]
                 if len(canonical(payload).encode()) > 3_500_000:
                     raise CloudUnavailable("CloudSnapshotBatchTooLarge")
-                result = self.request("/v1/sync", payload, operator=True)
+                try:
+                    result = self.request("/v1/sync", payload, operator=True)
+                except CloudUnavailable as error:
+                    diagnostic = dict(error.diagnostics or {})
+                    conflict = diagnostic.get("sync_conflict", {})
+                    index = conflict.get("conflict_index")
+                    diagnostic.update(
+                        sync_scope="task"
+                        if task_ids is not None
+                        else "metadata"
+                        if metadata_only
+                        else "full",
+                        sync_revision=revision,
+                        sync_batch_section=section,
+                    )
+                    if isinstance(index, int) and 0 <= index < len(batch):
+                        diagnostic["sync_record_hash"] = hashlib.sha256(
+                            str(batch[index][0]).encode()
+                        ).hexdigest()
+                    error.diagnostics = diagnostic
+                    error.sync_revision = revision
+                    raise
+                self.import_account_blocks(engine, result)
                 if result.get("stale"):
                     raise CloudUnavailable("CloudSnapshotStale")
                 # Commit each acknowledged slice, so failure resumes at the first
@@ -451,7 +711,32 @@ class CloudControl:
                         [(destination, section, r[0], r[1], revision) for r in batch],
                     )
                 changed += len(batch)
-        return {"changed_records": changed, "unchanged": changed == 0}
+        return {"changed_records": changed, "unchanged": changed == 0, "revision": revision}
+
+    @staticmethod
+    def import_account_blocks(engine, response):
+        """Mirror scoped remote stops; imported health never authorizes local recovery."""
+        from .account_blocks import merge_remote_block
+
+        if not isinstance(response, dict) or not isinstance(response.get("account_blocks"), list):
+            return
+        with engine.store.connect(write=True) as db:
+            for record in response["account_blocks"]:
+                if not isinstance(record, dict) or not isinstance(record.get("account_id"), str):
+                    continue
+                account = db.execute(
+                    "SELECT * FROM accounts WHERE id=?", (record.get("account_id"),)
+                ).fetchone()
+                if not account or route_for(dict(account)).identity != record.get("identity"):
+                    continue
+                state = record.get("outbound_block_state")
+                if isinstance(state, dict):
+                    merge_remote_block(
+                        db,
+                        account["id"],
+                        {**state, "affected_tasks": record.get("affected_tasks", [])},
+                        now=engine.clock(),
+                    )
 
     def flush_settings(self, engine):
         pending = engine.store.one("SELECT value FROM meta WHERE key='cloud_pending_settings'")
@@ -510,6 +795,20 @@ def _export_snapshot(engine, db, *, task_ids=None):
     from .models import CAPABILITIES
 
     accounts = {a["id"]: dict(a) for a in db.execute("SELECT * FROM accounts")}
+    # Keep cleared generations as tombstones: omission is never a remote resume.
+    # Export only authorization metadata, not health identity or raw evidence.
+    blocks = {
+        row["account_id"]: {
+            "state": row["state"],
+            "reason": row["reason"],
+            "since": row["since"],
+            "until": row["until_at"],
+            "generation": row["generation"],
+            "health_checked_at": row["health_checked_at"],
+            "health_ok": bool(row["health_ok"]),
+        }
+        for row in db.execute("SELECT * FROM account_blocks")
+    }
     for a in accounts.values():
         a["capabilities"] = sorted(CAPABILITIES[a["platform"]])
         a["automatic_actions"] = automatic_actions(a)
@@ -570,6 +869,7 @@ def _export_snapshot(engine, db, *, task_ids=None):
                 "cooldown_until": a["cooldown_until"],
                 "disabled": bool(a["disabled"]),
                 "allowed_actions": allowed,
+                **({"outbound_block_state": blocks[a["id"]]} if a["id"] in blocks else {}),
                 **({"owned_target_url": a["owned_target_url"]} if a["platform"] == "x" else {}),
             }
         )
@@ -727,6 +1027,8 @@ class CloudJournal:
 
     def __init__(self, engine, cloud):
         self.engine, self.store, self.cloud = engine, engine.store, cloud
+        if cloud is not None:
+            cloud._block_engine = engine
 
     def remember(self, lease):
         with self.store.connect(write=True) as db:

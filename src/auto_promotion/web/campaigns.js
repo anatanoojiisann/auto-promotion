@@ -460,7 +460,8 @@ async function executionSettingsForm() {
     ]);
   } catch (error) {
     if (requestGeneration !== panelGeneration) return;
-    throw error;
+    toast(error.message, true);
+    return;
   }
   if (requestGeneration !== panelGeneration) return;
   const channels = {

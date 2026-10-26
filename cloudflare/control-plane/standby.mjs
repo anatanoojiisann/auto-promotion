@@ -1,6 +1,6 @@
 // Read-only even when SQLite's write budget is exhausted. The deployment fence
 // makes this a single-node, single-database workspace in BOTH execution channels.
-import { ControlError } from "./kernel.mjs";
+import { accountBlockActive, ControlError } from "./kernel.mjs";
 
 export function standbyCheck(storage, nodeId, tokenHash, input, fence, now = Date.now() / 1000) {
   const rows = (q, ...args) => {
@@ -36,6 +36,8 @@ export function standbyCheck(storage, nodeId, tokenHash, input, fence, now = Dat
     const a = one("SELECT * FROM accounts WHERE id=?", j.account_id);
     if (!a) throw new ControlError("LocalChannelAccountNotMirrored", 409);
     account = JSON.parse(a.payload);
+    if (accountBlockActive(account.outbound_block_state, now))
+      throw new ControlError("AccountOutboundBlocked", 409);
     if (!j.manual && account.mode === "live" && !(account.allowed_actions || []).includes(j.action))
       throw new ControlError("ActionNotEnabled", 403);
     // The local ledger uses account IDs; do not drop a cloud identity-alias cap.

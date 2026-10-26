@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { submitOperation, readOperation } from "../telegram-adapter.mjs";
+import { submitOperation, readOperation, safeError } from "../telegram-adapter.mjs";
+import { ExecutorCore } from "../executor-core.mjs";
 function fixture({ newReply = false, changed = false } = {}) {
   let sends = 0,
     authorizations = 0;
@@ -110,4 +111,36 @@ test("public usernames belonging to people cannot be used to read private conver
   });
   assert.equal(r.status, "unavailable");
   assert.equal(reads, 0);
+});
+
+test("channel speaking rejection is known failure, keeps once-only receipt and never disables globally", async () => {
+  const f = fixture(), rows = new Map();
+  let sends = 0;
+  f.client.sendMessage = async () => { sends++; throw { errorMessage: "USER_BANNED_IN_CHANNEL" }; };
+  const request = { job_id: "send:rejected", account_id: "a", version: "v", attempt_id: "one", lease_token: "l" };
+  const core = new ExecutorCore({
+    store: { get: async k => rows.get(k), put: async (k,v) => rows.set(k, structuredClone(v)) },
+    authorize: async () => ({ allowed: true, lease_until: Date.now()/1000+60, job: { ...f.job, id: request.job_id, account_id: "a", version: "v" } }),
+    submit: (job, checkpoint, authorize) => submitOperation(f.client, job, checkpoint, authorize),
+    classifyError: safeError,
+  });
+  const rejected = await core.execute(request);
+  assert.equal(rejected.status, "failed_known");
+  assert.equal(rejected.account_restriction, "telegram_speaking_restricted");
+  assert.equal(rejected.risk_warning, undefined);
+  assert.equal(rejected.discussion_id, "123");
+  assert.equal(rejected.confirmed_rejected, true);
+  assert.equal(rejected.confirmed_not_submitted, false);
+  await core.execute(request);
+  assert.equal(sends, 1);
+});
+
+test("channel restriction after accepted ID stays unknown while timeouts remain ambiguous", () => {
+  const rejected = { errorMessage: "USER_BANNED_IN_CHANNEL" };
+  assert.equal(safeError(rejected, { submission_started: true, message_ids: [9] }).status, "unknown");
+  assert.equal(safeError(rejected, { submission_started: true, message_ids: [9] }).confirmed_rejected, false);
+  assert.equal(safeError(rejected, { submission_started: false }).confirmed_not_submitted, true);
+  assert.equal(safeError(rejected, { submission_started: false }).confirmed_rejected, false);
+  assert.equal(safeError(new Error("socket timeout"), { submission_started: true }).status, undefined);
+  assert.equal(safeError(rejected).risk_warning, undefined);
 });

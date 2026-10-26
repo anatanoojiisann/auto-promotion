@@ -57,7 +57,11 @@ class TaskChannelTests(unittest.TestCase):
             if path == "/v1/account-channel/status":
                 return {"channel": remote.get(payload["account_id"])}
             if path == "/v1/account-channel":
-                state = {"generation": payload["generation"], "channel": payload["channel"]}
+                state = {
+                    key: payload[key]
+                    for key in ("generation", "channel", "account_id", "node_id", "task_id")
+                }
+                state.update(until_at=payload["until"], store_id=payload["local_store_id"])
                 remote[payload["account_id"]] = state
                 if lose_response:
                     raise CloudUnavailable("CloudTransportUnavailable")
@@ -290,7 +294,14 @@ class TaskChannelTests(unittest.TestCase):
         def respond(path, payload=None, **kwargs):
             if path == "/v1/account-channel":
                 return {
-                    "channel": {"channel": payload["channel"], "generation": payload["generation"]}
+                    "channel": {
+                        **{
+                            key: payload[key]
+                            for key in ("channel", "generation", "account_id", "node_id", "task_id")
+                        },
+                        "until_at": payload["until"],
+                        "store_id": payload["local_store_id"],
+                    }
                 }
             return prior_request(path, payload, **kwargs)
 

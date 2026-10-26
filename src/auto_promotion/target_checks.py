@@ -40,7 +40,15 @@ class TargetChecks:
                 sorted({Path(m["filename"]).suffix.lower() for m in item.get("media", [])}),
             ]
         )
-        self.identity = digest([account["backend_label"], account.get("identity_hash")])
+        from .health_checks import probe_revision
+
+        self.identity = digest(
+            [
+                account["backend_label"],
+                account.get("identity_hash"),
+                probe_revision(account, engine.store.path),
+            ]
+        )
 
     def read(self, db=None):
         if not self.enabled:
@@ -49,14 +57,23 @@ class TargetChecks:
         params = (self.account["id"], self.identity, self.key)
         row = db.execute(query, params).fetchone() if db else self.engine.store.one(query, params)
         if row and row["retry_at"] > self.engine.clock():
-            return {**json.loads(row["result"]), "eligibility_retry_at": row["retry_at"]}
+            return {
+                **json.loads(row["result"]),
+                "eligibility_retry_at": row["retry_at"],
+                "read_state": "cache_hit",
+                "read_observed_at": None,
+                "read_rpc_used": 0,
+                "read_rpc_count_source": "local_negative_cache_no_rpc",
+                "read_rpc_wire_attempts": None,
+                "read_rpc_internal_retries": None,
+            }
         return None
 
     def failure(self, reason):
         return {"allowed": False, "verified": False, "reason": reason}
 
     def save(self, result):
-        if not self.enabled:
+        if not self.enabled or result.get("local_read_budget"):
             return
         allowed = (
             result.get("allowed") is True

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
+import uuid
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlparse
 
-from ..models import epoch
+from ..models import digest, epoch
 from .browser_status import check_status
 from .common import (
     BackendError,
@@ -20,6 +23,281 @@ from .common import (
 from .x_text import EDITOR_TEXT_JS, TWEET_TEXT_JS
 
 HOME = {"reddit": "https://www.reddit.com", "x": "https://x.com"}
+
+
+def read_limits(payload):
+    seconds = payload.get("timeout_seconds", 30)
+    limit = payload.get("read_request_limit")
+    if type(seconds) not in {int, float} or not math.isfinite(seconds) or not 1 <= seconds <= 120:
+        raise BackendError("InvalidBrowserReadBudget")
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= 1000):
+        raise BackendError("InvalidBrowserReadBudget")
+    return seconds, limit
+
+
+def retry_after(response, *, now=None):
+    """Use only bounded retry headers; never retain response headers or URLs."""
+    now = time.time() if now is None else now
+    try:
+        headers = response.headers
+        value = headers.get("retry-after", headers.get("Retry-After", ""))
+        wait = (
+            int(value) if str(value).isdigit() else parsedate_to_datetime(value).timestamp() - now
+        )
+        if math.isfinite(wait) and wait > 0:
+            return max(1, math.ceil(wait))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        pass
+    return 900
+
+
+class BrowserReadScan:
+    """One bounded DOM scan. Counts primary read attempts, never all wire requests."""
+
+    def __init__(self, page, payload):
+        seconds, self.limit = read_limits(payload)
+        self.page, self.deadline = page, time.monotonic() + seconds
+        self.requests, self.responses, self.blocked = 0, 0, 0
+        self.resources, self.resource_seen = {}, set()
+        self.state, self.reason, self.wait = None, None, 0
+        self.observed_at = None
+
+    def primary(self, request):
+        parsed = urlparse(request.url)
+        if parsed.scheme != "https" or parsed.hostname not in {
+            "x.com",
+            "www.x.com",
+            "api.x.com",
+            "twitter.com",
+            "www.twitter.com",
+            "api.twitter.com",
+        }:
+            return False
+        if request.is_navigation_request():
+            return request.frame == self.page.main_frame and parsed.path in {
+                "/",
+                "/home",
+                "/search",
+            }
+        if request.resource_type not in {"xhr", "fetch"}:
+            return False
+        parts = parsed.path.rstrip("/").split("/")
+        return (
+            "graphql" in parts and parts[-1] in {"SearchTimeline", "SearchTimelineV2"}
+        ) or parsed.path in {
+            "/i/api/2/search/adaptive.json",
+            "/2/search/adaptive.json",
+            "/1.1/search/tweets.json",
+            "/i/api/1.1/search/tweets.json",
+        }
+
+    def route(self, route):
+        if self.primary(route.request):
+            if self.state or (self.limit is not None and self.requests >= self.limit):
+                self.blocked += 1
+                if not self.state:
+                    self.state, self.reason = "budget_exhausted", "BrowserReadBudgetExhausted"
+                route.abort("aborted")
+                return
+            self.requests += 1
+        route.fallback()
+
+    def resource_failure(self, request):
+        if request in self.resource_seen:
+            return
+        self.resource_seen.add(request)
+        kind = request.resource_type
+        kind = kind if kind in {"image", "media", "font", "script", "stylesheet"} else "third_party"
+        self.resources[kind] = self.resources.get(kind, 0) + 1
+
+    def response(self, response):
+        if self.primary(response.request):
+            self.responses += 1
+            if response.status == 429:
+                self.state, self.reason = "rate_limited", "BrowserRateLimited"
+                self.wait = max(self.wait, retry_after(response))
+                self.observed_at = time.time()
+        elif response.status >= 400:
+            self.resource_failure(response.request)
+
+    def failed(self, request):
+        if self.primary(request):
+            if not self.state:
+                self.state, self.reason = "network_error", "BrowserSearchRequestFailed"
+        else:
+            self.resource_failure(request)
+
+    def remaining(self, cap=15000):
+        self.check()
+        return max(1, min(cap, (self.deadline - time.monotonic()) * 1000))
+
+    def check(self):
+        if self.state:
+            raise BackendError(self.reason)
+        if time.monotonic() >= self.deadline:
+            self.state, self.reason = "timeout", "BrowserReadDeadlineExceeded"
+            raise BackendError(self.reason)
+
+    def start(self):
+        self.page.route("**/*", self.route)
+        self.page.on("response", self.response)
+        self.page.on("requestfailed", self.failed)
+
+    def close(self):
+        complete = True
+        for cleanup in (
+            lambda: self.page.unroute("**/*", self.route),
+            lambda: self.page.remove_listener("response", self.response),
+            lambda: self.page.remove_listener("requestfailed", self.failed),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                complete = False
+        return complete
+
+    def decorate(self, result):
+        stopped = bool(
+            self.state or result.get("rate_limited") or result.get("account_block_reason")
+        )
+        state = self.state or (
+            "challenge"
+            if result.get("account_block_reason")
+            else "rate_limited"
+            if result.get("rate_limited")
+            else "partial"
+        )
+        if stopped:
+            result.update(candidates=[], read_page_complete=False)
+        else:
+            result.setdefault("read_page_complete", bool(result.get("candidates")))
+        values = result.get("candidates", [])
+        result.update(
+            read_state=state,
+            coverage_complete=False,
+            next_cursor=None,
+            read_observed_at=self.observed_at if stopped else time.time(),
+            read_observation_source="playwright_primary_response"
+            if self.observed_at
+            else "playwright_visible_dom",
+            read_primary_request_count=self.requests,
+            read_primary_response_count=self.responses,
+            read_primary_requests_blocked=self.blocked,
+            read_resource_failures=dict(self.resources),
+            read_request_count_source="playwright_navigation_and_search_attempts",
+            read_page_fingerprint=digest(
+                sorted(str(row.get("id") or row.get("target") or row.get("url")) for row in values)
+            )
+            if result["read_page_complete"]
+            else None,
+        )
+        if state == "rate_limited":
+            result.update(rate_limited=True, retry_after_seconds=self.wait or 900)
+        return result
+
+    def failure(self, exc):
+        code = self.reason or getattr(exc, "safe_code", type(exc).__name__)
+        if not self.state:
+            self.state = "timeout" if type(exc).__name__ == "TimeoutError" else "unobservable"
+        return self.decorate({"candidates": [], "reason": code, "read_page_complete": False})
+
+
+class XStateError(BackendError):
+    """Only safe, categorical evidence; never includes page or response text."""
+
+    def __init__(self, code, failure_class, account_block_reason=None, *, rejected=False):
+        super().__init__(code)
+        self.failure_class = failure_class
+        self.account_block_reason = account_block_reason
+        self.confirmed_rejected = rejected
+
+
+def check_x_state(page):
+    """Inspect trusted routes and visible controls, never user-authored tweet text."""
+    if not isinstance(page.url, str):
+        return
+    parsed = urlparse(page.url)
+    if parsed.scheme != "https" or parsed.hostname not in {
+        "x.com",
+        "www.x.com",
+        "twitter.com",
+        "www.twitter.com",
+    }:
+        return
+    path = parsed.path.rstrip("/").casefold()
+    if path in {"/account/access", "/i/flow/arkose", "/i/flow/challenge"}:
+        raise XStateError("XChallengeRequired", "challenge", "x_challenge")
+    if path in {"/login", "/i/flow/login"}:
+        raise XStateError("XLoginRequired", "login_required", "x_login_required")
+    if path in {"/account/suspended", "/account/locked"}:
+        raise XStateError("XAccountRestricted", "restricted", "x_account_restricted")
+    components = (
+        ('iframe[src^="https://client-api.arkoselabs.com/"]', "challenge", "x_challenge"),
+        ('iframe[src^="https://iframe.arkoselabs.com/"]', "challenge", "x_challenge"),
+        ('iframe[src^="https://challenges.cloudflare.com/"]', "challenge", "x_challenge"),
+        ("#arkoseFrame", "challenge", "x_challenge"),
+        ('[data-testid="arkoseChallenge"]', "challenge", "x_challenge"),
+        ('[data-testid="accountSuspended"]', "restricted", "x_account_restricted"),
+        ('[data-testid="accountLocked"]', "restricted", "x_account_restricted"),
+    )
+    for selector, kind, block in components:
+        locator = page.locator(selector)
+        if any(locator.nth(i).is_visible() for i in range(locator.count())):
+            raise XStateError(
+                "XChallengeRequired" if kind == "challenge" else "XAccountRestricted",
+                kind,
+                block,
+            )
+
+
+def x_response_error(document, status):
+    """Classify structured API codes, not message substrings or tweet content."""
+    errors = document.get("errors", []) if isinstance(document, dict) else []
+    codes = set()
+    for error in errors if isinstance(errors, list) else []:
+        if not isinstance(error, dict):
+            continue
+        extensions = error.get("extensions") or {}
+        if not isinstance(extensions, dict):
+            extensions = {}
+        for value in (error.get("code"), extensions.get("code"), error.get("type")):
+            if isinstance(value, (str, int)):
+                codes.add(str(value).upper())
+    if codes & {"CHALLENGE_REQUIRED", "CAPTCHA_REQUIRED", "ARKOSE_CHALLENGE_REQUIRED"}:
+        return XStateError("XChallengeRequired", "challenge", "x_challenge", rejected=True)
+    if codes & {"64", "226", "326", "ACCOUNT_LOCKED", "ACCOUNT_SUSPENDED"}:
+        return XStateError(
+            "XAccountRestricted", "restricted", "x_account_restricted", rejected=True
+        )
+    if status == 401 or codes & {"32", "89", "215", "AUTHENTICATION_REQUIRED", "UNAUTHORIZED"}:
+        return XStateError("XLoginRequired", "login_required", "x_login_required", rejected=True)
+    if status == 429 or codes & {"88", "185", "RATE_LIMITED", "TOO_MANY_REQUESTS"}:
+        return XStateError("BrowserRateLimited", "rate_limited", rejected=True)
+    if status == 403:
+        return XStateError("XHTTPForbidden", "http_forbidden", rejected=True)
+    if errors:
+        return XStateError("XResponseRejected", "response_rejected", rejected=True)
+    return None
+
+
+def parse_create_tweet(response):
+    try:
+        document = response.json()
+    except Exception:
+        document = {}
+    data = document if isinstance(document, dict) else {}
+    for key in ("data", "create_tweet", "tweet_results", "result"):
+        data = data.get(key) if isinstance(data, dict) else None
+    data = data or {}
+    if isinstance(data, dict):
+        data = data.get("tweet", data)
+    if isinstance(data, dict) and str(data.get("rest_id", "")).isdigit():
+        # A durable reference must be saved before any later page-state failure.
+        return data
+    error = x_response_error(document, response.status)
+    if error:
+        raise error
+    raise BackendError("XTweetReceiptUnavailable")
 
 
 def launch_context(runtime, root, *, browser_channel="chromium", headless):
@@ -205,6 +483,7 @@ class BrowserBackend:
         self.execution_step = "browser_start"
         self.submission_started = False
         self.progress = None
+        self.response_failure = None
 
     def step(self, value, submission_started=None):
         self.execution_step, self.step_started_at = value, time.time()
@@ -220,30 +499,132 @@ class BrowserBackend:
             "submission_started": self.submission_started,
         }
 
-    def check_identity(self, *, timeout=15000, composer_overlay=False):
+    def check_identity(self, *, timeout=None, composer_overlay=False):
+        self.check_state()
         check_status(self.page)
         try:
             observed = identity(
                 self.platform,
                 self.context,
                 self.page,
-                timeout=timeout,
+                timeout=self.read_timeout(15000 if timeout is None else timeout),
                 composer_overlay=composer_overlay,
             )
         except Exception:
             # A challenge may appear while the identity control is loading.
+            self.check_state()
             check_status(self.page)
             raise
         check_status(self.page)
+        self.check_state()
         if not observed or observed != self.settings["identity"]:
             raise BackendError("BrowserIdentityMismatch")
 
+    def read_timeout(self, cap=15000):
+        scan = getattr(self, "read_scan", None)
+        return scan.remaining(cap) if scan else cap
+
+    def wait_read_results(self, locator):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        deadline = time.monotonic() + self.read_timeout() / 1000
+        while time.monotonic() < deadline:
+            self.check_state()
+            try:
+                locator.wait_for(timeout=min(250, self.read_timeout()))
+                if getattr(self, "read_scan", None):
+                    self.read_scan.check()
+                self.check_state()
+                return True
+            except PlaywrightTimeoutError:
+                pass
+        return False
+
+    def check_state(self):
+        if self.platform == "x":
+            check_x_state(self.page)
+
+    def navigate_x(self, url):
+        response = self.page.goto(
+            url,
+            wait_until="domcontentloaded",
+            **({"timeout": self.read_timeout()} if getattr(self, "read_scan", None) else {}),
+        )
+        self.check_state()
+        if getattr(self, "read_scan", None):
+            self.read_scan.check()
+        if response is not None and response.status in {401, 403, 429}:
+            raise x_response_error({}, response.status)
+        if response is not None and response.status >= 500:
+            raise BackendError("BrowserNavigationServerError")
+        return response
+
+    def create_tweet_data(self, response):
+        data = parse_create_tweet(response)
+        # Even a partial GraphQL success can carry an account restriction.
+        # Save its accepted ID before reporting that independent account state.
+        try:
+            error = x_response_error(response.json(), response.status)
+        except Exception:
+            error = None
+        if error and error.account_block_reason:
+            self.response_failure = error
+        return data
+
     def run(self, operation, payload, checkpoint, authorize):
+        self.read_scan = None
+        self.read_guard_pending = False
+        if self.platform != "x" or operation != "discover":
+            return self._run_guarded(operation, payload, checkpoint, authorize)
+        self.read_scan = BrowserReadScan(self.page, payload)
+        self.read_scan.start()
+        result = None
+        try:
+            try:
+                result = self._run_guarded(operation, payload, checkpoint, authorize)
+            except Exception as exc:
+                if self.read_guard_pending:
+                    raise
+                result = self.read_scan.failure(exc)
+                return result
+            result = self.read_scan.decorate(result)
+            return result
+        finally:
+            if not self.read_scan.close() and result is not None:
+                result["read_cleanup_state"] = "incomplete"
+            self.read_scan = None
+
+    def _run_guarded(self, operation, payload, checkpoint, authorize):
+        if self.platform == "x":
+            # A receipt preserves delivery evidence, not a fresh observation of
+            # account state. Replaying its guard event could keep an old recovery
+            # token valid when this operation detects a new challenge.
+            payload = dict(payload)
+            for key in ("receipt", "result"):
+                if isinstance(payload.get(key), dict):
+                    payload[key] = {
+                        field: value
+                        for field, value in payload[key].items()
+                        if not field.startswith("account_block_")
+                        and field not in {"account_restriction", "browser_page_anomaly"}
+                    }
         self.progress = getattr(checkpoint, "progress", None) if operation == "execute" else None
         self.submission_started = bool(
             (payload.get("receipt") or payload.get("result") or {}).get("submission_started")
         )
         self.step("browser_ready")
+        self.response_failure = None
+        receipt = dict(payload.get("receipt") or payload.get("result") or {})
+        for key in ("external_reference", "message_ids"):
+            if payload.get(key) and not receipt.get(key):
+                receipt[key] = payload[key]
+        save = checkpoint
+
+        def checkpoint(result):
+            receipt.update(result)
+            save(result)
+
+        checkpoint.progress = self.progress
         try:
             result = self._run(operation, payload, checkpoint, authorize)
             if operation in {"execute", "verify"}:
@@ -252,6 +633,94 @@ class BrowserBackend:
                 result.update(self.diagnostics())
             return result
         except Exception as exc:
+            if self.platform == "x":
+                # A challenge may have appeared while a control wait timed out.
+                try:
+                    self.check_state()
+                except XStateError as state:
+                    # Preserve an explicit CreateTweet refusal if both exist.
+                    state.confirmed_rejected = getattr(exc, "confirmed_rejected", False)
+                    exc = state
+                except Exception:
+                    # A closed page cannot provide new state evidence.
+                    pass
+                code = getattr(exc, "safe_code", type(exc).__name__)
+                kind = getattr(exc, "failure_class", None)
+                if kind is None:
+                    if code == "BrowserNavigationAccessDenied":
+                        kind = "http_forbidden"
+                    elif code == "BrowserRateLimited":
+                        kind = "rate_limited"
+                    elif type(exc).__name__ == "TimeoutError":
+                        kind = (
+                            "network"
+                            if self.execution_step == "submission_response"
+                            else "page_anomaly"
+                        )
+                    elif (
+                        isinstance(exc, OSError)
+                        or "net::ERR_" in str(exc)
+                        or code
+                        in {
+                            "BrowserNavigationUnavailable",
+                            "BrowserNavigationDownload",
+                            "BrowserNavigationServerError",
+                        }
+                    ):
+                        kind = "network"
+                    elif code in {"BrowserIdentityMismatch", "XIdentityUnavailable"}:
+                        kind = "identity_mismatch"
+                    elif isinstance(exc, BackendError) and code not in {
+                        "BrowserReplyControlUnavailable",
+                        "BrowserReplyComposerAmbiguous",
+                        "BrowserControlNotUnambiguouslyAvailable",
+                        "BrowserNavigationTimeout",
+                        "XTweetReceiptUnavailable",
+                    }:
+                        kind = "preparation_failed"
+                    else:
+                        kind = "page_anomaly"
+                block = getattr(exc, "account_block_reason", None)
+                if operation != "execute" and not block and kind != "rate_limited":
+                    exc.execution_step = self.execution_step
+                    exc.submission_started = self.submission_started
+                    raise exc
+                durable = bool(receipt.get("external_reference") or receipt.get("message_ids"))
+                not_submitted = (
+                    operation == "execute" and not self.submission_started and not durable
+                )
+                rejected = (
+                    operation == "execute"
+                    and bool(getattr(exc, "confirmed_rejected", False))
+                    and not durable
+                )
+                result = {
+                    **receipt,
+                    "status": "failed_known" if not_submitted or rejected else "unknown",
+                    "verified": False,
+                    "reason": code,
+                    "failure_class": kind,
+                    "confirmed_not_submitted": not_submitted,
+                    "confirmed_rejected": rejected,
+                    **self.diagnostics(),
+                }
+                if block:
+                    result["account_block_reason"] = block
+                    # Generate once at the actual detection boundary; native
+                    # checkpoint and Engine then carry and deduplicate this ID.
+                    result["account_block_event_id"] = uuid.uuid4().hex
+                if kind == "page_anomaly" and operation == "execute":
+                    result["browser_page_anomaly"] = True
+                if kind == "rate_limited":
+                    result.update(rate_limited=True, retry_after_seconds=3600)
+                if operation == "health":
+                    result.update(healthy=False, service_ready=False, identity_verified=False)
+                elif operation == "preflight":
+                    result["allowed"] = False
+                if operation == "execute" or block:
+                    self.read_guard_pending = bool(block)
+                    checkpoint(result)
+                return result
             exc.execution_step = self.execution_step
             exc.submission_started = self.submission_started
             if isinstance(exc, BackendError) and exc.safe_code == "BrowserRateLimited":
@@ -284,7 +753,8 @@ class BrowserBackend:
             or (operation == "execute" and payload.get("payload", {}).get("action") == "post")
             else 15000
         )
-        navigate_home(self.page, self.platform, timeout=read_timeout)
+        self.navigation_timeout = read_timeout
+        self.navigate_home()
         self.step("identity_check")
         self.check_identity(timeout=read_timeout)
         if operation == "health":
@@ -314,10 +784,19 @@ class BrowserBackend:
             payload, checkpoint, authorize
         )
 
+    def navigate_home(self):
+        response = navigate_home(
+            self.page,
+            self.platform,
+            timeout=self.read_timeout(getattr(self, "navigation_timeout", 15000)),
+        )
+        self.check_state()
+        return response
+
     def discover(self, policy):
         records = {}
         maximum = policy["max_candidates"]
-        for query in policy["queries"]:
+        for query in dict.fromkeys(policy["queries"]):
             if self.platform == "reddit":
                 response = self.context.request.get(
                     HOME["reddit"]
@@ -345,13 +824,17 @@ class BrowserBackend:
                         "is_public": True,
                     }
             else:
-                check_response(
-                    self.page.goto(
-                        HOME["x"] + "/search?q=" + quote(query) + "&src=typed_query&f=live"
-                    )
-                )
-                self.page.get_by_test_id("tweet").first.wait_for(timeout=15000)
-                articles = self.page.get_by_test_id("tweet")
+                self.navigate_x(HOME["x"] + "/search?q=" + quote(query) + "&src=typed_query&f=live")
+                parsed = urlparse(self.page.url)
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname not in {"x.com", "www.x.com"}
+                    or parsed.path != "/search"
+                ):
+                    raise BackendError("BrowserSearchUnavailable")
+                articles = self.page.locator('[data-testid="primaryColumn"] [data-testid="tweet"]')
+                if not self.wait_read_results(articles.first):
+                    break
                 for index in range(min(articles.count(), maximum)):
                     article = articles.nth(index)
                     links = article.locator('a[href*="/status/"]').filter(
@@ -385,19 +868,18 @@ class BrowserBackend:
         if payload.get("cursor"):
             raise BackendError("BrowserSearchCursorUnavailable")
         query = payload["query"]
-        check_response(
-            self.page.goto(HOME["x"] + "/search?q=" + quote(query) + "&src=typed_query&f=live")
-        )
-        if "/search" not in urlparse(self.page.url).path:
+        self.navigate_x(HOME["x"] + "/search?q=" + quote(query) + "&src=typed_query&f=live")
+        parsed = urlparse(self.page.url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"x.com", "www.x.com"}
+            or parsed.path != "/search"
+        ):
             raise BackendError("BrowserSearchUnavailable")
         # Search results belong to the primary column. Other visible tweets can
         # appear in side panels and must not be admitted as query matches.
         articles = self.page.locator('[data-testid="primaryColumn"] [data-testid="tweet"]')
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-        try:
-            articles.first.wait_for(timeout=15000)
-        except PlaywrightTimeoutError:
+        if not self.wait_read_results(articles.first):
             return {
                 "candidates": [],
                 "next_cursor": None,
@@ -442,6 +924,9 @@ class BrowserBackend:
                     "query_visible_text": article.inner_text()[:2000],
                 }
             )
+        self.check_state()
+        if getattr(self, "read_scan", None):
+            self.read_scan.check()
         return {
             "candidates": observed,
             "next_cursor": None,
@@ -542,7 +1027,7 @@ class BrowserBackend:
         }:
             raise BackendError("InvalidXTarget")
         self.step("target_navigation")
-        check_response(page.goto(item["target"], wait_until="domcontentloaded"))
+        self.navigate_x(item["target"])
         self.step("target_lookup")
         article = self.tweet(item["target"])
         self.step("identity_check")
@@ -551,13 +1036,17 @@ class BrowserBackend:
         if action in {"like", "repost"}:
             done = "unlike" if action == "like" else "unretweet"
             if article.get_by_test_id(done).count() == 0:
+                self.check_state()
                 authorize()
+                self.check_state()
                 self.step("submit_click", True)
                 visible_one(
                     article.get_by_test_id("like" if action == "like" else "retweet")
                 ).click()
                 if action == "repost":
+                    self.check_state()
                     authorize()
+                    self.check_state()
                     visible_one(page.get_by_test_id("retweetConfirm")).click()
             self.step("submission_response")
             article.get_by_test_id(done).wait_for(timeout=15000)
@@ -611,6 +1100,7 @@ class BrowserBackend:
         else:
             raise BackendError("UnsupportedXAction")
         self.step("fill_reply")
+        self.check_state()
         editor = visible_one(composer.get_by_test_id("tweetTextarea_0"))
         editor.click()
         editor.press("Control+A")
@@ -624,7 +1114,9 @@ class BrowserBackend:
                 [m["path"] for m in item["media"]]
             )
         self.step("submission_authorization")
+        self.check_state()
         authorize()
+        self.check_state()
         with page.expect_response(
             lambda r: r.request.method == "POST" and "/CreateTweet" in r.url, timeout=25000
         ) as accepted:
@@ -632,15 +1124,7 @@ class BrowserBackend:
             visible_one(submit_button).click()
             self.step("submission_response")
         self.step("parse_receipt")
-        data = (
-            check_response(accepted.value)
-            .json()
-            .get("data", {})
-            .get("create_tweet", {})
-            .get("tweet_results", {})
-            .get("result", {})
-        )
-        data = data.get("tweet", data)
+        data = self.create_tweet_data(accepted.value)
         tweet_id = str(data.get("rest_id", ""))
         if not tweet_id.isdigit():
             raise BackendError("XTweetReceiptUnavailable")
@@ -658,6 +1142,9 @@ class BrowserBackend:
         }
         checkpoint(result)
         self.step("receipt_saved")
+        if self.response_failure:
+            raise self.response_failure
+        self.check_state()
         return self.verify({**payload, "receipt": result})
 
     def x_original_post(self, payload, checkpoint, authorize):
@@ -717,22 +1204,16 @@ class BrowserBackend:
         if x_editor_text(editor) != item["text"]:
             raise BackendError("ApprovedTextNotRetained")
         self.step("submission_authorization", False)
+        self.check_state()
         authorize()
+        self.check_state()
         with page.expect_response(
             lambda r: r.request.method == "POST" and "/CreateTweet" in r.url, timeout=25000
         ) as accepted:
             self.step("submit_click", True)
             visible_one(button).click()
         self.step("parse_receipt", True)
-        data = (
-            check_response(accepted.value)
-            .json()
-            .get("data", {})
-            .get("create_tweet", {})
-            .get("tweet_results", {})
-            .get("result", {})
-        )
-        data = data.get("tweet", data)
+        data = self.create_tweet_data(accepted.value)
         tweet_id, legacy = str(data.get("rest_id", "")), data.get("legacy", {})
         if not tweet_id.isdigit():
             raise BackendError("XTweetReceiptUnavailable")
@@ -758,6 +1239,9 @@ class BrowserBackend:
         }
         checkpoint(result)
         self.step("receipt_saved", True)
+        if self.response_failure:
+            raise self.response_failure
+        self.check_state()
         return self.verify({**payload, "receipt": result})
 
     def verify(self, payload):
@@ -805,7 +1289,7 @@ class BrowserBackend:
             if parsed.hostname not in {"x.com", "www.x.com"}:
                 raise BackendError("InvalidReceiptURL")
             self.step("receipt_navigation")
-            check_response(self.page.goto(url, wait_until="domcontentloaded"))
+            self.navigate_x(url)
             self.step("receipt_lookup")
             article = self.tweet(url)
             self.step("receipt_validation")

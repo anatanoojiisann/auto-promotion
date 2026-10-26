@@ -3,12 +3,19 @@
 import re
 from pathlib import Path
 
+from .read_cooldowns import FIELDS as X_READ_FIELDS
+from .telegram_reading import READ_FIELDS, read_diagnostics
+
 FIELDS = (
-    "execution_step",
-    "step_started_at",
-    "submission_started",
-    "exception_type",
-    "diagnostic_traceback",
+    (
+        "execution_step",
+        "step_started_at",
+        "submission_started",
+        "exception_type",
+        "diagnostic_traceback",
+    )
+    + READ_FIELDS
+    + X_READ_FIELDS
 )
 
 
@@ -117,6 +124,23 @@ def exception_details(exc):
         "exception_type": safe_code(type(exc).__name__),
         "diagnostic_traceback": frames[-12:],
     }
+    counts = getattr(exc, "rpc_counts", None)
+    if isinstance(counts, dict):
+        result["rpc_counts"] = {
+            key: count
+            for key, count in counts.items()
+            if key
+            in {"mutation", "identity", "permissions", "discovery", "history", "entity", "other"}
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= 0
+        }
+    source = getattr(exc, "rpc_count_source", None)
+    if isinstance(source, str):
+        result["rpc_count_source"] = safe_code(source)
+    extra = getattr(exc, "read_diagnostics", None)
+    if isinstance(extra, dict):
+        result.update(read_diagnostics(extra))
     if getattr(exc, "execution_step", None):
         result["execution_step"] = safe_code(exc.execution_step, "unknown")
     if isinstance(getattr(exc, "submission_started", None), bool):

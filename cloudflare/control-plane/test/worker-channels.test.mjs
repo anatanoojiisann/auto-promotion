@@ -402,12 +402,35 @@ test("production Worker enforces the fence on online and standby requests", asyn
       { pool: "x.edge", expected_id: "send:0" },
       { operator: false },
     );
-    assert.equal((await r.json()).job.id, "send:0");
+    const lease = (await r.json()).job;
+    assert.equal(lease.id, "send:0");
     r = await request(
       "/v1/claim",
       { pool: "x.edge", expected_id: "send:1" },
       { operator: false },
     );
+    assert.equal((await r.json()).job, null);
+    accounts[0].outbound_block_state = {
+      state: "active", reason: "x_challenge", since: now,
+      until: null, generation: 1,
+    };
+    r = await request("/v1/sync", { revision: 2, accounts: [accounts[0]], tasks: [], jobs: [] });
+    assert.equal(r.status, 200, await r.clone().text());
+    r = await request("/v1/authorize", {
+      id: lease.id, lease_token: lease.lease_token, attempt_id: "synthetic-blocked-attempt",
+    }, { operator: false });
+    assert.equal(r.status, 409);
+    assert.equal((await r.json()).error, "AccountOutboundBlocked");
+    r = await request("/v1/heartbeat", {}, { operator: false });
+    const blockedHeartbeat = await r.json();
+    assert.equal(blockedHeartbeat.account_blocks[0].account_id, accounts[0].id);
+    assert.equal(blockedHeartbeat.account_blocks[0].outbound_block_state.reason, "x_challenge");
+    assert.ok(blockedHeartbeat.account_blocks[0].affected_tasks.includes(tasks[0].id));
+    r = await request("/v1/complete", {
+      id: lease.id, lease_token: lease.lease_token, state: "pending", result: {},
+    }, { operator: false });
+    assert.equal(r.status, 200, await r.clone().text());
+    r = await request("/v1/claim", { pool: "x.edge", expected_id: lease.id }, { operator: false });
     assert.equal((await r.json()).job, null);
   } finally {
     await mf.dispose();
