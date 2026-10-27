@@ -1,5 +1,8 @@
 """Detect visible platform verification/restriction notices without interacting."""
 
+import re
+from urllib.parse import urlparse
+
 from .common import BackendError
 
 # Only platform notices and visible challenge controls are inspected. User posts
@@ -28,13 +31,27 @@ STATUS_JS = r"""() => {
     .map(el => el.innerText || '').join('\n');
   if (/your account (?:is|has been) (?:locked|suspended)|account (?:is |has been )?(?:temporarily )?(?:restricted|limited)|账号已被(?:锁定|冻结|限制)|帐[户号]已被(?:锁定|冻结|限制)/i.test(notices))
     return 'BrowserAccountRestricted';
-  if (/verify (?:that )?you are (?:a )?human|authenticate your account|help us keep your account safe|人机验证|验证您是人类|证明您是真人|完成安全验证/i.test(notices))
+  if (/verify (?:that )?you are (?:a )?human|authenticate your account|help us keep your account safe|人机验证|验证您是人类|证明您是真人|请验证您是真人|正在进行安全验证|完成安全验证/i.test(notices))
     return 'BrowserVerificationRequired';
   return null;
 }"""
 
 
 def check_status(page):
+    path = urlparse(page.url).path
+    if re.match(r"^/account/access(?:/|$)", path):
+        raise BackendError("BrowserVerificationRequired")
+    if re.fullmatch(r"/account/suspended/?", path):
+        raise BackendError("BrowserAccountRestricted")
     reason = page.evaluate(STATUS_JS)
     if reason in {"BrowserVerificationRequired", "BrowserAccountRestricted"}:
         raise BackendError(reason)
+
+
+def check_context_status(context):
+    """Inspect existing X pages before a health probe can replace them with /home."""
+    for page in getattr(context, "pages", []):
+        if page.is_closed():
+            continue
+        if urlparse(page.url).hostname in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
+            check_status(page)

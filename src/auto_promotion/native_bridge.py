@@ -102,6 +102,17 @@ def dispatch(request):
     payload = dict(request.get("payload", {}))
     write = operation in {"execute", "join"}
 
+    if operation == "health" and request.get("database") and request.get("account_id"):
+        from .account_blocks import active_block, blocked_health
+
+        with Store(request["database"], initialize=False).connect() as db:
+            block = active_block(db, request["account_id"], time.time())
+        generation = payload.get("account_block_recovery_generation")
+        if block and not (type(generation) is int and generation == block["generation"]):
+            # Do not navigate away from a verification page on an ordinary probe.
+            # A matching explicit recovery check remains read-only and never clears it.
+            return blocked_health(block)
+
     def authorize():
         return verify_claim(request)
 
@@ -130,6 +141,9 @@ def dispatch(request):
 
         def checkpoint(result):
             nonlocal pending_guard
+            from .account_blocks import normalize_evidence
+
+            normalize_evidence(result, platform)
             guard_evidence = any(
                 field in result
                 for field in ("account_block_reason", "account_restriction", "browser_page_anomaly")
@@ -284,13 +298,19 @@ def dispatch(request):
             if operation == "health":
                 if platform in {"x", "reddit"} and code == "Error":
                     code = browser_read_failure_reason(exc, code)
-                return {
+                result = {
                     "healthy": False,
                     "service_ready": False,
                     "identity_verified": False,
                     "reason": code,
                     **exception_details(exc),
                 }
+                from .account_blocks import normalize_evidence
+
+                normalize_evidence(result, platform)
+                if result.get("account_block_reason"):
+                    checkpoint(result)
+                return result
             if write:
                 result = {
                     **(receipt.read(key) or {}),
@@ -307,6 +327,9 @@ def dispatch(request):
                 error.rpc_count_source = details.get("rpc_count_source")
                 error.read_diagnostics = {key: details[key] for key in FIELDS if key in details}
                 raise error from None
+        from .account_blocks import normalize_evidence
+
+        normalize_evidence(result, platform)
         result = {**RUNTIME, **result}
         if write:
             progress_fields = {
@@ -316,6 +339,8 @@ def dispatch(request):
             }
             result = {**progress_fields, **result}
         result = {key: value for key, value in result.items() if key in RESULT_FIELDS}
+        if not write and operation != "verify" and result.get("account_block_reason"):
+            checkpoint(result)
         if operation == "verify" and result.get("verified") is True:
             checkpoint(result)
         if write:

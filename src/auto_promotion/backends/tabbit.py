@@ -108,27 +108,11 @@ def call(platform, settings, operation, payload=None, checkpoint=None, authorize
     try:
         if inventory.get("truncated"):
             raise BackendError("TabbitInventoryTruncated")
-        available = [
-            tab
-            for tab in inventory.get("tabs", [])
-            if tab.get("state") == "available"
-            and urlparse(tab.get("url", "")).hostname in {"x.com", "www.x.com"}
-        ]
-        preferred = [tab for tab in available if tab.get("tabId") == settings.get("tabbit_tab_id")]
-        if not preferred:
-            preferred = [
-                tab
-                for tab in available
-                if urlparse(tab["url"]).path.strip("/").split("/")[0].casefold() == expected
-            ]
-        selected = preferred[0] if len(preferred) == 1 else None
-        if selected is None and len(available) == 1:
-            selected = available[0]
-
         request_id = "identity-" + uuid.uuid4().hex
         arguments = ["nodejs", "--task", task, "--request-id", request_id, "--timeout-ms", "60000"]
-        if selected:
-            arguments.extend(["--tab", str(selected["tabId"])])
+        # A settled sender tab can still fail attachment before any health code
+        # runs. A new task without --tab gets its own scratch page in the same
+        # configured browser session; user tabs and their drafts stay untouched.
         # Account menu and Profile are observed controls on the authenticated X UI.
         code = (
             READ_STATE_JS
@@ -136,6 +120,7 @@ def call(platform, settings, operation, payload=None, checkpoint=None, authorize
             + STATUS_JS
             + ");\n"
             + r"""
+try {
 let blocked = await readOnlyState();
 if (blocked) return {...blocked,read_contract:'repo_x_scan_v1',read_observed_at:Date.now()/1000};
 if (!/^https:\/\/(www\.)?x\.com\//.test(page.url())) {
@@ -162,6 +147,9 @@ const profile = await page.getByRole("link", {name: "Profile", exact: true, incl
   .getAttribute("href");
 blocked = await readOnlyState();
 return {...(blocked || {handles,profile}),read_contract:'repo_x_scan_v1',read_observed_at:Date.now()/1000};
+} finally {
+  await page.close();
+}
 """
         )
         settled = False

@@ -21,7 +21,7 @@ class TabbitConnectionTests(unittest.TestCase):
             "result": {"value": {"handles": [handle], "profile": "/" + handle}},
         }
 
-    def test_verified_session_releases_and_retains_user_tab(self):
+    def test_verified_session_uses_scratch_page_and_retains_user_tabs(self):
         with patch(
             "auto_promotion.backends.tabbit.cli",
             side_effect=[self.inventory, self.response(), {"ok": True}],
@@ -30,7 +30,10 @@ class TabbitConnectionTests(unittest.TestCase):
         self.assertTrue(result["identity_verified"])
         self.assertEqual(result["account_identity"], "brand")
         self.assertEqual(result["permissions"], [])
-        self.assertIn("17", cli.call_args_list[1].args[0])
+        self.assertNotIn("--tab", cli.call_args_list[1].args[0])
+        code = cli.call_args_list[1].kwargs["code"]
+        self.assertIn("finally", code)
+        self.assertIn("await page.close()", code)
         self.assertEqual(cli.call_args_list[-1].args[0], ["finish", "--task", "Verify X brand"])
 
     def test_changed_identity_fails_closed(self):
@@ -59,7 +62,7 @@ class TabbitConnectionTests(unittest.TestCase):
                 )
                 self.assertEqual(cli.call_args_list[-1].args[0][0], "finish")
 
-    def test_existing_profile_subroute_is_selected_among_other_tabs(self):
+    def test_existing_profile_subroute_is_not_acquired_for_health(self):
         inventory = {
             **self.inventory,
             "tabs": [
@@ -73,8 +76,17 @@ class TabbitConnectionTests(unittest.TestCase):
             side_effect=[inventory, self.response(), {"ok": True}],
         ) as cli:
             self.assertTrue(call("x", self.settings, "health")["identity_verified"])
-        self.assertIn("19", cli.call_args_list[1].args[0])
+        self.assertNotIn("--tab", cli.call_args_list[1].args[0])
         self.assertEqual(cli.call_args_list[-1].args[0][0], "finish")
+
+    def test_configured_stale_tab_is_not_acquired_for_health(self):
+        settings = {**self.settings, "tabbit_tab_id": 17}
+        with patch(
+            "auto_promotion.backends.tabbit.cli",
+            side_effect=[self.inventory, self.response(), {"ok": True}],
+        ) as cli:
+            self.assertTrue(call("x", settings, "health")["identity_verified"])
+        self.assertNotIn("--tab", cli.call_args_list[1].args[0])
 
     def test_profile_must_match_account_menu(self):
         response = self.response()

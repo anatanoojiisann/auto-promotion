@@ -38,6 +38,25 @@ def normalize_health(result):
 
 
 def summary(account, now):
+    block = account.get("outbound_block")
+    if block:
+        state = {
+            "x_challenge": "verification_required",
+            "x_login_required": "authorization_required",
+            "x_account_restricted": "restricted",
+            "telegram_speaking_restricted": "restricted",
+        }.get(block["reason"], "temporary_unavailable")
+        return {
+            "account_id": account["id"],
+            "label": account["label"],
+            "platform": account["platform"],
+            "ready": False,
+            "state": state,
+            "reason": block["reason"],
+            "message": MESSAGES[state],
+            "checked_at": account["checked_at"],
+            "retry_at": block.get("until"),
+        }
     health = normalize_health(account["health"])
     reason = safe_code(health.get("reason"), "unverified")
     state = account["connection_state"]

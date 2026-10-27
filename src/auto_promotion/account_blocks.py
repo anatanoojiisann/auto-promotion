@@ -15,6 +15,7 @@ FIELDS = (
     "account_block_until",
     "account_block_generation",
     "account_block_event_id",
+    "account_block_cached",
     "account_restriction",
     "failure_class",
     "browser_page_anomaly",
@@ -36,6 +37,45 @@ MANUAL_REASONS = {
     "telegram_speaking_restricted",
     "account_guard_unavailable",
 }
+
+LEGACY_X_REASONS = {
+    "BrowserVerificationRequired": "x_challenge",
+    "XChallengeRequired": "x_challenge",
+    "CaptchaRequired": "x_challenge",
+    "ChallengeRequired": "x_challenge",
+    "BrowserLoginRequired": "x_login_required",
+    "BrowserAccountRestricted": "x_account_restricted",
+}
+
+
+def normalize_evidence(result, platform):
+    """Older providers may return only a reason; it still denotes a durable stop."""
+    if platform == "x" and not result.get("account_block_reason"):
+        reason = LEGACY_X_REASONS.get(result.get("reason"))
+        if reason:
+            result["account_block_reason"] = reason
+    return result
+
+
+def blocked_health(block):
+    """A normal identity probe cannot certify that a manual stop was resolved."""
+    reason = {
+        "x_challenge": "BrowserVerificationRequired",
+        "x_login_required": "BrowserLoginRequired",
+        "x_account_restricted": "BrowserAccountRestricted",
+    }.get(block["reason"], "AccountOutboundBlocked")
+    return {
+        "healthy": False,
+        "service_ready": True,
+        "identity_verified": False,
+        "permissions": [],
+        "reason": reason,
+        "account_block_reason": block["reason"],
+        "account_block_since": block["since"],
+        "account_block_until": block["until"],
+        "account_block_generation": block["generation"],
+        "account_block_cached": True,
+    }
 
 
 def active_block(db, account_id, now):
@@ -70,6 +110,14 @@ def active_block(db, account_id, now):
 def observe(db, account_id, result, *, now, operation, payload=None, task_id=None):
     """Call inside the account lane, before releasing it; no external calls here."""
     payload = payload or {}
+    if result.get("account_block_cached") is True:
+        # A local stop view is not a new platform observation. In particular it
+        # must not invalidate a fresh, explicit recovery probe or replay a stop
+        # which was already cleared.
+        return active_block(db, account_id, now)
+    if result.get("reason") in LEGACY_X_REASONS:
+        account = db.execute("SELECT platform FROM accounts WHERE id=?", (account_id,)).fetchone()
+        normalize_evidence(result, account[0] if account else None)
     reason = result.get("account_block_reason")
     if reason not in MANUAL_REASONS and reason != "browser_page_anomaly":
         reason = None

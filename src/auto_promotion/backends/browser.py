@@ -10,7 +10,7 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlparse
 
 from ..models import digest, epoch
-from .browser_status import check_status
+from .browser_status import check_context_status, check_status
 from .common import (
     BackendError,
     language_evidence,
@@ -1368,6 +1368,8 @@ def call(platform, label, operation, payload, checkpoint, authorize):
             headless=settings.get("browser_headless", True) is not False,
         )
         try:
+            if platform == "x":
+                check_context_status(context)
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(15000)
             return BrowserBackend(platform, label, context, page, settings).run(

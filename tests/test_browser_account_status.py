@@ -4,7 +4,7 @@ import os
 import unittest
 
 from auto_promotion.backends.browser import BrowserBackend
-from auto_promotion.backends.browser_status import STATUS_JS
+from auto_promotion.backends.browser_status import STATUS_JS, check_context_status
 from auto_promotion.backends.common import BackendError
 
 
@@ -32,6 +32,7 @@ class BrowserAccountStatusTests(unittest.TestCase):
     def test_visible_verification_and_restrictions_block_even_with_correct_identity(self):
         for notice, expected in (
             ("<h1>Verify you are human</h1>", "BrowserVerificationRequired"),
+            ("<h1>正在进行安全验证</h1><p>请验证您是真人</p>", "BrowserVerificationRequired"),
             ('<div role="dialog">Authenticate your account</div>', "BrowserVerificationRequired"),
             ('<iframe title="Security challenge"></iframe>', "BrowserVerificationRequired"),
             ("<h2>Your account has been locked</h2>", "BrowserAccountRestricted"),
@@ -73,3 +74,12 @@ class BrowserAccountStatusTests(unittest.TestCase):
         ):
             self.page.goto("https://synthetic.test" + path)
             self.assertEqual(self.page.evaluate(STATUS_JS), expected)
+
+    def test_verification_in_second_page_survives_before_home_navigation(self):
+        self.context.route("**/*", lambda route: route.fulfill(content_type="text/html", body="<p>offline</p>"))
+        self.page.goto("https://x.com/home")
+        second = self.context.new_page()
+        second.goto("https://x.com/account/access")
+        with self.assertRaisesRegex(BackendError, "BrowserVerificationRequired"):
+            check_context_status(self.context)
+        self.assertEqual(second.url, "https://x.com/account/access")

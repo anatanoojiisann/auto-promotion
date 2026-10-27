@@ -381,8 +381,9 @@ class Engine:
                     "account_retry_at": retry_at,
                     "cooldown_source": "x_read_rate_limit",
                 }
-            from .account_blocks import observe
+            from .account_blocks import normalize_evidence, observe
 
+            normalize_evidence(result, account["platform"])
             if any(key in result for key in BLOCK_FIELDS) or operation == "execute":
                 with self.store.connect(write=True) as db:
                     observe(
@@ -571,6 +572,18 @@ class Engine:
         from .health_checks import cached, probe_key
 
         account = self.account(account_id)
+        if not recovery and account.get("outbound_block"):
+            from .account_blocks import blocked_health
+            from .health_checks import category
+
+            stopped = blocked_health(account["outbound_block"])
+            return {
+                **account,
+                "status": "unavailable",
+                "connection_state": category(stopped["reason"]),
+                "writable": False,
+                "health": {**account["health"], **stopped, "probe_cached": True},
+            }
         if account["disabled"] or account["cooldown_until"] > self.clock():
             return account
         if not recovery and cached(
@@ -613,7 +626,16 @@ class Engine:
         if not recovery and cached(account, now, key, force=force):
             return {**account, "health": {**previous, "probe_cached": True}}
         try:
-            result = self.call(account, "health")
+            payload = None
+            if recovery and account.get("outbound_block"):
+                payload = {
+                    "account_block_recovery_generation": account["outbound_block"]["generation"]
+                }
+            result = (
+                self.call(account, "health", payload)
+                if payload
+                else self.call(account, "health")
+            )
         except AccountBusy:
             return {**account, "writable": False, "connection_state": "busy"}
         except Conflict as exc:
