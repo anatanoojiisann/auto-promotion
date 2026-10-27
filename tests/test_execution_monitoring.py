@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from auto_promotion.adapters import AdapterRegistry
@@ -109,8 +110,12 @@ class MonitoringTests(unittest.TestCase):
 
     def test_browser_failure_before_submission_records_exact_step(self):
         page = Mock()
+        page.url = "https://x.com/home"
+        page.locator.return_value.count.return_value = 0
         page.goto.side_effect = [None, TimeoutError("must-not-leak-cookie")]
-        backend = BrowserBackend("x", "local", Mock(), page, {"identity": "brand"})
+        backend = BrowserBackend(
+            "x", "local", SimpleNamespace(pages=[page]), page, {"identity": "brand"}
+        )
         with patch.object(backend, "check_identity"):
             result = backend.run(
                 "execute",

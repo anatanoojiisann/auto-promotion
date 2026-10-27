@@ -118,6 +118,73 @@ class AccountBlockTests(unittest.TestCase):
             len(self.store.rows("SELECT * FROM audit WHERE kind='account.outbound_blocked'")), 1
         )
 
+    def test_ordinary_healthy_probe_cannot_clear_stop_or_mark_recovery_success(self):
+        self.observe({"account_block_reason": "x_challenge"})
+        with patch.object(
+            self.engine,
+            "_call_unlocked",
+            return_value={
+                "healthy": True,
+                "identity_verified": True,
+                "account_identity": "synthetic",
+            },
+        ):
+            checked = self.engine.check_account(self.account["id"], force=True)
+        self.assertEqual(checked["connection_state"], "healthy")
+        self.assertFalse(checked["writable"])
+        self.assertFalse(checked["outbound_block"]["health_ok"])
+        restarted = Engine(self.store, self.engine.adapters, clock=self.engine.clock)
+        self.assertEqual(
+            restarted.account(self.account["id"])["outbound_block"]["reason"], "x_challenge"
+        )
+        self.assertIsNone(restarted._claim(self.store.one("SELECT id FROM items")["id"]))
+        self.assertEqual(self.store.one("SELECT count(*) n FROM attempts")["n"], 0)
+
+    def test_late_recovery_health_success_cannot_verify_new_challenge_generation(self):
+        self.observe({"account_block_reason": "x_challenge"})
+        # Obtain a prior successful recovery observation so another detection
+        # advances its generation. A later response must not verify that epoch.
+        with patch.object(
+            self.engine,
+            "call",
+            return_value={
+                "healthy": True,
+                "identity_verified": True,
+                "account_identity": "synthetic",
+            },
+        ):
+            prior = self.engine.check_account_block(self.account["id"])["outbound_block"]
+
+        def delayed(*_args):
+            self.observe({"account_block_reason": "x_challenge"}, item="later")
+            return {"healthy": True, "identity_verified": True, "account_identity": "synthetic"}
+
+        with patch.object(self.engine, "_call_unlocked", side_effect=delayed):
+            checked = self.engine.check_account_block(self.account["id"])
+        self.assertGreater(checked["outbound_block"]["generation"], prior["generation"])
+        self.assertFalse(checked["outbound_block"]["health_ok"])
+        self.assertFalse(checked["writable"])
+        with self.assertRaises(Conflict):
+            self.engine.resume_account_block(self.account["id"], prior["generation"])
+
+    def test_first_recovery_probe_cannot_verify_new_challenge_detected_while_in_flight(self):
+        self.observe({"account_block_reason": "x_challenge"})
+        original = self.engine.account(self.account["id"])["outbound_block"]
+        self.assertIsNone(original["health_checked_at"])
+
+        def delayed(*_args):
+            self.observe({"account_block_reason": "x_challenge"}, item="first-probe-new-evidence")
+            return {"healthy": True, "identity_verified": True, "account_identity": "synthetic"}
+
+        with patch.object(self.engine, "_call_unlocked", side_effect=delayed):
+            checked = self.engine.check_account_block(self.account["id"])
+        block = checked["outbound_block"]
+        self.assertGreater(block["generation"], original["generation"])
+        self.assertFalse(block["health_ok"])
+        self.assertFalse(checked["writable"])
+        with self.assertRaises(Conflict):
+            self.engine.resume_account_block(self.account["id"], block["generation"])
+
     def test_new_challenge_invalidates_previous_successful_health_probe(self):
         self.observe({"account_block_reason": "x_challenge"})
         with patch.object(
