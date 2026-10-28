@@ -1151,6 +1151,7 @@ class Engine:
             from .health_checks import AUTH, probe_key
 
             local_task = {
+                "id": task_id,
                 "account_ids": json.loads(task["account_ids"]),
                 "policy": json.loads(task["policy"]),
             }

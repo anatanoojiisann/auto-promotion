@@ -410,6 +410,25 @@ class TargetResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(Conflict, "TikTokVideoEvidenceBudgetExceeded"):
             resolve_video_target(self.engine, self.account, "123")
 
+    def test_repeated_active_id_start_rechecks_frozen_source_without_external_work(self):
+        self.candidate()
+        self.engine.set_items(self.task["id"], [self.item()])
+        self.ready()
+        with patch.object(
+            self.engine, "call", side_effect=AssertionError("No repeat preflight or send")
+        ):
+            duplicate = self.engine.start_and_run(self.task["id"])
+            self.assertTrue(duplicate["execution_result"]["already_started"])
+            self.assertEqual(duplicate["execution_result"]["processed"], [])
+            with self.engine.store.connect(write=True) as db:
+                db.execute(
+                    "UPDATE candidates SET decision='rejected' WHERE task_id=?", (self.task["id"],)
+                )
+            with self.assertRaisesRegex(Conflict, "TikTokVideoEvidenceRevoked"):
+                self.engine.start_and_run(self.task["id"])
+        self.assertEqual(self.engine.store.rows("SELECT * FROM attempts"), [])
+        self.assertEqual(self.bridge.phases, [])
+
 
 class ResolutionMCPTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_mcp_id_only_save_and_preparation_resolve_without_platform_calls(self):
