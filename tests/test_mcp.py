@@ -284,7 +284,12 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 str(Path(self.tmp.name) / "stdio.db"),
                 "--no-env",
             ],
-            env={"PYTHONIOENCODING": "utf-8", "AUTO_PROMOTION_LIVE_WRITES": "0"},
+            env={
+                "PYTHONIOENCODING": "utf-8",
+                "AUTO_PROMOTION_LIVE_WRITES": "0",
+                "PYTHONPATH": str(project / "src"),
+                "AP_ACCOUNTS_DIR": str(Path(self.tmp.name) / "stdio-accounts"),
+            },
             cwd=self.tmp.name,
         )
         async with asyncio.timeout(30):
@@ -292,7 +297,14 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 async with ClientSession(read, write) as client:
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
-                    self.assertEqual(len((await client.list_tools()).tools), 47)
+                    tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+                    self.assertEqual(len(tools), 48)
+                    self.assertEqual(
+                        set(tools), {tool.name for tool in await self.server.list_tools()}
+                    )
+                    self.assertTrue(
+                        tools["tiktok_check_interaction_input"].annotations.readOnlyHint
+                    )
                     status = await client.call_tool("system_status", {})
                     self.assertFalse(status.isError)
                     value = status.structuredContent or json.loads(status.content[0].text)
