@@ -109,7 +109,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 47)
+        self.assertEqual(len(tools), 48)
+
         self.assertTrue(
             {
                 "list_task_templates",
@@ -157,6 +158,30 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             accounts = await self.call("list_accounts", platform=platform)
             self.assertEqual([a["platform"] for a in accounts["accounts"]], [platform])
         self.assertEqual(self.provider.sends, 0)
+
+    async def test_tiktok_preparation_tool_is_local_and_missing_parent_can_be_corrected(self):
+        account_id = self.accounts["tiktok"]["id"]
+        with patch.object(self.engine, "call", side_effect=AssertionError("No platform probe")):
+            blocked = await self.call(
+                "tiktok_check_interaction_input",
+                account_id=account_id,
+                action="reply",
+                video_id="123",
+                target_owned=True,
+            )
+            self.assertEqual(blocked["reason"], "TikTokParentCommentRequired")
+            corrected = await self.call(
+                "tiktok_check_interaction_input",
+                account_id=account_id,
+                action="reply",
+                video_id="123",
+                parent_comment_id="456",
+                comment_url="https://www.tiktok.com/@target/video/123?comment_id=456",
+                target_owned=True,
+            )
+            self.assertTrue(corrected["input_valid"])
+            self.assertFalse(corrected["execution_ready"])
+        self.assertEqual(self.engine.store.rows("SELECT * FROM attempts"), [])
 
     async def test_draft_creation_does_not_grant_approval_or_publish(self):
         task = await self.call(

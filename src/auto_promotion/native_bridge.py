@@ -69,6 +69,7 @@ RESULT_FIELDS = {
     "publish_id",
     "post_ids",
     "comment_id",
+    "tiktok_receipt_binding",
     "platform_status",
     "insights",
     "next_cursor",
@@ -321,6 +322,7 @@ def dispatch(request):
                 or accepted.get("media_id")
                 or accepted.get("external_reference")
                 or accepted.get("publish_id")
+                or (platform == "tiktok" and accepted.get("comment_id"))
             ):
                 result = {**accepted, **result}
                 if result.get("status") == "failed_known" and not (

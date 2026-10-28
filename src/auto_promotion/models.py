@@ -177,10 +177,16 @@ class TikTokPostOptions(Model):
     auto_add_music: bool = False
 
 
+class TikTokTargetEvidence(Model):
+    kind: Literal["task_candidate", "account_opportunity"]
+    source_id: str = Field(min_length=1, max_length=100)
+    source_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class ItemInput(Model):
     account_id: str
     action: str
-    target: str = Field(min_length=1, max_length=500)
+    target: str = Field(default="", max_length=500)
     text: str = Field(default="", max_length=40000)
     title: str = Field(default="", max_length=300)
     media: list[Media] = Field(default_factory=list, max_length=10)
@@ -191,11 +197,18 @@ class ItemInput(Model):
     target_owned: bool = False
     execution_mode: Literal["automatic", "manual"] = "automatic"
     opportunity_id: str = ""
+    tiktok_target_evidence: TikTokTargetEvidence | None = None
     content_key: str = ""
     profile_version: int = Field(default=0, ge=0)
     tiktok_video_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
     tiktok_comment_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
     tiktok_options: TikTokPostOptions | None = None
+
+    @model_validator(mode="after")
+    def target_or_tiktok_video(self):
+        if not self.target and not (self.tiktok_video_id and self.action in {"comment", "reply"}):
+            raise ValueError("执行项需要目标；TikTok 视频评论可按已登记 video_id 解析")
+        return self
 
     @field_validator("scheduled_at")
     @classmethod

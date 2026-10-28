@@ -359,6 +359,10 @@ def verify_claim(request):
                     item["target"], profile["identity"]
                 ):
                     raise BackendError("XOwnedTargetRequired")
+            if item.get("tiktok_target_evidence"):
+                from ..tiktok_targets import validate_target_evidence
+
+                validate_target_evidence(db, current_account, item, task["id"], now)
             if item.get("opportunity_id"):
                 from ..planner import execution_mode
 

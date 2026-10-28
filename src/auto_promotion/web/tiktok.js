@@ -248,6 +248,9 @@ async function tiktokLibrary(accountId) {
 }
 
 function tiktokItemFields(item) {
+  const account = state.accounts.find((a) => a.id === item.account_id);
+  if (account?.platform === "tiktok" && account.tiktok_transport === "tabbit")
+    return `<div class="full"><p class="help">Tabbit 视频留言：目标填写完整视频链接并核对视频 ID。顶层留言不填父评论；回复须填写同视频的原生父评论 ID。访问受阻或关联不可验证时停止。</p><label>目标视频 ID<input name="tiktok_video_id" inputmode="numeric" pattern="[1-9][0-9]{0,29}" value="${esc(item.tiktok_video_id || "")}" required></label><label>父评论 ID（仅回复必填）<input name="tiktok_comment_id" inputmode="numeric" pattern="[1-9][0-9]{0,29}" value="${esc(item.tiktok_comment_id || "")}"></label></div>`;
   if (
     state.accounts.find((a) => a.id === item.account_id)?.platform !== "tiktok"
   )

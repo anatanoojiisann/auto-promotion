@@ -6,10 +6,10 @@ import json
 import re
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from ..models import TikTokPostOptions, canonical
+from ..models import TikTokPostOptions, canonical, digest
 from .common import BackendError, read_profile, save_profile
 
 BASE = "https://business-api.tiktok.com/open_api/v1.3/"
@@ -24,6 +24,50 @@ COMMENT_ACTIONS = {
 }
 NO_TEXT_ACTIONS = COMMENT_ACTIONS - {"reply", "comment"}
 APP_LABEL = "__tiktok_app__"
+
+
+def comment_binding(payload):
+    """Optional native URL evidence must describe the requested post/comment."""
+    payload = dict(payload)
+    url = payload.get("comment_url")
+    if not url:
+        return payload
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"www.tiktok.com", "tiktok.com"}
+        or parsed.username
+        or parsed.password
+        or parsed.port not in {None, 443}
+        or parsed.fragment
+    ):
+        raise BackendError("TikTokCommentURLInvalid")
+    match = re.fullmatch(r"/@[A-Za-z0-9_.]+/(?:video|photo)/([1-9][0-9]{0,29})/?", parsed.path)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    video = match.group(1) if match else (query.get("video_id") or [None])[0]
+    if video != payload.get("video_id") or ("video_id" in query and query["video_id"] != [video]):
+        raise BackendError("TikTokCommentVideoMismatch")
+    if not match:
+        raise BackendError("TikTokCommentURLInvalid")
+    identifiers = query.get("comment_id", [])
+    if len(identifiers) != 1 or not re.fullmatch(r"[1-9][0-9]{0,29}", identifiers[0]):
+        raise BackendError("TikTokParentCommentRequired")
+    if payload.get("comment_id") and payload["comment_id"] != identifiers[0]:
+        raise BackendError("TikTokParentCommentMismatch")
+    payload["comment_id"] = identifiers[0]
+    return payload
+
+
+def receipt_binding(identity, payload):
+    return digest(
+        [
+            identity,
+            payload.get("task_id"),
+            payload.get("item_id"),
+            payload.get("attempt_id"),
+            payload["payload"],
+        ]
+    )
 
 
 class TikTokError(BackendError):
@@ -67,7 +111,11 @@ class TikTokHTTP:
             retry = exc.headers.get("Retry-After", "60")
             retry = max(1, min(86400, int(retry))) if retry.isdigit() else 60
             raise TikTokError(
-                "TikTokRateLimited" if exc.code == 429 else "TikTokHTTPRejected",
+                "TikTokRateLimited"
+                if exc.code == 429
+                else "TikTokAccessDenied"
+                if exc.code == 403
+                else "TikTokHTTPRejected",
                 limited=exc.code == 429,
                 retry_after=retry,
             ) from None
@@ -218,6 +266,8 @@ def validate_item(item):
         raise BackendError("TikTokOwnedVideoRequired")
     if action != "comment" and not re.fullmatch(r"[0-9]{1,30}", item.get("tiktok_comment_id", "")):
         raise BackendError("TikTokCommentRequired")
+    if action == "comment" and item.get("tiktok_comment_id"):
+        raise BackendError("TikTokTopLevelCommentCannotReply")
     if item.get("media") or item.get("title") or item.get("tiktok_options"):
         raise BackendError("TikTokCommentTextOnly")
     if action in {"reply", "comment"} and (
@@ -407,6 +457,7 @@ class TikTokBackend:
                 "has_more": bool(data.get("has_more")),
             }
         if operation == "content":
+            payload = comment_binding(payload)
             data = self.comments(
                 payload["video_id"],
                 comment_id=payload.get("comment_id", ""),
@@ -415,6 +466,18 @@ class TikTokBackend:
             )
             content = []
             for row in data.get("comments", []):
+                if str(row.get("video_id")) != payload["video_id"] or (
+                    payload.get("comment_id")
+                    and str(row.get("comment_id")) != payload["comment_id"]
+                ):
+                    return {
+                        "content_items": [],
+                        "healthy": False,
+                        "reason": "TikTokCommentVideoMismatch",
+                        "read_page_complete": False,
+                        "next_cursor": payload.get("cursor", 0),
+                        "has_more": True,
+                    }
                 if row.get("owner") is True:
                     continue
                 identifier = str(row.get("comment_id", ""))
@@ -518,7 +581,12 @@ class TikTokBackend:
         data = self.http.request(
             endpoint, body=body
         )  # Exactly one write; never retry a timed-out POST.
-        receipt = {"status": "unknown", "verified": False, "platform_status": "ACCEPTED"}
+        receipt = {
+            "status": "unknown",
+            "verified": False,
+            "platform_status": "ACCEPTED",
+            "tiktok_receipt_binding": receipt_binding(self.settings["identity"], payload),
+        }
         if action == "publish":
             if not isinstance(data.get("share_id"), str) or not data["share_id"]:
                 raise BackendError("TikTokReceiptUnavailable")
@@ -537,6 +605,11 @@ class TikTokBackend:
         result = {**receipt, "status": "unknown", "verified": False}
         if item["target"] != self.settings["identity"]:
             raise BackendError("TikTokOwnedTargetRequired")
+        binding = receipt.get("tiktok_receipt_binding")
+        if (binding and binding != receipt_binding(self.settings["identity"], payload)) or (
+            not binding and any(payload.get(k) for k in ("task_id", "item_id", "attempt_id"))
+        ):
+            return {**result, "reason": "TikTokReceiptBindingMismatch"}
         if item["action"] == "publish":
             if not receipt.get("publish_id"):
                 return {**result, "reason": "no_durable_receipt"}
@@ -570,10 +643,27 @@ class TikTokBackend:
             reference = video.get("share_url") or "https://www.tiktok.com/@" + self.settings[
                 "username"
             ] + "/video/" + str(ids[0])
+            parsed_reference = urlparse(reference)
+            match = re.fullmatch(
+                r"/@[A-Za-z0-9_.]+/(?:video|photo)/([1-9][0-9]{0,29})/?", parsed_reference.path
+            )
+            if (
+                not match
+                or match.group(1) != str(ids[0])
+                or parse_qs(parsed_reference.query).get("comment_id")
+            ):
+                return {**result, "reason": "TikTokReceiptMismatch"}
+            reference = parsed_reference._replace(query="", fragment="").geturl()
         else:
             identifier = receipt.get("comment_id")
             if not identifier:
                 return {**result, "reason": "no_durable_receipt"}
+            if not isinstance(identifier, str) or not re.fullmatch(r"[1-9][0-9]{0,29}", identifier):
+                return {**result, "reason": "TikTokReceiptMismatch"}
+            if (item["action"] in NO_TEXT_ACTIONS and identifier != item["tiktok_comment_id"]) or (
+                item["action"] == "reply" and identifier == item["tiktok_comment_id"]
+            ):
+                return {**result, "reason": "TikTokReceiptMismatch"}
             if not self.owned_video(item["tiktok_video_id"]):
                 return {**result, "reason": "TikTokOwnedVideoRequired"}
             data = self.comments(item["tiktok_video_id"], comment_id=identifier)
@@ -590,8 +680,9 @@ class TikTokBackend:
                     and found.get("text") == item["text"]
                     and found.get("owner") is True
                     and (
-                        action != "reply"
-                        or str(found.get("parent_comment_id")) == item["tiktok_comment_id"]
+                        str(found.get("parent_comment_id")) == item["tiktok_comment_id"]
+                        if action == "reply"
+                        else found.get("parent_comment_id") in (None, "", 0, "0")
                     )
                 )
             elif action in {"like", "unlike"}:
@@ -620,15 +711,41 @@ class TikTokBackend:
                 else None
             )
         parsed = urlparse(reference)
-        if parsed.scheme != "https" or parsed.hostname not in {"www.tiktok.com", "tiktok.com"}:
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"www.tiktok.com", "tiktok.com"}
+            or parsed.username
+            or parsed.password
+            or parsed.port not in {None, 443}
+        ):
             return {**result, "reason": "TikTokInvalidReceiptURL"}
         return {**result, "status": "confirmed", "verified": True, "external_reference": reference}
 
 
 def call(label, operation, payload, checkpoint, authorize):
     try:
+        settings = read_profile("tiktok", label)
+        from .tiktok_desktop import call as desktop_call
+        from .tiktok_desktop import desktop_profile
+
+        if desktop_profile(settings):
+            return desktop_call(settings, operation, payload, checkpoint, authorize)
         return TikTokBackend(label).run(operation, payload, checkpoint, authorize)
     except TikTokError as exc:
+        if exc.safe_code == "TikTokAccessDenied":
+            return {
+                "status": "unknown",
+                "verified": False,
+                "allowed": False,
+                "healthy": False,
+                "reason": exc.safe_code,
+                "failure_class": "access_denied",
+                "read_state": "access_denied",
+                "rate_limited": False,
+                "retry_after_seconds": exc.retry_after,
+                "execution_step": "tiktok_api_" + operation,
+                "cooldown_source": "tiktok_api_access_denied",
+            }
         if not exc.limited:
             if operation == "preflight":
                 return {"allowed": False, "reason": exc.safe_code}

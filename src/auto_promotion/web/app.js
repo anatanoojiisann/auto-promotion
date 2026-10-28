@@ -1374,7 +1374,9 @@ function itemEditor(t) {
         t.policy.allow_owned_x_posts && live.platform === "x"
           ? "post"
           : live.platform === "tiktok"
-            ? "publish"
+            ? live.tiktok_transport === "tabbit"
+              ? "comment"
+              : "publish"
             : state.accounts
                 .find((x) => x.id === a.id)
                 .capabilities.find((c) => !["discover", "join"].includes(c)),
@@ -1382,7 +1384,9 @@ function itemEditor(t) {
         t.policy.allow_owned_x_posts && live.platform === "x"
           ? live.owned_target_url || ""
           : live.platform === "tiktok"
-            ? live.owned_target_id || ""
+            ? live.tiktok_transport === "tabbit"
+              ? ""
+              : live.owned_target_id || ""
             : "",
       text: "",
       title: "",
@@ -1394,7 +1398,7 @@ function itemEditor(t) {
       discord_reply_to: "",
       recipient_id: "",
       target_owned:
-        live.platform === "tiktok" ||
+        (live.platform === "tiktok" && live.tiktok_transport !== "tabbit") ||
         (live.platform === "x" && t.policy.allow_owned_x_posts),
       tiktok_video_id: "",
       tiktok_comment_id: "",
@@ -1442,7 +1446,7 @@ function itemEditor(t) {
             )
             .join(
               "",
-            )}</select></label></div><div class="full"><label>执行方式<select name="execution_mode"><option value="automatic" ${p.execution_mode !== "manual" ? "selected" : ""}>自动执行</option><option value="manual" ${p.execution_mode === "manual" ? "selected" : ""}>人工执行与结果登记</option></select></label></div><div class="full">${targetField(p, n)}</div>${tiktokItemFields(p)}<div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div>${replyField(p)}</div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 与 TikTok 必须勾选）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · ${state.accounts.find((a) => a.id === p.account_id).platform === "discord" ? "单文件最多 10 MiB，合计最多 25 MiB" : "最大 50 MB"}</p>${p.media.map((m, j) => `<button type="button" class="text-button" data-remove-media="${n}:${j}">移除此媒体</button><label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 与 TikTok 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
+            )}</select></label></div><div class="full"><label>执行方式<select name="execution_mode"><option value="automatic" ${p.execution_mode !== "manual" ? "selected" : ""}>自动执行</option><option value="manual" ${p.execution_mode === "manual" ? "selected" : ""}>人工执行与结果登记</option></select></label></div><div class="full">${targetField(p, n)}</div>${tiktokItemFields(p)}<div class="full"><label>标题（帖子需要）<input name="title" value="${esc(p.title)}"></label></div><div class="full"><label>完整正文 / Caption<textarea name="text">${esc(p.text)}</textarea></label></div><div><label>计划时间<input name="scheduled_at" type="datetime-local" value="${isoLocal(new Date(p.scheduled_at).getTime())}" required></label></div><div>${replyField(p)}</div><div class="full"><label class="checkbox-label"><input type="checkbox" name="target_owned" ${p.target_owned ? "checked" : ""}>这是自有发布目标（Instagram 与 TikTok API 必须勾选，Tabbit 视频留言按目标链接校验）</label></div><div class="full"><label>媒体文件<input type="file" data-upload="${n}"></label><p class="help">${p.media.map((m) => esc(m.filename)).join(" · ") || "尚未添加媒体"} · ${state.accounts.find((a) => a.id === p.account_id).platform === "discord" ? "单文件最多 10 MiB，合计最多 25 MiB" : "最大 50 MB"}</p>${p.media.map((m, j) => `<button type="button" class="text-button" data-remove-media="${n}:${j}">移除此媒体</button><label>媒体 ${j + 1} 的 HTTPS 地址（Instagram 与 TikTok 必需）<input data-source="${j}" value="${esc(m.source_url)}" placeholder="https://..."></label><label>媒体类型<select data-media-type="${j}"><option value="">按文件类型</option>${["IMAGE", "VIDEO", "REELS"].map((v) => `<option ${m.media_type === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>`).join("")}</div></div></fieldset>`,
       )
       .join(
         "",
@@ -1532,9 +1536,13 @@ function itemEditor(t) {
           items[index].tiktok_video_id = "";
           items[index].tiktok_comment_id = "";
           if (account.platform === "tiktok") {
-            items[index].target = account.owned_target_id || "";
-            items[index].target_owned = true;
-            items[index].action = "publish";
+            items[index].target =
+              account.tiktok_transport === "tabbit"
+                ? ""
+                : account.owned_target_id || "";
+            items[index].target_owned = account.tiktok_transport !== "tabbit";
+            items[index].action =
+              account.tiktok_transport === "tabbit" ? "comment" : "publish";
           } else if (account.platform === "x" && t.policy.allow_owned_x_posts) {
             items[index].action = "post";
             items[index].execution_mode = "automatic";
@@ -1653,7 +1661,10 @@ function itemEditor(t) {
           const selectedAccount = state.accounts.find(
             (a) => a.id === item.account_id,
           );
-          if (selectedAccount.platform === "tiktok")
+          if (
+            selectedAccount.platform === "tiktok" &&
+            selectedAccount.tiktok_transport !== "tabbit"
+          )
             item.target = selectedAccount.owned_target_id || item.target;
           cursors.set(key, index + 1);
           assigned += 1;

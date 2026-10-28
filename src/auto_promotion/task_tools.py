@@ -51,6 +51,7 @@ ITEM_FIELDS = (
     "profile_version",
     "tiktok_video_id",
     "tiktok_comment_id",
+    "tiktok_target_evidence",
     "tiktok_options",
 )
 RESULT_FIELDS = (
@@ -75,6 +76,7 @@ RESULT_FIELDS = (
         "publish_id",
         "post_ids",
         "comment_id",
+        "tiktok_receipt_binding",
         "platform_status",
     )
     + READ_FIELDS

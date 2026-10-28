@@ -399,6 +399,105 @@ class TikTokTests(unittest.TestCase):
             self.execute(self.item())
         self.assertEqual(self.api.writes, [])
 
+    def test_foreign_video_comment_is_not_imported_as_requested_video(self):
+        self.api.comments["456"]["video_id"] = "999"
+        result = self.backend().run(
+            "content", {"account_id": "synthetic", "video_id": "123"}, lambda _: None, lambda: None
+        )
+        self.assertEqual(result["content_items"], [])
+        self.assertEqual(result.get("reason"), "TikTokCommentVideoMismatch")
+
+    def test_comment_read_permalink_must_bind_requested_video_and_parent(self):
+        for url in [
+            "https://www.tiktok.com/@brand/video/999?comment_id=456",
+            "https://www.tiktok.com/@brand/video/123?comment_id=999",
+            "https://www.tiktok.com/business-suite/comments?video_id=999&comment_id=456",
+        ]:
+            with self.subTest(url=url), self.assertRaises(BackendError):
+                self.backend().run(
+                    "content",
+                    {
+                        "account_id": "synthetic",
+                        "video_id": "123",
+                        "comment_id": "456",
+                        "comment_url": url,
+                    },
+                    lambda _: None,
+                    lambda: None,
+                )
+        self.assertEqual(self.api.writes, [])
+
+    def test_management_receipt_cannot_confirm_a_different_comment(self):
+        for action in ["like", "unlike", "hide_comment", "unhide_comment", "delete_comment"]:
+            with self.subTest(action=action):
+                result = self.backend().verify(
+                    {
+                        "payload": self.item(action=action, text=""),
+                        "receipt": {"comment_id": "999", "mutation_accepted": True},
+                    }
+                )
+                self.assertFalse(result["verified"])
+                self.assertEqual(result["reason"], "TikTokReceiptMismatch")
+        self.assertIn("456", self.api.comments)
+        self.assertEqual(self.api.writes, [])
+
+    def test_receipt_id_must_be_native_and_top_level_comment_cannot_be_a_reply(self):
+        for identifier in ["None", "https://private.example/secret", "", "0"]:
+            with self.subTest(identifier=identifier):
+                result = self.backend().verify(
+                    {"payload": self.item(), "receipt": {"comment_id": identifier}}
+                )
+                self.assertFalse(result["verified"])
+                self.assertEqual(
+                    result["reason"],
+                    "TikTokReceiptMismatch" if identifier else "no_durable_receipt",
+                )
+        self.api.comments["789"] = {
+            "comment_id": "789",
+            "video_id": "123",
+            "text": "hello",
+            "owner": True,
+            "parent_comment_id": "456",
+        }
+        result = self.backend().verify(
+            {
+                "payload": self.item(action="comment", tiktok_comment_id=""),
+                "receipt": {"comment_id": "789"},
+            }
+        )
+        self.assertFalse(result["verified"])
+
+    def test_permissive_caller_flags_cannot_enable_external_video_or_dm(self):
+        from auto_promotion.tiktok import TikTokInteractionInput
+
+        a = self.engine.add_account(
+            AccountInput(
+                platform="tiktok",
+                label="local-check",
+                backend_label="brand",
+                mode="simulation",
+                min_interval=0,
+            )
+        )
+
+        def check(**kw):
+            return self.manager.check_interaction(a["id"], TikTokInteractionInput(**kw))
+
+        missing = check(action="reply", video_id="123", target_owned=True)
+        self.assertEqual(missing["reason"], "TikTokParentCommentRequired")
+        external = check(
+            action="reply", video_id="123", parent_comment_id="456", target_owned=False
+        )
+        self.assertEqual(external["reason"], "TikTokDesktopVideoCapabilityUnverified")
+        self.assertFalse(external["execution_ready"])
+        valid = check(action="comment", video_id="123", target_owned=True)
+        self.assertTrue(valid["input_valid"])
+        self.assertFalse(valid["execution_ready"])
+        dm = check(action="send_message")
+        self.assertEqual(dm["state"], "not_applicable")
+        self.assertNotEqual(dm["reason"], "TikTokParentCommentRequired")
+        self.assertEqual(self.api.writes, [])
+
     def test_reply_verifies_owner_and_parent_and_uses_string_ids(self):
         result = self.execute(self.item())
         self.assertEqual(result["status"], "confirmed")
@@ -450,6 +549,67 @@ class TikTokTests(unittest.TestCase):
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(second["status"], "unknown")
         self.assertEqual(len(self.api.writes), 1)
+
+    def test_native_comment_acceptance_survives_api403_readback(self):
+        backend = self.backend()
+        original = self.api.request
+
+        def blocked(path, **kwargs):
+            if path == "business/comment/list/" and self.api.writes:
+                raise TikTokError("TikTokAccessDenied", retry_after=120)
+            return original(path, **kwargs)
+
+        self.api.request = blocked
+        req = {
+            "platform": "tiktok",
+            "account": "brand",
+            "operation": "execute",
+            "payload": {
+                "item_id": "access-denied-item",
+                "attempt_id": "attempt",
+                "task_id": "task",
+                "payload": self.item(),
+            },
+        }
+        with (
+            patch("auto_promotion.native_bridge.verify_claim"),
+            patch("auto_promotion.backends.tiktok.TikTokBackend", return_value=backend),
+        ):
+            result = dispatch(req)
+            second = dispatch(req)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["comment_id"], "789")
+        self.assertEqual(result["reason"], "TikTokAccessDenied")
+        self.assertIn("tiktok_receipt_binding", result)
+        self.assertEqual(second["comment_id"], "789")
+        self.assertEqual(len(self.api.writes), 1)
+
+    def test_manager_comment_binding_blocks_before_provider_and_recovers(self):
+        from auto_promotion.tiktok import TikTokReadInput
+
+        account = self.engine.add_account(
+            AccountInput(platform="tiktok", label="reader", backend_label="brand", mode="live")
+        )
+        with patch.object(self.engine, "call", return_value={"content_items": []}) as provider:
+            with self.assertRaisesRegex(Conflict, "TikTokCommentVideoMismatch"):
+                self.manager.read(
+                    account["id"],
+                    "comments",
+                    TikTokReadInput(
+                        video_id="123",
+                        comment_url="https://www.tiktok.com/@target/video/999?comment_id=456",
+                    ),
+                )
+            provider.assert_not_called()
+            self.manager.read(
+                account["id"],
+                "comments",
+                TikTokReadInput(
+                    video_id="123",
+                    comment_url="https://www.tiktok.com/@target/video/123?comment_id=456",
+                ),
+            )
+            self.assertEqual(provider.call_args.args[2]["comment_id"], "456")
 
     def test_read_video_first_page_omits_zero_timestamp_cursor(self):
         self.backend().run("targets", {"cursor": 0, "limit": 30}, lambda _: None, lambda: None)
@@ -689,6 +849,20 @@ class TikTokTests(unittest.TestCase):
 
 
 class TikTokTransportTests(unittest.TestCase):
+    def test_http403_is_access_denied_not_rate_limit(self):
+        error = HTTPError(
+            "https://private.example/secret", 403, "PRIVATE", {"Retry-After": "120"}, None
+        )
+        with self.assertRaises(TikTokError) as caught:
+            TikTokHTTP(
+                opener=type(
+                    "Opener", (), {"open": lambda *_a, **_k: (_ for _ in ()).throw(error)}
+                )()
+            ).request("business/video/list/")
+        self.assertEqual(caught.exception.safe_code, "TikTokAccessDenied")
+        self.assertFalse(caught.exception.limited)
+        self.assertEqual(caught.exception.retry_after, 120)
+
     def test_transport_does_not_follow_redirect_or_leak_tokens_on_error(self):
         from unittest.mock import MagicMock
 

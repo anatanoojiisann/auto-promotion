@@ -8,6 +8,7 @@ from .models import epoch
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "tiktok_video_evidence_invalid": "TikTok 视频目标证据已失效或变化，请检查原候选与授权并重新准备新任务",
     "account_outbound_blocked": "账号外发已暂停，请在账号中心处理原因并检查恢复",
     "execution_account_mismatch": "发送清单账号与当前执行归属不一致，已阻止提交",
     "conversation_owner_mismatch": "P0 执行账号必须与原会话账号一致",

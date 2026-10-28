@@ -44,6 +44,7 @@ jobs:
           python -m unittest discover -s tests -p test_x_post_browser.py -v
           python -m unittest discover -s tests -p test_x_browser_safety.py -v
           python -m unittest discover -s tests -p test_browser_read_observations.py -v
+          python -m unittest discover -s tests -p test_tiktok_desktop.py -v
         env:
           AP_TEST_BROWSER_BACKENDS: '1'
       - run: npm run format:check
