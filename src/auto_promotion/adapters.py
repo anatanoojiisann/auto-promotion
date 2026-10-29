@@ -135,6 +135,12 @@ class AdapterRegistry:
             return self.overrides[account["platform"]].call(account, operation, payload)
         if account["mode"] == "simulation":
             return self.simulation.call(account, operation, payload)
+        from .routing import route_for
+        if route_for(account).transport == "phone":
+            # Preparation uses the durable phone_prepare job path. No direct native
+            # adapter call may create a promotion or consume a once-only attempt.
+            from .backends.phone import PhoneBackend
+            return PhoneBackend().call(account, operation, payload)
         if account["platform"] == "tiktok":
             from .tiktok_browser import TikTokBrowser
 

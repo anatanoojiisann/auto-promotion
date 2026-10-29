@@ -126,6 +126,7 @@ def create_app(
     token=None,
     pooled_worker=None,
     statistics_only=False,
+    phone_fleet_config=None,
 ):
     if statistics_only:
         worker, report_worker = False, True
@@ -146,6 +147,10 @@ def create_app(
     tiktok = TikTokManager(engine)
     meta_browser = MetaBrowser(engine)
     tiktok_browser = TikTokBrowser(engine)
+    phone_preparations = None
+    if phone_fleet_config is not None:
+        from .phone_fleet import configured
+        phone_preparations = configured(engine, phone_fleet_config)
     interactions = Interactions(
         engine,
         worker_available=lambda: (
@@ -387,6 +392,25 @@ def create_app(
     @app.get("/api/interactions")
     def interaction_policies():
         return interactions.list()
+
+    @app.post("/api/tasks/{task_id}/items/{item_id}/phone-preparations/{operation}")
+    def phone_prepare(task_id: str, item_id: str, operation: str):
+        if phone_preparations is None:
+            raise Conflict("PhoneFleetDevelopmentDisabled")
+        job_id = phone_preparations.enqueue(task_id, item_id, operation)
+        return phone_preparations.view(job_id)
+
+    @app.get("/api/phone-preparations/{job_id}")
+    def phone_preparation(job_id: str):
+        if phone_preparations is None:
+            raise Conflict("PhoneFleetDevelopmentDisabled")
+        return phone_preparations.view(job_id)
+
+    @app.post("/api/phone-preparations/{job_id}/{action}")
+    async def phone_preparation_control(job_id: str, action: str):
+        if phone_preparations is None:
+            raise Conflict("PhoneFleetDevelopmentDisabled")
+        return await phone_preparations.control(job_id, action)
 
     @app.get("/api/interactions/defaults")
     def interaction_defaults(profile: str = "legacy"):
