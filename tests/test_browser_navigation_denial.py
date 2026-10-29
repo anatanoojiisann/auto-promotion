@@ -10,6 +10,10 @@ from auto_promotion.backends.common import BackendError
 class BrowserNavigationDenialTests(unittest.TestCase):
     def page(self, *, status, navigation=True, main_frame=True, abort=True, host="x.com"):
         page = MagicMock()
+        page.url = "https://x.com/home"
+        page.is_closed.return_value = False
+        page.locator.return_value.count.return_value = 0
+        page.evaluate.return_value = None
         response = MagicMock(status=status)
         # The backend retains only navigation responses from the platform host.
         response.url = "https://" + host + "/"
@@ -30,7 +34,7 @@ class BrowserNavigationDenialTests(unittest.TestCase):
 
     def test_empty_403_document_retains_denial_and_stops_before_identity(self):
         page, _ = self.page(status=403)
-        backend = BrowserBackend("x", "brand", MagicMock(), page, {"identity": "brand"})
+        backend = BrowserBackend("x", "brand", MagicMock(pages=[page]), page, {"identity": "brand"})
         backend.check_identity = MagicMock()
         with self.assertRaises(BackendError) as caught:
             backend.run("health", {}, MagicMock(), MagicMock())
@@ -41,7 +45,7 @@ class BrowserNavigationDenialTests(unittest.TestCase):
 
     def test_empty_429_document_preserves_rate_limit_handling(self):
         page, _ = self.page(status=429)
-        backend = BrowserBackend("x", "brand", MagicMock(), page, {"identity": "brand"})
+        backend = BrowserBackend("x", "brand", MagicMock(pages=[page]), page, {"identity": "brand"})
         backend.check_identity = MagicMock()
         result = backend.run("health", {}, MagicMock(), MagicMock())
         self.assertTrue(result["rate_limited"])
@@ -71,7 +75,7 @@ class BrowserNavigationDenialTests(unittest.TestCase):
 
     def test_success_still_requires_exact_account_identity(self):
         page, _ = self.page(status=200, abort=False)
-        backend = BrowserBackend("x", "brand", MagicMock(), page, {"identity": "brand"})
+        backend = BrowserBackend("x", "brand", MagicMock(pages=[page]), page, {"identity": "brand"})
         backend.check_identity = MagicMock(side_effect=BackendError("BrowserIdentityMismatch"))
         with self.assertRaises(BackendError) as caught:
             backend.run("health", {}, MagicMock(), MagicMock())

@@ -187,6 +187,22 @@ class Engine:
                     for a in value["capabilities"]
                     if a not in {"send_direct_message", "reply_direct_message"}
                 ]
+            value["tiktok_transport"] = route_for(value).transport
+            if value["tiktok_transport"] == "tabbit":
+                value["capabilities"] = ["comment", "reply"]
+            from .backends.tiktok_desktop import desktop_profile, tabbit_candidate_enabled
+
+            try:
+                settings = read_profile("tiktok", value["backend_label"])
+            except BackendError:
+                settings = {}
+            if (
+                desktop_profile(settings)
+                and settings.get("connection_type") != "tiktok_desktop"
+                and not tabbit_candidate_enabled(settings)
+            ):
+                value["capabilities"] = []
+                value["tiktok_candidate_disabled"] = True
             try:
                 value["owned_target_id"] = (
                     read_profile(
@@ -345,6 +361,22 @@ class Engine:
                         },
                     )
             if (
+                account["platform"] == "tiktok"
+                and account["cooldown_until"] > self.clock()
+                and operation in {"health", "preflight", "verify", "targets", "content", "insights"}
+            ):
+                return {
+                    "status": "unknown",
+                    "verified": False,
+                    "healthy": False,
+                    "allowed": False,
+                    "reason": "TikTokAccountCooldown",
+                    "failure_class": "cooldown",
+                    "account_retry_at": account["cooldown_until"],
+                    "retry_after_seconds": max(1, int(account["cooldown_until"] - self.clock())),
+                    "execution_step": "tiktok_api_cooldown",
+                }
+            if (
                 account["platform"] == "telegram"
                 and account["mode"] == "live"
                 and (account["disabled"] or account["cooldown_until"] > self.clock())
@@ -419,6 +451,11 @@ class Engine:
             from .account_blocks import normalize_evidence, observe
 
             normalize_evidence(result, account["platform"])
+            if account["platform"] == "tiktok" and result.get("reason") == "TikTokAccessDenied":
+                result["account_retry_at"] = self.clock() + max(
+                    1, int(result.get("retry_after_seconds") or 60)
+                )
+                self.apply_cooldown(account["id"], result)
             if any(key in result for key in BLOCK_FIELDS) or operation == "execute":
                 with self.store.connect(write=True) as db:
                     observe(
@@ -933,7 +970,14 @@ class Engine:
         return {"targets": result.get("targets", []), "truncated": bool(result.get("truncated"))}
 
     def apply_cooldown(self, account_id, result):
-        if result.get("rate_limited") or result.get("risk_warning"):
+        if (
+            result.get("rate_limited")
+            or result.get("risk_warning")
+            or (
+                result.get("reason") == "TikTokAccessDenied"
+                and self.account(account_id)["platform"] == "tiktok"
+            )
+        ):
             until = result.get("account_retry_at") or self.clock() + max(
                 1, int(result.get("retry_after_seconds") or 60)
             )
@@ -1256,6 +1300,7 @@ class Engine:
             from .health_checks import AUTH, probe_key
 
             local_task = {
+                "id": task_id,
                 "account_ids": json.loads(task["account_ids"]),
                 "policy": json.loads(task["policy"]),
             }
@@ -1660,6 +1705,16 @@ class Engine:
             and value.execution_mode != "manual"
         ):
             raise Conflict("此平台当前仅开放人工互动清单，请选择人工执行方式")
+        if value.tiktok_target_evidence:
+            from .tiktok_targets import validate_target_evidence
+
+            try:
+                with self.store.connect() as evidence_db:
+                    validate_target_evidence(
+                        evidence_db, account, value.model_dump(), task["id"], self.clock()
+                    )
+            except BackendError as exc:
+                raise Conflict(exc.safe_code) from None
         if value.opportunity_id:
             from .planner import content_key, execution_mode
 
@@ -1744,8 +1799,8 @@ class Engine:
         ):
             raise Conflict("TikTok 字段仅用于 TikTok")
         if platform == "tiktok":
-            from .backends.common import BackendError
-            from .backends.tiktok import validate_item
+            from .backends.tiktok import validate_item as validate_api_item
+            from .backends.tiktok_desktop import validate_item as validate_desktop_item
             from .tiktok_browser import validate_browser_item
 
             try:
@@ -1766,8 +1821,10 @@ class Engine:
                         )
                         if not conversation or conversation["peer_username"] != value.recipient_id:
                             raise Conflict("私信会话与已采集的收件人不一致")
+                elif account["mode"] == "live" and route_for(account).transport == "tabbit":
+                    validate_desktop_item(value.model_dump())
                 else:
-                    validate_item(value.model_dump())
+                    validate_api_item(value.model_dump())
             except (BackendError, ValueError) as exc:
                 raise Conflict(
                     getattr(exc, "safe_code", str(exc) or "TikTok 发布选项无效")
@@ -1780,7 +1837,6 @@ class Engine:
         if platform != "discord" and value.discord_reply_to:
             raise Conflict("Discord 原消息 ID 仅用于 Discord")
         if platform == "discord":
-            from .backends.common import BackendError
             from .backends.discord import MAX_FILE_BYTES, MAX_TOTAL_BYTES, snowflake
 
             try:
@@ -1934,6 +1990,31 @@ class Engine:
         last_by_account = {}
         payloads = []
         for index, value in enumerate(values):
+            if not value.target:
+                account = self.account(value.account_id)
+                if account["platform"] != "tiktok" or route_for(account).transport not in {
+                    "desktop",
+                    "tabbit",
+                }:
+                    raise Conflict("TikTokIDResolutionRequiresDesktopAccount")
+                from .tiktok_targets import resolve_video_target
+
+                resolved = resolve_video_target(
+                    self,
+                    account,
+                    value.tiktok_video_id,
+                    task_id=task_id,
+                    opportunity_id=value.opportunity_id,
+                    action=value.action,
+                    parent_comment_id=value.tiktok_comment_id,
+                )
+                value = ItemInput(
+                    **{
+                        **value.model_dump(),
+                        "target": resolved["target"],
+                        "tiktok_target_evidence": resolved["target_evidence"],
+                    }
+                )
             account = self.validate_item(task, value)
             due = epoch(value.scheduled_at)
             if due < previous_due:
@@ -2327,6 +2408,13 @@ class Engine:
                 and payload.get("execution_mode", "automatic") != "manual"
             ):
                 return self._skip(item_id, "platform_policy_blocked", db)
+            if payload.get("tiktok_target_evidence"):
+                from .tiktok_targets import validate_target_evidence
+
+                try:
+                    validate_target_evidence(db, account, payload, task["id"], now)
+                except BackendError:
+                    return self._skip(item_id, "tiktok_video_evidence_invalid", db)
             if payload.get("opportunity_id"):
                 from .planner import execution_mode
 
@@ -2652,6 +2740,21 @@ class Engine:
                     ).fetchone()
                     self._integrity(db, task, "outbound")
                     reason = telegram_blocker(db, task, json.loads(row["payload"]), self.clock())
+                    evidence_payload = json.loads(row["payload"])
+                    if not reason and evidence_payload.get("tiktok_target_evidence"):
+                        from .tiktok_targets import validate_target_evidence
+
+                        try:
+                            evidence_account = dict(
+                                db.execute(
+                                    "SELECT * FROM accounts WHERE id=?", (row["account_id"],)
+                                ).fetchone()
+                            )
+                            validate_target_evidence(
+                                db, evidence_account, evidence_payload, task["id"], self.clock()
+                            )
+                        except BackendError:
+                            reason = "tiktok_video_evidence_invalid"
                 if reason:
                     self._skip(row["id"], reason)
                     continue
@@ -2803,6 +2906,7 @@ class Engine:
                 "conversation_id",
                 "recipient_id",
                 "interaction_channel",
+                "tiktok_receipt_binding",
                 "platform_status",
             )
             + FIELDS
@@ -2938,7 +3042,14 @@ class Engine:
             if account["platform"] == "tiktok":
                 progress = {
                     k: result[k]
-                    for k in ("publish_id", "post_ids", "comment_id", "platform_status", "reason")
+                    for k in (
+                        "publish_id",
+                        "post_ids",
+                        "comment_id",
+                        "tiktok_receipt_binding",
+                        "platform_status",
+                        "reason",
+                    )
                     if k in result
                 }
                 with self.store.connect(write=True) as db:

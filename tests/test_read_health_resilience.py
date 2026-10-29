@@ -206,6 +206,8 @@ class ReadHealthTests(unittest.TestCase):
     def test_download_after_http403_is_navigation_evidence_not_login_failure(self):
         callbacks = {}
         page = Mock()
+        page.url = "https://x.com/home"
+        page.locator.return_value.count.return_value = 0
         page.on.side_effect = lambda event, callback: callbacks.update({event: callback})
 
         def navigate(*args, **kwargs):
@@ -221,7 +223,9 @@ class ReadHealthTests(unittest.TestCase):
             raise RuntimeError("Page.goto: Download is starting SECRET_CANARY")
 
         page.goto.side_effect = navigate
-        backend = BrowserBackend("x", "synthetic", Mock(), page, {"identity": "synthetic"})
+        backend = BrowserBackend(
+            "x", "synthetic", types.SimpleNamespace(pages=[page]), page, {"identity": "synthetic"}
+        )
         with self.assertRaises(BackendError) as caught:
             backend.run("health", {}, Mock(), Mock())
         self.assertEqual(caught.exception.safe_code, "BrowserNavigationAccessDenied")
@@ -568,8 +572,16 @@ class ReadHealthTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 page = Mock()
+                page.url = "https://x.com/home"
+                page.locator.return_value.count.return_value = 0
                 page.goto.side_effect = error
-                backend = BrowserBackend("x", "synthetic", Mock(), page, {"identity": "synthetic"})
+                backend = BrowserBackend(
+                    "x",
+                    "synthetic",
+                    types.SimpleNamespace(pages=[page]),
+                    page,
+                    {"identity": "synthetic"},
+                )
                 with self.assertRaises(BackendError) as caught:
                     backend.run("health", {}, Mock(), Mock())
                 self.assertEqual(caught.exception.safe_code, expected)

@@ -1,8 +1,10 @@
 """Credential-free execution routes for every supported platform and connection."""
 
+import re
 from dataclasses import asdict, dataclass
 
 from .backends.common import BackendError, read_profile
+from .backends.tiktok_desktop import tabbit_candidate_enabled
 from .models import PLATFORMS, digest
 
 TRANSPORTS = {
@@ -18,9 +20,18 @@ POOLS = frozenset(
     [f"{p}.{t}" for p, t in TRANSPORTS.items()]
     + ["x.edge", "x.tabbit", "x.browser_use", "x.api"]
     + ["instagram.desktop", "tiktok.desktop"]
+    + ["tiktok.tabbit"]
     + [f"{p}.manual" for p in PLATFORMS]
     + [f"simulation.{p}" for p in PLATFORMS]
 )
+
+
+def tabbit_resource(profile):
+    """One resource identity across all platforms on a bound instance."""
+    instance = profile.get("instance_id") or profile.get("tabbit_instance", "")
+    if not isinstance(instance, str) or not re.fullmatch(r"[0-9A-F]{16}", instance):
+        return "desktop:tabbit:unbound"
+    return "desktop:tabbit:" + digest(instance)[:24]
 
 
 @dataclass(frozen=True)
@@ -61,6 +72,9 @@ def route_for(account, payload=None, *, profile=None):
                     :24
                 ]
             )
+        elif platform == "tiktok" and tabbit_candidate_enabled(profile):
+            transport = "tabbit"
+            resource = tabbit_resource(profile)
     if platform == "x":
         if profile is None:
             try:

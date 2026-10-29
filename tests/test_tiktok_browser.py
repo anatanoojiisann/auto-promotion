@@ -13,7 +13,7 @@ from auto_promotion.backends.common import BackendError, read_profile, save_prof
 from auto_promotion.cloud_control import CloudControl
 from auto_promotion.core import Conflict, Engine
 from auto_promotion.meta_browser import MetaBrowser, event_key
-from auto_promotion.models import AccountInput, ItemInput, Policy, TaskInput
+from auto_promotion.models import AccountInput, CandidateInput, ItemInput, Policy, TaskInput, digest
 from auto_promotion.routing import route_for
 from auto_promotion.statistics import Statistics
 from auto_promotion.store import Store
@@ -78,6 +78,78 @@ class TikTokBrowserTests(unittest.TestCase):
             "observed_at": self.now,
             "evidence": "Current signed-in Profile navigation and profile heading match",
         }
+
+    def test_id_only_registered_desktop_preparation_and_revocation_before_guard(self):
+        self.browser.observe(self.aid, self.identity())
+        task = self.engine.create_task(
+            TaskInput(
+                name="Registered desktop ID entry",
+                account_ids=[self.aid],
+                policy=Policy(
+                    starts_at=iso(self.now - 60),
+                    ends_at=iso(self.now + 1800),
+                    execution_channel="local",
+                ),
+            )
+        )
+        self.engine.candidate(
+            task["id"],
+            CandidateInput(
+                account_id=self.aid,
+                target="https://www.tiktok.com/@creator/video/123456789",
+                is_public=True,
+                language="en",
+                confidence=1,
+            ),
+        )
+        saved = self.engine.set_items(
+            task["id"],
+            [
+                ItemInput(
+                    account_id=self.aid,
+                    action="comment",
+                    text="A precise helpful answer",
+                    tiktok_video_id="123456789",
+                    scheduled_at=iso(self.now - 1),
+                )
+            ],
+        )
+        item = saved["items"][0]
+        self.assertTrue(item["payload"]["tiktok_target_evidence"])
+        self.assertEqual(self.store.rows("SELECT * FROM attempts"), [])
+        from auto_promotion.tiktok import TikTokInteractionInput, TikTokManager
+
+        checked = TikTokManager(self.engine).check_interaction(
+            self.aid,
+            TikTokInteractionInput(action="comment", video_id="123456789", task_id=task["id"]),
+        )
+        self.assertEqual(checked["state"], "needs_desktop_preflight")
+        self.assertEqual(checked["capability_scope"], "registered_desktop_video")
+        self.assertFalse(checked["execution_ready"])
+        self.engine.start_task(task["id"])
+        proof = self.proof(item)
+        owner = self.browser.begin(item["id"], proof)["owner"]
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "UPDATE candidates SET decision='rejected' WHERE id=?",
+                (item["payload"]["tiktok_target_evidence"]["source_id"],),
+            )
+        with self.assertRaisesRegex(BackendError, "TikTokVideoEvidenceRevoked"):
+            self.browser.guard(item["id"], owner, proof)
+        self.assertEqual(
+            self.store.one("SELECT submission_started FROM meta_browser_claims")[
+                "submission_started"
+            ],
+            0,
+        )
+
+    def test_legacy_registered_route_and_capabilities_do_not_require_candidate_flag(self):
+        account = self.engine.account(self.aid)
+        route = route_for(account)
+        self.assertEqual(route.pool, "tiktok.desktop")
+        self.assertEqual(account["tiktok_transport"], "desktop")
+        self.assertFalse(account.get("tiktok_candidate_disabled", False))
+        self.assertEqual(route.resource, "desktop:tabbit:" + digest("ABC123")[:24])
 
     def ready(self, *, reply=False, start=True, video="123456789"):
         self.browser.observe(self.aid, self.identity())

@@ -180,7 +180,10 @@ def observe(db, account_id, result, *, now, operation, payload=None, task_id=Non
                 and current["reason"] != "account_guard_unavailable"
             )
         ):
-            if new_evidence and current["health_checked_at"] is not None:
+            # Fence even the FIRST in-flight recovery probe. It has no saved
+            # health_checked_at yet, but its late success must not verify an
+            # independent challenge observed after that probe began.
+            if new_evidence:
                 db.execute(
                     "UPDATE account_blocks SET generation=generation+1,health_ok=0,health_checked_at=NULL,"
                     "health_identity_hash=NULL,updated_at=? WHERE account_id=?",

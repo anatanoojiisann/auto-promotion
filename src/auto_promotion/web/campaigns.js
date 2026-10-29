@@ -476,6 +476,7 @@ async function executionSettingsForm() {
     "instagram.manual": "Instagram · 人工评论",
     "discord.bot": "Discord · 机器人",
     "tiktok.organic": "TikTok · API",
+    "tiktok.tabbit": "TikTok · Tabbit",
   };
   const channelKeys = [
     ...new Set([

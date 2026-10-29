@@ -53,6 +53,7 @@ ITEM_FIELDS = (
     "tiktok_comment_id",
     "tiktok_conversation_id",
     "tiktok_message_id",
+    "tiktok_target_evidence",
     "tiktok_options",
 )
 RESULT_FIELDS = (
@@ -81,6 +82,7 @@ RESULT_FIELDS = (
         "conversation_id",
         "recipient_id",
         "interaction_channel",
+        "tiktok_receipt_binding",
         "platform_status",
     )
     + READ_FIELDS

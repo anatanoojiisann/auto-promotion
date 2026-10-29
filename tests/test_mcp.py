@@ -109,7 +109,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 68)
+        self.assertEqual(len(tools), 69)
         self.assertIn("remove_x_local_account_daily_limits", tools)
         self.assertIn("search_x_content", tools)
         self.assertEqual(
@@ -130,6 +130,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             <= tools.keys()
         )
         self.assertIn("proof", tools["tiktok_browser_guard"].inputSchema["required"])
+        self.assertIn("tiktok_check_interaction_input", tools)
         self.assertTrue(
             {
                 "list_task_templates",
@@ -177,6 +178,30 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             accounts = await self.call("list_accounts", platform=platform)
             self.assertEqual([a["platform"] for a in accounts["accounts"]], [platform])
         self.assertEqual(self.provider.sends, 0)
+
+    async def test_tiktok_preparation_tool_is_local_and_missing_parent_can_be_corrected(self):
+        account_id = self.accounts["tiktok"]["id"]
+        with patch.object(self.engine, "call", side_effect=AssertionError("No platform probe")):
+            blocked = await self.call(
+                "tiktok_check_interaction_input",
+                account_id=account_id,
+                action="reply",
+                video_id="123",
+                target_owned=True,
+            )
+            self.assertEqual(blocked["reason"], "TikTokParentCommentRequired")
+            corrected = await self.call(
+                "tiktok_check_interaction_input",
+                account_id=account_id,
+                action="reply",
+                video_id="123",
+                parent_comment_id="456",
+                comment_url="https://www.tiktok.com/@target/video/123?comment_id=456",
+                target_owned=True,
+            )
+            self.assertTrue(corrected["input_valid"])
+            self.assertFalse(corrected["execution_ready"])
+        self.assertEqual(self.engine.store.rows("SELECT * FROM attempts"), [])
 
     async def test_draft_creation_does_not_grant_approval_or_publish(self):
         task = await self.call(
@@ -283,6 +308,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 "PYTHONIOENCODING": "utf-8",
                 "AUTO_PROMOTION_LIVE_WRITES": "0",
                 "PYTHONPATH": str(project / "src"),
+                "AP_ACCOUNTS_DIR": str(Path(self.tmp.name) / "stdio-accounts"),
             },
             cwd=self.tmp.name,
         )
@@ -291,7 +317,14 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 async with ClientSession(read, write) as client:
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
-                    self.assertEqual(len((await client.list_tools()).tools), 68)
+                    tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+                    self.assertEqual(len(tools), 69)
+                    self.assertEqual(
+                        set(tools), {tool.name for tool in await self.server.list_tools()}
+                    )
+                    self.assertTrue(
+                        tools["tiktok_check_interaction_input"].annotations.readOnlyHint
+                    )
                     status = await client.call_tool("system_status", {})
                     self.assertFalse(status.isError)
                     value = status.structuredContent or json.loads(status.content[0].text)

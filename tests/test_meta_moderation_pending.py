@@ -266,6 +266,10 @@ class MetaModerationPendingTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.browser.begin(item["id"], self.proof(item))
 
+    @unittest.skipUnless(
+        Path("outputs/facebook-p1-execution-20261026/executor/guarded_controller.py").is_file(),
+        "Optional private campaign controller is not in this checkout",
+    )
     def test_guarded_controller_records_independent_review_and_unblocks_other_post(self):
         spec = importlib.util.spec_from_file_location(
             "moderation_controller",
@@ -363,6 +367,10 @@ class MetaModerationPendingTests(unittest.TestCase):
         self.assertLessEqual(state["next_activation"]["delay_minutes"], 70)
         self.assertNotIn("operator_inflight", state)
 
+    @unittest.skipUnless(
+        Path("outputs/facebook-p1-execution-20261026/executor/guarded_controller.py").is_file(),
+        "Optional private campaign controller is not in this checkout",
+    )
     def test_unverified_submission_schedules_only_read_only_review(self):
         spec = importlib.util.spec_from_file_location(
             "unknown_controller",

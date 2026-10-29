@@ -28,6 +28,7 @@ X_REPLY_TARGET_WAIT_MS = 15000
 X_REPLY_EDITOR_READY_MS = 10000
 X_REPLY_EDITOR_FOCUS_MS = 5000
 X_REPLY_TYPING_TIMEOUT_MS = 30000
+X_STATE_PAGE_LIMIT = 32
 
 
 def read_limits(payload):
@@ -247,12 +248,100 @@ def check_x_state(page):
     )
     for selector, kind, block in components:
         locator = page.locator(selector)
-        if any(locator.nth(i).is_visible() for i in range(locator.count())):
+        count = locator.count()
+        if count > X_STATE_PAGE_LIMIT:
+            raise BackendError("XStateObservationUnavailable")
+        if any(
+            locator.nth(i).is_visible()
+            and locator.nth(i).evaluate("""el => {
+              for (let node = el; node; node = node.parentElement) {
+                const style = getComputedStyle(node);
+                if (style.visibility === 'hidden' || style.visibility === 'collapse' ||
+                    Number(style.opacity) === 0 || node.getAttribute('aria-hidden') === 'true')
+                  return false;
+              }
+              return true;
+            }""")
+            for i in range(count)
+        ):
             raise XStateError(
                 "XChallengeRequired" if kind == "challenge" else "XAccountRestricted",
                 kind,
                 block,
             )
+
+
+def check_x_context_state(context, selected):
+    """Observe only this account's context; never navigate away from evidence.
+
+    A failed observation cannot establish health. Continue past unreadable pages
+    so reliable challenge evidence on another page still takes precedence.
+    """
+    incomplete = False
+    try:
+        pages = context.pages if context is not None else [selected]
+        if not isinstance(pages, (list, tuple)) or len(pages) > X_STATE_PAGE_LIMIT:
+            raise BackendError("XStateObservationUnavailable")
+        pages = list(pages)
+        if selected not in pages:
+            raise BackendError("XStateObservationUnavailable")
+    except Exception:
+        raise BackendError("XStateObservationUnavailable") from None
+    for page in pages:
+        try:
+            closed = getattr(page, "is_closed", lambda: False)() is True
+            if closed:
+                incomplete |= page is selected
+                continue
+            before = page.url
+            check_x_state(page)
+            # Recheck the route after DOM observation; a navigation can change
+            # the route to a challenge while locators are being inspected.
+            after = page.url
+            if after != before:
+                check_x_state(page)
+                incomplete = True
+        except XStateError:
+            raise
+        except Exception:
+            # A sibling proven closed is no longer an observable account page.
+            # Unknown/failed closure checks remain incomplete, never healthy.
+            try:
+                closed = getattr(page, "is_closed", lambda: False)() is True
+            except Exception:
+                closed = False
+            incomplete |= page is selected or not closed
+    if context is not None:
+        try:
+            current = context.pages
+            incomplete |= (
+                not isinstance(current, (list, tuple))
+                or len(current) > X_STATE_PAGE_LIMIT
+                or selected not in current
+                or any(page not in pages for page in current)
+            )
+        except Exception:
+            incomplete = True
+    try:
+        incomplete |= getattr(selected, "is_closed", lambda: False)() is True
+    except Exception:
+        incomplete = True
+    if incomplete:
+        raise BackendError("XStateObservationUnavailable")
+
+
+def legacy_x_state_error(exc):
+    """Bridge exact trusted helper codes, never exception text or page prose."""
+    signals = {
+        "BrowserVerificationRequired": ("challenge", "x_challenge"),
+        "BrowserAccountRestricted": ("restricted", "x_account_restricted"),
+        "BrowserLoginRequired": ("login_required", "x_login_required"),
+    }
+    code = getattr(exc, "safe_code", None)
+    if isinstance(exc, BackendError) and code in signals:
+        kind, block = signals[code]
+        return XStateError(code, kind, block, rejected=getattr(exc, "confirmed_rejected", False))
+    return exc
 
 
 def x_response_error(document, status):
@@ -585,7 +674,7 @@ class BrowserBackend:
 
     def check_state(self):
         if self.platform == "x":
-            check_x_state(self.page)
+            check_x_context_state(self.context, self.page)
 
     def navigate_x(self, url):
         response = self.page.goto(
@@ -677,6 +766,7 @@ class BrowserBackend:
             return result
         except Exception as exc:
             if self.platform == "x":
+                exc = legacy_x_state_error(exc)
                 # A challenge may have appeared while a control wait timed out.
                 try:
                     self.check_state()
@@ -793,6 +883,8 @@ class BrowserBackend:
             raise
 
     def _run(self, operation, payload, checkpoint, authorize):
+        self.step("account_state_check")
+        self.check_state()
         self.step("home_navigation")
         read_timeout = (
             45000

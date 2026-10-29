@@ -8,8 +8,8 @@
     "test:ui:telegram-reads": "node scripts/telegram_read_ui_test.cjs",
     "test:ui:task-start": "node scripts/task_start_ui_test.cjs",
     "test:ui:interactions": "node scripts/hf_ui_test.cjs",
-    "format": "prettier --write src/auto_promotion/web scripts/ui_test.cjs scripts/pool_ui_test.cjs scripts/hf_ui_test.cjs scripts/test_offline.cjs scripts/test_ui_offline.cjs scripts/account_block_ui_test.cjs scripts/telegram_read_ui_test.cjs scripts/task_start_ui_test.cjs",
-    "format:check": "prettier --check src/auto_promotion/web scripts/ui_test.cjs scripts/pool_ui_test.cjs scripts/hf_ui_test.cjs scripts/test_offline.cjs scripts/test_ui_offline.cjs scripts/account_block_ui_test.cjs scripts/telegram_read_ui_test.cjs scripts/task_start_ui_test.cjs"
+    "format": "prettier --write src/auto_promotion/web scripts/ui_test.cjs scripts/pool_ui_test.cjs scripts/hf_ui_test.cjs scripts/test_offline.cjs scripts/test_ui_offline.cjs scripts/account_block_ui_test.cjs scripts/telegram_read_ui_test.cjs scripts/task_start_ui_test.cjs scripts/test_tiktok_desktop.cjs",
+    "format:check": "prettier --check src/auto_promotion/web scripts/ui_test.cjs scripts/pool_ui_test.cjs scripts/hf_ui_test.cjs scripts/test_offline.cjs scripts/test_ui_offline.cjs scripts/account_block_ui_test.cjs scripts/telegram_read_ui_test.cjs scripts/task_start_ui_test.cjs scripts/test_tiktok_desktop.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1",

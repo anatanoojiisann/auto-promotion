@@ -9,13 +9,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location(
-    "mira_continuation", Path("var/private/tiktok-dm-continuation/continuation-local-api.py")
+module = None
+if Path("var/private/tiktok-dm-continuation/continuation-local-api.py").is_file():
+    spec = importlib.util.spec_from_file_location(
+        "mira_continuation", Path("var/private/tiktok-dm-continuation/continuation-local-api.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+
+@unittest.skipUnless(
+    module is not None, "Optional private operations fixture is not in this checkout"
 )
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-
 class TikTokContinuationControlTests(unittest.TestCase):
     def setUp(self):
         base = Path.cwd() / "tmp" / "tiktok-continuation-tests"

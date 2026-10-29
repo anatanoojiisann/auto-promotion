@@ -4,14 +4,19 @@ import unittest
 from pathlib import Path
 
 root = Path("var/private/tiktok-dm-latest10-20261027").resolve()
-sys.path.insert(0, str(root))
-spec = importlib.util.spec_from_file_location(
-    "mira_batch_control", root / "local-batch-task-api.py"
+control = None
+if (root / "local-batch-task-api.py").is_file():
+    sys.path.insert(0, str(root))
+    spec = importlib.util.spec_from_file_location(
+        "mira_batch_control", root / "local-batch-task-api.py"
+    )
+    control = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(control)
+
+
+@unittest.skipUnless(
+    control is not None, "Optional private operations fixture is not in this checkout"
 )
-control = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(control)
-
-
 class MiraLocalControlHealthTests(unittest.TestCase):
     def test_sidecar_requires_current_source_and_existing_live_worker(self):
         sidecar = {

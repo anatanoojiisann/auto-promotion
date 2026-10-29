@@ -176,6 +176,16 @@ test("unchanged snapshots do not rewrite account or task rows", () => {
   assert.equal(f.db.prepare("SELECT total_changes() n").get().n, before);
 });
 
+test("TikTok Tabbit jobs use the same persistent claim and once-only fence", () => {
+  const f = fixture();
+  const s = f.seed({pool:"tiktok.tabbit", identity:"tiktok:bound", resource:"desktop:tabbit:bound"});
+  const node=f.node("desktop",["a"],["tiktok.tabbit"]);
+  const lease=f.k.claim(node,"tiktok.tabbit",s.j.id);
+  assert.ok(lease.lease_token);
+  f.k.complete(node,s.j.id,lease.lease_token,{state:"unknown",result:{submission_started:true}});
+  assert.equal(f.k.claim(node,"tiktok.tabbit",s.j.id),null);
+});
+
 test("frozen conflict exposes field names and batch index while preserving unknown attempts", () => {
   const f = fixture(), s = f.seed();
   f.db.prepare("UPDATE jobs SET state='unknown',attempt_id='previous-attempt' WHERE id=?").run(s.j.id);

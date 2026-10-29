@@ -28,6 +28,7 @@ export const POOLS = new Set([
   "discord.bot",
   "tiktok.organic",
   "tiktok.desktop",
+  "tiktok.tabbit",
   ...Array.from(PLATFORMS, (p) => p + ".manual"),
   ...Array.from(PLATFORMS, (p) => "simulation." + p),
 ]);

@@ -1,4 +1,12 @@
-"use strict";
+function tiktokUsesPublicBrowser(account) {
+  return (
+    account?.platform === "tiktok" &&
+    (account.execution_backend === "desktop" ||
+      account.tiktok_transport === "tabbit")
+  );
+}
+
+("use strict");
 
 function tiktokErrorMessage(value) {
   return (
@@ -256,10 +264,7 @@ function tiktokItemFields(item) {
     ["send_direct_message", "reply_direct_message"].includes(item.action)
   )
     return `<div class="full"><p class="help">私信只在明确启动本机任务后发送。页面不允许联系、需要验证或结果不明确时保持等待／待核验；当前最多 1000 字符。</p><label>收件人用户名<input name="dm_recipient" value="${esc(item.recipient_id || "")}" required></label><label>会话 ID${item.action === "reply_direct_message" ? "（必填）" : "（已有会话时填写）"}<input name="tiktok_conversation_id" value="${esc(item.tiktok_conversation_id || "")}" ${item.action === "reply_direct_message" ? "required" : ""}></label><label>原私信消息 ID（回复必填）<input name="tiktok_message_id" value="${esc(item.tiktok_message_id || "")}" ${item.action === "reply_direct_message" ? "required" : ""}></label></div>`;
-  if (
-    browserAccount?.platform === "tiktok" &&
-    browserAccount.execution_backend === "desktop"
-  )
+  if (tiktokUsesPublicBrowser(browserAccount))
     return `<div class="full"><p class="help">指定公开视频的文字评论／回复，首版最多 150 字符。回复需使用带 comment_id 的评论链接。仅在本机任务明确启动后执行。</p><label>视频 ID<input name="tiktok_video_id" inputmode="numeric" pattern="[0-9]{1,30}" value="${esc(item.tiktok_video_id || "")}" required></label><label>目标评论 ID（回复必填）<input name="tiktok_comment_id" inputmode="numeric" pattern="[0-9]{1,30}" value="${esc(item.tiktok_comment_id || "")}" ${item.action === "reply" ? "required" : ""}></label></div>`;
   if (
     state.accounts.find((a) => a.id === item.account_id)?.platform !== "tiktok"

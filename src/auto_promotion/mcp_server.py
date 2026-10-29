@@ -36,7 +36,7 @@ from .statistics import ZONE, Statistics
 from .store import Store
 from .task_tool_models import TemplateSave, TemplateTask
 from .task_tools import TaskTools
-from .tiktok import TikTokManager, TikTokReadInput
+from .tiktok import TikTokInteractionInput, TikTokManager, TikTokReadInput
 from .tiktok_browser import TikTokBrowser, TikTokBrowserConnect
 from .workers import Workers
 
@@ -78,6 +78,11 @@ def create_server(engine=None):
             "Creating, editing, planning or previewing a task never starts execution. "
             "Tools do not enable live writes or release the global stop. "
             "Account health and tool availability do not prove publication permission."
+            " Before preparing TikTok video interactions, call tiktok_check_interaction_input. "
+            "It checks input only and never authorizes sending; external-video work also needs "
+            "a bound desktop provider and independently verifiable results. "
+            "For TikTok ID-only drafts, omit target in set_task_items so the Engine resolves "
+            "and freezes account-scoped source evidence; resolved_target is a preview only."
         ),
         log_level="WARNING",
     )
@@ -113,6 +118,8 @@ def create_server(engine=None):
         cursor: int = 0,
         limit: int = 20,
         import_to_pool: bool = False,
+        comment_id: str = "",
+        comment_url: str = "",
     ) -> dict:
         """Read owned-video comments; optionally import into the shared pool; never replies."""
         return invoke(
@@ -120,7 +127,12 @@ def create_server(engine=None):
                 account_id,
                 "comments",
                 TikTokReadInput(
-                    video_id=video_id, cursor=cursor, limit=limit, import_to_pool=import_to_pool
+                    video_id=video_id,
+                    cursor=cursor,
+                    limit=limit,
+                    import_to_pool=import_to_pool,
+                    comment_id=comment_id,
+                    comment_url=comment_url,
                 ),
             )
         )
@@ -129,6 +141,33 @@ def create_server(engine=None):
     def tiktok_account_insights(account_id: str) -> dict:
         """Read permitted TikTok account metrics; absent values remain unknown."""
         return invoke(lambda: tiktok.read(account_id, "insights", TikTokReadInput()))
+
+    @server.tool(annotations=read)
+    def tiktok_check_interaction_input(
+        account_id: str,
+        action: str,
+        video_id: str = "",
+        parent_comment_id: str = "",
+        comment_url: str = "",
+        target_owned: bool = False,
+        task_id: str = "",
+        opportunity_id: str = "",
+    ) -> dict:
+        """Resolve ID from account-scoped candidate evidence and check native video/parent binding locally before preparation; never grants send permission."""
+        return invoke(
+            lambda: tiktok.check_interaction(
+                account_id,
+                TikTokInteractionInput(
+                    action=action,
+                    video_id=video_id,
+                    parent_comment_id=parent_comment_id,
+                    comment_url=comment_url,
+                    target_owned=target_owned,
+                    task_id=task_id,
+                    opportunity_id=opportunity_id,
+                ),
+            )
+        )
 
     @server.tool(annotations=read)
     def list_task_templates() -> dict:
@@ -525,7 +564,7 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def set_task_items(task_id: str, items: list[dict]) -> dict:
-        """Save draft outbound items without starting execution."""
+        """Save drafts only. TikTok desktop comment/reply may omit target: resolve tiktok_video_id from this task/account candidate evidence; no send permission."""
         return invoke(lambda: engine.set_items(task_id, [ItemInput(**i) for i in items]))
 
     @server.tool(annotations=local)

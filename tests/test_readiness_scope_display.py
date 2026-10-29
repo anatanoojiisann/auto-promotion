@@ -201,5 +201,7 @@ class ScopedReadinessDisplayTests(unittest.TestCase):
         value = self.workflow()
         self.assertEqual(value["status"], "expired")
         self.assertIn("未尝试", value["message"])
-        self.task["items"].append({"status": "unknown", "result": {}, "payload": {"action": "reply"}})
+        self.task["items"].append(
+            {"status": "unknown", "result": {}, "payload": {"action": "reply"}}
+        )
         self.assertEqual(self.workflow()["status"], "verifying")

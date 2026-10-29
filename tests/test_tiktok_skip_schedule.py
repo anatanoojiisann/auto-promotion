@@ -8,13 +8,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location(
-    "dm_batch_schedule", Path("var/private/tiktok-dm-latest10-20261027/schedule.py")
+schedule = None
+if Path("var/private/tiktok-dm-latest10-20261027/schedule.py").is_file():
+    spec = importlib.util.spec_from_file_location(
+        "dm_batch_schedule", Path("var/private/tiktok-dm-latest10-20261027/schedule.py")
+    )
+    schedule = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(schedule)
+
+
+@unittest.skipUnless(
+    schedule is not None, "Optional private operations fixture is not in this checkout"
 )
-schedule = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(schedule)
-
-
 class TikTokSkippedScheduleTests(unittest.TestCase):
     def setUp(self):
         root = Path.cwd() / "tmp" / "tiktok-schedule-tests"

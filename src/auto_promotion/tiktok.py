@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -15,7 +16,15 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from pydantic import Field, SecretStr, field_validator, model_validator
 
 from .backends.common import BackendError, account_lock, read_profile, save_profile
-from .backends.tiktok import APP_LABEL, TikTokHTTP, scope_set, secure_url, token_settings
+from .backends.tiktok import (
+    APP_LABEL,
+    COMMENT_ACTIONS,
+    TikTokHTTP,
+    comment_binding,
+    scope_set,
+    secure_url,
+    token_settings,
+)
 from .campaigns import Campaigns
 from .core import Conflict
 from .models import AccountInput, Model, OpportunityInput, canonical
@@ -81,6 +90,18 @@ class TikTokReadInput(Model):
     limit: int = Field(default=20, ge=1, le=30)
     video_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
     import_to_pool: bool = False
+    comment_id: str = Field(default="", pattern=r"^(?:|[1-9][0-9]{0,29})$")
+    comment_url: str = Field(default="", max_length=1000)
+
+
+class TikTokInteractionInput(Model):
+    task_id: str = Field(default="", max_length=100)
+    opportunity_id: str = Field(default="", max_length=100)
+    action: str = Field(max_length=40)
+    video_id: str = Field(default="", max_length=30)
+    parent_comment_id: str = Field(default="", max_length=30)
+    comment_url: str = Field(default="", max_length=1000)
+    target_owned: bool = False
 
 
 class TikTokWebhookInput(Model):
@@ -294,19 +315,132 @@ class TikTokManager:
             raise Conflict("TikTok 账号仍在冷却")
         if kind == "comments" and not value.video_id:
             raise Conflict("读取评论需要自有视频 ID")
+        payload = value.model_dump()
+        if kind == "comments":
+            try:
+                payload = comment_binding(payload)
+            except (BackendError, ValueError) as exc:
+                raise Conflict(getattr(exc, "safe_code", "TikTokCommentURLInvalid")) from None
+        from .backends.tiktok_desktop import desktop_profile
+
+        try:
+            settings = read_profile(
+                "tiktok", account["backend_label"], accounts_dir=self.accounts_dir
+            )
+        except BackendError:
+            settings = {}
+        if desktop_profile(settings):
+            raise Conflict(
+                "TikTokDesktopReadCapabilityRequired：此工具只读取自有内容API；请使用已绑定的桌面agent读取能力，不代表需要安装执行器"
+            )
         operation = {"videos": "targets", "comments": "content", "insights": "insights"}[kind]
-        result = self.engine.call(
-            account, operation, {"account_id": account_id, **value.model_dump()}
-        )
+        result = self.engine.call(account, operation, {"account_id": account_id, **payload})
         self.engine.apply_cooldown(account_id, result)
         if result.get("rate_limited") or result.get("healthy") is False:
-            raise Conflict("TikTok 读取未完成，请稍后重试")
+            raise Conflict(
+                "TikTok 读取未完成：" + str(result.get("reason", "TikTokReadUnavailable"))
+            )
         if kind == "comments" and value.import_to_pool:
             result["imported"] = Campaigns(self.engine).import_content(
                 [OpportunityInput.model_validate(v) for v in result.get("content_items", [])],
                 preserve_review=True,
             )
         return result
+
+    def check_interaction(self, account_id, value):
+        """Local preparation contract, never execution permission or an API call."""
+        account = self.engine.account(account_id)
+        if account["platform"] != "tiktok":
+            raise Conflict("请选择 TikTok 账号")
+        result = {
+            "execution_ready": False,
+            "input_valid": False,
+            "state": "blocked",
+            "capability_scope": "owned_content_api",
+            "platform_probe_performed": False,
+        }
+        if value.action not in COMMENT_ACTIONS:
+            return {
+                **result,
+                "state": "not_applicable",
+                "reason": "TikTokActionRequiresItsOwnProvider",
+            }
+        if not re.fullmatch(r"[1-9][0-9]{0,29}", value.video_id):
+            return {**result, "reason": "TikTokVideoRequired"}
+        try:
+            bound = comment_binding(
+                {
+                    "video_id": value.video_id,
+                    "comment_id": value.parent_comment_id,
+                    "comment_url": value.comment_url,
+                }
+            )
+        except (BackendError, ValueError) as exc:
+            return {**result, "reason": getattr(exc, "safe_code", "TikTokCommentURLInvalid")}
+        parent = bound.get("comment_id", "")
+        if value.action != "comment" and not re.fullmatch(r"[1-9][0-9]{0,29}", parent):
+            return {**result, "reason": "TikTokParentCommentRequired"}
+        if value.action == "comment" and parent:
+            return {**result, "reason": "TikTokTopLevelCommentCannotReply"}
+        result.update(input_valid=True, video_id=value.video_id, parent_comment_id=parent)
+        try:
+            profile = read_profile(
+                "tiktok", account["backend_label"], accounts_dir=self.accounts_dir
+            )
+        except BackendError:
+            profile = {}
+        from .backends.tiktok_desktop import tabbit_candidate_enabled
+
+        registered = profile.get("connection_type") == "tiktok_desktop"
+        candidate = tabbit_candidate_enabled(profile)
+        if (registered or candidate) and value.action in {"comment", "reply"}:
+            instance = profile.get("instance_id") or profile.get("tabbit_instance", "")
+            if candidate and not re.fullmatch(r"[0-9A-F]{16}", instance):
+                return {**result, "reason": "TikTokDesktopBindingUnavailable"}
+            from .tiktok_targets import resolve_video_target
+
+            try:
+                if value.comment_url:
+                    from .backends.tiktok_desktop import video_target
+
+                    resolved = {"target": video_target(value.comment_url, value.video_id)}
+                else:
+                    resolved = resolve_video_target(
+                        self.engine,
+                        account,
+                        value.video_id,
+                        task_id=value.task_id,
+                        opportunity_id=value.opportunity_id,
+                        action=value.action,
+                        parent_comment_id=parent,
+                    )
+            except (Conflict, BackendError, ValueError) as exc:
+                return {**result, "reason": getattr(exc, "safe_code", str(exc))}
+            return {
+                **result,
+                "resolved_target": resolved["target"],
+                "evidence_sources": resolved.get("evidence_sources", []),
+                "capability_scope": "registered_desktop_video"
+                if registered
+                else "bound_tabbit_video",
+                "state": "needs_desktop_preflight",
+                "reason": "TikTokDesktopRequiresTargetAndIdentityCheck",
+            }
+        if not value.target_owned:
+            return {
+                **result,
+                "reason": "TikTokDesktopVideoCapabilityUnverified",
+                "required_evidence": [
+                    "native_target_binding",
+                    "independent_result_readback",
+                    "existing_desktop_provider",
+                ],
+            }
+        return {
+            **result,
+            "state": "needs_platform_preflight",
+            "reason": "TikTokOwnedAPIRequiresLivePermissionCheck",
+        }
 
     def reconcile_due(self):
         """Poll only existing receipts, including while outbound work is paused."""

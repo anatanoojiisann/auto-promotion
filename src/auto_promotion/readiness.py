@@ -8,6 +8,7 @@ from .models import epoch
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "tiktok_video_evidence_invalid": "TikTok 视频目标证据已失效或变化，请检查原候选与授权并重新准备新任务",
     "account_outbound_blocked": "账号外发已暂停，请在账号中心处理原因并检查恢复",
     "meta_source_unknown": "旧流程状态或回执无法确认，先只读核验",
     "meta_source_busy": "该账号的旧互动或回复观察仍未结束",
