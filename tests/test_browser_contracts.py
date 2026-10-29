@@ -57,6 +57,11 @@ class XBrowserTests(unittest.TestCase):
         self.editor_requires_keyboard = False
         self.expected_text = "exact approved text"
         self.post_dropped = False
+        self.target_reads = 0
+        self.empty_target_reads = 0
+        self.empty_target_challenge = False
+        self.empty_target_rate_limited = False
+        self.editor_ready_delay_ms = 0
         self.context.route("**/*", self.route)
         self.backend = BrowserBackend(
             "x", "local-x", self.context, self.page, {"identity": "brand"}
@@ -82,6 +87,29 @@ class XBrowserTests(unittest.TestCase):
 
     def route(self, route):
         parsed = urlparse(route.request.url)
+        if parsed.path == "/i/api/graphql/fixture/TweetDetail":
+            route.fulfill(status=429, content_type="application/json", body="{}")
+            return
+        if parsed.path == "/target/status/456":
+            self.target_reads += 1
+            if self.target_reads <= self.empty_target_reads:
+                challenge = (
+                    '<div data-testid="arkoseChallenge">Verify</div>'
+                    if self.empty_target_challenge
+                    else ""
+                )
+                limited = (
+                    "<script>fetch('/i/api/graphql/fixture/TweetDetail')</script>"
+                    if self.empty_target_rate_limited
+                    else ""
+                )
+                route.fulfill(
+                    content_type="text/html",
+                    body='<button data-testid="SideNav_AccountSwitcher_Button">Brand @brand</button>'
+                    + challenge
+                    + limited,
+                )
+                return
         if parsed.path == "/pending-image":
             # Keep an unrelated asset pending while the target DOM is usable.
             self.pending_routes.append(route)
@@ -129,7 +157,8 @@ class XBrowserTests(unittest.TestCase):
             if self.reply_as_dialog
             else "fetch('/CreateTweet', {method:'POST'})"
         )
-        modal_editor = '<div contenteditable="true" data-testid="tweetTextarea_0"></div>'
+        editable = "false" if self.editor_ready_delay_ms else "true"
+        modal_editor = f'<div contenteditable="{editable}" style="min-height:20px" data-testid="tweetTextarea_0"></div>'
         if self.duplicate_modal_editor:
             modal_editor += '<div contenteditable="true" data-testid="tweetTextarea_0"></div>'
         media_input = '<input type="file" multiple>' if self.with_media else ""
@@ -157,7 +186,7 @@ class XBrowserTests(unittest.TestCase):
           <div data-testid="tweetText">{text}</div>
           {'<div data-testid="tweetPhoto"></div>' if own and self.with_media else ""}
           <button data-testid="{done}" onclick="this.dataset.testid='unlike'">Like</button>
-          <button data-testid="reply" style="visibility:{"hidden" if self.reply_control_delay_ms else "visible"}" onclick="setTimeout(()=>document.querySelector('{reply_destination}').hidden=false,{self.reply_delay_ms})">Reply</button>
+          <button data-testid="reply" style="visibility:{"hidden" if self.reply_control_delay_ms else "visible"}" onclick="setTimeout(()=>{{document.querySelector('{reply_destination}').hidden=false;setTimeout(()=>document.querySelectorAll('[data-testid=tweetTextarea_0]').forEach(e=>e.contentEditable='true'),{self.editor_ready_delay_ms})}},{self.reply_delay_ms})">Reply</button>
           {extra_reply_control}
         </article>"""
         route.fulfill(
@@ -166,7 +195,7 @@ class XBrowserTests(unittest.TestCase):
             {article}{article if self.duplicate_target else ""}
             {'<img src="/pending-image">' if self.pending_image else ""}
             <div id="reply-compose" {" " if self.reply_as_dialog else "hidden"}>
-              <div contenteditable="true" data-testid="tweetTextarea_0" onkeydown="document.querySelector('[data-testid=tweetButtonInline]').disabled=false;{late_open}"></div>
+              <div contenteditable="{editable}" style="min-height:20px" data-testid="tweetTextarea_0" onkeydown="document.querySelector('[data-testid=tweetButtonInline]').disabled=false;{late_open}"></div>
               {media_input}
               <button data-testid="tweetButtonInline" {"disabled" if self.editor_requires_keyboard else ""} onclick="{inline_action}">Post</button>
             </div>{dialog_compose}
@@ -180,6 +209,142 @@ class XBrowserTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertTrue(self.receipts[0]["target_verified"])
         self.assertEqual(result["external_reference"], "https://x.com/brand/status/123")
+
+    def test_missing_target_reloads_once_before_one_submission(self):
+        self.empty_target_reads = 1
+        with patch("auto_promotion.backends.browser.X_REPLY_TARGET_WAIT_MS", 150):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.target_reads, self.posts, self.checks), (2, 1, 1))
+
+    def test_missing_target_stops_after_two_reads_with_safe_diagnostics(self):
+        self.empty_target_reads = 99
+        with patch("auto_promotion.backends.browser.X_REPLY_TARGET_WAIT_MS", 150):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["reason"], "BrowserReplyTargetTimeout")
+        self.assertEqual(result["execution_step"], "target_lookup_retry")
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertTrue(
+            any(f["function"] == "reply_target" for f in result["diagnostic_traceback"])
+        )
+        self.assertEqual((self.target_reads, self.posts, self.checks), (2, 0, 0))
+
+    def test_missing_target_challenge_never_reloads_or_submits(self):
+        self.empty_target_reads = 99
+        self.empty_target_challenge = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["account_block_reason"], "x_challenge")
+        self.assertEqual((self.target_reads, self.posts, self.checks), (1, 0, 0))
+
+    def test_tweet_detail_rate_limit_never_reloads_or_submits(self):
+        self.empty_target_reads = 99
+        self.empty_target_rate_limited = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertTrue(result["rate_limited"])
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertEqual((self.target_reads, self.posts, self.checks), (1, 0, 0))
+
+    def test_reply_preparation_after_submission_never_navigates(self):
+        self.backend.submission_started = True
+        with self.assertRaisesRegex(Exception, "ReplyPreparationAfterSubmissionBlocked"):
+            self.backend.reply_target(self.payload()["payload"]["target"])
+        self.assertEqual(self.target_reads, 0)
+
+    def test_editor_waits_until_editable_then_types_once(self):
+        self.editor_ready_delay_ms = 700
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_editor_focus_timeout_is_recovered_before_typing(self):
+        from playwright.sync_api import Locator
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        original = Locator.click
+        attempts = []
+
+        def click(locator, *args, **kwargs):
+            if locator.get_attribute("data-testid") == "tweetTextarea_0":
+                attempts.append(True)
+                if len(attempts) == 1:
+                    raise PlaywrightTimeoutError("PRIVATE_FOCUS_SECRET")
+            return original(locator, *args, **kwargs)
+
+        with patch.object(Locator, "click", click):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_editor_that_never_becomes_editable_never_types_or_submits(self):
+        from playwright.sync_api import Locator
+
+        self.editor_ready_delay_ms = 10000
+        with (
+            patch("auto_promotion.backends.browser.X_REPLY_EDITOR_READY_MS", 150),
+            patch.object(
+                Locator, "press_sequentially", side_effect=AssertionError("must not type")
+            ),
+        ):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["reason"], "BrowserReplyEditorNotReady")
+        self.assertEqual(result["execution_step"], "reply_editor_ready")
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertEqual((self.posts, self.checks), (0, 0))
+
+    def test_persistently_blocked_focus_stops_before_typing(self):
+        from playwright.sync_api import Locator
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        original = Locator.click
+        attempts = []
+
+        def blocked(locator, *args, **kwargs):
+            if locator.get_attribute("data-testid") == "tweetTextarea_0":
+                attempts.append(True)
+                raise PlaywrightTimeoutError("PRIVATE_BLOCKED_SECRET")
+            return original(locator, *args, **kwargs)
+
+        with patch.object(Locator, "click", blocked):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["execution_step"], "reply_editor_focus")
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertNotIn("PRIVATE_BLOCKED_SECRET", json.dumps(result))
+        self.assertEqual((self.posts, self.checks), (0, 0))
+
+    def test_partial_typing_timeout_never_retypes_and_keeps_safe_substep(self):
+        from playwright.sync_api import Locator
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        original = Locator.press_sequentially
+        attempts = []
+
+        def type_once(locator, text, **kwargs):
+            attempts.append(True)
+            original(locator, text[:3], **kwargs)
+            raise PlaywrightTimeoutError("PRIVATE_TYPING_SECRET")
+
+        with patch.object(Locator, "press_sequentially", type_once):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["status"], "failed_known")
+        self.assertEqual(result["execution_step"], "reply_editor_type")
+        self.assertEqual(result["exception_type"], "TimeoutError")
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertNotIn("PRIVATE_TYPING_SECRET", json.dumps(result))
+        self.assertEqual((len(attempts), self.target_reads, self.posts, self.checks), (1, 1, 0, 0))
 
     def test_identity_timeout_is_rechecked_once_before_submission(self):
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError

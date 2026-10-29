@@ -9,6 +9,7 @@ import uuid
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlparse
 
+from ..execution_diagnostics import exception_details
 from ..models import digest, epoch
 from .browser_status import check_context_status, check_status
 from .common import (
@@ -23,6 +24,10 @@ from .common import (
 from .x_text import EDITOR_TEXT_JS, TWEET_TEXT_JS
 
 HOME = {"reddit": "https://www.reddit.com", "x": "https://x.com"}
+X_REPLY_TARGET_WAIT_MS = 15000
+X_REPLY_EDITOR_READY_MS = 10000
+X_REPLY_EDITOR_FOCUS_MS = 5000
+X_REPLY_TYPING_TIMEOUT_MS = 30000
 
 
 def read_limits(payload):
@@ -713,6 +718,9 @@ class BrowserBackend:
                         "BrowserReplyComposerAmbiguous",
                         "BrowserControlNotUnambiguouslyAvailable",
                         "BrowserNavigationTimeout",
+                        "BrowserReplyTargetTimeout",
+                        "BrowserReplyEditorNotReady",
+                        "BrowserReplyEditorFocusLost",
                         "XTweetReceiptUnavailable",
                     }:
                         kind = "preparation_failed"
@@ -734,6 +742,7 @@ class BrowserBackend:
                 )
                 result = {
                     **receipt,
+                    **exception_details(exc),
                     "status": "failed_known" if not_submitted or rejected else "unknown",
                     "verified": False,
                     "reason": code,
@@ -1045,14 +1054,103 @@ class BrowserBackend:
         checkpoint(result)
         return self.verify({**payload, "receipt": result})
 
-    def tweet(self, url):
+    def tweet(self, url, *, timeout=15000):
         status_id = urlparse(url).path.rstrip("/").split("/")[-1]
         if not status_id.isdigit():
             raise BackendError("InvalidXTarget")
         articles = self.page.get_by_test_id("tweet")
         article = articles.filter(has=self.page.locator(f'a[href$="/status/{status_id}"] time'))
-        article.first.wait_for(timeout=15000)
+        article.first.wait_for(timeout=timeout)
         return visible_one(article)
+
+    def reply_target(self, url):
+        """One guarded read-only reload for a target that has not rendered yet."""
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        response_error = None
+
+        def observed(response):
+            nonlocal response_error
+            parsed = urlparse(response.url)
+            if (
+                parsed.hostname
+                in {"x.com", "www.x.com", "api.x.com", "twitter.com", "api.twitter.com"}
+                and "TweetDetail" in parsed.path
+                and response.status in {401, 403, 429}
+            ):
+                response_error = x_response_error({}, response.status)
+
+        def guard():
+            if self.submission_started:
+                raise BackendError("ReplyPreparationAfterSubmissionBlocked")
+            if response_error:
+                raise response_error
+            self.check_state()
+            check_status(self.page)
+
+        self.page.on("response", observed)
+        try:
+            for attempt in range(2):
+                guard()
+                self.step("target_navigation" if attempt == 0 else "target_reload")
+                self.navigate_x(url)
+                self.step("target_lookup" if attempt == 0 else "target_lookup_retry")
+                deadline = time.monotonic() + X_REPLY_TARGET_WAIT_MS / 1000
+                while time.monotonic() < deadline:
+                    guard()
+                    try:
+                        article = self.tweet(
+                            url, timeout=max(1, min(250, (deadline - time.monotonic()) * 1000))
+                        )
+                        guard()
+                        return article
+                    except PlaywrightTimeoutError:
+                        pass
+                guard()
+            raise BackendError("BrowserReplyTargetTimeout")
+        finally:
+            self.page.remove_listener("response", observed)
+
+    def ready_reply_editor(self):
+        """Recover focus once before typing; never replay partial input."""
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        for attempt in range(2):
+            if self.submission_started:
+                raise BackendError("ReplyPreparationAfterSubmissionBlocked")
+            self.step("reply_editor_ready")
+            self.check_state()
+            check_status(self.page)
+            editor, submit, composer = x_reply_controls(self.page)
+            deadline = time.monotonic() + X_REPLY_EDITOR_READY_MS / 1000
+            while not editor.evaluate(
+                "e => e.isContentEditable && e.getAttribute('aria-readonly') !== 'true'"
+            ):
+                self.check_state()
+                check_status(self.page)
+                if time.monotonic() >= deadline:
+                    raise BackendError("BrowserReplyEditorNotReady")
+                self.page.wait_for_timeout(100)
+            self.step("reply_editor_focus")
+            try:
+                editor.click(timeout=X_REPLY_EDITOR_FOCUS_MS)
+            except PlaywrightTimeoutError:
+                self.check_state()
+                check_status(self.page)
+                if attempt == 0:
+                    continue
+                raise
+            current, submit, composer = x_reply_controls(self.page)
+            handle = editor.element_handle()
+            same = handle and current.evaluate("(e, previous) => e === previous", handle)
+            focused = same and current.evaluate(
+                "e => e === document.activeElement || e.contains(document.activeElement)"
+            )
+            if focused:
+                return current, submit, composer
+            if attempt:
+                raise BackendError("BrowserReplyEditorFocusLost")
+        raise BackendError("BrowserReplyEditorFocusLost")
 
     def x_execute(self, payload, checkpoint, authorize):
         item = payload["payload"]
@@ -1067,10 +1165,13 @@ class BrowserBackend:
             "www.twitter.com",
         }:
             raise BackendError("InvalidXTarget")
-        self.step("target_navigation")
-        self.navigate_x(item["target"])
-        self.step("target_lookup")
-        article = self.tweet(item["target"])
+        if item["action"] == "reply":
+            article = self.reply_target(item["target"])
+        else:
+            self.step("target_navigation")
+            self.navigate_x(item["target"])
+            self.step("target_lookup")
+            article = self.tweet(item["target"])
         self.step("identity_check")
         self.check_send_identity()
         action = item["action"]
@@ -1138,12 +1239,27 @@ class BrowserBackend:
             raise BackendError("UnsupportedXAction")
         self.step("fill_reply")
         self.check_state()
-        if action != "reply":
+        if action == "reply":
+            editor, submit_button, composer = self.ready_reply_editor()
+        else:
             editor = visible_one(composer.get_by_test_id("tweetTextarea_0"))
-        editor.click()
+            editor.click()
+        if action == "reply":
+            self.step("reply_editor_select")
+            self.check_state()
         editor.press("Control+A")
+        if action == "reply":
+            self.step("reply_editor_clear")
+            self.check_state()
         editor.press("Backspace")
-        editor.press_sequentially(item["text"])
+        if action == "reply":
+            self.step("reply_editor_type")
+            self.check_state()
+            editor.press_sequentially(item["text"], timeout=X_REPLY_TYPING_TIMEOUT_MS)
+            self.step("reply_editor_validate")
+            self.check_state()
+        else:
+            editor.press_sequentially(item["text"])
         if editor.inner_text() != item["text"]:
             raise BackendError("ApprovedTextNotRetained")
         media_editor = editor.element_handle() if action == "reply" and item["media"] else None

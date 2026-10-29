@@ -369,6 +369,15 @@ def task_workflow(task, blockers, item_blockers, now):
             if fallback
             else "按启动时固定的清单执行并逐项核验回执。",
         )
+    if any(i["status"] == "missed" and not i.get("attempt_id") for i in task["items"]) and not any(
+        i["status"] in {"executing", "unknown", "scheduled", "manual_attention"}
+        for i in task["items"]
+    ):
+        return step(
+            "expired",
+            "有项目的发送窗口已过",
+            "未尝试的项目没有发布；请查看逐项结果和原任务的后续安排。",
+        )
     return step("verifying", "等待结果核验", "核对已提交项目的投递或排期回执。")
 
 

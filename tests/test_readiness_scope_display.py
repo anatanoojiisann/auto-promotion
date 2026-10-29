@@ -195,3 +195,11 @@ class ScopedReadinessDisplayTests(unittest.TestCase):
         self.assertEqual(value["status"], "waiting_schedule")
         self.assertTrue(value["service_observation"]["task_scope_failed"])
         self.assertEqual(value["service_observation"]["task_retry_at"], self.now + 45)
+
+    def test_unattempted_missed_item_is_not_described_as_pending_receipt(self):
+        self.task["items"][0].update(status="missed", attempt_id=None)
+        value = self.workflow()
+        self.assertEqual(value["status"], "expired")
+        self.assertIn("未尝试", value["message"])
+        self.task["items"].append({"status": "unknown", "result": {}, "payload": {"action": "reply"}})
+        self.assertEqual(self.workflow()["status"], "verifying")
