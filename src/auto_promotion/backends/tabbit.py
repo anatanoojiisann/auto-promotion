@@ -115,7 +115,8 @@ def call(platform, settings, operation, payload=None, checkpoint=None, authorize
         # configured browser session; user tabs and their drafts stay untouched.
         # Account menu and Profile are observed controls on the authenticated X UI.
         code = (
-            READ_STATE_JS
+            "await page.setViewportSize({width:1440,height:1000});\n"
+            + READ_STATE_JS
             + "const readStatus = () => page.evaluate("
             + STATUS_JS
             + ");\n"
@@ -431,22 +432,9 @@ def hf_discover(settings, payload, *, checkpoint=None):
     inventory = bounded_cli(["create", "--task", task, "--limit", "200"], instance)
     if inventory.get("task", {}).get("reused") or inventory.get("truncated"):
         raise BackendError("TabbitInventoryUnavailable")
-    available = [
-        tab
-        for tab in inventory.get("tabs", [])
-        if tab.get("state") == "available"
-        and urlparse(tab.get("url", "")).hostname in {"x.com", "www.x.com"}
-    ]
-    preferred = [tab for tab in available if tab.get("tabId") == settings.get("tabbit_tab_id")]
-    if not preferred:
-        preferred = [
-            tab
-            for tab in available
-            if urlparse(tab["url"]).path.strip("/").split("/")[0].casefold() == expected
-        ]
-    selected = preferred[0] if len(preferred) == 1 else None
-    if selected is None and len(available) == 1:
-        selected = available[0]
+    # As with health and replies, use a task-owned page in the existing session.
+    # Attaching settled user tabs can fail before dispatch and must not navigate drafts.
+    selected = None
 
     code = (
         "const expected = "
@@ -461,6 +449,7 @@ def hf_discover(settings, payload, *, checkpoint=None):
         + "; const requestLimit = "
         + json.dumps(request_limit)
         + ";\n"
+        + "await page.setViewportSize({width:1440,height:1000});\n"
         + READ_ONLY_SCAN_JS
     )
     settled = False
@@ -471,7 +460,7 @@ def hf_discover(settings, payload, *, checkpoint=None):
         if selected:
             arguments.extend(["--tab", str(selected["tabId"])])
         arguments.extend(
-            ["--request-id", request_id, "--timeout-ms", str(max(1, int(remaining() * 1000)))]
+            ["--request-id", request_id, "--timeout-ms", str(max(60000, int(remaining() * 1000)))]
         )
         response = bounded_cli(arguments, instance, code=code)
         if response.get("status") in {"queued", "running"}:
@@ -780,7 +769,8 @@ def reply(settings, operation, payload, checkpoint, authorize):
         raise BackendError("TabbitCheckPending")
     settled = True
     prefix = (
-        "const expected = "
+        "await page.setViewportSize({width:1440,height:1000});\n"
+        + "const expected = "
         + json.dumps(expected)
         + "; const item = "
         + json.dumps(item)

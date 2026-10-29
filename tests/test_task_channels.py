@@ -5,8 +5,12 @@ from unittest.mock import patch
 import test_persistent_pools as fixtures
 
 from auto_promotion.cloud_control import CloudControl, CloudUnavailable
-from auto_promotion.execution_channels import configure_independent, read_state
-from auto_promotion.models import AccountInput
+from auto_promotion.execution_channels import (
+    configure_independent,
+    read_state,
+    recover_local_renewal,
+)
+from auto_promotion.models import AccountInput, epoch
 from auto_promotion.pool_runtime import run_pool
 from auto_promotion.queue_store import JobQueue, job_scope
 from auto_promotion.store import Store
@@ -86,6 +90,108 @@ class TaskChannelTests(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT count(*) n FROM attempts")["n"], 1)
         self.assertIsNone(self.queue.claim("simulation.x", "replacement"))
         self.assertEqual(read_state(self.store), {"active": "cloud"})
+
+    def test_independent_handoff_renews_ready_local_route_without_server(self):
+        task, account = self.fixture.ready(channel="local")
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "INSERT INTO account_task_channels VALUES(?,?,?,?,?,'ready','cloud_acknowledged',?,NULL,0)",
+                (account["id"], "local", "old-generation", self.now - 1, task["id"], self.now - 10),
+            )
+        _, _, request, sync = self.fake_cloud()
+        with patch.dict("os.environ", {"AP_NODE_ID": "node"}):
+            configure_independent(self.engine, [account["id"]], self.now + 4000)
+        context, _ = TaskChannelRouter(self.engine).prepare(self.claim(task))
+        self.assertEqual(context["channel"], "local")
+        self.assertNotEqual(context["generation"], "old-generation")
+        self.assertEqual(
+            self.store.one("SELECT * FROM account_task_channels")["until_at"],
+            epoch(task["policy"]["ends_at"]),
+        )
+        self.assertEqual(read_state(self.store)["until"], self.now + 4000)
+        guard_context(self.engine, context)
+        request.assert_not_called()
+        sync.assert_not_called()
+
+    def test_independent_handoff_preserves_cloud_and_unresolved_routes(self):
+        task, account = self.fixture.ready(channel="local")
+        for channel, state, error, retry in (
+            ("cloud", "ready", None, 0),
+            ("local", "handoff", None, 0),
+            ("local", "ready", "ReceiptPending", 0),
+            ("local", "ready", None, self.now + 30),
+        ):
+            with self.subTest(channel=channel, state=state, error=error, retry=retry):
+                with self.store.connect(write=True) as db:
+                    db.execute("DELETE FROM account_task_channels")
+                    db.execute(
+                        "INSERT INTO account_task_channels VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            account["id"],
+                            channel,
+                            "original",
+                            self.now - 1,
+                            task["id"],
+                            state,
+                            "cloud_acknowledged",
+                            self.now - 10,
+                            error,
+                            retry,
+                        ),
+                    )
+                before = dict(self.store.one("SELECT * FROM account_task_channels"))
+                configure_independent(self.engine, [account["id"]], self.now + 4000)
+                self.assertEqual(
+                    dict(self.store.one("SELECT * FROM account_task_channels")), before
+                )
+
+    def test_interrupted_local_renewal_requires_prior_local_ack(self):
+        task, account = self.fixture.ready(channel="local")
+        configure_independent(self.engine, [account["id"]], self.now + 4000)
+        with self.store.connect(write=True) as db:
+            db.execute(
+                "INSERT INTO account_task_channels VALUES(?,?,?,?,?,'handoff','pending',?,'ControlPlaneError',?)",
+                (
+                    account["id"],
+                    "local",
+                    "pending",
+                    self.now + 3600,
+                    task["id"],
+                    self.now,
+                    self.now + 30,
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "OwnershipNotProven"):
+            recover_local_renewal(self.engine, account["id"])
+        with self.store.connect(write=True) as db:
+            Store.audit(
+                db,
+                "execution.account_channel_changed",
+                {"account_id": account["id"], "channel": "local"},
+                task["id"],
+                self.now - 100,
+            )
+            Store.audit(
+                db,
+                "execution.account_handoff_started",
+                {"account_id": account["id"], "channel": "cloud"},
+                task["id"],
+                self.now - 50,
+            )
+        with self.assertRaisesRegex(ValueError, "InterveningCloudHandoff"):
+            recover_local_renewal(self.engine, account["id"])
+        with self.store.connect(write=True) as db:
+            Store.audit(
+                db,
+                "execution.account_channel_changed",
+                {"account_id": account["id"], "channel": "local"},
+                task["id"],
+                self.now - 20,
+            )
+        result = recover_local_renewal(self.engine, account["id"])
+        self.assertEqual(result["generation"], "pending")
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(self.store.one("SELECT count(*) n FROM attempts")["n"], 0)
 
     def test_cloud_task_is_claimable_outside_legacy_local_account_scope(self):
         old, local_account = self.fixture.ready()

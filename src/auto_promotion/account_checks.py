@@ -56,6 +56,7 @@ def summary(account, now):
             "message": MESSAGES[state],
             "checked_at": account["checked_at"],
             "retry_at": block.get("until"),
+            "pacing_until": account.get("next_at", 0),
         }
     health = normalize_health(account["health"])
     reason = safe_code(health.get("reason"), "unverified")
@@ -80,4 +81,5 @@ def summary(account, now):
         "message": MESSAGES.get(state, MESSAGES.get(category(reason), MESSAGES["unverified"])),
         "checked_at": account["checked_at"],
         "retry_at": retry_at if state != "healthy" and retry_at > now else None,
+        "pacing_until": account.get("next_at", 0),
     }

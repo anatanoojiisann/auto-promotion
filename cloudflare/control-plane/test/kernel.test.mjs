@@ -118,6 +118,53 @@ function fixture({ beforeOpen } = {}) {
   };
 }
 
+test("adding TikTok desktop preserves existing node scope, settings and queued work", () => {
+  const f=fixture();
+  f.seed({id:"existing-x"});
+  f.node("node",["a"],["x.edge"]);
+  const before=f.k.status();
+  f.k.registerNode({id:"node",token_hash:"a".repeat(64),pools:["x.edge","tiktok.desktop"],account_ids:["a","tk"]});
+  const node=f.k.node("node","a".repeat(64));
+  assert.deepEqual(node.pools,["x.edge","tiktok.desktop"]);
+  assert.deepEqual(node.accounts,["a","tk"]);
+  assert.deepEqual(f.k.settings(),before.settings);
+  assert.deepEqual(f.k.status().jobs,before.jobs);
+  assert.equal(f.k.claim(node,"tiktok.desktop"),null);
+  assert.ok(f.k.claim(node,"x.edge"));
+});
+
+test("unused Facebook placeholder binds its first verified identity once", () => {
+  const f = fixture();
+  const account = { id: "fb-new", identity: "facebook:fb-new", platform: "facebook", mode: "live", limits: {daily:5,hourly:1}, allowed_actions:["comment","reply"] };
+  f.k.sync({accounts:[account],tasks:[],jobs:[]});
+  const verified = {...account,identity:"facebook:" + "b".repeat(64)};
+  f.k.sync({accounts:[verified],tasks:[],jobs:[]});
+  assert.equal(f.k.one("SELECT identity FROM accounts WHERE id=?", account.id).identity, verified.identity);
+  const changes = f.db.prepare("SELECT total_changes() n").get().n;
+  f.k.sync({accounts:[verified],tasks:[],jobs:[]});
+  assert.equal(f.db.prepare("SELECT total_changes() n").get().n,changes);
+  assert.throws(()=>f.k.sync({accounts:[{...verified,identity:"facebook:"+"c".repeat(64)}],tasks:[],jobs:[]}),/AccountIdentityChanged/);
+});
+
+test("Facebook placeholder with any queued job cannot change identity", () => {
+  const f = fixture();
+  const s = f.seed({account:"fb-queued",identity:"facebook:fb-queued",pool:"facebook.desktop",action:"comment"});
+  assert.throws(()=>f.k.sync({accounts:[{...s.a,identity:"facebook:"+"b".repeat(64)}],tasks:[],jobs:[]}),/AccountIdentityChanged/);
+  assert.equal(f.k.one("SELECT identity FROM accounts WHERE id=?",s.a.id).identity,s.a.identity);
+});
+
+test("Facebook placeholder retains quota and cooldown identity protections", () => {
+  for (const protectedBy of ["quota","cooldown","disabled"]) {
+    const f=fixture();
+    const a={id:"fb-protected",identity:"facebook:fb-protected",platform:"facebook",mode:"live",limits:{daily:5,hourly:1}};
+    f.k.sync({accounts:[a],tasks:[],jobs:[]});
+    if (protectedBy==="quota") f.db.prepare("INSERT INTO quota_history VALUES(?,?,?,?)").run("old-attempt","account",JSON.stringify(["live",a.identity]),1800000000);
+    if (protectedBy==="cooldown") f.db.prepare("UPDATE accounts SET cooldown_until=? WHERE id=?").run(1800001000,a.id);
+    if (protectedBy==="disabled") f.db.prepare("UPDATE accounts SET disabled=1 WHERE id=?").run(a.id);
+    assert.throws(()=>f.k.sync({accounts:[{...a,identity:"facebook:"+"b".repeat(64)}],tasks:[],jobs:[]}),/AccountIdentityChanged/);
+  }
+});
+
 test("unchanged snapshots do not rewrite account or task rows", () => {
   const f = fixture();
   const s = f.seed();
@@ -305,6 +352,9 @@ test("quota errors are safe and retry after UTC day reset", () => {
   const result = cloudFailure(new Error("Exceeded allowed rows written in Durable Objects free tier."), 3600000);
   assert.equal(result.error, "CloudWriteQuotaExceeded");
   assert.equal(result.retry_after_seconds, 23 * 3600 + 30);
+  const readFailure = cloudFailure(new Error("Exceeded allowed rows read in Durable Objects free tier."), 3600000);
+  assert.equal(readFailure.error, "CloudReadQuotaExceeded");
+  assert.equal(readFailure.retry_after_seconds, 23 * 3600 + 30);
   assert.deepEqual(cloudFailure(new Error("private provider exception")), {error: "CloudRuntimeUnavailable", retry_after_seconds: 60});
 });
 

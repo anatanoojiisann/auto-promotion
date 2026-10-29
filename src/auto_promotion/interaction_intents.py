@@ -44,6 +44,287 @@ def historical_sender(db, scope, platform, event):
     return None
 
 
+def transfer_reserved_task_intents(db, old_task_id, new_task_id, now):
+    """Move only unsent reservations for an explicitly rescheduled exact copy.
+
+    Both tasks must be stopped. Attempts, receipts, claimed intents and frozen
+    payloads are never reset or modified. The caller owns the write transaction.
+    """
+    old = db.execute("SELECT * FROM tasks WHERE id=?", (old_task_id,)).fetchone()
+    new = db.execute("SELECT * FROM tasks WHERE id=?", (new_task_id,)).fetchone()
+    if (
+        not old
+        or not new
+        or old["state"] not in {"paused", "cancelled", "completed"}
+        or new["state"] not in {"draft", "paused"}
+    ):
+        raise ValueError("ReservationTransferRequiresStoppedTasks")
+    if old["mode"] != new["mode"] or json.loads(old["account_ids"]) != json.loads(
+        new["account_ids"]
+    ):
+        raise ValueError("ReservationTransferAccountMismatch")
+    projects = [
+        scope_id(db, json.loads(t["policy"]).get("project_id", "default")) for t in (old, new)
+    ]
+    if projects[0] != projects[1]:
+        raise ValueError("ReservationTransferScopeMismatch")
+    rows = [
+        db.execute("SELECT * FROM items WHERE task_id=? ORDER BY position", (t,)).fetchall()
+        for t in (old_task_id, new_task_id)
+    ]
+    if not rows[0] or len(rows[0]) != len(rows[1]):
+        raise ValueError("ReservationTransferCountMismatch")
+    if old["state"] == "completed" and any(item["status"] != "missed" for item in rows[0]):
+        raise ValueError("ReservationTransferCompletedTaskNotMissed")
+    if db.execute(
+        "SELECT 1 FROM execution_jobs WHERE task_id IN (?,?) AND state='leased' AND lease_until>?",
+        (old_task_id, new_task_id, now),
+    ).fetchone():
+        raise ValueError("ReservationTransferLeaseActive")
+    if db.execute(
+        "SELECT 1 FROM cloud_receipt_outbox r JOIN execution_jobs j ON j.id=r.job_id WHERE j.task_id IN (?,?)",
+        (old_task_id, new_task_id),
+    ).fetchone():
+        raise ValueError("ReservationTransferReceiptPending")
+    changes = []
+    for previous, replacement in zip(*rows):
+        for item in (previous, replacement):
+            if (
+                item["attempt_id"]
+                or item["external_reference"]
+                or item["status"] not in {"not_attempted", "missed", "cancelled"}
+                or db.execute("SELECT 1 FROM attempts WHERE item_id=?", (item["id"],)).fetchone()
+            ):
+                raise ValueError("ReservationTransferAttemptedItem")
+        if replacement["status"] != "not_attempted":
+            raise ValueError("ReservationTransferReplacementNotReady")
+        payloads = [json.loads(i["payload"]) for i in (previous, replacement)]
+        comparable = [
+            {
+                k: v
+                for k, v in p.items()
+                if k not in {"scheduled_at", "position", "account_label", "platform"}
+            }
+            for p in payloads
+        ]
+        if comparable[0] != comparable[1]:
+            raise ValueError("ReservationTransferPayloadMismatch")
+        account = db.execute(
+            "SELECT platform FROM accounts WHERE id=?", (previous["account_id"],)
+        ).fetchone()
+        event = event_id(account[0], payloads[0])
+        if not event:
+            raise ValueError("ReservationTransferUnsupportedEvent")
+        key = (projects[0], account[0], event, "reply")
+        intent = db.execute(
+            "SELECT * FROM interaction_intents WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind=?",
+            key,
+        ).fetchone()
+        if (
+            not intent
+            or intent["state"] != "reserved"
+            or intent["item_id"] not in {previous["id"], replacement["id"]}
+        ):
+            raise ValueError("ReservationTransferIntentNotReserved")
+        changes.append((key, previous["id"], replacement["id"]))
+    for key, previous_id, replacement_id in changes:
+        db.execute(
+            "UPDATE interaction_intents SET item_id=? WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind=? AND item_id=? AND state='reserved'",
+            (replacement_id, *key, previous_id),
+        )
+    from .store import Store
+
+    Store.audit(
+        db,
+        "interaction.reservations_transferred",
+        {
+            "source_task_id": old_task_id,
+            "replacement_task_id": new_task_id,
+            "count": len(changes),
+            "attempts_changed": False,
+        },
+        new_task_id,
+        now,
+    )
+    return len(changes)
+
+
+def authorize_known_unsent_retry(db, old_item_id, new_item_id, now, *, source):
+    """Transfer a claimed intent only after an explicit, proven no-submit retry request."""
+    from .models import digest
+    from .store import Store
+
+    if source != "explicit_user_known_unsent_local_retry":
+        raise ValueError("RetryRequiresExplicitUserInstruction")
+    old = db.execute(
+        "SELECT i.*,t.state task_state,t.mode task_mode,t.policy FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.id=?",
+        (old_item_id,),
+    ).fetchone()
+    new = db.execute(
+        "SELECT i.*,t.state task_state,t.mode task_mode,t.policy FROM items i JOIN tasks t ON t.id=i.task_id WHERE i.id=?",
+        (new_item_id,),
+    ).fetchone()
+    if not old or not new or old["task_state"] != "completed" or new["task_state"] != "draft":
+        raise ValueError("RetryRequiresStoppedOriginalAndDraft")
+    if old["account_id"] != new["account_id"] or old["task_mode"] != new["task_mode"]:
+        raise ValueError("RetryAccountMismatch")
+    policy_old, policy_new = json.loads(old["policy"]), json.loads(new["policy"])
+    if (
+        scope_id(db, policy_old.get("project_id", "default"))
+        != scope_id(db, policy_new.get("project_id", "default"))
+        or policy_new.get("execution_channel") != "local"
+    ):
+        raise ValueError("RetryScopeOrChannelMismatch")
+    old_payload, new_payload = json.loads(old["payload"]), json.loads(new["payload"])
+    ignored = {"scheduled_at", "position", "account_label", "platform"}
+    if {k: v for k, v in old_payload.items() if k not in ignored} != {
+        k: v for k, v in new_payload.items() if k not in ignored
+    }:
+        raise ValueError("RetryPayloadMismatch")
+    if (
+        new["status"] != "not_attempted"
+        or new["attempt_id"]
+        or new["external_reference"]
+        or db.execute("SELECT 1 FROM attempts WHERE item_id=?", (new_item_id,)).fetchone()
+    ):
+        raise ValueError("RetryReplacementNotUnattempted")
+    result = json.loads(old["result"])
+    if (
+        old["status"] != "failed_known"
+        or not old["attempt_id"]
+        or old["external_reference"]
+        or result.get("status") != "failed_known"
+        or result.get("verified") is not False
+        or result.get("confirmed_not_submitted") is not True
+        or result.get("submission_started") is not False
+    ):
+        raise ValueError("RetrySubmissionNotDisproved")
+    attempts = db.execute("SELECT * FROM attempts WHERE item_id=?", (old_item_id,)).fetchall()
+    if (
+        len(attempts) != 1
+        or attempts[0]["id"] != old["attempt_id"]
+        or attempts[0]["outcome"] != "failed_known"
+        or not attempts[0]["finished_at"]
+    ):
+        raise ValueError("RetryAttemptEvidenceMismatch")
+    old_job = db.execute(
+        "SELECT * FROM execution_jobs WHERE reference_id=? AND kind='send'", (old_item_id,)
+    ).fetchone()
+    if (
+        not old_job
+        or old_job["state"] != "failed_known"
+        or old_job["owner"]
+        or old_job["lease_until"] > now
+    ):
+        raise ValueError("RetryPriorJobNotSettled")
+    if db.execute(
+        "SELECT 1 FROM cloud_receipt_outbox WHERE job_id IN (?,?)",
+        (old_job["id"], "send:" + new_item_id),
+    ).fetchone():
+        raise ValueError("RetryReceiptPending")
+    receipts = db.execute(
+        "SELECT outcome FROM cloud_receipt_history WHERE job_id=?", (old_job["id"],)
+    ).fetchall()
+    evidence_source = "channel_receipt_history"
+    if not receipts:
+        # Offline-only executions have no online receipt history. Accept only
+        # the account-local FINAL envelope, revalidated against the frozen
+        # manifest, attempt, identity and job by the existing proof routine.
+        # A progress checkpoint or caller-supplied evidence is never enough.
+        from .execution_channels import independent_scope
+        from .final_receipts import proof
+        from .store import Store
+
+        state_row = db.execute("SELECT value FROM meta WHERE key='execution_channel'").fetchone()
+        state = json.loads(state_row[0]) if state_row else {}
+        scope = independent_scope(db)
+        channel = db.execute(
+            "SELECT channel FROM task_channel_claims WHERE job_id=?", (old_job["id"],)
+        ).fetchone()
+        local_audit = db.execute(
+            "SELECT 1 FROM audit WHERE task_id=? AND kind='execution.job_channel' "
+            "AND json_extract(details,'$.job_id')=? AND json_extract(details,'$.channel')='local' LIMIT 1",
+            (old["task_id"], old_job["id"]),
+        ).fetchone()
+        database = db.execute("PRAGMA database_list").fetchone()[2]
+        if not (
+            state.get("active") == "local"
+            and state.get("offline_only") is True
+            and state.get("authorization") == "local_queue"
+            and state.get("until", 0) > now
+            and old["account_id"] in state.get("account_ids", [])
+            and scope
+            and sorted(scope.get("account_ids", [])) == sorted(state.get("account_ids", []))
+            and account_is_x(db, old["account_id"])
+            and channel
+            and channel[0] == "local"
+            and local_audit
+        ):
+            raise ValueError("RetryReceiptEvidenceMissing")
+        local_proof = proof(Store(database, initialize=False), old)
+        if not local_proof or local_proof[2] != result:
+            raise ValueError("RetryReceiptEvidenceMissing")
+        evidence_source = "native_final_receipt"
+    for row in receipts:
+        receipt = json.loads(row[0])
+        detail = receipt.get("result", {})
+        if (
+            receipt.get("state") != "failed_known"
+            or receipt.get("attempt_id") != old["attempt_id"]
+            or detail.get("confirmed_not_submitted") is not True
+            or detail.get("submission_started") is not False
+            or detail.get("external_reference")
+        ):
+            raise ValueError("RetryReceiptEvidenceMismatch")
+    account = db.execute(
+        "SELECT platform FROM accounts WHERE id=?", (old["account_id"],)
+    ).fetchone()
+    event = event_id(account[0], old_payload) if account else None
+    project = scope_id(db, policy_old.get("project_id", "default"))
+    if not event or historical_sender(db, project, account[0], event):
+        raise ValueError("RetryOtherHistoryUnresolved")
+    intent = db.execute(
+        "SELECT * FROM interaction_intents WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind='reply'",
+        (project, account[0], event),
+    ).fetchone()
+    if (
+        not intent
+        or intent["item_id"] != old_item_id
+        or intent["state"] != "claimed"
+        or intent["candidate_id"]
+    ):
+        raise ValueError("RetryOriginalClaimNotOwned")
+    changed = db.execute(
+        "UPDATE interaction_intents SET item_id=?,state='reserved' WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind='reply' AND item_id=? AND state='claimed'",
+        (new_item_id, project, account[0], event, old_item_id),
+    ).rowcount
+    if changed != 1:
+        raise ValueError("RetryClaimChanged")
+    Store.audit(
+        db,
+        "interaction.explicit_unsent_retry_authorized",
+        {
+            "old_item_id": old_item_id,
+            "new_item_id": new_item_id,
+            "account_id": old["account_id"],
+            "source_event_id": event,
+            "attempt_id": old["attempt_id"],
+            "result_digest": digest(result),
+            "source": source,
+            "evidence_source": evidence_source,
+            "attempts_changed": False,
+        },
+        new["task_id"],
+        now,
+    )
+    return {"old_item_id": old_item_id, "new_item_id": new_item_id, "source_event_id": event}
+
+
+def account_is_x(db, account_id):
+    row = db.execute("SELECT platform FROM accounts WHERE id=?", (account_id,)).fetchone()
+    return bool(row and row[0] == "x")
+
+
 def event_id(platform, payload):
     if platform != "x" or payload.get("action") != "reply":
         return None
@@ -51,6 +332,72 @@ def event_id(platform, payload):
         r"https://(?:www\.)?(?:x|twitter)\.com/(?:[\w]+|i/web)/status/(\d+)/?", payload["target"]
     )
     return match[1] if match else None
+
+
+def explicit_unsent_retry_source(db, account, task, payload, item_id):
+    """Return only the exact audited no-submit attempt underlying this retry."""
+    from .models import digest
+
+    marker = db.execute(
+        "SELECT details FROM audit WHERE task_id=? AND kind='interaction.explicit_unsent_retry_authorized' AND json_extract(details,'$.new_item_id')=? ORDER BY id DESC LIMIT 1",
+        (task["id"], item_id),
+    ).fetchone()
+    if not marker:
+        return None
+    proof = json.loads(marker[0])
+    if (
+        proof.get("source") != "explicit_user_known_unsent_local_retry"
+        or proof.get("account_id") != account["id"]
+        or proof.get("source_event_id") != event_id(account["platform"], payload)
+    ):
+        return None
+    old = db.execute("SELECT * FROM items WHERE id=?", (proof.get("old_item_id"),)).fetchone()
+    if (
+        not old
+        or old["account_id"] != account["id"]
+        or old["status"] != "failed_known"
+        or old["external_reference"]
+        or event_id(account["platform"], json.loads(old["payload"])) != proof["source_event_id"]
+    ):
+        return None
+    result = json.loads(old["result"])
+    if (
+        result.get("confirmed_not_submitted") is not True
+        or result.get("submission_started") is not False
+        or proof.get("result_digest") != digest(result)
+        or proof.get("attempt_id") != old["attempt_id"]
+    ):
+        return None
+    attempt = db.execute(
+        "SELECT * FROM attempts WHERE id=? AND item_id=?", (old["attempt_id"], old["id"])
+    ).fetchone()
+    if (
+        not attempt
+        or attempt["account_id"] != old["account_id"]
+        or attempt["task_id"] != old["task_id"]
+        or attempt["outcome"] != "failed_known"
+        or not attempt["finished_at"]
+    ):
+        return None
+    policy = json.loads(task["policy"]) if isinstance(task["policy"], str) else task["policy"]
+    intent = db.execute(
+        "SELECT item_id,state FROM interaction_intents WHERE project_id=? AND platform=? AND source_event_id=? AND action_kind='reply'",
+        (
+            scope_id(db, policy.get("project_id", "default")),
+            account["platform"],
+            proof["source_event_id"],
+        ),
+    ).fetchone()
+    if not intent or intent["item_id"] != item_id or intent["state"] not in {"reserved", "claimed"}:
+        return None
+    return {
+        "account": old["account_id"],
+        "task": old["task_id"],
+        "attempt_at": attempt["started_at"],
+        "due_at": old["due_at"],
+        "target": attempt["target_key"],
+        "user": attempt["user_key"],
+    }
 
 
 def intent_blocker(db, account, task, payload, item_id):
@@ -75,7 +422,7 @@ def intent_blocker(db, account, task, payload, item_id):
         }
     # Include receipts created before this additive migration, and unresolved manual evidence.
     for old in db.execute(
-        "SELECT i.id,i.task_id,i.account_id,i.status,i.external_reference,i.result,i.payload,t.policy FROM items i JOIN tasks t ON t.id=i.task_id "
+        "SELECT i.id,i.task_id,i.account_id,i.status,i.attempt_id,i.external_reference,i.result,i.payload,t.policy FROM items i JOIN tasks t ON t.id=i.task_id "
         "JOIN accounts a ON a.id=i.account_id WHERE a.platform=? AND i.id<>? AND "
         "(i.attempt_id IS NOT NULL OR i.status IN ('confirmed','executing','unknown','scheduled'))",
         (account["platform"], item_id),
@@ -97,6 +444,36 @@ def intent_blocker(db, account, task, payload, item_id):
         ).fetchone()
         if proven_not_submitted and retry:
             continue
+        if (
+            old["status"] == "failed_known"
+            and not old["external_reference"]
+            and old["account_id"] == account["id"]
+            and previous.get("submission_started") is False
+            and proven_not_submitted
+        ):
+            from .models import digest
+
+            marker = db.execute(
+                "SELECT details FROM audit WHERE task_id=? AND kind='interaction.explicit_unsent_retry_authorized' AND json_extract(details,'$.old_item_id')=? AND json_extract(details,'$.new_item_id')=? ORDER BY id DESC LIMIT 1",
+                (task["id"], old["id"], item_id),
+            ).fetchone()
+            if marker:
+                evidence = json.loads(marker[0])
+                attempt = db.execute(
+                    "SELECT outcome,finished_at FROM attempts WHERE id=? AND item_id=?",
+                    (old["attempt_id"], old["id"]),
+                ).fetchone()
+                if (
+                    evidence.get("source") == "explicit_user_known_unsent_local_retry"
+                    and evidence.get("account_id") == account["id"]
+                    and evidence.get("source_event_id") == source_id
+                    and evidence.get("attempt_id") == old["attempt_id"]
+                    and evidence.get("result_digest") == digest(previous)
+                    and attempt
+                    and attempt["outcome"] == "failed_known"
+                    and attempt["finished_at"]
+                ):
+                    continue
         if (
             scope_id(db, json.loads(old["policy"]).get("project_id", "default")) == project
             and event_id(account["platform"], json.loads(old["payload"])) == source_id
@@ -214,10 +591,19 @@ def candidate_guard(db, item_id, now):
         ):
             return "account_profile_mismatch"
     limits = config["publishing"]
+    from .account_daily_local import enabled as local_daily_unlimited
+    from .account_daily_local import item_uses_local_channel
+
     for seconds, limit in (
         (3600, limits["max_per_account_hour"]),
         (86400, limits["max_per_account_day"]),
     ):
+        if (
+            seconds == 86400
+            and local_daily_unlimited(db, account["platform"])
+            and item_uses_local_channel(db, item_id, execution, now)
+        ):
+            continue
         if limit is None:
             continue
         start = now - 3600 if seconds == 3600 else now - now % 86400

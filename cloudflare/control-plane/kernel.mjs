@@ -8,6 +8,7 @@ export const PLATFORMS = new Set([
   "x",
   "reddit",
   "instagram",
+  "facebook",
   "discord",
   "tiktok",
 ]);
@@ -21,9 +22,12 @@ export const POOLS = new Set([
   "x.manual",
   "reddit.manual",
   "instagram.graph",
+  "instagram.desktop",
+  "facebook.desktop",
   "instagram.manual",
   "discord.bot",
   "tiktok.organic",
+  "tiktok.desktop",
   ...Array.from(PLATFORMS, (p) => p + ".manual"),
   ...Array.from(PLATFORMS, (p) => "simulation." + p),
 ]);
@@ -65,12 +69,16 @@ export class ControlError extends Error {
   }
 }
 export function cloudFailure(error, now = Date.now()) {
-  const quota =
+  const writeQuota =
     /Exceeded allowed rows written in Durable Objects free tier/i.test(
       String(error?.message || ""),
     );
+  const readQuota = /Exceeded allowed rows read in Durable Objects free tier/i.test(
+    String(error?.message || ""),
+  );
+  const quota = writeQuota || readQuota;
   return {
-    error: quota ? "CloudWriteQuotaExceeded" : "CloudRuntimeUnavailable",
+    error: writeQuota ? "CloudWriteQuotaExceeded" : readQuota ? "CloudReadQuotaExceeded" : "CloudRuntimeUnavailable",
     retry_after_seconds: quota
       ? Math.ceil((86400000 - (now % 86400000)) / 1000) + 30
       : 60,
@@ -349,11 +357,27 @@ export class ControlKernel {
         if (!PLATFORMS.has(a.platform) || !a.id || !a.identity || !a.limits)
           throw new ControlError("InvalidAccount", 400);
         const prior = this.one(
-          "SELECT identity,payload FROM accounts WHERE id=?",
+          "SELECT identity,payload,next_at,cooldown_until,disabled FROM accounts WHERE id=?",
           a.id,
         );
-        if (prior && prior.identity !== a.identity)
-          throw new ControlError("AccountIdentityChanged");
+        if (prior && prior.identity !== a.identity) {
+          // A newly enrolled Facebook account can be mirrored before its first
+          // desktop identity observation. Bind that unused placeholder once;
+          // an account that has ever entered a queue keeps its original identity.
+          const unusedPlaceholder =
+            a.platform === "facebook" &&
+            a.mode === "live" &&
+            prior.identity === "facebook:" + a.id &&
+            /^facebook:[a-f0-9]{64}$/.test(a.identity) &&
+            !prior.next_at && !prior.cooldown_until && !prior.disabled &&
+            !this.one("SELECT 1 FROM jobs WHERE account_id=? LIMIT 1", a.id) &&
+            !(this.one("SELECT name FROM sqlite_master WHERE type='table' AND name='jobs_v1_archive'") &&
+              this.one("SELECT 1 FROM jobs_v1_archive WHERE account_id=? LIMIT 1", a.id)) &&
+            !this.one("SELECT 1 FROM quota_events WHERE scope='account' AND (instr(scope_key,?)>0 OR instr(scope_key,?)>0) LIMIT 1", a.id, prior.identity);
+          if (!unusedPlaceholder) throw new ControlError("AccountIdentityChanged");
+          this.sql.exec("UPDATE accounts SET identity=? WHERE id=?", a.identity, a.id);
+          this.event("account_identity_verified", null, { account_id: a.id });
+        }
         const block = mergeOutboundBlock(
           prior ? JSON.parse(prior.payload).outbound_block_state : undefined,
           a.outbound_block_state,

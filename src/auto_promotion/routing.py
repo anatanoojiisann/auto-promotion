@@ -9,6 +9,7 @@ TRANSPORTS = {
     "telegram": "mtproto",
     "discord": "bot",
     "instagram": "graph",
+    "facebook": "desktop",
     "tiktok": "organic",
     "reddit": "manual",
     "x": "playwright",
@@ -16,6 +17,7 @@ TRANSPORTS = {
 POOLS = frozenset(
     [f"{p}.{t}" for p, t in TRANSPORTS.items()]
     + ["x.edge", "x.tabbit", "x.browser_use", "x.api"]
+    + ["instagram.desktop", "tiktok.desktop"]
     + [f"{p}.manual" for p in PLATFORMS]
     + [f"simulation.{p}" for p in PLATFORMS]
 )
@@ -43,6 +45,22 @@ def route_for(account, payload=None, *, profile=None):
     payload = payload or {}
     transport = TRANSPORTS[platform]
     resource = None
+    if platform in {"facebook", "instagram", "tiktok"}:
+        if profile is None:
+            try:
+                profile = read_profile(platform, account["backend_label"])
+            except BackendError:
+                profile = {}
+        if profile.get("connection_type") in {"meta_desktop", "tiktok_desktop"}:
+            transport = "desktop"
+            resource = (
+                "desktop:"
+                + profile["browser_channel"]
+                + ":"
+                + digest(str(profile.get("instance_id") or profile.get("browser") or "default"))[
+                    :24
+                ]
+            )
     if platform == "x":
         if profile is None:
             try:

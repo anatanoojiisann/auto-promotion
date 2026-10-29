@@ -9,7 +9,7 @@ from pathlib import Path
 
 from auto_promotion.adapters import AdapterRegistry, SimulationAdapter
 from auto_promotion.core import Engine
-from auto_promotion.models import PLATFORMS, AccountInput, ItemInput, TaskInput
+from auto_promotion.models import PLATFORMS, AccountInput, ExecutionSettings, ItemInput, TaskInput
 from auto_promotion.pool_runtime import run_pool
 from auto_promotion.queue_store import JobQueue
 from auto_promotion.routing import route_for
@@ -99,6 +99,7 @@ class PersistentPoolTests(unittest.TestCase):
                 "telegram": "mtproto",
                 "discord": "bot",
                 "instagram": "graph",
+                "facebook": "desktop",
                 "tiktok": "organic",
                 "reddit": "manual",
                 "x": "playwright",
@@ -365,6 +366,7 @@ class PersistentPoolTests(unittest.TestCase):
         from datetime import datetime, timezone
 
         self.engine.clock = time.time
+        self.engine.configure_execution(ExecutionSettings(max_workers=len(PLATFORMS)))
         now = time.time()
 
         def iso(at):
@@ -383,6 +385,10 @@ class PersistentPoolTests(unittest.TestCase):
                 "execution_mode": "manual",
             },
             "discord": {"action": "send_message", "target": "123456789012345678"},
+            "facebook": {
+                "action": "comment",
+                "target": "https://www.facebook.com/groups/test/posts/123/",
+            },
             "tiktok": {
                 "action": "reply",
                 "target": "owned-account",
@@ -447,7 +453,7 @@ class PersistentPoolTests(unittest.TestCase):
                     "--node-id",
                     "process-test",
                     "--idle-exit",
-                    "1",
+                    "3",
                 ],
                 env=env,
                 stdout=subprocess.PIPE,
@@ -467,10 +473,14 @@ class PersistentPoolTests(unittest.TestCase):
                     child.communicate()
         states = self.store.rows("SELECT status,COUNT(*) n FROM items GROUP BY status")
         self.assertEqual(
-            {r["status"]: r["n"] for r in states}, {"confirmed": 5, "manual_attention": 1}
+            {r["status"]: r["n"] for r in states},
+            {"confirmed": 6, "manual_attention": 1},
+            self.store.rows(
+                "SELECT a.platform,i.status,i.result FROM items i JOIN accounts a ON a.id=i.account_id"
+            ),
         )
         self.assertEqual(
-            len({r["pid"] for r in self.store.rows("SELECT pid FROM pool_workers")}), 6
+            len({r["pid"] for r in self.store.rows("SELECT pid FROM pool_workers")}), 7
         )
 
 

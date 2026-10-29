@@ -51,6 +51,8 @@ ITEM_FIELDS = (
     "profile_version",
     "tiktok_video_id",
     "tiktok_comment_id",
+    "tiktok_conversation_id",
+    "tiktok_message_id",
     "tiktok_options",
 )
 RESULT_FIELDS = (
@@ -75,6 +77,10 @@ RESULT_FIELDS = (
         "publish_id",
         "post_ids",
         "comment_id",
+        "message_id",
+        "conversation_id",
+        "recipient_id",
+        "interaction_channel",
         "platform_status",
     )
     + READ_FIELDS

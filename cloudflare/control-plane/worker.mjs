@@ -519,7 +519,7 @@ export class WorkspaceCoordinator extends DurableObject {
       });
     } catch (e) {
       const failure = cloudFailure(e);
-      if (failure.error === "CloudWriteQuotaExceeded")
+      if (["CloudWriteQuotaExceeded", "CloudReadQuotaExceeded"].includes(failure.error))
         return Response.json(failure, {
           status: 503,
           headers: {
@@ -539,10 +539,11 @@ export class WorkspaceCoordinator extends DurableObject {
       this.kernel.sweep();
       await scheduleMaintenance(this.kernel, this.ctx.storage);
     } catch (error) {
-      if (cloudFailure(error).error !== "CloudWriteQuotaExceeded") throw error;
+      const failure = cloudFailure(error);
+      if (!["CloudWriteQuotaExceeded", "CloudReadQuotaExceeded"].includes(failure.error)) throw error;
       // An exhausted write budget cannot run migration or expiry maintenance.
       // Do not poison read-only standby requests with a retrying failed alarm.
-      console.error("CloudWriteQuotaExceeded");
+      console.error(failure.error);
     }
   }
 }

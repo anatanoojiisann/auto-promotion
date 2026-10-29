@@ -112,7 +112,7 @@ async function renderInteractions(id) {
       )
       .join(
         "",
-      )}</div><div class="surface padded"><h2>${readOnly ? "只读连接" : "执行条件"}</h2>${p.effective_accounts.map((a) => `<p><strong>${esc(a.label)}</strong> · ${a.mode === "simulation" ? "模拟" : "真实账号"}<br>${esc(a.capabilities.transport)} · ${esc(readOnly ? a.capabilities.discovery : a.capabilities.publishing)}<br>有效额度 ${a.hourly_limit}/小时，${a.daily_limit}/天，间隔 ${a.min_interval} 秒</p>`).join("") || "未选择账号"}${readOnly ? "" : `<p>媒体：${p.media.configured ? "已配置，按需检查预算" : esc(p.media.reason)}；未配置收费预算时只继续文字流程。</p>`}${p.block_reasons.map((r) => `<span class="chip">${esc(r.block_reason)} × ${r.count}</span>`).join(" ")}</div></div>` +
+      )}</div><div class="surface padded"><h2>${readOnly ? "只读连接" : "执行条件"}</h2>${p.effective_accounts.map((a) => `<p><strong>${esc(a.label)}</strong> · ${a.mode === "simulation" ? "模拟" : "真实账号"}<br>${esc(a.capabilities.transport)} · ${esc(readOnly ? a.capabilities.discovery : a.capabilities.publishing)}<br>有效额度 ${a.hourly_limit}/小时，${a.daily_limit == null ? "本地账号每日不限" : a.daily_limit + "/天"}，间隔 ${a.min_interval} 秒</p>`).join("") || "未选择账号"}${readOnly ? "" : `<p>媒体：${p.media.configured ? "已配置，按需检查预算" : esc(p.media.reason)}；未配置收费预算时只继续文字流程。</p>`}${p.block_reasons.map((r) => `<span class="chip">${esc(r.block_reason)} × ${r.count}</span>`).join(" ")}</div></div>` +
     (joint
       ? '<label class="mt-20">当前页按产品筛选<select id="hf-product-filter"><option value="">全部产品</option><option value="aigram">AIgram</option><option value="aurax">Aurax AI</option></select></label>'
       : "") +

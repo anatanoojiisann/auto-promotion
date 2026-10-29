@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-PLATFORMS = ("telegram", "reddit", "instagram", "x", "discord", "tiktok")
+PLATFORMS = ("telegram", "reddit", "instagram", "facebook", "x", "discord", "tiktok")
 CAPABILITIES = {
     "telegram": {
         "discover",
@@ -20,10 +20,13 @@ CAPABILITIES = {
         "join",
     },
     "reddit": {"discover", "reply", "post"},
-    "instagram": {"publish", "manual_comment"},
+    "instagram": {"publish", "manual_comment", "comment", "reply"},
+    "facebook": {"comment", "reply"},
     "x": {"discover", "like", "reply", "repost", "quote", "post"},
     "discord": {"send_message", "reply", "send_file"},
     "tiktok": {
+        "send_direct_message",
+        "reply_direct_message",
         "publish",
         "reply",
         "comment",
@@ -67,7 +70,7 @@ class TelegramReadPolicy(Model):
 
 
 class AccountInput(Model):
-    platform: Literal["telegram", "reddit", "instagram", "x", "discord", "tiktok"]
+    platform: Literal["telegram", "reddit", "instagram", "facebook", "x", "discord", "tiktok"]
     label: str = Field(min_length=1, max_length=80)
     backend_label: str = Field(min_length=1, max_length=100)
     mode: Literal["live", "simulation"] = "live"
@@ -100,6 +103,9 @@ class Policy(Model):
     account_hourly_limit: int | None = Field(default=None, ge=1, le=20)
     account_daily_limit: int | None = Field(default=None, ge=1, le=300)
     execution_channel: Literal["inherit", "cloud", "local"] = "inherit"
+    execution_channel_source: str = Field(default="", max_length=240)
+    outbound_dependency_mode: Literal["published", "finished"] = "published"
+    outbound_dependency_deadline: str | None = None
     queries: list[str] = Field(default_factory=list, max_length=20)
     required_keywords: list[str] = Field(default_factory=list)
     blocked_keywords: list[str] = Field(default_factory=list)
@@ -110,7 +116,7 @@ class Policy(Model):
     min_confidence: float = Field(default=0.8, ge=0.5, le=1)
     max_candidates: int = Field(default=20, ge=1, le=200)
     max_joins: int = Field(default=0, ge=0, le=20)
-    outbound_after_membership_seconds: int | None = Field(default=None, ge=3600, le=604800)
+    outbound_after_membership_seconds: int | None = Field(default=None, ge=600, le=604800)
     outbound_after_service_recovery_seconds: int | None = Field(default=None, ge=30, le=86400)
     allow_owned_x_posts: bool = False
     outbound_after_task_ids: list[str] = Field(default_factory=list, max_length=50)
@@ -130,6 +136,8 @@ class Policy(Model):
     @model_validator(mode="after")
     def window(self):
         ZoneInfo(self.timezone)
+        if self.execution_channel_source and self.execution_channel == "inherit":
+            raise ValueError("明确的通道指令来源需要同时指定 cloud 或 local，不能跟随默认")
         if self.user_daily_limit == 3 and not (
             self.allow_owned_x_posts and self.execution_channel == "cloud" and self.daily_limit == 1
         ):
@@ -140,6 +148,11 @@ class Policy(Model):
             raise ValueError("必须指定允许语言")
         if bool(self.outbound_after_task_ids) != (self.outbound_after_tasks_seconds is not None):
             raise ValueError("完成后发布需要同时指定互动任务和等待秒数")
+        if self.outbound_dependency_deadline is not None:
+            if not self.outbound_after_task_ids or not epoch(self.starts_at) <= epoch(
+                self.outbound_dependency_deadline
+            ) <= epoch(self.ends_at):
+                raise ValueError("依赖截止时间必须在本任务窗口内且配置前置任务")
         if len(set(self.outbound_after_task_ids)) != len(self.outbound_after_task_ids):
             raise ValueError("前置互动任务不能重复")
         if self.outbound_after_task_ids and (
@@ -200,6 +213,8 @@ class ItemInput(Model):
     tiktok_video_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
     tiktok_comment_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
     tiktok_options: TikTokPostOptions | None = None
+    tiktok_conversation_id: str = Field(default="", pattern=r"^[A-Za-z0-9:_-]{0,160}$")
+    tiktok_message_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
 
     @field_validator("scheduled_at")
     @classmethod
@@ -287,7 +302,7 @@ class PoolInput(Model):
 
 
 class OpportunityInput(Model):
-    platform: Literal["telegram", "reddit", "instagram", "x", "discord", "tiktok"]
+    platform: Literal["telegram", "reddit", "instagram", "facebook", "x", "discord", "tiktok"]
     external_id: str = Field(min_length=1, max_length=160)
     native_target_id: str = Field(default="", pattern=r"^(?:|-?[1-9][0-9]{0,20})$")
     target: str = Field(min_length=1, max_length=500)
@@ -320,6 +335,11 @@ class OpportunityInput(Model):
 
     @model_validator(mode="after")
     def valid(self):
+        if self.platform == "tiktok" and self.action in {
+            "send_direct_message",
+            "reply_direct_message",
+        }:
+            raise ValueError("TikTok 私信保存在独立收件箱，不导入共享公开内容池")
         if self.action not in CAPABILITIES[self.platform] - {"discover", "join"}:
             raise ValueError("平台不支持该互动动作")
         for value in (self.published_at, self.expires_at):

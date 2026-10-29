@@ -20,6 +20,7 @@ from .execution_channels import (
     independent_scope,
     local_account_scope,
     local_active,
+    offline_only,
     read_state,
     use_cloud,
 )
@@ -37,7 +38,11 @@ class PoolScheduler:
         self.children, self.handles = {}, {}
         self.last_sync = 0
         self.last_heartbeat = None
-        self.cloud = None if independent_active(engine) else CloudControl.configured()
+        self.cloud = (
+            None
+            if independent_active(engine) or offline_only(engine.store)
+            else CloudControl.configured()
+        )
         self.closed = False
 
     def enable(self):
@@ -64,9 +69,14 @@ class PoolScheduler:
             "SELECT value FROM meta WHERE key='cloud_control_required'"
         )
         independent = independent_active(self.engine)
-        if not independent and not self.cloud:
+        no_cloud = offline_only(self.engine.store)
+        if no_cloud:
+            self.cloud = None
+        elif not independent and not self.cloud:
             self.cloud = CloudControl.configured()
         mixed = pending_managed(self.engine)
+        if no_cloud and not independent and not mixed:
+            return self.queue.pools()
         if (
             required
             and required["value"] == "1"
@@ -119,7 +129,7 @@ class PoolScheduler:
         folder.mkdir(exist_ok=True)
         for row in pools:
             pool = row["pool"]
-            if pool not in POOLS or (allowed and pool not in allowed):
+            if pool.endswith(".desktop") or pool not in POOLS or (allowed and pool not in allowed):
                 continue
             cap = settings.get("pool_workers", {}).get(pool, 1)
             active = self.engine.store.one(
@@ -311,7 +321,7 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
         raise ValueError("UnknownExecutionPool")
     queue = JobQueue(engine)
     independent = independent_active(engine)
-    cloud = None if independent else CloudControl.configured()
+    cloud = None if independent or offline_only(engine.store) else CloudControl.configured()
     journal = CloudJournal(engine, cloud) if cloud else None
     required = engine.store.one("SELECT value FROM meta WHERE key='cloud_control_required'")
     if (
@@ -416,16 +426,17 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                         {k: channel_state[k] for k in ("generation", "store_id", "node_id")}
                     )
                     context["channel"] = "local"
-                with engine.store.connect(write=True) as db:
-                    Store.audit(
-                        db,
-                        "execution.job_channel",
+                if not is_managed:
+                    from .channel_decisions import audit_route
+
+                    audit_route(
+                        engine,
+                        job,
                         {
-                            "job_id": job["id"],
-                            "channel": "local" if local else "cloud" if cloud else "local_only",
+                            **context,
+                            "channel": "local" if local else "cloud" if cloud else "local",
+                            "node_id": node_id,
                         },
-                        task_id=job["task_id"],
-                        now=engine.clock(),
                     )
                 with (
                     job_scope(job),

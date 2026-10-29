@@ -272,11 +272,12 @@ class Store:
             if self._schema_ready(db):
                 return
             from .interaction_schema import SCHEMA as INTERACTION_SCHEMA
+            from .meta_schema import SCHEMA as META_SCHEMA
             from .queue_store import QUEUE_SCHEMA
 
             # executescript implicitly commits a pending transaction. Execute
             # complete statements instead, including each whole trigger body.
-            for script in (SCHEMA, QUEUE_SCHEMA, INTERACTION_SCHEMA):
+            for script in (SCHEMA, QUEUE_SCHEMA, INTERACTION_SCHEMA, META_SCHEMA):
                 statement = ""
                 for line in script.splitlines(keepends=True):
                     statement += line
@@ -334,6 +335,7 @@ class Store:
     def _schema_ready(db):
         from .interaction_schema import ADDITIONS
         from .interaction_schema import SCHEMA as INTERACTION_SCHEMA
+        from .meta_schema import SCHEMA as META_SCHEMA
         from .queue_store import QUEUE_SCHEMA
 
         names = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
@@ -347,7 +349,7 @@ class Store:
         expected = set(
             re.findall(
                 r"CREATE\s+(?:UNIQUE\s+)?(?:TABLE|VIEW|INDEX|TRIGGER)\s+IF NOT EXISTS\s+(\w+)",
-                SCHEMA + QUEUE_SCHEMA + INTERACTION_SCHEMA,
+                SCHEMA + QUEUE_SCHEMA + INTERACTION_SCHEMA + META_SCHEMA,
                 re.I,
             )
         )
@@ -400,10 +402,17 @@ class Store:
                 + sum(self.lock_retry_delays)
             )
 
+            acquisition_started = time.monotonic()
+
             def prepare(sql):
                 remaining = max(0, deadline - time.monotonic())
                 db.execute(f"PRAGMA busy_timeout={int(min(self.lock_timeout, remaining) * 1000)}")
-                return db.execute(sql)
+                try:
+                    return db.execute(sql)
+                except sqlite3.OperationalError as exc:
+                    exc.db_phase = "write_lock" if sql == "BEGIN IMMEDIATE" else "connection_setup"
+                    exc.lock_wait_ms = int((time.monotonic() - acquisition_started) * 1000)
+                    raise
 
             for attempt in range(len(self.lock_retry_delays) + 1):
                 try:
@@ -453,14 +462,14 @@ class Store:
             (time.time() if now is None else now, task_id, kind, canonical(details)),
         )
 
-    def audit_best_effort(self, kind, details, *, now=None):
+    def audit_best_effort(self, kind, details, *, now=None, task_id=None):
         """Diagnostics may fail; never add a full lock budget or kill a host."""
         try:
             mirror = Store(self.path, initialize=False)
             mirror.lock_timeout = 0
             mirror.lock_retry_delays = ()
             with mirror.connect(write=True) as db:
-                self.audit(db, kind, details, now=now)
+                self.audit(db, kind, details, task_id=task_id, now=now)
             return True
         except sqlite3.Error as exc:
             logging.getLogger(__name__).warning(

@@ -90,6 +90,18 @@ def x_api_channel(account):
 
 def automatic_actions(account):
     """Account-local opt-in; existing X connections remain read-only by default."""
+    if account["mode"] == "live" and account["platform"] in {"instagram", "facebook", "tiktok"}:
+        try:
+            profile = read_profile(account["platform"], account["backend_label"])
+        except BackendError:
+            return []
+        expected = "tiktok_desktop" if account["platform"] == "tiktok" else "meta_desktop"
+        if profile.get("connection_type") != expected:
+            return []
+        actions = ["comment", "reply"]
+        if account["platform"] == "tiktok" and profile.get("direct_messages_enabled") is True:
+            actions += ["send_direct_message", "reply_direct_message"]
+        return actions
     if account["platform"] != "x" or account["mode"] != "live":
         return []
     try:

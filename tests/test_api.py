@@ -186,7 +186,7 @@ class APITests(unittest.TestCase):
         r = self.call(f"/api/tasks/{id}/run", "POST")[1]
         self.assertEqual(r["processed"][0]["status"], "confirmed")
         self.assertEqual(self.call(f"/api/tasks/{id}/run", "POST")[1]["processed"], [])
-        self.assertEqual(len(self.call("/api/services")[1]), 6)
+        self.assertEqual(len(self.call("/api/services")[1]), 7)
         self.assertGreater(len(self.call("/api/calls")[1]), 0)
         self.assertGreater(len(self.call("/api/audit")[1]), 0)
 

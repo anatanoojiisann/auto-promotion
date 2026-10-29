@@ -88,6 +88,16 @@ class TabbitConnectionTests(unittest.TestCase):
             self.assertTrue(call("x", settings, "health")["identity_verified"])
         self.assertNotIn("--tab", cli.call_args_list[1].args[0])
 
+    def test_health_stabilizes_layout_before_reading_account_menu(self):
+        with patch(
+            "auto_promotion.backends.tabbit.cli",
+            side_effect=[self.inventory, self.response(), {"ok": True}],
+        ) as cli:
+            self.assertTrue(call("x", self.settings, "health")["identity_verified"])
+        code = cli.call_args_list[1].kwargs["code"]
+        self.assertLess(code.index("setViewportSize"), code.index("menu.textContent"))
+        self.assertIn("handles,profile", code)
+
     def test_profile_must_match_account_menu(self):
         response = self.response()
         response["result"]["value"]["profile"] = "/other"

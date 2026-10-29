@@ -11,6 +11,8 @@ htmlcov/
 node_modules/
 var/
 output/
+/outputs/
+/tmp/
 .env*
 !.env.example
 *.db

@@ -37,9 +37,10 @@ from .store import Store
 from .task_tool_models import TemplateSave, TemplateTask
 from .task_tools import TaskTools
 from .tiktok import TikTokManager, TikTokReadInput
+from .tiktok_browser import TikTokBrowser, TikTokBrowserConnect
 from .workers import Workers
 
-Platform = Literal["telegram", "reddit", "instagram", "x", "discord", "tiktok"]
+Platform = Literal["telegram", "reddit", "instagram", "facebook", "x", "discord", "tiktok"]
 
 
 def client_config(project_dir, python=None):
@@ -60,6 +61,9 @@ def client_config(project_dir, python=None):
 
 
 def create_server(engine=None):
+    from .runtime_identity import capture_runtime
+
+    runtime = capture_runtime("mcp")
     engine = engine or Engine(
         Store(database_path()),
         AdapterRegistry(workspace_path()),
@@ -68,7 +72,7 @@ def create_server(engine=None):
     server = FastMCP(
         "Auto Promotion",
         instructions=(
-            "Manage Telegram, Reddit, Instagram, X, Discord and TikTok through persistent tasks. "
+            "Manage Telegram, Reddit, Instagram, Facebook, X, Discord and TikTok through persistent tasks. "
             "When the user explicitly instructs you to start sending, replying or joining, "
             "call start_task or start_joins for the specified task without asking for approval phrases. "
             "Creating, editing, planning or previewing a task never starts execution. "
@@ -85,6 +89,10 @@ def create_server(engine=None):
     growth = Growth(engine)
     task_tools = TaskTools(engine)
     tiktok = TikTokManager(engine)
+    from .meta_browser import MetaBrowser
+
+    meta_browser = MetaBrowser(engine)
+    tiktok_browser = TikTokBrowser(engine)
 
     @server.tool(annotations=read)
     def tiktok_configuration_status() -> dict:
@@ -197,6 +205,103 @@ def create_server(engine=None):
                 code = "BackendError"
             raise ToolError(code) from None
 
+    @server.tool(annotations=local)
+    def meta_browser_status() -> dict:
+        """Synchronize existing Meta workflow states without starting any task."""
+        return invoke(meta_browser.status)
+
+    @server.tool(annotations=local)
+    def meta_browser_jobs() -> dict:
+        """Read due Facebook/IG desktop jobs and unknown receipts; never submit."""
+        return invoke(meta_browser.pending)
+
+    @server.tool(annotations=local)
+    def meta_browser_observe(account_id: str, proof: dict) -> dict:
+        """Save a fresh identity observation made through the account's existing browser."""
+        return invoke(lambda: meta_browser.observe(account_id, proof))
+
+    @server.tool(annotations=local)
+    def meta_browser_begin(item_id: str, proof: dict) -> dict:
+        """Claim one due item of an explicitly started task before operating its browser."""
+        return invoke(lambda: meta_browser.begin(item_id, proof))
+
+    @server.tool(annotations=local)
+    def meta_browser_guard(item_id: str, owner: str) -> dict:
+        """Immediately before clicking Submit, recheck all stops and use its one submission permit."""
+        return invoke(lambda: meta_browser.guard(item_id, owner))
+
+    @server.tool(annotations=local)
+    def meta_browser_result(item_id: str, receipt: dict, owner: str | None = None) -> dict:
+        """Save independent browser receipt evidence; an unknown item can never be resent."""
+        return invoke(lambda: meta_browser.result(item_id, receipt, owner))
+
+    @server.tool(annotations=local)
+    def meta_browser_feedback(item_id: str, evidence: dict) -> dict:
+        """Save observed direct replies with honest thread coverage; never send a reply."""
+        return invoke(lambda: meta_browser.feedback(item_id, evidence))
+
+    @server.tool(annotations=local)
+    def tiktok_browser_status() -> dict:
+        """Read enrolled TikTok browser connections; never start or submit."""
+        return invoke(tiktok_browser.status)
+
+    @server.tool(annotations=local)
+    def tiktok_browser_connect(connection: dict) -> dict:
+        """Enroll TikTok browser metadata without logging in or enabling writes."""
+        return invoke(
+            lambda: tiktok_browser.connect(TikTokBrowserConnect.model_validate(connection))
+        )
+
+    @server.tool(annotations=local)
+    def tiktok_browser_jobs() -> dict:
+        """Read due TikTok desktop jobs and unresolved receipts without submitting."""
+        return invoke(tiktok_browser.pending)
+
+    @server.tool(annotations=local)
+    def tiktok_browser_observe(account_id: str, proof: dict) -> dict:
+        """Save current TikTok authenticated-menu and profile evidence, or a blocker."""
+        return invoke(lambda: tiktok_browser.observe(account_id, proof))
+
+    @server.tool(annotations=local)
+    def tiktok_browser_begin(item_id: str, proof: dict) -> dict:
+        """Claim one explicitly started TikTok comment/reply with current UI evidence."""
+        return invoke(lambda: tiktok_browser.begin(item_id, proof))
+
+    @server.tool(annotations=local)
+    def tiktok_browser_guard(item_id: str, owner: str, proof: dict) -> dict:
+        """Immediately before clicking, recheck fresh TikTok UI proof and consume one permit."""
+        return invoke(lambda: tiktok_browser.guard(item_id, owner, proof))
+
+    @server.tool(annotations=local)
+    def tiktok_browser_result(item_id: str, receipt: dict, owner: str | None = None) -> dict:
+        """Record an independently observed TikTok comment receipt; never resend."""
+        return invoke(lambda: tiktok_browser.result(item_id, receipt, owner))
+
+    @server.tool(annotations=local)
+    def tiktok_browser_feedback(item_id: str, evidence: dict) -> dict:
+        """Record observed direct replies and coverage without sending follow-ups."""
+        return invoke(lambda: tiktok_browser.feedback(item_id, evidence))
+
+    @server.tool(annotations=local)
+    def tiktok_dm_collect(account_id: str, snapshot: dict) -> dict:
+        """Save observed private inbox data locally; never start, accept a request, or send."""
+        return invoke(lambda: tiktok_browser.messages.collect(account_id, snapshot))
+
+    @server.tool(annotations=read)
+    def tiktok_dm_inbox(account_id: str) -> dict:
+        """Read this account's collected private conversations, outside the shared pool."""
+        return invoke(lambda: tiktok_browser.messages.inbox(account_id))
+
+    @server.tool(annotations=read)
+    def tiktok_dm_messages(account_id: str, conversation_id: str, limit: int = 100) -> dict:
+        """Read at most 200 locally collected private messages for a verified conversation."""
+        return invoke(lambda: tiktok_browser.messages.messages(account_id, conversation_id, limit))
+
+    @server.tool(annotations=local)
+    def tiktok_dm_enable(account_id: str, enabled: bool = True) -> dict:
+        """Configure DM task capability after inbox observation; never enable live writer or send."""
+        return invoke(lambda: tiktok_browser.messages.enable(account_id, enabled))
+
     @server.tool(annotations=read)
     def system_status() -> dict:
         """Read MCP/platform readiness and execution switches without contacting platforms."""
@@ -206,6 +311,7 @@ def create_server(engine=None):
             lambda: {
                 "mcp_server": "auto-promotion",
                 "transport": "stdio",
+                "runtime": runtime,
                 "platforms": engine.adapters.services(),
                 "global_stop": engine.store.one("SELECT value FROM meta WHERE key='global_stop'")[
                     "value"
@@ -227,6 +333,16 @@ def create_server(engine=None):
                 ]
             }
         )
+
+    @server.tool(annotations=local)
+    def remove_x_local_account_daily_limits() -> dict:
+        """Remove X account-daily limits for local execution on explicit instruction.
+
+        All hourly, task, platform and global limits remain. Does not change cloud settings.
+        """
+        from .account_daily_local import enable
+
+        return invoke(lambda: enable(engine))
 
     @server.tool(annotations=read)
     def list_account_pools() -> dict:
@@ -362,9 +478,39 @@ def create_server(engine=None):
 
     @server.tool(annotations=local)
     def create_task(name: str, account_ids: list[str], policy: dict) -> dict:
-        """Create a draft task without starting execution. Use start_task on an explicit user instruction."""
+        """Create a draft without execution; preserve the user's explicit channel choice.
+
+        Use policy.execution_channel=cloud/local for an explicit instruction and record
+        its reference in execution_channel_source. Never silently leave that instruction
+        as inherit or switch channels after an error. Cloud authorization and the actual
+        browser execution node are separate. Creation never starts a task.
+        """
         return invoke(
             lambda: engine.create_task(TaskInput(name=name, account_ids=account_ids, policy=policy))
+        )
+
+    @server.tool(annotations=remote_read)
+    def search_x_content(
+        account_id: str,
+        query: str,
+        lookback_hours: float = 12,
+        timeout_seconds: int = 30,
+        max_results: int = 100,
+    ) -> dict:
+        """Read one bounded X search page through the unified reader; never interact.
+
+        Returns exact source times and observations pending context/priority review.
+        Use this entry for live X discovery instead of temporary browser scripts.
+        Rate limits and verification blocks persist; incomplete coverage stays explicit.
+        """
+        return invoke(
+            lambda: engine.search_x_content(
+                account_id,
+                query,
+                lookback_hours=lookback_hours,
+                timeout_seconds=timeout_seconds,
+                max_results=max_results,
+            )
         )
 
     @server.tool(annotations=remote_read)

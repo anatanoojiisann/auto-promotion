@@ -191,6 +191,13 @@ class OriginalPostTests(unittest.TestCase):
                 self.finish(source, status=status, verified=verified, published=published)
                 child = self.item(self.task(sources=[source["id"]]))
                 child = self.engine.start_task(child["id"])
+                if status == "missed":
+                    self.assertEqual(child["state"], "completed")
+                    self.assertEqual(
+                        child["items"][0]["result"]["reason"], "interaction_dependencies_failed"
+                    )
+                    self.assertIsNone(child["manifest_hash"])
+                    continue
                 self.assertEqual(child["phase"], "starting")
                 self.assertIsNone(child["manifest_hash"])
                 self.assertEqual(child["readiness"]["workflow"]["status"], "waiting_interactions")

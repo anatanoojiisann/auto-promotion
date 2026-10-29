@@ -71,6 +71,18 @@ class ReadObservationContractTests(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         self.assertFalse(result["read_page_complete"])
 
+    def test_search_uses_owned_scratch_page_instead_of_attaching_user_tab(self):
+        _, cli = self.scan(self.value())
+        args = cli.call_args_list[1].args[0]
+        code = cli.call_args_list[1].kwargs["code"]
+        self.assertNotIn("--tab", args)
+        self.assertIn("const scratch = true", code)
+        self.assertIn("await page.setViewportSize({width:1440,height:1000});", code)
+        self.assertGreaterEqual(int(args[args.index("--timeout-ms") + 1]), 60000)
+        # The transport minimum must not replace the smaller in-page read budget.
+        self.assertIn("const scanTimeoutMs = ", code)
+        self.assertNotIn("const scanTimeoutMs = 60000", code)
+
     def test_tabbit_external_search_url_is_rejected(self):
         with self.assertRaisesRegex(BackendError, "TabbitSearchUnavailable"):
             self.scan(self.value(url="https://example.com/search?q=video"))

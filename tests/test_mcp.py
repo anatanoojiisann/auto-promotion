@@ -109,7 +109,27 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 47)
+        self.assertEqual(len(tools), 68)
+        self.assertIn("remove_x_local_account_daily_limits", tools)
+        self.assertIn("search_x_content", tools)
+        self.assertEqual(
+            tools["search_x_content"].inputSchema["properties"]["lookback_hours"]["default"], 12
+        )
+        self.assertTrue(
+            {"tiktok_dm_collect", "tiktok_dm_inbox", "tiktok_dm_messages", "tiktok_dm_enable"}
+            <= tools.keys()
+        )
+        self.assertTrue(
+            {
+                "tiktok_browser_connect",
+                "tiktok_browser_jobs",
+                "tiktok_browser_guard",
+                "tiktok_browser_begin",
+                "tiktok_browser_result",
+            }
+            <= tools.keys()
+        )
+        self.assertIn("proof", tools["tiktok_browser_guard"].inputSchema["required"])
         self.assertTrue(
             {
                 "list_task_templates",
@@ -259,7 +279,11 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 str(Path(self.tmp.name) / "stdio.db"),
                 "--no-env",
             ],
-            env={"PYTHONIOENCODING": "utf-8", "AUTO_PROMOTION_LIVE_WRITES": "0"},
+            env={
+                "PYTHONIOENCODING": "utf-8",
+                "AUTO_PROMOTION_LIVE_WRITES": "0",
+                "PYTHONPATH": str(project / "src"),
+            },
             cwd=self.tmp.name,
         )
         async with asyncio.timeout(30):
@@ -267,7 +291,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 async with ClientSession(read, write) as client:
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
-                    self.assertEqual(len((await client.list_tools()).tools), 47)
+                    self.assertEqual(len((await client.list_tools()).tools), 68)
                     status = await client.call_tool("system_status", {})
                     self.assertFalse(status.isError)
                     value = status.structuredContent or json.loads(status.content[0].text)

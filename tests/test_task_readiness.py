@@ -16,6 +16,62 @@ def iso(seconds):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_explicit_ten_minute_wait_uses_actual_late_membership(self):
+        task = self.task(
+            max_joins=1,
+            outbound_after_membership_seconds=600,
+            ends_at=iso(self.now + 86400),
+        )
+        candidate = self.candidate(task)
+        self.items(task, scheduled_at=iso(self.now + 600))
+        self.assertEqual(self.engine.start_task(task["id"])["phase"], "starting")
+        self.now += 7200
+        joined_at = self.now
+        self.membership(candidate, outbound_eligible_at_utc=iso(joined_at + 3600))
+        task = self.engine.start_task(task["id"], source="scheduler")
+        self.assertEqual(task["phase"], "ready")
+        self.assertEqual(task["items"][0]["due_at"], joined_at + 600)
+        self.now = joined_at + 599
+        self.assertEqual(self.engine.run_once(task["id"])["processed"], [])
+        self.now = joined_at + 600
+        self.assertEqual(self.engine.run_once(task["id"])["processed"][0]["status"], "confirmed")
+
+    def test_twenty_minute_wait_still_requires_verified_send_permission(self):
+        task = self.task(max_joins=1, outbound_after_membership_seconds=1200)
+        candidate = self.candidate(task)
+        self.items(task, scheduled_at=iso(self.now + 1200))
+        self.membership(candidate, can_send=False, outbound_eligible_at_utc=iso(self.now + 3600))
+        self.assertEqual(self.engine.start_task(task["id"])["phase"], "starting")
+        self.membership(candidate, outbound_eligible_at_utc=iso(self.now + 3600))
+        task = self.engine.start_task(task["id"], source="scheduler")
+        self.assertEqual(task["phase"], "ready")
+        self.assertEqual(task["items"][0]["due_at"], self.now + 1200)
+
+    def test_readonly_lookup_can_confirm_existing_member_without_join_attempt(self):
+        task = self.task(max_joins=1, outbound_after_membership_seconds=600)
+        candidate = self.candidate(task)
+        result = dict(
+            status="joined",
+            verified=True,
+            can_send=True,
+            external_reference="simulation://membership/existing",
+            outbound_eligible_at_utc=iso(self.now + 3600),
+        )
+        with patch.object(self.engine, "call", return_value=result) as call:
+            observed = self.engine.reconcile_join(candidate["id"])
+        self.assertEqual(call.call_args.args[1], "verify_join")
+        self.assertEqual(observed["status"], "already_joined")
+        self.assertEqual(self.engine.task(task["id"])["candidates"][0]["state"], "already_joined")
+        self.assertFalse(self.store.rows("SELECT * FROM join_attempts"))
+
+    def test_readonly_nonmember_lookup_keeps_the_first_join_available(self):
+        task = self.task(max_joins=1, outbound_after_membership_seconds=600)
+        candidate = self.candidate(task)
+        with patch.object(self.engine, "call", return_value=dict(status="unknown", verified=False)):
+            self.engine.reconcile_join(candidate["id"])
+        self.assertEqual(self.engine.task(task["id"])["candidates"][0]["state"], "not_attempted")
+        self.assertFalse(self.store.rows("SELECT * FROM join_attempts"))
+
     def test_recovery_schedule_waits_for_cloud_and_keeps_hour_and_spacing(self):
         task = self.task(
             max_joins=1,

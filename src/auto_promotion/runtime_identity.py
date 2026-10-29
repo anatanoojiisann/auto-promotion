@@ -13,6 +13,10 @@ FINGERPRINT_FILES = (
     "interaction_intents.py",
     "queue_store.py",
     "task_channels.py",
+    "task_dependencies.py",
+    "channel_decisions.py",
+    "task_lifecycle.py",
+    "statistics_retries.py",
     "cloud_control.py",
     "store.py",
     "api.py",
@@ -37,6 +41,27 @@ FINGERPRINT_FILES = (
     "backends/browser_use.py",
     "interactions.py",
     "readiness.py",
+    "runtime_identity.py",
+    "account_daily_local.py",
+    "mcp_server.py",
+    "cli.py",
+    "config.py",
+    "x_reading.py",
+    "meta_browser.py",
+    "meta_coordination.py",
+    "meta_schema.py",
+    "tiktok_browser.py",
+    "tiktok_messages.py",
+    "alert_service.py",
+    "alert_rules.py",
+    "completion_cycles.py",
+    "web/app.js",
+    "web/interactions.js",
+    "web/index.html",
+    "web/tiktok.js",
+    "web/tiktok-browser.js",
+    "web/tiktok-desktop.js",
+    "web/tiktok-messages-desktop.js",
 )
 
 
@@ -55,6 +80,7 @@ def capture_runtime(component):
             text=True,
             timeout=2,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode == 0 and len(result.stdout.strip()) == 40:
             commit = result.stdout.strip()

@@ -190,7 +190,9 @@ async function cleanup() {
   await page.getByRole("link", { name: "账号中心", exact: true }).click();
   await page.getByRole("heading", { name: "账号中心", exact: true }).waitFor();
   assert.ok((await page.locator("tbody tr").count()) >= 4);
-  await page.getByRole("button", { name: "连接 IG", exact: true }).click();
+  await page
+    .getByRole("button", { name: "连接 IG 发布接口", exact: true })
+    .click();
   await page.getByLabel("平台用户名", { exact: true }).fill("brand");
   assert.equal(
     await page.getByLabel("Instagram 用户访问令牌").getAttribute("type"),
@@ -236,7 +238,7 @@ async function cleanup() {
     });
   await page.getByRole("link", { name: "API 中心", exact: true }).click();
   await page.getByRole("heading", { name: "API 中心", exact: true }).waitFor();
-  assert.equal(await page.locator(".service-row").count(), 6);
+  assert.equal(await page.locator(".service-row").count(), 7);
   if (!process.env.AP_UI_SKIP_SCREENSHOTS)
     await page.screenshot({
       path: "output/playwright/api-desktop.png",
@@ -255,11 +257,9 @@ async function cleanup() {
     .locator(`input[name="accounts"][value="${secondAccount.id}"]`)
     .check();
   await page.getByLabel("发现主题（每行一个）").fill("AI video");
-  assert.equal(await page.locator("#execution-channel option").count(), 3);
-  assert.equal(
-    await page.locator("#execution-channel").inputValue(),
-    "inherit",
-  );
+  assert.equal(await page.locator("#execution-channel option").count(), 4);
+  assert.equal(await page.locator("#execution-channel").inputValue(), "");
+  await page.locator("#execution-channel").selectOption("inherit");
   await page.locator("#task-interval").fill("0");
   await page
     .locator("#task-form")
@@ -686,7 +686,7 @@ async function cleanup() {
     "simulation must not inflate live publications",
   );
   assert.equal(statistics.totals.received_replies, null);
-  assert.equal(statistics.platforms.length, 6);
+  assert.equal(statistics.platforms.length, 7);
   assert.equal(
     await page
       .getByRole("columnheader", { name: "当日累计发布", exact: true })
@@ -894,7 +894,8 @@ async function cleanup() {
     .locator(`#task-form [name=accounts][value="${xAccount.id}"]`)
     .check();
   await page.locator("#task-form [name=allow_owned_x_posts]").check();
-  assert.equal(await page.locator("#execution-channel").inputValue(), "cloud");
+  assert.equal(await page.locator("#execution-channel").inputValue(), "");
+  await page.locator("#execution-channel").selectOption("cloud");
   assert.equal(
     await page
       .locator("#task-form [name=outbound_after_tasks_minutes]")

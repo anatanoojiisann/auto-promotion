@@ -124,6 +124,10 @@ def exception_details(exc):
         "exception_type": safe_code(type(exc).__name__),
         "diagnostic_traceback": frames[-12:],
     }
+    for field in ("sqlite_errorcode", "sqlite_errorname", "db_phase", "lock_wait_ms"):
+        value = getattr(exc, field, None)
+        if type(value) in {str, int, float}:
+            result[field] = value
     counts = getattr(exc, "rpc_counts", None)
     if isinstance(counts, dict):
         result["rpc_counts"] = {

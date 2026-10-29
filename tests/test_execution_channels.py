@@ -87,6 +87,7 @@ class ExecutionChannelTests(unittest.TestCase):
 
     def test_other_errors_never_trigger_fallback(self):
         for error in (
+            "CloudReadQuotaExceeded",
             "CloudTransportUnavailable",
             "Unauthorized",
             "QuotaExceeded",

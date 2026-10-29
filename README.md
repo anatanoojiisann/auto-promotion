@@ -1,10 +1,26 @@
 # Auto Promotion
 
+新增 **Facebook / IG 统一浏览器互动**：沿用 Kore 的 Tabbit、Loo 的 Chrome 和
+christina225559 的 Edge，接入统一任务队列、账号节奏、回执、统计与三小时播报。
+旧任务只读迁入，停止与未知结果不重新排队；IG 沿用原共享锁与冷却。
+详见 [Facebook / IG 接入](docs/meta-browser-integration.md)。
+
 一个面向 Telegram、Reddit、Instagram、X、Discord 和 TikTok 的本机推广工作台，将账号、任务启动、调度和执行记录集中在同一个入口。
 
 **工作台和六个平台后端均包含在本仓库中，真实写入默认关闭。** Telegram 使用 Telethon，Reddit/X 使用本机独立浏览器，Instagram 使用 Graph API，Discord 使用官方 Bot HTTP API。无需另一台电脑或相邻工程；账号须在本机重新登录或授权，平台账号和运行数据不随源码分发。
 
 ## 功能
+
+新增 **按账号完成后扫描**：跨工作区登记真实账号，已启动的互动及有限跟进全部结束后，
+每个账号独立等待两小时再领取一次扫描。轮次和计时持久保存，重启不重计；
+P0/P1 由已授权的持续执行器编排，P2/P3/P4 在本轮高优先级互动得到确定结果后汇总待授权。
+P4 表示弱相关、可拓展但尚无明确需求的机会；无关和禁止内容仍排除。
+`scripts/completion_cycle.py` 提供 `init/refresh/status/claim/scan-result/begin/result/authorize`
+等持久门槛，不直接操作平台。原生账号从任务库自动登记，Instagram、Facebook 等外部
+流程登记各自真实身份和只读状态文件，由聊天自动任务接续既有连接。模拟账号不进入真实策略。
+未决提交阻止新互动，P2–P4 未授权不发送；平台权限、停止、额度、账号冷却和最终上下文核对仍生效。
+通用模板见 `examples/completion-cycle-policy.json`。与旧高频策略切换时应先停用重复的扫描入口，
+保留原任务、已接受排期和未决回执；本功能不会把手工连接改造成自动发布连接。
 
 新增 **高频互动**：默认十分钟增量扫描，合格 P0/P1 自动进入原持久发送队列，
 P2 固定五小时批次，连续五轮完整空扫描后才评估 P3 人工候补。
@@ -220,6 +236,7 @@ docs/                   平台接入与测试说明
 
 
 TikTok 的授权配置、发布与自有评论管理、独立回调和真实验收见 [TikTok 接入说明](docs/tiktok.md)。
+现有浏览器的指定视频评论／回复、桌面队列及独立回执核验见 [TikTok 网页互动](docs/tiktok-browser.md)。
 
 六个平台的持久任务、按平台和接入方式划分的执行池、Cloudflare 部署与常驻节点配置见 [持久化执行服务](docs/cloudflare-execution.md)。工作台“推广活动 → 调度与额度 → 发送通道”可查看通道积压、核验状态和并发设置。
 

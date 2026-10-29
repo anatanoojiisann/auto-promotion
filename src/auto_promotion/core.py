@@ -44,6 +44,7 @@ from .runtime_identity import result_runtime
 from .statistics import ZONE, Statistics, publication_time, record_publication
 from .store import Store, decode
 from .task_dependencies import publication_schedule
+from .telegram_reading import read_diagnostics
 from .workers import Workers
 
 RUNTIME = result_runtime("engine")
@@ -124,6 +125,10 @@ class Engine:
 
         recover_private_stop(self.store, row, now=self.clock())
         value = decode(row, "health")
+        from .account_daily_local import enabled as local_daily_unlimited
+
+        with self.store.connect() as db:
+            value["daily_limit_unlimited_locally"] = local_daily_unlimited(db, value["platform"])
         from .health_checks import probe_key, state
 
         value["connection_state"] = state(value, self.clock())
@@ -136,6 +141,25 @@ class Engine:
             value["connection_state"] = "unverified"
         value["capabilities"] = sorted(CAPABILITIES[value["platform"]])
         value["automatic_actions"] = automatic_actions(value)
+        if value["platform"] in {"facebook", "instagram", "tiktok"}:
+            connection = self.store.one(
+                "SELECT connector,browser,profile_url,observation FROM meta_browser_accounts WHERE account_id=?",
+                (account_id,),
+            )
+            if connection:
+                from .meta_browser import fresh
+
+                value["browser_connection"] = {
+                    k: connection[k] for k in ("connector", "browser", "profile_url")
+                }
+                value["execution_backend"] = "desktop"
+                value["capabilities"] = ["comment", "reply"]
+                if value["platform"] == "tiktok":
+                    value["capabilities"] = value["automatic_actions"]
+                if not fresh(json.loads(connection["observation"]), self.clock()):
+                    value["connection_state"] = "unverified"
+            elif value["platform"] == "instagram" and value["mode"] == "live":
+                value["capabilities"] = ["manual_comment", "publish"]
         if value["platform"] == "x":
             try:
                 identity = (
@@ -157,6 +181,12 @@ class Engine:
             except BackendError:
                 value["owned_target_url"] = ""
         if value["platform"] == "tiktok":
+            if value.get("execution_backend") != "desktop":
+                value["capabilities"] = [
+                    a
+                    for a in value["capabilities"]
+                    if a not in {"send_direct_message", "reply_direct_message"}
+                ]
             try:
                 value["owned_target_id"] = (
                     read_profile(
@@ -188,6 +218,11 @@ class Engine:
                 or value["health"].get("permissions")
             )
         )
+        if value.get("execution_backend") == "desktop" and value["platform"] != "tiktok":
+            from .meta_browser import MetaBrowser
+
+            if MetaBrowser(store=self.store).release_pending():
+                value["writable"] = False
         return value
 
     def accounts(self):
@@ -632,9 +667,7 @@ class Engine:
                     "account_block_recovery_generation": account["outbound_block"]["generation"]
                 }
             result = (
-                self.call(account, "health", payload)
-                if payload
-                else self.call(account, "health")
+                self.call(account, "health", payload) if payload else self.call(account, "health")
             )
         except AccountBusy:
             return {**account, "writable": False, "connection_state": "busy"}
@@ -1031,6 +1064,19 @@ class Engine:
             s: sum(i["status"] == s for i in result["items"])
             for s in {i["status"] for i in result["items"]}
         }
+        history = self.store.one(
+            "SELECT s.path,s.state,s.details FROM meta_browser_sources s WHERE s.task_id=? "
+            "UNION SELECT s.path,s.state,s.details FROM meta_browser_history h "
+            "JOIN meta_browser_sources s ON s.id=h.source_id JOIN items i ON i.id=h.item_id "
+            "WHERE i.task_id=? LIMIT 1",
+            (task_id, task_id),
+        )
+        result["legacy_source"] = (
+            {**history, "details": json.loads(history["details"])} if history else None
+        )
+        result["desktop_execution"] = any(
+            route_for(self.account(a)).transport == "desktop" for a in result["account_ids"]
+        )
         from .delivery_summary import summarize
 
         result["delivery_summary"] = summarize(result["items"], result["mode"])
@@ -1040,10 +1086,12 @@ class Engine:
         from .queue_store import JobQueue
 
         result["execution"]["pools"] = JobQueue(self).pools(task_id)
-        result["readiness"] = self.readiness(result)
         from .task_channels import snapshot
+        from .task_lifecycle import receipt_summary
 
         result["channel"] = snapshot(self, result)
+        result["receipt_summary"] = receipt_summary(result["items"])
+        result["readiness"] = self.readiness(result)
         reply = self.store.one(
             "SELECT r.event_id,r.platform,r.account_id,i.payload FROM reply_inbox r "
             "JOIN items i ON i.id=r.item_id WHERE r.followup_task_id=? LIMIT 1",
@@ -1121,6 +1169,7 @@ class Engine:
                             **(blocked if blocked and reason == blocked["reason"] else {}),
                         }
                     )
+        task["account_checks"] = accounts
         return {
             "accounts": accounts,
             "accounts_ready": all(a["ready"] for a in accounts),
@@ -1265,6 +1314,12 @@ class Engine:
         _expected_stop_revision=None,
     ):
         """Persist an explicit start; no approval phrases or approval rows are required."""
+        if self.store.one(
+            "SELECT 1 FROM meta_browser_history h JOIN items i ON i.id=h.item_id WHERE i.task_id=? "
+            "UNION SELECT 1 FROM meta_browser_sources WHERE task_id=? LIMIT 1",
+            (task_id, task_id),
+        ):
+            raise Conflict("迁入的旧任务只同步历史状态，不能重新启动；请创建新任务")
         stop_revision = (
             self._start_stop_revision(task_id)
             if _expected_stop_revision is None
@@ -1318,6 +1373,9 @@ class Engine:
             ):
                 raise Conflict("开始请求期间清单或配置已变化，请刷新后再开始")
             self._validate_start_accounts(task)
+            from .channel_decisions import freeze
+
+            freeze(db, task, self.clock(), source=source, actor=actor)
             from .interaction_intents import reserve_task_intents
 
             reserve_task_intents(db, task, self.clock())
@@ -1353,6 +1411,8 @@ class Engine:
                     if dependency_reason in {
                         "interaction_schedule_elapsed",
                         "interaction_schedule_outside_window",
+                        "interaction_dependencies_failed",
+                        "interaction_dependency_deadline_elapsed",
                     }:
                         db.execute(
                             "UPDATE items SET status='missed',result=? WHERE task_id=? "
@@ -1485,7 +1545,7 @@ class Engine:
             ):
                 continue
             try:
-                # Backend receipts already include the mandatory first 3600 seconds.
+                # Backend receipts include the legacy default of 3600 seconds.
                 eligible = epoch(receipt["outbound_eligible_at_utc"]) + delay - 3600
             except (KeyError, TypeError, ValueError):
                 continue
@@ -1656,18 +1716,62 @@ class Engine:
         if value.action in {"like", "repost"} and (value.text or value.media or value.title):
             raise Conflict("点赞和转发不能附带正文或媒体")
         platform = account["platform"]
+        desktop_actions = {"comment", "reply"}
+        if platform == "tiktok":
+            desktop_actions |= {"send_direct_message", "reply_direct_message"}
+        if account.get("execution_backend") == "desktop" and value.action not in desktop_actions:
+            raise Conflict("该浏览器连接当前只接入文字评论和回复")
+        if platform in {"facebook", "instagram"} and value.action in {"comment", "reply"}:
+            from .meta_browser import event_key
+
+            try:
+                event_key(platform, value.target)
+            except ValueError as exc:
+                raise Conflict(str(exc)) from None
+            if value.media or value.title or len(value.text) > 2200:
+                raise Conflict("Facebook／IG 浏览器互动支持最多 2200 字符的精确文字评论或回复")
+            if account["mode"] == "live" and (
+                value.action not in account["automatic_actions"]
+                or task["policy"].get("execution_channel") != "local"
+            ):
+                raise Conflict("请使用已接入的浏览器账号，并为评论任务选择本机通道")
         if platform != "tiktok" and (
-            value.tiktok_video_id or value.tiktok_comment_id or value.tiktok_options
+            value.tiktok_video_id
+            or value.tiktok_comment_id
+            or value.tiktok_options
+            or value.tiktok_conversation_id
+            or value.tiktok_message_id
         ):
             raise Conflict("TikTok 字段仅用于 TikTok")
         if platform == "tiktok":
             from .backends.common import BackendError
             from .backends.tiktok import validate_item
+            from .tiktok_browser import validate_browser_item
 
             try:
-                validate_item(value.model_dump())
+                if account.get("execution_backend") == "desktop":
+                    if (
+                        task["policy"].get("execution_channel") != "local"
+                        or value.action not in account["automatic_actions"]
+                    ):
+                        raise Conflict("TikTok 网页互动需要已登记浏览器账号和本机任务通道")
+                    validate_browser_item(value.model_dump())
+                    if (
+                        value.action in {"send_direct_message", "reply_direct_message"}
+                        and value.tiktok_conversation_id
+                    ):
+                        conversation = self.store.one(
+                            "SELECT peer_username FROM tiktok_dm_conversations WHERE account_id=? AND conversation_id=?",
+                            (value.account_id, value.tiktok_conversation_id),
+                        )
+                        if not conversation or conversation["peer_username"] != value.recipient_id:
+                            raise Conflict("私信会话与已采集的收件人不一致")
+                else:
+                    validate_item(value.model_dump())
             except (BackendError, ValueError) as exc:
-                raise Conflict(getattr(exc, "safe_code", "TikTok 发布选项无效")) from None
+                raise Conflict(
+                    getattr(exc, "safe_code", str(exc) or "TikTok 发布选项无效")
+                ) from None
             for entry in value.media:
                 self.verify_media(entry.model_dump())
                 ceiling = 20 * 1024 * 1024 if entry.media_type == "IMAGE" else 1024 * 1024 * 1024
@@ -1960,6 +2064,30 @@ class Engine:
         )
 
     def change_state(self, task_id, state):
+        # A local cancel can close receipt follow-up without retracting a native schedule.
+        if state == "cancelled":
+            with self.store.connect(write=True) as db:
+                row = db.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if row and row["state"] == "completed":
+                    db.execute(
+                        "UPDATE tasks SET state='cancelled',updated_at=? WHERE id=?",
+                        (self.clock(), task_id),
+                    )
+                    Store.audit(
+                        db,
+                        "task.cancelled",
+                        {"execution_already_finished": True, "receipts_preserved": True},
+                        task_id,
+                        self.clock(),
+                    )
+            if row and row["state"] == "completed":
+                return self.task(task_id)
+        if state == "active" and self.store.one(
+            "SELECT 1 FROM meta_browser_history h JOIN items i ON i.id=h.item_id WHERE i.task_id=? "
+            "UNION SELECT 1 FROM meta_browser_sources WHERE task_id=? LIMIT 1",
+            (task_id, task_id),
+        ):
+            raise Conflict("历史接入任务只同步原状态，不能重新恢复执行")
         task = self.task(task_id)
         if state == "active":
             if task["state"] in {"cancelled", "completed"}:
@@ -2181,6 +2309,12 @@ class Engine:
             ).fetchone()
             account = dict(account)
             account["automatic_actions"] = automatic_actions(account)
+            if account["platform"] in {"facebook", "instagram", "tiktok"}:
+                from .meta_browser import claim_blocker
+
+                reason = claim_blocker(db, account, payload, item_id, now)
+                if reason:
+                    return self._skip(item_id, reason, db)
             if (
                 account["mode"] == "live"
                 and (
@@ -2624,22 +2758,15 @@ class Engine:
         db.execute(
             "DELETE FROM content_contacts WHERE assignment_id IN (SELECT ca.id FROM campaign_assignments ca JOIN items i ON i.id=ca.item_id WHERE i.status IN ('cancelled','missed') AND i.attempt_id IS NULL)"
         )
-        scope = " AND id=? AND state='active'" if task_id else " AND state='active'"
-        params = (self.clock(), task_id) if task_id else (self.clock(),)
-        db.execute(
-            "UPDATE tasks SET state='completed',updated_at=? "
-            "WHERE state NOT IN ('cancelled','completed') AND phase='ready' "
-            "AND EXISTS(SELECT 1 FROM items WHERE task_id=tasks.id) "
-            "AND NOT EXISTS(SELECT 1 FROM items WHERE task_id=tasks.id "
-            "AND status NOT IN ('confirmed','failed_known','missed','cancelled'))" + scope,
-            params,
-        )
+        from .task_lifecycle import complete_batches
+
+        complete_batches(db, self.clock(), task_id)
         db.execute(
             "UPDATE campaigns SET state='completed',updated_at=? WHERE state='materialized' AND EXISTS(SELECT 1 FROM tasks WHERE campaign_id=campaigns.id) AND NOT EXISTS(SELECT 1 FROM tasks WHERE campaign_id=campaigns.id AND state NOT IN ('completed','cancelled'))",
             (self.clock(),),
         )
 
-    def finish(self, claim, result, *, _db=None):
+    def finish(self, claim, result, *, _db=None, _allow_skipped_confirmation=False):
         status = result.get("status", "unknown")
         reference = result.get("external_reference")
         if status == "confirmed" and not (result.get("verified") and reference):
@@ -2672,6 +2799,10 @@ class Engine:
                 "publish_id",
                 "post_ids",
                 "comment_id",
+                "message_id",
+                "conversation_id",
+                "recipient_id",
+                "interaction_channel",
                 "platform_status",
             )
             + FIELDS
@@ -2691,9 +2822,18 @@ class Engine:
             ).fetchone()
             if not row:
                 raise Conflict("执行所有者不匹配")
-            if row["status"] not in {"executing", "unknown"}:
-                return json.loads(row["result"])
             previous = json.loads(row["result"])
+            if row["status"] not in {"executing", "unknown"}:
+                # A user-skipped unknown may later receive an independently
+                # verified platform receipt. Only the Meta receipt validator
+                # enables this transition; the original attempt is never replayed.
+                if not (
+                    _allow_skipped_confirmation
+                    and row["status"] == "cancelled"
+                    and previous.get("reason") == "UserSkippedUnknownSubmission"
+                    and status == "confirmed"
+                ):
+                    return previous
             for key in FIELDS:
                 if key not in safe and key in previous:
                     safe[key] = previous[key]
@@ -2745,6 +2885,24 @@ class Engine:
                 claim["task_id"],
                 now,
             )
+            channel = db.execute(
+                "SELECT j.id,c.channel,c.generation FROM execution_jobs j JOIN task_channel_claims c ON c.job_id=j.id WHERE j.kind='send' AND j.reference_id=?",
+                (claim["item_id"],),
+            ).fetchone()
+            if channel:
+                Store.audit(
+                    db,
+                    "execution.channel_result",
+                    {
+                        **dict(channel),
+                        "item_id": claim["item_id"],
+                        "stage": "receipt",
+                        "status": status,
+                        "verified": safe.get("verified") is True,
+                    },
+                    claim["task_id"],
+                    now,
+                )
             self._mark_completed(db, claim["task_id"])
         return safe
 
@@ -2789,7 +2947,11 @@ class Engine:
                         (canonical({**json.loads(row["result"]), **progress}), item_id),
                     )
                 return {"status": row["status"], **progress}
-            return {"status": row["status"], "reason": "not_conclusively_verified", **reads}
+            return {
+                "status": row["status"],
+                "reason": safe_code(result.get("reason"), "not_conclusively_verified"),
+                **reads,
+            }
         # Reconciliation never turns an item back into a retryable state.
         with self.store.connect(write=True) as db:
             db.execute(
@@ -2857,7 +3019,7 @@ class Engine:
                     "item_id": item_id,
                     "status": "failed",
                     "reason": safe_code(result.get("reason"), "feedback_unverified"),
-                    "read_rpc_used": result.get("read_rpc_used"),
+                    **read_diagnostics(result),
                 }
             if "read_identity_verified" in result and (
                 result.get("read_identity_verified") is not True
@@ -2948,6 +3110,9 @@ class Engine:
                     (now, slot),
                 )
             ]
+        from .statistics_retries import pending_until, settle_read
+        from .telegram_reading import read_diagnostics
+
         processed, seen, calls, rpc_used = [], set(), {}, {}
         try:
             for entry in pending:
@@ -2957,6 +3122,12 @@ class Engine:
                 if item_id in seen:
                     continue
                 seen.add(item_id)
+                with self.store.connect() as db:
+                    retry_at = max(
+                        pending_until(db, item_id), pending_until(db, "account:" + account_id)
+                    )
+                if retry_at > self.clock():
+                    continue
                 account = self.account(account_id)
                 policy = self.telegram_read_policy(account_id)["policy"]
                 if calls.get(account_id, 0) >= policy["groups_per_scan"]:
@@ -2971,7 +3142,7 @@ class Engine:
                             (max(account["cooldown_until"], self.clock() + 60), item_id),
                         )
                     continue
-                result, completed = None, False
+                result, completed, verification = None, False, {}
                 try:
                     if (
                         entry["status"] in {"scheduled", "unknown"}
@@ -2986,6 +3157,8 @@ class Engine:
                                 "item_id": item_id,
                                 "status": "pending_verification",
                                 "read_rpc_used": None,
+                                "reason": verification.get("reason", "pending_verification"),
+                                **read_diagnostics(verification),
                             }
                         else:
                             used += amount
@@ -3009,7 +3182,10 @@ class Engine:
                             "item_id": item_id,
                             "status": "pending_verification",
                             "read_rpc_used": 0,
+                            "reason": verification.get("reason", "pending_verification"),
+                            **read_diagnostics(verification),
                         }
+                        result["read_rpc_used"] = 0  # Verification was already charged above.
                 except Exception as exc:
                     result = {
                         "item_id": item_id,
@@ -3030,11 +3206,14 @@ class Engine:
                     ).fetchone()
                     if not lease or lease[0] != owner:
                         break
+                    retry_at = settle_read(db, item_id, result, completed, self.clock())
+                    if "BudgetExhausted" in result.get("reason", ""):
+                        settle_read(db, "account:" + account_id, result, False, self.clock())
                     db.execute(
                         "UPDATE telegram_statistics_progress SET complete=?,retry_at=? WHERE item_id=? AND slot<=? AND complete=0",
                         (
                             int(completed),
-                            self.clock() + (1 if result.get("status") == "partial" else 60),
+                            retry_at,
                             item_id,
                             slot,
                         ),
@@ -3224,6 +3403,20 @@ class Engine:
             )
         return {"decision": decision, "reasons": reasons}
 
+    def search_x_content(
+        self, account_id, query, *, lookback_hours=12, timeout_seconds=30, max_results=100
+    ):
+        from .x_reading import search
+
+        return search(
+            self,
+            account_id,
+            query,
+            lookback_hours=lookback_hours,
+            timeout_seconds=timeout_seconds,
+            max_results=max_results,
+        )
+
     def discover(self, task_id, account_id):
         task = self.task(task_id)
         if account_id not in task["account_ids"]:
@@ -3231,6 +3424,16 @@ class Engine:
         account = self.account(account_id)
         if "discover" not in CAPABILITIES[account["platform"]]:
             raise Conflict("该平台请通过候选录入接入")
+        if account["platform"] == "x" and account["mode"] == "live":
+            if task["state"] in {"paused", "cancelled", "completed"}:
+                raise Conflict("任务已暂停或结束")
+            if not task["policy"]["queries"]:
+                raise Conflict("XSearchQueryRequired")
+            return self.search_x_content(
+                account_id,
+                task["policy"]["queries"][0],
+                max_results=min(100, task["policy"]["max_candidates"]),
+            )
         from .health_checks import probe_revision
         from .telegram_reading import read_diagnostics
 
@@ -3646,7 +3849,13 @@ class Engine:
         row = self.store.one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
         if not row:
             raise NotFound("候选不存在")
-        if row["state"] not in {"unknown", "pending_admin_approval", "joined", "already_joined"}:
+        if row["state"] not in {
+            "not_attempted",
+            "unknown",
+            "pending_admin_approval",
+            "joined",
+            "already_joined",
+        }:
             raise Conflict("只有已尝试的入群或成员身份需要核对")
         account = self.account(row["account_id"])
         result = self.call(
@@ -3686,6 +3895,10 @@ class Engine:
             )
             if k in result
         }
+        if row["state"] == "not_attempted":
+            # A read-only observation can confirm existing membership without
+            # claiming a join attempt or issuing a JoinChannel request.
+            safe["status"] = "already_joined"
         previous = json.loads(row["result"])
         if previous.get("outbound_eligible_at_utc"):
             # A read-only permission refresh is not a new join; retain the
@@ -3693,7 +3906,7 @@ class Engine:
             safe["outbound_eligible_at_utc"] = previous["outbound_eligible_at_utc"]
         with self.store.connect(write=True) as db:
             db.execute(
-                "UPDATE candidates SET state=?,result=? WHERE id=? AND state IN ('unknown','pending_admin_approval','joined','already_joined')",
+                "UPDATE candidates SET state=?,result=? WHERE id=? AND state IN ('not_attempted','unknown','pending_admin_approval','joined','already_joined')",
                 (safe["status"], canonical(safe), candidate_id),
             )
             db.execute(

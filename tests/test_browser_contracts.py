@@ -3,7 +3,9 @@
 import json
 import os
 import re
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -43,6 +45,10 @@ class XBrowserTests(unittest.TestCase):
         self.duplicate_target = False
         self.duplicate_reply_control = False
         self.reply_as_dialog = False
+        self.nested_reply_dialog = False
+        self.duplicate_modal_editor = False
+        self.late_modal_after_input = False
+        self.with_media = False
         self.post_limited = False
         self.reply_delay_ms = 0
         self.reply_control_delay_ms = 0
@@ -123,12 +129,25 @@ class XBrowserTests(unittest.TestCase):
             if self.reply_as_dialog
             else "fetch('/CreateTweet', {method:'POST'})"
         )
+        modal_editor = '<div contenteditable="true" data-testid="tweetTextarea_0"></div>'
+        if self.duplicate_modal_editor:
+            modal_editor += '<div contenteditable="true" data-testid="tweetTextarea_0"></div>'
+        media_input = '<input type="file" multiple>' if self.with_media else ""
+        modal_body = (
+            modal_editor
+            + media_input
+            + "<button data-testid=\"tweetButton\" onclick=\"fetch('/CreateTweet', {method:'POST'})\">Post</button>"
+        )
+        if self.nested_reply_dialog:
+            modal_body = '<div role="dialog">' + modal_body + "</div>"
         dialog_compose = (
-            """<div id="reply-dialog" role="dialog" hidden>
-          <div contenteditable="true" data-testid="tweetTextarea_0"></div>
-          <button data-testid="tweetButton" onclick="fetch('/CreateTweet', {method:'POST'})">Post</button>
-        </div>"""
-            if self.reply_as_dialog
+            ('<div id="reply-dialog" role="dialog" hidden>' + modal_body + "</div>")
+            if (self.reply_as_dialog or self.late_modal_after_input)
+            else ""
+        )
+        late_open = (
+            "document.querySelector('#reply-dialog').hidden=false;"
+            if self.late_modal_after_input
             else ""
         )
         article = f"""
@@ -136,6 +155,7 @@ class XBrowserTests(unittest.TestCase):
           <div data-testid="User-Name">Name @{author}</div>
           <a href="/{author}/status/{identifier}"><time>today</time></a>
           <div data-testid="tweetText">{text}</div>
+          {'<div data-testid="tweetPhoto"></div>' if own and self.with_media else ""}
           <button data-testid="{done}" onclick="this.dataset.testid='unlike'">Like</button>
           <button data-testid="reply" style="visibility:{"hidden" if self.reply_control_delay_ms else "visible"}" onclick="setTimeout(()=>document.querySelector('{reply_destination}').hidden=false,{self.reply_delay_ms})">Reply</button>
           {extra_reply_control}
@@ -146,7 +166,8 @@ class XBrowserTests(unittest.TestCase):
             {article}{article if self.duplicate_target else ""}
             {'<img src="/pending-image">' if self.pending_image else ""}
             <div id="reply-compose" {" " if self.reply_as_dialog else "hidden"}>
-              <div contenteditable="true" data-testid="tweetTextarea_0" onkeydown="document.querySelector('[data-testid=tweetButtonInline]').disabled=false"></div>
+              <div contenteditable="true" data-testid="tweetTextarea_0" onkeydown="document.querySelector('[data-testid=tweetButtonInline]').disabled=false;{late_open}"></div>
+              {media_input}
               <button data-testid="tweetButtonInline" {"disabled" if self.editor_requires_keyboard else ""} onclick="{inline_action}">Post</button>
             </div>{dialog_compose}
             <script>setTimeout(()=>document.querySelectorAll('article [data-testid=reply]').forEach(
@@ -159,6 +180,46 @@ class XBrowserTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertTrue(self.receipts[0]["target_verified"])
         self.assertEqual(result["external_reference"], "https://x.com/brand/status/123")
+
+    def test_identity_timeout_is_rechecked_once_before_submission(self):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        original = self.backend.check_identity
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                raise PlaywrightTimeoutError("synthetic identity delay")
+            return original(*args, **kwargs)
+
+        with patch.object(self.backend, "check_identity", side_effect=flaky):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["status"], "confirmed")
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_identity_timeout_followed_by_challenge_never_retries_or_submits(self):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        calls = []
+
+        def challenge(*args, **kwargs):
+            calls.append(True)
+            self.page.evaluate("""() => { const node=document.createElement('div');
+              node.dataset.testid='arkoseChallenge'; node.textContent='Verify'; document.body.append(node); }""")
+            raise PlaywrightTimeoutError("synthetic identity delay")
+
+        with patch.object(self.backend, "check_identity", side_effect=challenge):
+            result = self.backend.run(
+                "execute", self.payload(), self.receipts.append, self.authorize
+            )
+        self.assertEqual(result["status"], "failed_known")
+        self.assertEqual(result["account_block_reason"], "x_challenge")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((self.posts, self.checks), (0, 0))
 
     def test_high_frequency_browser_read_is_partial_and_never_submits(self):
         from auto_promotion.models import epoch
@@ -218,6 +279,43 @@ class XBrowserTests(unittest.TestCase):
         self.assertEqual(result["status"], "confirmed")
         self.assertEqual((self.posts, self.checks), (1, 1))
 
+    def test_nested_dialogs_with_one_editor_use_the_modal_once(self):
+        self.reply_as_dialog = True
+        self.nested_reply_dialog = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_two_visible_modal_editors_never_submit(self):
+        self.reply_as_dialog = True
+        self.nested_reply_dialog = True
+        self.duplicate_modal_editor = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "failed_known")
+        self.assertEqual(result["reason"], "BrowserReplyComposerAmbiguous")
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertEqual((self.posts, self.checks), (0, 0))
+
+    def test_nested_modal_with_media_keeps_same_editor_and_submits_once(self):
+        self.reply_as_dialog = True
+        self.nested_reply_dialog = True
+        self.with_media = True
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "fixture.png"
+            image.write_bytes(b"synthetic image bytes")
+            payload = self.payload()
+            payload["payload"]["media"] = [{"path": str(image)}]
+            result = self.backend.run("execute", payload, self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual((self.posts, self.checks), (1, 1))
+
+    def test_late_modal_after_typing_does_not_submit_the_background_reply(self):
+        self.late_modal_after_input = True
+        result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
+        self.assertEqual(result["status"], "failed_known")
+        self.assertTrue(result["confirmed_not_submitted"])
+        self.assertEqual((self.posts, self.checks), (0, 0))
+
     def test_delayed_reply_composer_is_ready_before_filling(self):
         self.reply_delay_ms = 1200
         result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
@@ -226,7 +324,7 @@ class XBrowserTests(unittest.TestCase):
 
     def test_opening_modal_is_selected_before_touching_background_inline_editor(self):
         self.reply_as_dialog = True
-        self.reply_delay_ms = 1200
+        self.reply_delay_ms = 2000
         result = self.backend.run("execute", self.payload(), self.receipts.append, self.authorize)
         self.assertEqual(result["status"], "confirmed")
         self.assertEqual((self.posts, self.checks), (1, 1))

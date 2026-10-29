@@ -47,6 +47,7 @@ from .interaction_models import (
 )
 from .interactions import Interactions
 from .legacy import inventory
+from .meta_browser import MetaBrowser
 from .models import (
     AccountInput,
     AccountProfile,
@@ -80,6 +81,12 @@ from .tiktok import (
     TikTokReadInput,
     TikTokWebhookInput,
 )
+from .tiktok_browser import (
+    TikTokBrowser,
+    TikTokBrowserConnect,
+    TikTokBrowserGuard,
+    TikTokBrowserResult,
+)
 from .workers import WorkerRun, Workers
 
 WORKER_INTERVAL_SECONDS = 10
@@ -93,6 +100,15 @@ class Toggle(BaseModel):
 class DiscoverInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     account_id: str
+
+
+class XSearchInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_id: str
+    query: str
+    lookback_hours: float = 12
+    timeout_seconds: int = 30
+    max_results: int = 100
 
 
 class ResumeAccountBlock(BaseModel):
@@ -128,6 +144,8 @@ def create_app(
     growth = Growth(engine)
     task_tools = TaskTools(engine)
     tiktok = TikTokManager(engine)
+    meta_browser = MetaBrowser(engine)
+    tiktok_browser = TikTokBrowser(engine)
     interactions = Interactions(
         engine,
         worker_available=lambda: (
@@ -156,6 +174,9 @@ def create_app(
     runtime = capture_runtime("api")
     background_tasks = {}
     background_errors = {}
+    background_error_at = {}
+    background_success_at = {}
+    background_error_details = {}
     from .pool_runtime import PoolScheduler
     from .queue_store import JobQueue
 
@@ -175,20 +196,25 @@ def create_app(
                 if pool_scheduler is None and pending_managed(engine):
                     pool_scheduler = PoolScheduler(engine)
                     pool_scheduler.enable()
-                sender.phase("executing")
+                await asyncio.to_thread(sender.phase, "executing")
                 await asyncio.to_thread(pool_scheduler.tick if pool_scheduler else engine.run_cycle)
+                background_success_at["sender"] = time.time()
             except Exception as exc:
                 background_errors["sender"] = type(exc).__name__
+                background_error_at["sender"] = time.time()
+                background_error_details["sender"] = exception_details(exc)
                 store.audit_best_effort(
                     "worker.error", {"reason": "worker_cycle_failed", **exception_details(exc)}
                 )
             try:
-                sender.phase("waiting")
+                await asyncio.to_thread(sender.phase, "waiting")
             except Exception as exc:
                 background_errors["sender"] = type(exc).__name__
+                background_error_at["sender"] = time.time()
+                background_error_details["sender"] = exception_details(exc)
                 store.audit_best_effort(
                     "worker.error",
-                    {"reason": "worker_phase_failed", "error_type": type(exc).__name__},
+                    {"reason": "worker_phase_failed", **exception_details(exc)},
                 )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=WORKER_INTERVAL_SECONDS)
@@ -199,14 +225,18 @@ def create_app(
         while not stop.is_set():
             try:
                 await asyncio.to_thread(callback)
+                background_success_at[kind] = time.time()
             except Exception as exc:
                 background_errors[kind] = type(exc).__name__
+                background_error_at[kind] = time.time()
+                background_error_details[kind] = exception_details(exc)
                 store.audit_best_effort(
                     "statistics.error",
                     {
                         "reason": "report_cycle_failed",
                         "kind": kind,
                         "error_type": type(exc).__name__,
+                        **background_error_details[kind],
                     },
                 )
             try:
@@ -226,7 +256,10 @@ def create_app(
                 sender = stack.enter_context(WorkerRun(store, live_enabled=engine.live_enabled))
                 background_tasks["sender"] = asyncio.create_task(work_loop())
                 jobs.append(background_tasks["sender"])
-                callbacks = [(interactions.schedule, "hf_schedule")]
+                callbacks = [
+                    (interactions.schedule, "hf_schedule"),
+                    (meta_browser.sync, "meta_browser_sync"),
+                ]
                 callbacks.extend(
                     (lambda stage=stage: interactions.run_stage(stage, max_jobs=3), "hf_" + stage)
                     for stage in interactions.stages
@@ -336,6 +369,10 @@ def create_app(
     async def account_busy(request, exc):
         return JSONResponse({"error": "账号正被其他操作使用，请稍后重试"}, status_code=409)
 
+    @app.exception_handler(ValueError)
+    async def invalid_local_input(request, exc):
+        return JSONResponse({"error": "请求信息或当前浏览器核验不符合要求"}, status_code=400)
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
         if request.url.path == "/api/connections" or request.url.path.startswith("/api/tiktok/"):
@@ -415,6 +452,88 @@ def create_app(
     def interaction_action(value: CandidateAction):
         return interactions.action(value)
 
+    @app.get("/api/meta-browser/status")
+    def meta_browser_status():
+        return meta_browser.status()
+
+    @app.post("/api/meta-browser/import-existing")
+    def meta_browser_import():
+        from .meta_migration import import_existing
+
+        return import_existing(meta_browser)
+
+    @app.get("/api/meta-browser/jobs")
+    def meta_browser_jobs():
+        return meta_browser.pending()
+
+    @app.post("/api/meta-browser/accounts/{account_id}/observe")
+    def meta_browser_observe(account_id: str, proof: dict):
+        return meta_browser.observe(account_id, proof)
+
+    @app.post("/api/meta-browser/items/{item_id}/begin")
+    def meta_browser_begin(item_id: str, proof: dict):
+        return meta_browser.begin(item_id, proof)
+
+    @app.post("/api/meta-browser/items/{item_id}/guard")
+    def meta_browser_guard(item_id: str, value: dict):
+        return meta_browser.guard(item_id, value["owner"])
+
+    @app.post("/api/meta-browser/items/{item_id}/result")
+    def meta_browser_result(item_id: str, value: dict):
+        return meta_browser.result(item_id, value["receipt"], value.get("owner"))
+
+    @app.post("/api/meta-browser/items/{item_id}/feedback")
+    def meta_browser_feedback(item_id: str, evidence: dict):
+        return meta_browser.feedback(item_id, evidence)
+
+    @app.get("/api/tiktok-browser/status")
+    def tiktok_browser_status():
+        return tiktok_browser.status()
+
+    @app.post("/api/tiktok-browser/connect")
+    def tiktok_browser_connect(value: TikTokBrowserConnect):
+        return tiktok_browser.connect(value)
+
+    @app.get("/api/tiktok-browser/jobs")
+    def tiktok_browser_jobs():
+        return tiktok_browser.pending()
+
+    @app.post("/api/tiktok-browser/accounts/{account_id}/dm/collect")
+    def tiktok_dm_collect(account_id: str, snapshot: dict):
+        return tiktok_browser.messages.collect(account_id, snapshot)
+
+    @app.get("/api/tiktok-browser/accounts/{account_id}/dm/inbox")
+    def tiktok_dm_inbox(account_id: str):
+        return tiktok_browser.messages.inbox(account_id)
+
+    @app.get("/api/tiktok-browser/accounts/{account_id}/dm/messages")
+    def tiktok_dm_messages(account_id: str, conversation_id: str, limit: int = 100):
+        return tiktok_browser.messages.messages(account_id, conversation_id, limit)
+
+    @app.post("/api/tiktok-browser/accounts/{account_id}/dm/enable")
+    def tiktok_dm_enable(account_id: str, value: Toggle):
+        return tiktok_browser.messages.enable(account_id, value.enabled)
+
+    @app.post("/api/tiktok-browser/accounts/{account_id}/observe")
+    def tiktok_browser_observe(account_id: str, proof: dict):
+        return tiktok_browser.observe(account_id, proof)
+
+    @app.post("/api/tiktok-browser/items/{item_id}/begin")
+    def tiktok_browser_begin(item_id: str, proof: dict):
+        return tiktok_browser.begin(item_id, proof)
+
+    @app.post("/api/tiktok-browser/items/{item_id}/guard")
+    def tiktok_browser_guard(item_id: str, value: TikTokBrowserGuard):
+        return tiktok_browser.guard(item_id, value.owner, value.proof)
+
+    @app.post("/api/tiktok-browser/items/{item_id}/result")
+    def tiktok_browser_result(item_id: str, value: TikTokBrowserResult):
+        return tiktok_browser.result(item_id, value.receipt, value.owner)
+
+    @app.post("/api/tiktok-browser/items/{item_id}/feedback")
+    def tiktok_browser_feedback(item_id: str, evidence: dict):
+        return tiktok_browser.feedback(item_id, evidence)
+
     @app.get("/api/tiktok/app")
     def tiktok_app_status():
         return tiktok.status()
@@ -459,9 +578,38 @@ def create_app(
                     "enabled": worker,
                     "alive": alive,
                     "last_error": background_errors.get("sender"),
+                    **(
+                        {
+                            "last_error_at": background_error_at["sender"],
+                            "last_error_details": background_error_details["sender"],
+                        }
+                        if "sender" in background_error_at
+                        else {}
+                    ),
+                    **(
+                        {"last_success_at": background_success_at["sender"]}
+                        if "sender" in background_success_at
+                        else {}
+                    ),
                 },
                 "reports": {
-                    kind: {"alive": not job.done(), "last_error": background_errors.get(kind)}
+                    kind: {
+                        "alive": not job.done(),
+                        "last_error": background_errors.get(kind),
+                        **(
+                            {
+                                "last_error_at": background_error_at[kind],
+                                "last_error_details": background_error_details[kind],
+                            }
+                            if kind in background_error_at
+                            else {}
+                        ),
+                        **(
+                            {"last_success_at": background_success_at[kind]}
+                            if kind in background_success_at
+                            else {}
+                        ),
+                    }
                     for kind, job in background_tasks.items()
                     if kind != "sender"
                 },
@@ -471,6 +619,12 @@ def create_app(
     @app.get("/api/statistics/feedback-issues")
     def feedback_issues():
         return {"issues": statistics.feedback_issues()}
+
+    @app.get("/api/alerts/status")
+    def alerts_status():
+        from .alert_store import read_alert_status
+
+        return read_alert_status(Path(store.path).parent / "alerts.db", clock=clock)
 
     @app.post("/api/session")
     def session():
@@ -671,6 +825,12 @@ def create_app(
     def item_feedback(item_id: str):
         return engine.collect_feedback(item_id)
 
+    @app.post("/api/accounts/x/local-daily-limit/unlimited")
+    def remove_x_local_account_daily_limits():
+        from .account_daily_local import enable
+
+        return enable(engine)
+
     @app.post("/api/accounts", status_code=201)
     def add_account(value: AccountInput):
         return engine.add_account(value)
@@ -836,6 +996,10 @@ def create_app(
     @app.post("/api/tasks/{task_id}/discover")
     def discover(task_id: str, value: DiscoverInput):
         return engine.discover(task_id, value.account_id)
+
+    @app.post("/api/x/search")
+    def search_x_content(value: XSearchInput):
+        return engine.search_x_content(**value.model_dump())
 
     @app.post("/api/tasks/{task_id}/candidates")
     def candidate(task_id: str, value: CandidateInput):

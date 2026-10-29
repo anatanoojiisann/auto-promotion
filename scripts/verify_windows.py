@@ -108,11 +108,11 @@ def fingerprint(root=ROOT):
     names = ast.literal_eval(manifest[0])
     if (
         not isinstance(names, tuple)
-        or not 1 <= len(names) <= 32
+        or not 1 <= len(names) <= 256
         or any(
             not isinstance(name, str)
             or len(name) > 100
-            or not name.endswith(".py")
+            or Path(name).suffix not in {".py", ".js", ".html", ".css"}
             or not (package / name).resolve().is_relative_to(package)
             for name in names
         )

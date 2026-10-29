@@ -149,6 +149,17 @@ def main():
         )
         return
     if args.command == "login":
+        if args.platform == "facebook":
+            print(
+                json.dumps(
+                    {
+                        "authenticated": False,
+                        "error": "UseExistingMetaBrowser",
+                        "next_step": "Open the workbench Facebook / IG browser panel.",
+                    }
+                )
+            )
+            raise SystemExit(2)
         if args.platform == "tiktok":
             print(
                 json.dumps(

@@ -14,6 +14,10 @@ def publication_schedule(db, task, now):
     account_ids = json.loads(task["account_ids"])
     if len(account_ids) != 1:
         return None, "interaction_dependencies_invalid"
+    if policy.get("outbound_dependency_deadline") and now >= epoch(
+        policy["outbound_dependency_deadline"]
+    ):
+        return None, "interaction_dependency_deadline_elapsed"
     latest = None
     for source_id in sources:
         source = db.execute("SELECT * FROM tasks WHERE id=?", (source_id,)).fetchone()
@@ -28,8 +32,19 @@ def publication_schedule(db, task, now):
             "SELECT status,result,external_reference FROM items WHERE task_id=? AND account_id=?",
             (source_id, account_ids[0]),
         ).fetchall()
+        if source["state"] == "cancelled":
+            return None, "interaction_dependencies_failed"
+        if policy.get("outbound_dependency_mode") == "finished":
+            if source["state"] != "completed":
+                return None, "interaction_dependencies_pending"
+            latest = max(latest or 0, source["updated_at"])
+            continue
+        if any(row["status"] in {"failed_known", "missed", "cancelled"} for row in rows):
+            return None, "interaction_dependencies_failed"
         if not rows:
-            return None, "interaction_dependencies_pending"
+            return None, "interaction_dependencies_failed" if source[
+                "state"
+            ] == "completed" else "interaction_dependencies_pending"
         for row in rows:
             result = json.loads(row["result"])
             stamp = result.get("published_at")

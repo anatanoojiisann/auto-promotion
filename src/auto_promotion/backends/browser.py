@@ -449,6 +449,33 @@ def visible_one(locator):
     return visible[0]
 
 
+def x_reply_controls(page):
+    """Resolve distinct visible editors, not nested dialog ancestors.
+
+    A reply modal may sit above a still-visible inline editor and X may nest
+    role=dialog containers around the same editor. More than one visible modal
+    editor, or an ambiguous inline editor, remains a hard pre-submit stop.
+    """
+    editors = page.get_by_test_id("tweetTextarea_0")
+    visible = [editors.nth(i) for i in range(editors.count()) if editors.nth(i).is_visible()]
+    modal = [
+        editor for editor in visible if editor.locator('xpath=ancestor::*[@role="dialog"]').count()
+    ]
+    if len(modal) > 1:
+        raise BackendError("BrowserReplyComposerAmbiguous")
+    if modal:
+        editor = modal[0]
+        scope = editor.locator(
+            'xpath=ancestor::*[@role="dialog"][.//*[@data-testid="tweetButton"]][1]'
+        )
+        if scope.count() != 1:
+            raise BackendError("BrowserReplyComposerAmbiguous")
+        return editor, visible_one(scope.get_by_test_id("tweetButton")), scope
+    if len(visible) != 1:
+        raise BackendError("BrowserReplyComposerAmbiguous")
+    return visible[0], visible_one(page.get_by_test_id("tweetButtonInline")), page
+
+
 def x_editor_text(editor):
     return editor.evaluate(EDITOR_TEXT_JS)
 
@@ -519,6 +546,17 @@ class BrowserBackend:
         self.check_state()
         if not observed or observed != self.settings["identity"]:
             raise BackendError("BrowserIdentityMismatch")
+
+    def check_send_identity(self, *, timeout=15000):
+        """Retry only a timed-out, read-only identity check before submission."""
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            self.check_identity(timeout=timeout)
+        except PlaywrightTimeoutError:
+            self.check_state()
+            check_status(self.page)
+            self.check_identity(timeout=timeout)
 
     def read_timeout(self, cap=15000):
         scan = getattr(self, "read_scan", None)
@@ -756,7 +794,10 @@ class BrowserBackend:
         self.navigation_timeout = read_timeout
         self.navigate_home()
         self.step("identity_check")
-        self.check_identity(timeout=read_timeout)
+        if self.platform == "x" and operation == "execute":
+            self.check_send_identity(timeout=read_timeout)
+        else:
+            self.check_identity(timeout=read_timeout)
         if operation == "health":
             from ..models import CAPABILITIES
 
@@ -1031,7 +1072,7 @@ class BrowserBackend:
         self.step("target_lookup")
         article = self.tweet(item["target"])
         self.step("identity_check")
-        self.check_identity()
+        self.check_send_identity()
         action = item["action"]
         if action in {"like", "repost"}:
             done = "unlike" if action == "like" else "unretweet"
@@ -1072,26 +1113,22 @@ class BrowserBackend:
             except PlaywrightTimeoutError:
                 raise BackendError("BrowserReplyControlUnavailable") from None
             self.step("reply_composer")
-            # X uses either an inline composer or a modal, depending on the
-            # current page layout. A hidden dialog shell may coexist with the
-            # inline composer, so select only the active modal when present.
-            # The background inline editor can stay visible while a modal opens.
-            page.wait_for_timeout(1500)
+            # An inline editor can already be visible when a modal is still
+            # opening. Prefer a focused editor or a visible modal before falling
+            # back to a unique inline editor after a bounded wait.
+            try:
+                page.wait_for_function(
+                    """() => {
+                      const visible=e=>!!(e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden');
+                      return [...document.querySelectorAll('[data-testid="tweetTextarea_0"]')]
+                        .some(e=>visible(e) && (e.closest('[role="dialog"]') || e.contains(document.activeElement)));
+                    }""",
+                    timeout=2500,
+                )
+            except PlaywrightTimeoutError:
+                pass
             page.locator('[data-testid="tweetTextarea_0"]:visible').first.wait_for(timeout=15000)
-            active_dialogs = [
-                page.get_by_role("dialog").nth(i)
-                for i in range(page.get_by_role("dialog").count())
-                if page.get_by_role("dialog").nth(i).is_visible()
-                and page.get_by_role("dialog").nth(i).get_by_test_id("tweetTextarea_0").count()
-            ]
-            if len(active_dialogs) > 1:
-                raise BackendError("BrowserReplyComposerAmbiguous")
-            if active_dialogs:
-                composer = active_dialogs[0]
-                submit_button = composer.get_by_test_id("tweetButton")
-            else:
-                composer = page
-                submit_button = page.get_by_test_id("tweetButtonInline")
+            editor, submit_button, composer = x_reply_controls(page)
         elif action == "quote":
             visible_one(article.get_by_test_id("retweet")).click()
             visible_one(page.get_by_role("menuitem", name="Quote", exact=True)).click()
@@ -1101,13 +1138,15 @@ class BrowserBackend:
             raise BackendError("UnsupportedXAction")
         self.step("fill_reply")
         self.check_state()
-        editor = visible_one(composer.get_by_test_id("tweetTextarea_0"))
+        if action != "reply":
+            editor = visible_one(composer.get_by_test_id("tweetTextarea_0"))
         editor.click()
         editor.press("Control+A")
         editor.press("Backspace")
         editor.press_sequentially(item["text"])
         if editor.inner_text() != item["text"]:
             raise BackendError("ApprovedTextNotRetained")
+        media_editor = editor.element_handle() if action == "reply" and item["media"] else None
         if item["media"]:
             self.step("attach_media")
             composer.locator('input[type="file"]').set_input_files(
@@ -1115,8 +1154,34 @@ class BrowserBackend:
             )
         self.step("submission_authorization")
         self.check_state()
+        if action == "reply":
+            # A modal can appear or be replaced while typing. Re-resolve the
+            # unique active editor and refuse to submit if its text changed.
+            current_editor, submit_button, _ = x_reply_controls(page)
+            if current_editor.inner_text() != item["text"]:
+                raise BackendError("ApprovedTextNotRetained")
+            if item["media"]:
+                current_handle = current_editor.element_handle()
+                if (
+                    not media_editor
+                    or not current_handle
+                    or not media_editor.evaluate("(a,b) => a === b", current_handle)
+                ):
+                    raise BackendError("BrowserReplyComposerAmbiguous")
         authorize()
         self.check_state()
+        if action == "reply":
+            current_editor, submit_button, _ = x_reply_controls(page)
+            if current_editor.inner_text() != item["text"]:
+                raise BackendError("ApprovedTextNotRetained")
+            if item["media"]:
+                current_handle = current_editor.element_handle()
+                if (
+                    not media_editor
+                    or not current_handle
+                    or not media_editor.evaluate("(a,b) => a === b", current_handle)
+                ):
+                    raise BackendError("BrowserReplyComposerAmbiguous")
         with page.expect_response(
             lambda r: r.request.method == "POST" and "/CreateTweet" in r.url, timeout=25000
         ) as accepted:

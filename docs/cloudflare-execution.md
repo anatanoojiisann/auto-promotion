@@ -13,7 +13,7 @@
 | X 人工任务 | `x.manual` | 只生成人工处理记录 |
 | Instagram | `instagram.graph`、`instagram.manual` | Graph 发布；第三方评论保留人工处理 |
 | Discord | `discord.bot` | Bot 及目标频道权限 |
-| TikTok | `tiktok.organic` | 已开放的 Organic API 能力及审核权限 |
+| TikTok | `tiktok.organic`、`tiktok.desktop` | Organic API 保留原审核范围；网页任务使用已登记浏览器、本机通道、明确任务启动和独立回执核验 |
 | Reddit | `reddit.manual` | 保留人工社区互动 |
 | 六个平台模拟账号 | `simulation.<platform>` | 仅合成测试结果 |
 
@@ -70,6 +70,9 @@ Cloudflare 登录授权须由账号持有人完成。部署脚本生成并私下
 已有 Windows 任务计划程序继续守护服务，启动后使用分池模式。Linux 节点可以用 systemd/容器守护相同 CLI；禁止把两个未同步的本地任务库注册成同一账号的可重试发送源。仅重启服务不会开启新任务。
 
 ## 运维与验证
+
+- 数据库每日读取额度耗尽时返回 `CloudReadQuotaExceeded` 和距下次 UTC 零点恢复的重试时间，
+  避免将它误报为通用500错误。读取额度耗尽不触发本地发送降级，仍保留原交接与提交检查。
 
 - `GET /api/execution/pools` 展示各池队列、心跳、云端同步状态及待补传回执数。父调度器存活不代表每个池都正常，需同时检查这些数据。
 - 本地队列使用索引查找到期任务；云端领取事务按账号身份和节点资源排除占用。全局与平台并发上限对所有池生效。

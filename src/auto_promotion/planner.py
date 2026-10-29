@@ -14,6 +14,15 @@ from .quotas import Calendar, event, events, scopes, settings
 
 def content_key(value):
     platform = value["platform"]
+    if platform in {"facebook", "instagram"}:
+        from .meta_browser import event_key
+
+        try:
+            return digest([platform, event_key(platform, value["target"])])
+        except ValueError:
+            # Existing own-media publishing targets can be numeric IDs.
+            if value.get("action") in {"comment", "reply"}:
+                raise
     if platform == "telegram":
         return digest(
             [
@@ -74,6 +83,17 @@ def execution_mode(account, opportunity):
     if account["mode"] == "simulation":
         return "automatic", "模拟执行"
     platform = account["platform"]
+    if (
+        platform in {"facebook", "instagram"} or account.get("execution_backend") == "desktop"
+    ) and opportunity["action"] in {"comment", "reply"}:
+        if (
+            opportunity["action"] in account.get("automatic_actions", [])
+            and opportunity["is_public"]
+            and opportunity["permission"] == "allowed"
+            and opportunity["permission_evidence"].strip()
+        ):
+            return "automatic", "沿用已登记浏览器；提交前核对原帖、身份、权限和历史互动"
+        return "disabled", "需要已接入浏览器及明确的公开目标互动许可"
     if platform == "x":
         if opportunity["action"] == "like":
             return "disabled", "X 不开放自动点赞"

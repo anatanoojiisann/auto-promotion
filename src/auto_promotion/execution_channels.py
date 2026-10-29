@@ -21,6 +21,14 @@ def read_state(store):
     return json.loads(row["value"]) if row else {"active": "cloud"}
 
 
+def offline_only(store, account_id=None):
+    """A scoped local-only instruction cannot change an unrelated account's route."""
+    state = read_state(store)
+    return state.get("offline_only") is True and (
+        account_id is None or not state.get("account_ids") or account_id in state["account_ids"]
+    )
+
+
 def binding(engine):
     existing = engine.store.one("SELECT value FROM meta WHERE key='execution_store_id'")
     if existing:
@@ -54,7 +62,13 @@ def local_account_scope(db, now):
 
 
 def configure_independent(
-    engine, account_ids, until, *, source="explicit_user_local", through_task_ids=None
+    engine,
+    account_ids,
+    until,
+    *,
+    source="explicit_user_local",
+    through_task_ids=None,
+    offline_only_requested=False,
 ):
     """Local ownership handoff, authorized by the user, with no server request.
 
@@ -98,6 +112,8 @@ def configure_independent(
         "generation": uuid.uuid4().hex,
         "account_ids": authority["account_ids"],
     }
+    if offline_only_requested or offline_only(engine.store):
+        state["offline_only"] = True
     if continuation:
         state.update(through_task_ids=continuation)
     with engine.store.connect(write=True) as db:
@@ -115,6 +131,72 @@ def configure_independent(
             raise CloudUnavailable("LocalChannelHandoffBusy")
         if db.execute("SELECT 1 FROM meta WHERE key='local_fallback_expiry_requested'").fetchone():
             raise CloudUnavailable("LocalChannelOtherHandoffPending")
+        if state.get("offline_only") is True:
+            from .task_channels import binding_matches, channel_binding
+
+            fences = {}
+            for account_id in authority["account_ids"]:
+                prior = db.execute(
+                    "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
+                ).fetchone()
+                bound = channel_binding(db, account_id)
+                if (
+                    not prior
+                    or prior["state"] != "ready"
+                    or prior["error"]
+                    or prior["retry_at"] > now
+                ):
+                    raise CloudUnavailable("OfflinePriorOwnershipUnresolved")
+                if not binding_matches(prior, bound, state["node_id"], store_id):
+                    raise CloudUnavailable("OfflinePriorOwnershipUnverified")
+                if prior["channel"] == "cloud":
+                    if bound.get("fence_source") != "cloud_acknowledged" or prior["until_at"] > now:
+                        raise CloudUnavailable("OfflinePriorCloudStillActive")
+                    fences[account_id] = {
+                        "generation": prior["generation"],
+                        "until_at": prior["until_at"],
+                    }
+                elif prior["channel"] != "local":
+                    raise CloudUnavailable("OfflinePriorOwnershipUnverified")
+                if db.execute(
+                    "SELECT 1 FROM cloud_receipt_outbox r LEFT JOIN execution_jobs j ON j.id=r.job_id "
+                    "WHERE json_extract(r.lease,'$.account_id')=? OR j.account_id=? LIMIT 1",
+                    (account_id, account_id),
+                ).fetchone():
+                    raise CloudUnavailable("LocalChannelReceiptPending")
+            state["offline_fences"] = fences
+        # Renew acknowledged local routes within the user's explicit scope.
+        # Cloud-owned or unresolved routes retain their normal handoff checks.
+        for account_id in authority["account_ids"]:
+            prior = db.execute(
+                "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
+            ).fetchone()
+            if (
+                prior
+                and prior["channel"] == "local"
+                and prior["state"] == "ready"
+                and not prior["error"]
+                and prior["retry_at"] <= now
+                and prior["until_at"] < until
+            ):
+                generation = uuid.uuid4().hex
+                db.execute(
+                    "UPDATE account_task_channels SET until_at=?,generation=?,"
+                    "fence_source='independent_local',updated_at=? WHERE account_id=?",
+                    (until, generation, now, account_id),
+                )
+                Store.audit(
+                    db,
+                    "execution.local_account_authority_renewed",
+                    {
+                        "account_id": account_id,
+                        "previous_until": prior["until_at"],
+                        "until": until,
+                        "generation": generation,
+                        "source": source,
+                    },
+                    now=now,
+                )
         for key, value in (
             ("execution_channel_policy", "cloud_then_local"),
             ("local_channel_authority", canonical(authority)),
@@ -132,6 +214,212 @@ def configure_independent(
             now=now,
         )
     return state
+
+
+def extend_offline_scope(engine, account_ids, *, source="explicit_user_local_retry"):
+    """Add explicitly requested accounts without disturbing another local scope."""
+    from .task_channels import binding_matches, channel_binding
+
+    requested = sorted(set(account_ids))
+    if not requested or source not in {"explicit_user_local_retry", "explicit_user_local_task"}:
+        raise ValueError("OfflineScopeRequiresExplicitUser")
+    now = engine.clock()
+    with engine.store.connect(write=True) as db:
+        row = db.execute("SELECT value FROM meta WHERE key='execution_channel'").fetchone()
+        scope = independent_scope(db)
+        state = json.loads(row[0]) if row else {}
+        if not (
+            scope
+            and state.get("active") == "local"
+            and state.get("authorization") == "local_queue"
+            and state.get("offline_only") is True
+            and state.get("until", 0) > now
+            and sorted(state.get("account_ids", [])) == sorted(scope.get("account_ids", []))
+            and not state.get("through_task_ids")
+            and state.get("generation")
+        ):
+            raise CloudUnavailable("OfflineScopeUnavailable")
+        store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
+        if not store or store[0] != state.get("store_id"):
+            raise CloudUnavailable("LocalChannelBindingMismatch")
+        if db.execute("SELECT 1 FROM meta WHERE key='local_fallback_expiry_requested'").fetchone():
+            raise CloudUnavailable("LocalChannelOtherHandoffPending")
+        added, fences = [], dict(state.get("offline_fences", {}))
+        authorizations = dict(state.get("account_authorizations", {}))
+        for account_id in requested:
+            if account_id in state["account_ids"]:
+                continue
+            account = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if (
+                not account
+                or account["platform"] != "x"
+                or account["mode"] != "live"
+                or account["status"] != "healthy"
+                or account["disabled"]
+                or account["cooldown_until"] > now
+            ):
+                raise CloudUnavailable("OfflineAccountUnavailable")
+            if db.execute(
+                "SELECT 1 FROM account_blocks WHERE account_id=? AND state='active' AND (until_at IS NULL OR until_at>?)",
+                (account_id, now),
+            ).fetchone():
+                raise CloudUnavailable("OfflineAccountBlocked")
+            prior = db.execute(
+                "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
+            ).fetchone()
+            bound = channel_binding(db, account_id)
+            if (
+                not prior
+                or prior["state"] != "ready"
+                or prior["retry_at"] > now
+                or prior["error"] not in (None, "OperationalError")
+                or not binding_matches(prior, bound, state["node_id"], store[0])
+            ):
+                raise CloudUnavailable("OfflinePriorOwnershipUnverified")
+            ack = db.execute(
+                "SELECT id,details FROM audit WHERE kind='execution.account_channel_changed' AND json_extract(details,'$.account_id')=? ORDER BY id DESC LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if not ack:
+                raise CloudUnavailable("OfflinePriorOwnershipUnverified")
+            event = json.loads(ack["details"])
+            if (
+                event.get("channel") != prior["channel"]
+                or event.get("generation") != prior["generation"]
+            ):
+                raise CloudUnavailable("OfflinePriorOwnershipUnverified")
+            if db.execute(
+                "SELECT 1 FROM audit WHERE id>? AND kind='execution.account_handoff_started' AND json_extract(details,'$.account_id')=? LIMIT 1",
+                (ack["id"], account_id),
+            ).fetchone():
+                raise CloudUnavailable("OfflinePriorOwnershipUnresolved")
+            if prior["channel"] == "cloud":
+                if bound.get("fence_source") != "cloud_acknowledged" or prior["until_at"] > now:
+                    raise CloudUnavailable("OfflinePriorCloudStillActive")
+                fences[account_id] = {
+                    "generation": prior["generation"],
+                    "until_at": prior["until_at"],
+                }
+            elif prior["channel"] != "local":
+                raise CloudUnavailable("OfflinePriorOwnershipUnverified")
+            if db.execute(
+                "SELECT 1 FROM execution_jobs WHERE account_id=? AND state='leased' AND lease_until>?",
+                (account_id, now),
+            ).fetchone():
+                raise CloudUnavailable("LocalChannelHandoffBusy")
+            if db.execute(
+                "SELECT 1 FROM items WHERE account_id=? AND status='executing'", (account_id,)
+            ).fetchone():
+                raise CloudUnavailable("LocalChannelHandoffBusy")
+            if db.execute(
+                "SELECT 1 FROM cloud_receipt_outbox r LEFT JOIN execution_jobs j ON j.id=r.job_id WHERE json_extract(r.lease,'$.account_id')=? OR j.account_id=? LIMIT 1",
+                (account_id, account_id),
+            ).fetchone():
+                raise CloudUnavailable("LocalChannelReceiptPending")
+            added.append(account_id)
+            authorizations[account_id] = {"at": now, "source": source, "prior_ack_id": ack["id"]}
+        merged = sorted(set(state["account_ids"]) | set(requested))
+        state.update(
+            account_ids=merged, offline_fences=fences, account_authorizations=authorizations
+        )
+        scope["account_ids"] = merged
+        db.execute("UPDATE meta SET value=? WHERE key='execution_channel'", (canonical(state),))
+        db.execute(
+            "UPDATE meta SET value=? WHERE key='local_channel_authority'", (canonical(scope),)
+        )
+        if added:
+            Store.audit(
+                db,
+                "execution.local_scope_extended",
+                {"account_ids": added, "source": source, "offline_only": True},
+                now=now,
+            )
+    return {"added": added, "account_ids": merged, "until": state["until"], "offline_only": True}
+
+
+def recover_local_renewal(engine, account_id):
+    """Finish an interrupted local-to-local renewal with durable ownership proof.
+
+    An intervening cloud handoff, outstanding lease/receipt or publication attempt
+    prevents recovery. This does not authorize a cloud-to-local offline switch.
+    """
+    now = engine.clock()
+    if not independent_active(engine):
+        raise ValueError("IndependentLocalAuthorityRequired")
+    with engine.store.connect(write=True) as db:
+        authority = json.loads(
+            db.execute("SELECT value FROM meta WHERE key='execution_channel'").fetchone()[0]
+        )
+        route = db.execute(
+            "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
+        ).fetchone()
+        if (
+            account_id not in authority.get("account_ids", [])
+            or not route
+            or route["channel"] != "local"
+            or route["state"] != "handoff"
+            or route["until_at"] > authority["until"]
+        ):
+            raise ValueError("LocalRenewalNotInScope")
+        ack = db.execute(
+            "SELECT id,details FROM audit WHERE kind='execution.account_channel_changed' AND json_extract(details,'$.account_id')=? ORDER BY id DESC LIMIT 1",
+            (account_id,),
+        ).fetchone()
+        if not ack or json.loads(ack["details"]).get("channel") != "local":
+            raise ValueError("LocalOwnershipNotProven")
+        if db.execute(
+            "SELECT 1 FROM audit WHERE id>? AND kind='execution.account_handoff_started' AND json_extract(details,'$.account_id')=? AND json_extract(details,'$.channel')<>'local'",
+            (ack["id"], account_id),
+        ).fetchone():
+            raise ValueError("InterveningCloudHandoff")
+        task = db.execute(
+            "SELECT state,policy FROM tasks WHERE id=?", (route["task_id"],)
+        ).fetchone()
+        if (
+            not task
+            or task["state"] not in {"active", "paused"}
+            or json.loads(task["policy"]).get("execution_channel") != "local"
+        ):
+            raise ValueError("LocalRenewalTaskMismatch")
+        if (
+            db.execute(
+                "SELECT 1 FROM execution_jobs WHERE account_id=? AND state='leased' AND lease_until>?",
+                (account_id, now),
+            ).fetchone()
+            or db.execute(
+                "SELECT 1 FROM items WHERE task_id=? AND attempt_id IS NOT NULL",
+                (route["task_id"],),
+            ).fetchone()
+            or db.execute(
+                "SELECT 1 FROM cloud_receipt_outbox r JOIN execution_jobs j ON j.id=r.job_id WHERE j.account_id=?",
+                (account_id,),
+            ).fetchone()
+        ):
+            raise ValueError("LocalRenewalHasOutstandingWork")
+        db.execute(
+            "UPDATE account_task_channels SET state='ready',fence_source='independent_local',updated_at=?,error=NULL,retry_at=0 WHERE account_id=? AND generation=?",
+            (now, account_id, route["generation"]),
+        )
+        Store.audit(
+            db,
+            "execution.local_renewal_recovered",
+            {
+                "account_id": account_id,
+                "generation": route["generation"],
+                "previous_local_ack_id": ack["id"],
+                "until": route["until_at"],
+                "attempts_changed": False,
+            },
+            route["task_id"],
+            now,
+        )
+        return {
+            "account_id": account_id,
+            "state": "ready",
+            "channel": "local",
+            "generation": route["generation"],
+            "until": route["until_at"],
+        }
 
 
 def local_context_valid(db, context, *, now=None):

@@ -121,11 +121,60 @@ class StartupResilienceTests(unittest.TestCase):
             patch("auto_promotion.api.WORKER_INTERVAL_SECONDS", 0.01, create=True),
         ):
             with TestClient(app) as client:
-                self.assertTrue(second.wait(1), "failed error audit killed the scheduler")
-                health = client.get("/health").json()
+                self.assertTrue(second.wait(5), "failed error audit killed the scheduler")
+                for _ in range(100):
+                    health = client.get("/health").json()
+                    if health["background"]["sender"].get("last_success_at"):
+                        break
+                    time.sleep(0.01)
                 self.assertTrue(health["background"]["sender"]["alive"])
+                self.assertEqual(health["background"]["sender"]["last_error"], "OperationalError")
+                self.assertGreaterEqual(
+                    health["background"]["sender"]["last_success_at"],
+                    health["background"]["sender"]["last_error_at"],
+                )
+                self.assertNotIn(
+                    "database is locked", str(health["background"]["sender"]["last_error_details"])
+                )
         self.assertEqual(store.one("SELECT value FROM meta WHERE key='global_stop'")["value"], "1")
         self.assertFalse(store.rows("SELECT * FROM attempts"))
+
+    def test_background_sqlite_error_keeps_safe_code_and_later_success(self):
+        from auto_promotion.interactions import Interactions
+        from auto_promotion.meta_browser import MetaBrowser
+
+        completed, calls = threading.Event(), []
+
+        def schedule(_):
+            calls.append(True)
+            if len(calls) == 1:
+                error = sqlite3.OperationalError("PRIVATE_SECRET_DO_NOT_LOG")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                error.sqlite_errorname = "SQLITE_BUSY"
+                raise error
+            completed.set()
+
+        app = create_app(db_path=self.path, worker=True, report_worker=False, pooled_worker=True)
+        with (
+            patch.object(Interactions, "stages", ()),
+            patch.object(Interactions, "schedule", schedule),
+            patch.object(MetaBrowser, "sync", return_value=None),
+            patch.object(PoolScheduler, "tick", return_value=None),
+            patch("auto_promotion.api.WORKER_INTERVAL_SECONDS", 0.01),
+        ):
+            with TestClient(app) as client:
+                self.assertTrue(completed.wait(2))
+                for _ in range(100):
+                    record = client.get("/health").json()["background"]["reports"]["hf_schedule"]
+                    if record.get("last_success_at"):
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(record["last_error_details"]["sqlite_errorname"], "SQLITE_BUSY")
+                self.assertGreaterEqual(record["last_success_at"], record["last_error_at"])
+                self.assertNotIn("PRIVATE_SECRET", str(record))
+        audit = Store(self.path).rows("SELECT details FROM audit WHERE kind='statistics.error'")
+        self.assertTrue(any("SQLITE_BUSY" in row["details"] for row in audit))
+        self.assertNotIn("PRIVATE_SECRET", str(audit))
 
     def test_health_freezes_runtime_fingerprint_and_tracks_actual_task_liveness(self):
         app = create_app(db_path=self.path, worker=False, report_worker=False)

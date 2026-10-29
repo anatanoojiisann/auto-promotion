@@ -257,12 +257,19 @@ async function screenshots(page) {
   let dueAt = 0;
   for (const task of campaign.tasks) {
     await page.goto(`${base}/#tasks/${task.id}`);
-    await Promise.all([
+    await page.waitForFunction(
+      (id) => document.querySelector("#main")?.innerText.includes(id),
+      task.id,
+    );
+    const [startedResponse] = await Promise.all([
       page.waitForResponse(
-        (r) => r.url().endsWith("/start") && r.request().method() === "POST",
+        (r) =>
+          r.url().endsWith(`/api/tasks/${task.id}/start`) &&
+          r.request().method() === "POST",
       ),
       page.getByRole("button", { name: "开始发送", exact: true }).click(),
     ]);
+    assert.equal(startedResponse.status(), 200, await startedResponse.text());
     await page.getByRole("button", { name: "开始发送", exact: true }).waitFor();
     const approved = await read(`/tasks/${task.id}`);
     assert.equal(approved.approvals.length, 0);
@@ -297,7 +304,15 @@ async function screenshots(page) {
     assert.equal(repeatedResponse.status(), 200);
     const repeated = await repeatedResponse.json();
     assert.equal(repeated.mode, "simulation");
-    assert.equal(repeated.execution_result.already_started, true);
+    assert.equal(
+      repeated.execution_result.already_started,
+      true,
+      JSON.stringify({
+        phase: repeated.phase,
+        workflow: repeated.readiness.workflow,
+        result: repeated.execution_result,
+      }),
+    );
     assert.deepEqual(repeated.execution_result.processed, []);
     // The temporary service runs without a worker. Advance only its
     // synthetic scheduler; duplicate Start must not run the task again.

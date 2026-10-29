@@ -209,6 +209,7 @@ class ConnectionsTests(unittest.TestCase):
         context = runtime.chromium.launch_persistent_context.return_value
         context.pages = [MagicMock()]
         page = context.pages[0]
+        page.url = "https://x.com/home"
         page.is_closed.return_value = False
         page.get_by_test_id.return_value.count.return_value = 1
         page.get_by_test_id.return_value.first.is_visible.return_value = True

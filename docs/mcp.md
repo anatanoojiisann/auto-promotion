@@ -45,6 +45,14 @@ codex mcp add auto-promotion -- "$PWD\.venv\Scripts\python.exe" -m auto_promotio
 
 ## 工具与账号
 
+真实 X 内容发现使用 `search_x_content(account_id, query, lookback_hours=12,
+timeout_seconds=30, max_results=100)`，通过注册账号的统一只读后端读取一页，
+不再使用临时浏览器脚本。结果包含原帖时间、读取预算及耗时；
+`quality_status=context_review_required` 表示仍需核对正文和优先级，
+不能把搜索命中当成P0/P1。429和验证阻断仍持久保留，覆盖不完整保持显式。
+网页/API可调用 `POST /api/x/search`；真实X的任务发现入口同样接入此读取器。
+`system_status.runtime` 返回MCP启动时PID和源码指纹，用于重新连接后验收。
+
 任务工具另提供 `list_task_templates`、`save_task_template`、`create_task_from_template`、`task_evidence` 和 `task_review`。模板只复用设置，新任务不继承旧启动状态、目标或正文；证据只读取所选任务的关联记录。详情见 [固定工具](task-tools.md)。
 
 号池工具包括 `list_account_pools`、`save_account_pool`、`get_account_profile`、`save_account_profile`；内容工具包括 `list_opportunities`、`import_opportunities`、`collect_telegram_content`。活动使用 `create_campaign`、`plan_campaign`、`get_campaign`、`list_campaigns`、`edit_campaign_draft`、`create_campaign_batches`、`populate_campaign_batch`。

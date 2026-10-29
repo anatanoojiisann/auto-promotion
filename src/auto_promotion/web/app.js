@@ -20,6 +20,7 @@ const names = {
   telegram: "Telegram",
   reddit: "Reddit",
   instagram: "Instagram",
+  facebook: "Facebook",
   x: "X",
   discord: "Discord",
   tiktok: "TikTok",
@@ -38,7 +39,9 @@ const actions = {
   like: "点赞",
   repost: "转发",
   quote: "引用",
-  comment: "评论自有内容",
+  comment: "发表评论",
+  send_direct_message: "主动发送私信",
+  reply_direct_message: "回复私信",
   unlike: "取消评论点赞",
   hide_comment: "隐藏评论",
   unhide_comment: "恢复评论显示",
@@ -184,7 +187,7 @@ function badge(value) {
   return `<span class="badge ${color}">${esc(statuses[value] || value)}</span>`;
 }
 function platform(p) {
-  return `<span class="platform"><span class="platform-mark ${esc(p)}">${esc({ telegram: "TG", reddit: "R", instagram: "IG", x: "X", discord: "DC", tiktok: "TT" }[p])}</span>${esc(names[p])}</span>`;
+  return `<span class="platform"><span class="platform-mark ${esc(p)}">${esc({ telegram: "TG", reddit: "R", instagram: "IG", facebook: "FB", x: "X", discord: "DC", tiktok: "TT" }[p])}</span>${esc(names[p])}</span>`;
 }
 function heading(title, desc, button = "") {
   return `<div class="page-heading"><div><h1>${title}</h1><p>${desc}</p></div>${button}</div>`;
@@ -349,18 +352,59 @@ async function renderStatistics(day = "") {
       toast(error.message, true),
     );
 }
+async function metaBrowserPanel() {
+  const [status, queue] = await Promise.all([
+    api("/meta-browser/status"),
+    api("/meta-browser/jobs"),
+  ]);
+  const labels = {
+    stopped: "原任务已停止",
+    complete: "原流程已结束",
+    busy: "原流程仍在观察或执行",
+    unknown: "原流程有未决状态",
+  };
+  openPanel(
+    "Facebook / IG 浏览器互动",
+    `
+    ${status.cloud_catalog_pending ? '<div class="banner warning">接入已保存，等待队列服务更新；暂不执行新互动。</div>' : ""}
+    <p class="help">沿用现有账号和浏览器。新任务在明确启动后进入统一队列，到期由桌面执行端接单。</p>
+    ${status.accounts.map((a) => `<article class="item-preview"><strong>${esc(a.label || a.external_id)}</strong><p>${esc(a.browser)} · ${a.identity_observation_fresh ? "最近已核验身份" : "等待浏览器身份核验"}</p>${a.sources.map((s) => `<p class="help">${esc(s.coordination_only ? "共享冷却与历史记录" : labels[s.state] || s.state)} · <button class="text-button" data-meta-task="${esc(s.task_id)}">查看历史任务</button></p>`).join("")}</article>`).join("")}
+    <p>等待执行 ${queue.jobs.length} 条；待核对 ${queue.unresolved.length} 条；旧记录待补核验 ${queue.unverified_history} 条。</p>
+    <p class="help">旧任务保留原状态，历史条目不会重新进入发送队列。未决提交只核对回执。</p>
+    <button id="meta-import-existing" class="secondary">同步已有账号和旧任务</button>`,
+  );
+  document.querySelectorAll("[data-meta-task]").forEach((button) => {
+    button.onclick = () => {
+      closePanel();
+      location.hash = "#tasks/" + button.dataset.metaTask;
+    };
+  });
+  $("#meta-import-existing").onclick = (e) =>
+    busy(e.target, async () => {
+      await api("/meta-browser/import-existing", "POST");
+      await refresh();
+      await metaBrowserPanel();
+    });
+}
+
 function renderAccounts() {
-  const checked = state.accounts.filter((a) => a.status === "healthy").length;
+  const checked = state.accounts.filter(
+    (a) => a.connection_state === "healthy",
+  ).length;
   $("#main").innerHTML =
     heading(
       "账号中心",
       "连接账号，确认能力，让每一次执行都有明确的身份。",
-      '<div class="actions"><button class="secondary" id="connect-tiktok">连接 TikTok</button><button class="secondary" id="connect-discord">连接 Discord</button><button class="secondary" id="connect-instagram">连接 IG</button><button class="secondary" id="connect-x">连接 X</button><button id="new-account">添加账号</button></div>',
+      '<div class="actions"><button class="secondary" id="meta-browser">Facebook / IG 浏览器</button><button class="secondary" id="tiktok-browser">TikTok 网页账号</button><button class="secondary" id="connect-tiktok">TikTok 发布接口</button><button class="secondary" id="connect-discord">连接 Discord</button><button class="secondary" id="connect-instagram">连接 IG 发布接口</button><button class="secondary" id="connect-x">连接 X</button><button id="new-account">添加账号</button></div>',
     ) +
     `<div class="stats"><span class="stat"><strong>${state.accounts.length}</strong>已登记账号</span><span class="stat"><strong>${checked}</strong>通过身份核验</span><span class="stat"><strong>${state.accounts.filter((a) => a.mode === "live").length}</strong>真实账号</span></div><div id="connection-list"></div><div class="toolbar"><div class="filter-tabs"><button class="selected" data-mode="all">全部账号</button><button data-mode="live">真实账号</button><button data-mode="simulation">模拟账号</button></div><span class="spacer"></span><button class="secondary compact" id="check-all">检查全部连接</button></div><div class="surface" id="account-list"></div><p class="connect-note">TikTok、Discord、IG 和 X 可在这里完成连接，身份核验后自动登记。登录不启用推广发布；外发在明确启动任务后执行。</p>`;
   $("#connect-tiktok").onclick = () =>
     tiktokSetup().catch((e) => toast(e.message, true));
+  $("#tiktok-browser").onclick = () =>
+    tiktokBrowserPanel().catch((e) => toast(e.message, true));
   $("#connect-instagram").onclick = () => connectionForm("instagram");
+  $("#meta-browser").onclick = () =>
+    metaBrowserPanel().catch((e) => toast(e.message, true));
   $("#connect-x").onclick = () => connectionForm("x");
   $("#connect-discord").onclick = discordConnectionForm;
   $("#new-account").onclick = accountForm;
@@ -531,7 +575,7 @@ setInterval(async () => {
 function accountRows(mode) {
   const rows = state.accounts.filter((a) => mode === "all" || a.mode === mode);
   $("#account-list").innerHTML = rows.length
-    ? `<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>账号 / 平台</th><th>连接状态</th><th>可接入能力</th><th>执行边界</th><th>操作</th></tr></thead><tbody>${rows.map((a) => `<tr><td>${platform(a.platform)}<span class="sub">${esc(a.label)} · ${a.mode === "simulation" ? "模拟" : "真实"}</span></td><td>${badge(a.status)}${a.disabled ? ' <span class="badge amber">已停用</span>' : ""}<span class="sub">${a.checked_at ? fmt(a.checked_at) : "尚未检查"}${a.cooldown_until > Date.now() / 1000 ? "<br>冷却至 " + fmt(a.cooldown_until) : ""}</span></td><td><div class="chips">${a.capabilities.map((c) => `<span class="chip">${actions[c] || c}</span>`).join("")}</div></td><td>${a.daily_limit} 条 / 日<span class="sub">间隔 ${a.min_interval} 秒</span></td><td><div class="actions"><button class="secondary compact" data-check="${a.id}">检查</button><button class="text-button" data-disable="${a.id}" data-value="${!a.disabled}">${a.disabled ? "启用" : "停用"}</button></div></td></tr>`).join("")}</tbody></table></div>`
+    ? `<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>账号 / 平台</th><th>连接状态</th><th>可接入能力</th><th>执行边界</th><th>操作</th></tr></thead><tbody>${rows.map((a) => `<tr><td>${platform(a.platform)}<span class="sub">${esc(a.label)} · ${a.mode === "simulation" ? "模拟" : "真实"}</span></td><td>${badge(a.status)}${a.disabled ? ' <span class="badge amber">已停用</span>' : ""}<span class="sub">${a.checked_at ? fmt(a.checked_at) : "尚未检查"}${a.cooldown_until > Date.now() / 1000 ? "<br>冷却至 " + fmt(a.cooldown_until) : ""}</span></td><td><div class="chips">${a.capabilities.map((c) => `<span class="chip">${actions[c] || c}</span>`).join("")}</div></td><td>${a.daily_limit_unlimited_locally ? "本地账号每日不限" : `${a.daily_limit} 条 / 日`}<span class="sub">间隔 ${a.min_interval} 秒</span></td><td><div class="actions"><button class="secondary compact" data-check="${a.id}">检查</button><button class="text-button" data-disable="${a.id}" data-value="${!a.disabled}">${a.disabled ? "启用" : "停用"}</button></div></td></tr>`).join("")}</tbody></table></div>`
     : empty("暂无账号", "添加现有平台账号，或创建模拟账号测试完整流程。");
   for (const account of rows) {
     const control = document.querySelector(`[data-disable="${account.id}"]`);
@@ -617,7 +661,11 @@ function accountRows(mode) {
       };
       control.insertAdjacentElement("beforebegin", reads);
     }
-    if (account.platform === "tiktok" && account.mode === "live") {
+    if (
+      account.platform === "tiktok" &&
+      account.mode === "live" &&
+      account.execution_backend !== "desktop"
+    ) {
       const content = document.createElement("button");
       content.className = "text-button";
       content.textContent = "内容与评论";
@@ -838,6 +886,13 @@ function editAccountForm(account) {
     "编辑账号",
     `<form id="edit-account-form"><p class="help">平台与本机账号标签保持不变。已被未结束任务使用的账号需先结束旧任务。</p><div class="field-grid"><div class="full"><label>显示名称<input name="label" value="${esc(account.label)}" required maxlength="80"></label></div><div><label>每日限额<input name="daily_limit" type="number" value="${account.daily_limit}" min="1" max="300" required></label></div><div><label>每小时限额<input name="hourly_limit" type="number" value="${account.hourly_limit}" min="1" max="20" required></label></div><div><label>最小间隔（秒）<input name="min_interval" type="number" value="${account.min_interval}" min="${account.mode === "live" ? 120 : 0}" max="86400" required></label></div></div><div class="form-actions"><button type="submit">保存账号</button></div></form>`,
   );
+  if (account.daily_limit_unlimited_locally) {
+    const notice = document.createElement("p");
+    notice.className = "help";
+    notice.textContent =
+      "本地账号每日不限。下面保留的数值用于其他通道及将来恢复。";
+    $("#edit-account-form").prepend(notice);
+  }
   $("#edit-account-form").onsubmit = (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
@@ -952,11 +1007,24 @@ function taskForm() {
   );
   $("#task-form fieldset").insertAdjacentHTML(
     "afterend",
-    '<div class="full"><label for="execution-channel">执行通道</label><select id="execution-channel" name="execution_channel"><option value="inherit">跟随默认</option><option value="cloud">在线队列</option><option value="local">本地队列</option></select><span class="help">只决定本次任务的通道；同一账号仍按顺序执行。在线连接失败时等待恢复。</span></div>',
+    '<div class="full"><label for="execution-channel">执行通道</label><select id="execution-channel" name="execution_channel" required><option value="">请选择本次通道</option><option value="inherit">跟随默认（随配置变化）</option><option value="cloud">在线队列</option><option value="local">本地队列</option></select><span class="help">只决定本次任务的通道；同一账号仍按顺序执行。在线连接失败时等待恢复。</span></div>',
   );
   $("#task-form").onsubmit = (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
+    if (
+      state.accounts.some(
+        (a) =>
+          f.getAll("accounts").includes(a.id) &&
+          a.execution_backend === "desktop",
+      ) &&
+      f.get("execution_channel") !== "local"
+    ) {
+      toast(
+        "此桌面账号需要本机通道；请修改通道选择，或改选支持线上队列的账号。",
+      );
+      return;
+    }
     const split = (n) =>
       String(f.get(n) || "")
         .split(/[,，\n]/)
@@ -968,12 +1036,25 @@ function taskForm() {
         account_ids: f.getAll("accounts"),
         policy: {
           execution_channel: f.get("execution_channel"),
+          execution_channel_source:
+            f.get("execution_channel") === "inherit"
+              ? ""
+              : "workbench_task_form",
           ...(f.get("allow_owned_x_posts") === "on"
             ? { allow_owned_x_posts: true }
             : {}),
           ...(split("outbound_after_task_ids").length
             ? {
                 outbound_after_task_ids: split("outbound_after_task_ids"),
+                outbound_dependency_mode:
+                  f.get("outbound_dependency_mode") || "published",
+                ...(f.get("outbound_dependency_deadline")
+                  ? {
+                      outbound_dependency_deadline: new Date(
+                        f.get("outbound_dependency_deadline"),
+                      ).toISOString(),
+                    }
+                  : {}),
                 outbound_after_tasks_seconds:
                   Number(f.get("outbound_after_tasks_minutes")) * 60,
               }
@@ -1007,13 +1088,21 @@ function taskForm() {
   };
   $("#task-form .form-actions").insertAdjacentHTML(
     "beforebegin",
-    '<fieldset><legend>X 原创发布</legend><label class="checkbox-label"><input type="checkbox" name="allow_owned_x_posts">允许本任务向自有 X 账号发布原创推文</label><p class="help">使用在线队列，保留账号限额和每条仅提交一次的规则。每个账号分别创建一条发布任务。</p><label>等待完成的互动任务 ID（每行一个，可留空）<textarea name="outbound_after_task_ids" rows="2"></textarea></label><label>全部核验发布后等待（分钟）<input type="number" name="outbound_after_tasks_minutes" min="0" max="10080" value="60"></label><p class="help">有漏发、结果未知或缺少实际发布时间时继续等待。目标时间已过时不会补发。</p></fieldset>',
+    '<fieldset><legend>X 原创发布</legend><label class="checkbox-label"><input type="checkbox" name="allow_owned_x_posts">允许本任务向自有 X 账号发布原创推文</label><p class="help">使用在线队列，保留账号限额和每条仅提交一次的规则。每个账号分别创建一条发布任务。</p><label>等待完成的互动任务 ID（每行一个，可留空）<textarea name="outbound_after_task_ids" rows="2"></textarea></label><label>依赖满足后等待（分钟）<input type="number" name="outbound_after_tasks_minutes" min="0" max="10080" value="60"></label><p class="help"><label>依赖条件<select name="outbound_dependency_mode"><option value="published">前置任务全部核验发布成功</option><option value="finished">前置执行已结束（不要求全部成功）</option></select></label><label>等待截止时间（可选）<input type="datetime-local" name="outbound_dependency_deadline"></label>失败或超过截止时间会结束等待；未知结果仍保留核验。目标时间已过时不会补发。</p></fieldset>',
   );
-  $("#task-form [name=allow_owned_x_posts]").onchange = (e) => {
-    if (e.target.checked) $("#execution-channel").value = "cloud";
+  $("#task-form [name=allow_owned_x_posts]").onchange = () => {
+    $("#execution-channel").focus();
   };
 }
 function taskReadinessPanel(t) {
+  if (t.legacy_source)
+    return `<div class="banner" id="task-readiness"><strong>历史任务 · 只读同步</strong><p>原状态：${esc(t.legacy_source.details.legacy_status)}。保留已发送、已停止、回复观察及未决记录；此任务不能重新启动。</p></div>`;
+  if (
+    t.state === "completed" &&
+    (t.receipt_summary?.pending_verification ||
+      t.receipt_summary?.manual_attention)
+  )
+    return `<div class="banner" id="task-readiness"><strong>执行已结束 · 回执待处理</strong><p>未知结果仅核验，不重新发送；平台排期和人工项目保留原状态。</p></div>`;
   if (["completed", "cancelled"].includes(t.state)) return "";
   const checks = t.readiness;
   if (!checks) return "";
@@ -1059,6 +1148,8 @@ function taskChannelPanel(t) {
     TaskChannelHandoffBusy: "等待该账号当前操作完成",
     AccountChannelHandoffBusy: "等待该账号在线操作完成",
     TaskChannelHandoffPending: "等待该账号完成通道交接",
+    LocalOfflineModeActive: "此账号已指定独立本机，不能改用线上",
+    OfflinePriorOwnershipUnverified: "本机归属证明未核实，保持等待",
     AccountChannelGenerationConflict: "通道状态已更新，等待核对",
   };
   const accounts = channel.accounts
@@ -1066,18 +1157,21 @@ function taskChannelPanel(t) {
       const label =
         t.account_snapshot.find((x) => x.id === a.account_id)?.label || "账号";
       const desired =
-        channel.requested === "inherit" ? channel.default : channel.requested;
+        channel.resolved?.[a.account_id] ||
+        (channel.requested === "inherit" ? channel.default : channel.requested);
       const actual =
-        a.state !== "ready"
-          ? "等待交接"
-          : a.channel === desired
-            ? labels[a.channel]
-            : `等待交接到${labels[desired]}（账号当前：${labels[a.channel]}）`;
+        a.until_at <= Date.now() / 1000
+          ? "账号通道授权已到期"
+          : a.state !== "ready"
+            ? "等待交接"
+            : a.channel === desired
+              ? labels[a.channel]
+              : `等待交接到${labels[desired]}（账号当前：${labels[a.channel]}）`;
       const reason = a.error ? reasons[a.error] || "等待队列核验" : "";
-      return `<li>${esc(label)}：${esc(actual)}${reason ? " · " + esc(reason) : ""}</li>`;
+      return `<li>${esc(label)}：${esc(actual)}${reason ? " · " + esc(reason) : ""}${a.until_at ? " · 授权截止 " + fmt(a.until_at) : ""}</li>`;
     })
     .join("");
-  return `<div class="surface padded mt-20" id="task-channel"><h2>执行通道</h2><p>任务选择：${esc(labels[channel.requested] || "跟随默认")}${channel.requested === "inherit" ? "（当前默认：" + esc(labels[channel.default]) + "）" : ""}</p>${accounts ? "<ul>" + accounts + "</ul>" : '<p class="help">开始任务后确定账号的实际通道。</p>'}<p class="help">同一账号等待当前操作和回执完成后交接，其他账号独立执行。在线任务遇到连接问题时保持等待。</p></div>`;
+  return `<div class="surface padded mt-20" id="task-channel"><h2>执行通道</h2><p>任务选择：${esc(labels[channel.requested] || "跟随默认")}${channel.requested === "inherit" ? "（当前默认：" + esc(labels[channel.default]) + "）" : ""}</p>${accounts ? "<ul>" + accounts + "</ul>" : '<p class="help">开始任务后确定账号的实际通道。</p>'}<p class="help">线上队列负责授权和账本，本机执行器操作平台；本机队列是否依赖线上交接取决于账号授权。明确选择的通道不会因报错反向切换。</p></div>`;
 }
 
 async function taskControlRequest(id, action, body) {
@@ -1164,6 +1258,14 @@ async function renderTask(id) {
         : ""
     }${t.candidates.length ? '<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>候选目标</th><th>资格判断</th><th>原因</th></tr></thead><tbody>' + t.candidates.map((c) => `<tr><td>${esc(c.target)}</td><td>${badge(c.decision)}</td><td>${esc(c.reasons.join(" · ") || "通过发现政策")}<span class="sub">${esc(c.state)}</span>${["unknown", "pending_admin_approval", "joined", "already_joined"].includes(c.state) ? `<button class="text-button" data-join-reconcile="${c.id}">只读核对入群</button>` : ""}</td></tr>`).join("") + "</tbody></table></div>" : '<p class="muted mt-14">搜索结果先经过资格筛选，低置信度候选会被记录为拒绝。</p>'}</div></div><div class="surface mt-24"><div class="section-header"><h2>任务日志</h2></div><div class="padded" id="task-audit">正在读取…</div></div></div><aside class="detail-aside"><div class="surface padded"><h2>任务范围</h2><details><summary>查看完整范围</summary><p class="help">账号：${t.account_snapshot.map((a) => esc(a.label) + " (" + names[a.platform] + ")").join("、")}</p><pre>${esc(JSON.stringify(t.policy, null, 2))}</pre></details>${t.manifest ? `<details><summary>查看发送清单</summary><pre>${esc(JSON.stringify(t.manifest, null, 2))}</pre></details>` : '<p class="help">点击开始发送时自动固定清单，无需审批或确认短语。</p>'}</div><div class="surface padded mt-20"><h2>执行控制</h2><p class="help">${state.overview.global_stop ? "全局执行已暂停。请使用顶部开关恢复。" : "任务启动后按计划时间执行。"}</p><div class="actions mt-14">${!ended ? `<button id="run-task" class="compact" ${taskStartOperations.has(id) ? "disabled" : ""}>${t.items.length ? "开始发送" : t.policy.max_joins ? "开始入群" : "开始任务"}</button><button class="secondary compact" id="pause-task">${t.state === "paused" ? "恢复任务" : "暂停任务"}</button><button class="danger compact" id="cancel-task">取消任务</button>` : ""}</div><p class="native-note">停止本地任务不会撤回已经提交给 Telegram 的原生排期。</p></div></aside></div>`;
   bindTaskTools(t);
+  if (t.legacy_source) {
+    ["#run-task", "#pause-task", "#cancel-task"].forEach((selector) =>
+      $(selector)?.remove(),
+    );
+    document
+      .querySelectorAll("[data-manual]")
+      .forEach((button) => button.remove());
+  }
   $("#refresh-task").onclick = () => renderTask(id);
   $("#edit-items")?.addEventListener("click", () => itemEditor(t));
   $("#run-task")?.addEventListener("click", (e) =>
@@ -1399,15 +1501,21 @@ function itemEditor(t) {
       action:
         t.policy.allow_owned_x_posts && live.platform === "x"
           ? "post"
-          : live.platform === "tiktok"
-            ? "publish"
-            : state.accounts
-                .find((x) => x.id === a.id)
-                .capabilities.find((c) => !["discover", "join"].includes(c)),
+          : live.platform === "tiktok" && live.execution_backend === "desktop"
+            ? "comment"
+            : live.execution_backend === "desktop"
+              ? "reply"
+              : live.platform === "tiktok"
+                ? "publish"
+                : state.accounts
+                    .find((x) => x.id === a.id)
+                    .capabilities.find(
+                      (c) => !["discover", "join"].includes(c),
+                    ),
       target:
         t.policy.allow_owned_x_posts && live.platform === "x"
           ? live.owned_target_url || ""
-          : live.platform === "tiktok"
+          : live.platform === "tiktok" && live.execution_backend !== "desktop"
             ? live.owned_target_id || ""
             : "",
       text: "",
@@ -1420,10 +1528,12 @@ function itemEditor(t) {
       discord_reply_to: "",
       recipient_id: "",
       target_owned:
-        live.platform === "tiktok" ||
+        (live.platform === "tiktok" && live.execution_backend !== "desktop") ||
         (live.platform === "x" && t.policy.allow_owned_x_posts),
       tiktok_video_id: "",
       tiktok_comment_id: "",
+      tiktok_conversation_id: "",
+      tiktok_message_id: "",
       tiktok_options: null,
     };
   }
@@ -1476,6 +1586,7 @@ function itemEditor(t) {
     container.querySelectorAll("[data-index]").forEach((row) => {
       const item = items[Number(row.dataset.index)];
       const account = state.accounts.find((a) => a.id === item.account_id);
+      tiktokBrowserEditor(row, item);
       if (account.platform !== "x" || item.action !== "post") return;
       const title = row.querySelector("[name=title]");
       title.type = "hidden";
@@ -1557,10 +1668,24 @@ function itemEditor(t) {
           items[index].tiktok_options = null;
           items[index].tiktok_video_id = "";
           items[index].tiktok_comment_id = "";
-          if (account.platform === "tiktok") {
+          items[index].tiktok_conversation_id = "";
+          items[index].tiktok_message_id = "";
+          items[index].recipient_id = "";
+          if (
+            account.platform === "tiktok" &&
+            account.execution_backend !== "desktop"
+          ) {
             items[index].target = account.owned_target_id || "";
             items[index].target_owned = true;
             items[index].action = "publish";
+          } else if (
+            account.platform === "tiktok" &&
+            account.execution_backend === "desktop"
+          ) {
+            items[index].action = "comment";
+            items[index].target_owned = false;
+            items[index].title = "";
+            items[index].media = [];
           } else if (account.platform === "x" && t.policy.allow_owned_x_posts) {
             items[index].action = "post";
             items[index].execution_mode = "automatic";

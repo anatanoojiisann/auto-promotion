@@ -25,6 +25,7 @@ PROJECTS = {
     "telegram": "telegram-mcp",
     "reddit": "reddit-engagement-workflow",
     "instagram": "meta-social-engagement",
+    "facebook": "meta-social-engagement",
     "x": "x-engagement",
     "discord": "discord-bot",
     "tiktok": "tiktok-accounts",

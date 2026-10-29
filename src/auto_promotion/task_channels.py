@@ -41,16 +41,10 @@ def pending_managed(engine):
     )
 
 
-def effective(engine, policy):
-    from .execution_channels import read_state
+def effective(engine, policy, task_id=None, account_id=None):
+    from .channel_decisions import resolved
 
-    channel = requested(policy)
-    if channel != "inherit":
-        return channel
-    state = read_state(engine.store)
-    if state.get("active") == "local" and state.get("until", 0) <= engine.clock():
-        return "cloud"
-    return state.get("active", "cloud")
+    return resolved(engine, policy, task_id, account_id)
 
 
 def handoff_blocks(db, authority, task_id, now):
@@ -74,6 +68,15 @@ def valid_context(db, context, *, now):
         "JOIN task_channel_claims c ON c.job_id=j.id JOIN tasks t ON t.id=j.task_id WHERE j.id=?",
         (context.get("id"),),
     ).fetchone()
+    from .channel_decisions import saved
+
+    decision = saved(db, row["job_task_id"]) if row else None
+    if (
+        decision
+        and row["account_id"] in decision["resolved"]
+        and decision["resolved"][row["account_id"]] != context.get("channel")
+    ):
+        return False
     bound = channel_binding(db, row["account_id"]) if row else {}
     store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
     return bool(
@@ -302,15 +305,42 @@ def task_local_scope_valid(engine, task_id):
 
 def snapshot(engine, task):
     rows = engine.store.rows(
-        "SELECT account_id,channel,state,until_at,error,retry_at,updated_at "
+        "SELECT account_id,channel,state,until_at,error,retry_at,updated_at,fence_source "
         "FROM account_task_channels WHERE account_id IN ("
         + ",".join("?" for _ in task["account_ids"])
         + ")",
         tuple(task["account_ids"]),
     )
+    from .execution_channels import read_state
+
+    state, now = read_state(engine.store), engine.clock()
+    selected = {a: effective(engine, task["policy"], task["id"], a) for a in task["account_ids"]}
+    for row in rows:
+        row["authorization_valid_until"] = row["until_at"]
+        row["blocking_reason"] = (
+            "账号通道交接尚未确认；保留原有归属，等待核验"
+            if row["state"] == "handoff"
+            else "账号通道检查暂未通过：" + safe_channel_code(row["error"])
+            if row["error"] and row["retry_at"] > now
+            else None
+        )
+    scoped_accounts = state.get("account_ids", [])
+    expired = bool(
+        state.get("active") == "local"
+        and state.get("until", 0) <= now
+        and any(
+            c == "local" and (not scoped_accounts or a in scoped_accounts)
+            for a, c in selected.items()
+        )
+    )
     return {
         "requested": requested(task["policy"]),
         "default": effective(engine, {"execution_channel": "inherit"}),
+        "resolved": selected,
+        "local_authority_expired": expired,
+        "authorization_required": True,
+        "execution_location": "local_platform_executor",
+        "intent_source": task["policy"].get("execution_channel_source", ""),
         "accounts": rows,
     }
 
@@ -351,18 +381,49 @@ class TaskChannelRouter:
         return sorted(task_ids)
 
     def prepare(self, job):
-        from .execution_channels import binding, independent_active, read_state
+        from .channel_decisions import audit_route
+
+        try:
+            context, cloud = self._prepare(job)
+        except Exception as exc:
+            self.store.audit_best_effort(
+                "execution.channel_failed",
+                {
+                    "job_id": job["id"],
+                    "account_id": job["account_id"],
+                    "stage": "authorization",
+                    "reason": safe_channel_code(str(exc)),
+                },
+                task_id=job["task_id"],
+            )
+            raise
+        audit_route(self.engine, job, context)
+        return context, cloud
+
+    def _prepare(self, job):
+        from .execution_channels import binding, independent_active, offline_only, read_state
 
         now = self.engine.clock()
         task = self.store.one("SELECT policy FROM tasks WHERE id=?", (job["task_id"],))
         if not task:
             raise CloudUnavailable("TaskChannelTaskMissing")
         policy = json.loads(task["policy"])
-        channel, until = effective(self.engine, policy), epoch(policy["ends_at"])
+        channel, until = (
+            effective(self.engine, policy, job["task_id"], job["account_id"]),
+            epoch(policy["ends_at"]),
+        )
         if until <= now:
             raise CloudUnavailable("TaskChannelWindowExpired")
-        cloud = CloudControl.configured()
-        node_id = cloud.node_id if cloud else os.getenv("AP_NODE_ID", socket.gethostname())
+        no_cloud = offline_only(self.store, job["account_id"]) or (
+            channel == "local" and offline_only(self.store)
+        )
+        if no_cloud and channel == "cloud":
+            raise CloudUnavailable("LocalOfflineModeActive")
+        cloud = None if no_cloud else CloudControl.configured()
+        local_state = read_state(self.store)
+        node_id = (local_state.get("node_id") if no_cloud else None) or (
+            cloud.node_id if cloud else os.getenv("AP_NODE_ID", socket.gethostname())
+        )
         store_id = binding(self.engine)
         if cloud and self.store.one(
             "SELECT 1 FROM cloud_receipt_outbox WHERE json_extract(lease,'$.account_id')=? LIMIT 1",
@@ -385,6 +446,16 @@ class TaskChannelRouter:
                 raise CloudUnavailable("TaskChannelHandoffPending")
             old_binding = channel_binding(db, job["account_id"])
             bound = binding_matches(prior, old_binding, node_id, store_id)
+            if no_cloud and prior and prior["channel"] == "cloud":
+                proof = local_state.get("offline_fences", {}).get(job["account_id"], {})
+                if (
+                    not bound
+                    or prior["state"] != "ready"
+                    or prior["until_at"] > now
+                    or proof.get("generation") != prior["generation"]
+                    or proof.get("until_at") != prior["until_at"]
+                ):
+                    raise CloudUnavailable("OfflinePriorOwnershipUnverified")
             reusable = bool(
                 prior
                 and prior["state"] == "ready"
@@ -461,7 +532,7 @@ class TaskChannelRouter:
                 if channel == "cloud":
                     if not cloud:
                         raise CloudUnavailable("CloudControlConfigurationMissing")
-                    cloud.flush_settings(self.engine)
+                    cloud.flush_settings(self.engine, account_id=job["account_id"])
                     cloud.sync(self.engine, task_ids=[job["task_id"]])
             else:
                 required = self.store.one(
@@ -496,7 +567,7 @@ class TaskChannelRouter:
                                 and self.engine.clock() < observed["until_at"] < until
                             ):
                                 raise CloudUnavailable("TaskChannelHandoffUnverified")
-                        cloud.flush_settings(self.engine)
+                        cloud.flush_settings(self.engine, account_id=job["account_id"])
                         CloudJournal(self.engine, cloud).flush(account_id=job["account_id"])
                         cloud.sync(self.engine, task_ids=self.handoff_tasks(job, prior))
                         observed = cloud.request(

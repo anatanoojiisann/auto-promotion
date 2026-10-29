@@ -370,7 +370,7 @@ class JobQueue:
                     (max(now, due[0]), now, job["id"]),
                 )
 
-    def claim(self, pool, owner, lease_seconds=90):
+    def claim(self, pool, owner, lease_seconds=90, *, reference_id=None):
         from .account_blocks import recover_private_stop
 
         for account in self.store.rows("SELECT * FROM accounts WHERE mode='live'"):
@@ -400,9 +400,17 @@ class JobQueue:
                 "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' "
                 "AND busy.lease_until>? AND busy.account_id=j.account_id) "
                 "AND NOT EXISTS(SELECT 1 FROM account_lanes lane "
-                "WHERE lane.account_id=j.account_id AND lane.expires_at>?)"
+                "WHERE lane.account_id=j.account_id AND lane.expires_at>?) "
+                "AND j.expires_at>? AND (j.kind<>'send' OR t.phase='ready') "
+                "AND NOT EXISTS(SELECT 1 FROM execution_resources r WHERE r.resource=json_extract(j.route,'$.resource') AND r.expires_at>?) "
+                "AND NOT EXISTS(SELECT 1 FROM account_task_channels ch LEFT JOIN tasks holder ON holder.id=ch.task_id "
+                "WHERE ch.account_id=j.account_id AND (ch.retry_at>? OR (ch.state='handoff' AND ch.task_id<>j.task_id "
+                "AND holder.state='active' AND unixepoch(json_extract(holder.policy,'$.ends_at'))>?)))"
             )
-            params = [pool, now, now, now, now, now, now]
+            params = [pool, now, now, now, now, now, now, now, now, now, now]
+            if reference_id is not None:
+                sql += " AND j.reference_id=?"
+                params.append(reference_id)
             from .execution_channels import local_account_scope
 
             accounts = local_account_scope(db, now)
@@ -423,10 +431,10 @@ class JobQueue:
                 params.extend(task_ids)
             sql += (
                 " ORDER BY CASE WHEN j.kind='send' THEN 0 ELSE 1 END,a.next_at,"
-                "j.available_at,COALESCE(i.position,0),j.id LIMIT 64"
+                "j.available_at,COALESCE(i.position,0),j.id"
             )
             self._refresh_intent_waits(db, pool, now)
-            rows = db.execute(sql, params).fetchall()
+            rows = db.execute(sql, params)
             for row in rows:
                 from .task_channels import handoff_blocks
 
@@ -575,6 +583,8 @@ class JobQueue:
                     job["owner"],
                 ),
             )
+            if state in WRITE_TERMINAL:
+                self.engine._mark_completed(db, job["task_id"])
         return state
 
     def pools(self, task_id=None):

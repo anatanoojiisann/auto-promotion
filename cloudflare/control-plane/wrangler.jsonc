@@ -8,7 +8,7 @@
     "WORKSPACE_ID": "auto-promotion",
     "FALLBACK_NODE_ID": "windows-primary",
     "FALLBACK_STORE_ID": "feea453950ce4caebed3e167ff8598f5",
-    "LOCAL_CHANNEL_UNTIL": "1792858322.783418",
+    "LOCAL_CHANNEL_UNTIL": "1792956600",
     "TELEGRAM_EXECUTOR_ACCOUNT": "acc-d9b07057bfe9",
   },
   "services": [

@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "wait_seconds": 7200,
+  "source": "Replace with the human instruction authorizing this continuous policy before enabling.",
+  "external_accounts": []
+}

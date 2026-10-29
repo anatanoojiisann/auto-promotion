@@ -930,6 +930,8 @@ class EngineTests(unittest.TestCase):
                         changes["title"] = "Synthetic title"
                 if platform == "instagram" and action == "publish":
                     changes.update(target="owned", target_owned=True, media=[media])
+                if platform == "instagram" and action in {"comment", "reply"}:
+                    changes["target"] = "https://www.instagram.com/p/synthetic_" + action + "/"
                 if platform == "x":
                     changes["target"] = "https://x.com/example/status/" + str(number)
                     if action in {"like", "repost"}:
@@ -954,8 +956,8 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(item["status"], expected, (platform, action))
                 if expected != "manual_attention":
                     self.assertTrue(item["external_reference"].startswith("simulation://"))
-        self.assertEqual(number, 14)
-        self.assertEqual(self.provider.sends, 13)
+        self.assertEqual(number, 16)
+        self.assertEqual(self.provider.sends, 15)
 
     def test_simulated_discovery_flows_through_qualification(self):
         for platform in ["telegram", "reddit", "x"]:

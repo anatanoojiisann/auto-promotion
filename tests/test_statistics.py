@@ -80,7 +80,7 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(data["totals"]["pending_verification"], 2)
         self.assertIsNone(data["totals"]["received_replies"])
         self.assertEqual(data["scope"], "all_live_tasks")
-        self.assertEqual(len(data["platforms"]), 6)
+        self.assertEqual(len(data["platforms"]), 7)
 
     def test_midnight_and_actual_publication_date_not_planned_or_verification_time(self):
         midnight, _ = day_bounds("2026-10-13")

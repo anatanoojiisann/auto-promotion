@@ -135,6 +135,18 @@ class AdapterRegistry:
             return self.overrides[account["platform"]].call(account, operation, payload)
         if account["mode"] == "simulation":
             return self.simulation.call(account, operation, payload)
+        if account["platform"] == "tiktok":
+            from .tiktok_browser import TikTokBrowser
+
+            browser = TikTokBrowser.for_account(self.database, account)
+            if browser:
+                return browser.backend(account, operation, payload)
+        if account["platform"] in {"facebook", "instagram"}:
+            from .meta_browser import MetaBrowser
+
+            browser = MetaBrowser.for_account(self.database, account)
+            if browser:
+                return browser.backend(account, operation, payload)
         legacy = os.getenv("AP_" + account["platform"].upper() + "_BACKEND", "builtin") == "legacy"
         if legacy and account["platform"] in {"discord", "tiktok"}:
             raise RuntimeError(account["platform"] + "_legacy_backend_unsupported")
@@ -206,6 +218,8 @@ class AdapterRegistry:
                 "platform": p,
                 "project": name
                 if os.getenv("AP_" + p.upper() + "_BACKEND") == "legacy"
+                else "auto_promotion.meta_browser"
+                if p == "facebook"
                 else "auto_promotion.backends." + ("browser" if p in {"reddit", "x"} else p),
                 "installed": (self.workspace / name).is_dir()
                 if os.getenv("AP_" + p.upper() + "_BACKEND") == "legacy"

@@ -348,8 +348,11 @@ class TelegramBackend:
             if operation == "preflight":
                 item = payload["payload"]
                 target = await client.get_entity(self.target(item["target"]))
-                permissions = await client.get_permissions(target, "me")
-                allowed = self.can_send_messages(target, permissions)
+                if getattr(target, "bot", False):
+                    allowed = self.is_spambot_diagnostic(target, item)
+                else:
+                    permissions = await client.get_permissions(target, "me")
+                    allowed = self.can_send_messages(target, permissions)
                 return {
                     "allowed": allowed,
                     **({"reason": "TargetWriteForbidden"} if not allowed else {}),
@@ -799,6 +802,21 @@ class TelegramBackend:
         }
 
     @staticmethod
+    def is_spambot_diagnostic(entity, item):
+        """Only an exact, identity-pinned diagnostic command may address a bot."""
+        return bool(
+            getattr(entity, "bot", False)
+            and (getattr(entity, "username", "") or "").casefold() == "spambot"
+            and item.get("target", "").casefold() == "@spambot"
+            and item.get("recipient_id") == str(getattr(entity, "id", ""))
+            and item.get("action") == "send_message"
+            and item.get("text") == "/start"
+            and not item.get("media")
+            and not item.get("reply_to")
+            and not item.get("title")
+        )
+
+    @staticmethod
     def can_send_messages(entity, permissions):
         """Resolve group write access from Telegram's ban rights and membership state."""
         if getattr(entity, "broadcast", False):
@@ -843,21 +861,33 @@ class TelegramBackend:
             # server still decides races between this read and the final RPC.
             from telethon import errors
 
-            try:
-                permissions = await client.get_permissions(entity, "me")
-            except (
-                errors.ChannelPrivateError,
-                errors.UserNotParticipantError,
-                errors.ChatWriteForbiddenError,
-                errors.ChatAdminRequiredError,
-            ) as exc:
-                return {"status": "failed_known", "verified": False, "reason": type(exc).__name__}
-            if not self.can_send_messages(entity, permissions):
-                return {
-                    "status": "failed_known",
-                    "verified": False,
-                    "reason": "TargetWriteForbidden",
-                }
+            if getattr(entity, "bot", False):
+                if not self.is_spambot_diagnostic(entity, item):
+                    return {
+                        "status": "failed_known",
+                        "verified": False,
+                        "reason": "UnsupportedBotDiagnostic",
+                    }
+            else:
+                try:
+                    permissions = await client.get_permissions(entity, "me")
+                except (
+                    errors.ChannelPrivateError,
+                    errors.UserNotParticipantError,
+                    errors.ChatWriteForbiddenError,
+                    errors.ChatAdminRequiredError,
+                ) as exc:
+                    return {
+                        "status": "failed_known",
+                        "verified": False,
+                        "reason": type(exc).__name__,
+                    }
+                if not self.can_send_messages(entity, permissions):
+                    return {
+                        "status": "failed_known",
+                        "verified": False,
+                        "reason": "TargetWriteForbidden",
+                    }
             schedule = (
                 datetime.fromisoformat(item["scheduled_at"].replace("Z", "+00:00"))
                 if native

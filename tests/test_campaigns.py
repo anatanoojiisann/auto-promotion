@@ -302,8 +302,10 @@ class CampaignTests(unittest.TestCase):
         with self.store.connect() as db:
             self.assertEqual(quota_events(db, "live"), [])
             self.assertEqual(quota_events(db, "live", delivery=True), [])
-        self.campaigns.change_state(campaign["id"], "cancelled")
-        self.assertEqual(self.store.one("SELECT count(*) n FROM content_contacts")["n"], 0)
+        finished = self.engine.task(task["id"])
+        self.assertEqual(finished["state"], "completed")
+        self.assertEqual(finished["items"][0]["status"], "manual_attention")
+        self.assertEqual(self.store.one("SELECT count(*) n FROM content_contacts")["n"], 1)
         with (
             patch("auto_promotion.core.automatic_actions", return_value=["reply"]),
             patch.object(self.engine.adapters, "commissioned", return_value=True),
@@ -315,9 +317,9 @@ class CampaignTests(unittest.TestCase):
                         pool=pool,
                         values=[
                             self.opportunity(
-                                1,
+                                2,
                                 platform="x",
-                                target="https://x.com/test/status/123",
+                                target="https://x.com/test/status/124",
                                 reply_to=None,
                             )
                         ],

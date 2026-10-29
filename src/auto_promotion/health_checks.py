@@ -7,6 +7,9 @@ from .backends.common import profile_path
 from .models import digest
 
 TRANSIENT = {
+    "MetaBrowserRecheckRequired",
+    "MetaBrowserDesktopExecutorRequired",
+    "MetaBrowserReceiptCheckRequired",
     "IncompleteReadError",
     "IncompleteRead",
     "ConnectionResetError",

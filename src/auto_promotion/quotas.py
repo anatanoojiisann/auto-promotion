@@ -25,7 +25,9 @@ def bounded(left, right):
     return {k: min(left[k], right[k]) for k in ("daily", "hourly")}
 
 
-def scopes(db, account, task, payload):
+def scopes(db, account, task, payload, *, include_local_override=True):
+    from .account_daily_local import enabled
+
     account, task = dict(account), dict(task)
     policy = task["policy"]
     if isinstance(policy, str):
@@ -40,7 +42,9 @@ def scopes(db, account, task, payload):
             "account",
             account["id"],
             {
-                "daily": min(
+                "daily": None
+                if include_local_override and enabled(db, platform)
+                else min(
                     account["daily_limit"],
                     policy.get("account_daily_limit") or account["daily_limit"],
                 ),
@@ -203,7 +207,10 @@ class Calendar:
         day = at - at % 86400
         for scope, key, limit in limits:
             times = self.times.get((mode, scope, key), [])
-            if bisect_left(times, day + 86400) - bisect_left(times, day) >= limit["daily"]:
+            if (
+                limit["daily"] is not None
+                and bisect_left(times, day + 86400) - bisect_left(times, day) >= limit["daily"]
+            ):
                 next_at, reason = max(next_at, day + 86400), scope + "_daily_limit"
             if len(times) < limit["hourly"]:
                 continue
@@ -227,11 +234,33 @@ class Calendar:
 
 
 def check_claim(db, account, task, payload, due, now, item_id):
+    from .interaction_intents import explicit_unsent_retry_source
+
     limits = scopes(db, account, task, payload)
-    actual = Calendar(events(db, account["mode"], exclude_item=item_id))
+    proof = explicit_unsent_retry_source(db, account, task, payload, item_id)
+
+    def records(*, delivery):
+        rows = events(db, account["mode"], delivery=delivery, exclude_item=item_id)
+        if not proof:
+            return rows
+        at = proof["due_at"] if delivery else proof["attempt_at"]
+        return [
+            {**row, "target": None, "user": None}
+            if (
+                row.get("account") == proof["account"]
+                and row.get("task") == proof["task"]
+                and row.get("at") == at
+                and row.get("target") == proof["target"]
+                and row.get("user") == proof["user"]
+            )
+            else row
+            for row in rows
+        ]
+
+    actual = Calendar(records(delivery=False))
     if actual.blocker(limits, now, account["mode"], future=False)[0]:
         return "activity_limit"
-    delivery = Calendar(events(db, account["mode"], delivery=True, exclude_item=item_id))
+    delivery = Calendar(records(delivery=True))
     if delivery.blocker(limits, due, account["mode"])[0]:
         return "delivery_limit"
     return None

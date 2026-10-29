@@ -464,8 +464,17 @@ class CloudControl:
         )
 
     def sync(self, engine, *, force=False, task_ids=None, metadata_only=False):
-        from .execution_channels import binding
+        from .execution_channels import binding, offline_only
 
+        if offline_only(engine.store):
+            if not task_ids:
+                raise CloudUnavailable("LocalOfflineModeActive")
+            for tid in task_ids:
+                row = engine.store.one("SELECT account_ids FROM tasks WHERE id=?", (tid,))
+                if not row or any(
+                    offline_only(engine.store, a) for a in json.loads(row["account_ids"])
+                ):
+                    raise CloudUnavailable("LocalOfflineModeActive")
         binding(engine)
         selected = sorted(set(task_ids or [])) if task_ids is not None else None
         if selected is not None:
@@ -738,7 +747,11 @@ class CloudControl:
                         now=engine.clock(),
                     )
 
-    def flush_settings(self, engine):
+    def flush_settings(self, engine, *, account_id=None):
+        from .execution_channels import offline_only
+
+        if offline_only(engine.store, account_id):
+            raise CloudUnavailable("LocalOfflineModeActive")
         pending = engine.store.one("SELECT value FROM meta WHERE key='cloud_pending_settings'")
         if not pending:
             return
@@ -827,6 +840,29 @@ def _export_snapshot(engine, db, *, task_ids=None):
             except BackendError:
                 pass
     tasks = {t["id"]: dict(t) for t in db.execute("SELECT * FROM tasks")}
+    # Imported history never becomes remote executable jobs. A production
+    # catalog release awaiting human approval must not disrupt existing platforms
+    # by uploading unsupported desktop accounts; it grants no local write path.
+    archived_tasks = {
+        r[0]
+        for r in db.execute(
+            "SELECT task_id FROM meta_browser_sources UNION "
+            "SELECT i.task_id FROM meta_browser_history h JOIN items i ON i.id=h.item_id"
+        )
+    }
+    release = db.execute("SELECT value FROM meta WHERE key='meta_browser_cloud_catalog'").fetchone()
+    withheld = (
+        {r[0] for r in db.execute("SELECT account_id FROM meta_browser_accounts")}
+        if release and release[0] == "pending_user_approval"
+        else set()
+    )
+    excluded = archived_tasks | {
+        t["id"] for t in tasks.values() if withheld.intersection(json.loads(t["account_ids"]))
+    }
+    if task_ids is not None and set(task_ids).intersection(excluded):
+        raise CloudUnavailable("MetaBrowserCloudCatalogPending")
+    tasks = {k: t for k, t in tasks.items() if k not in excluded}
+    accounts = {k: a for k, a in accounts.items() if k not in withheld}
     if task_ids is not None:
         selected = set(task_ids)
         if selected - tasks.keys():
@@ -855,6 +891,10 @@ def _export_snapshot(engine, db, *, task_ids=None):
             continue
         route = route_for(a)
         allowed = a["automatic_actions"] if a["platform"] == "x" else a["capabilities"]
+        if route.transport == "desktop":
+            allowed = a["automatic_actions"]
+        elif a["platform"] == "instagram":
+            allowed = ["publish", "manual_comment"]
         if a["platform"] == "reddit":
             allowed = []
         result["accounts"].append(
@@ -899,6 +939,8 @@ def _export_snapshot(engine, db, *, task_ids=None):
             }
         )
     for row in db.execute("SELECT * FROM items").fetchall():
+        if row["task_id"] in excluded:
+            continue
         if task_ids is not None and row["task_id"] not in tasks:
             continue
         t, a = tasks.get(row["task_id"]), accounts.get(row["account_id"])
@@ -913,7 +955,7 @@ def _export_snapshot(engine, db, *, task_ids=None):
         native = p["action"] in {"schedule_message", "schedule_file"}
         scopes = [
             {"scope": k, "key": canonical([a["mode"], str(key)]), "limit": limit}
-            for k, key, limit in quotas.scopes(db, a, t, p)
+            for k, key, limit in quotas.scopes(db, a, t, p, include_local_override=False)
         ]
         result["jobs"].append(
             {
@@ -939,6 +981,8 @@ def _export_snapshot(engine, db, *, task_ids=None):
             }
         )
     for row in db.execute("SELECT * FROM candidates WHERE decision='qualified'").fetchall():
+        if row["task_id"] in excluded:
+            continue
         if task_ids is not None and row["task_id"] not in tasks:
             continue
         t, a = tasks.get(row["task_id"]), accounts.get(row["account_id"])
@@ -954,7 +998,7 @@ def _export_snapshot(engine, db, *, task_ids=None):
         p = {"target": row["target"], "recipient_id": row["target"], "action": "join"}
         scopes = [
             {"scope": k, "key": canonical([a["mode"], str(key)]), "limit": limit}
-            for k, key, limit in quotas.scopes(db, a, t, p)
+            for k, key, limit in quotas.scopes(db, a, t, p, include_local_override=False)
         ]
         result["jobs"].append(
             {
@@ -1076,6 +1120,14 @@ class CloudJournal:
         self.flush(job_id=lease["id"])
 
     def flush(self, job_id=None, *, account_id=None):
+        from .execution_channels import offline_only
+
+        if job_id and account_id is None:
+            row = self.store.one("SELECT account_id FROM execution_jobs WHERE id=?", (job_id,))
+            if row:
+                account_id = row["account_id"]
+        if offline_only(self.engine.store, account_id):
+            raise CloudUnavailable("LocalOfflineModeActive")
         now = self.engine.clock()
         if not job_id:
             self.refresh_reconciled(account_id=account_id)

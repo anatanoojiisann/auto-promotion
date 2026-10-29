@@ -126,6 +126,9 @@ class ScopedReadinessDisplayTests(unittest.TestCase):
         channel["valid_for_task"] = True
         self.assertEqual(self.workflow()["status"], "waiting_schedule")
         channel["until"] = self.now
+        # A validated task-scoped lease may outlive the legacy global entry.
+        self.assertEqual(self.workflow()["status"], "waiting_schedule")
+        channel["valid_for_task"] = False
         self.assertEqual(self.workflow()["status"], "waiting_execution_service")
 
     def test_retry_time_is_distinct_from_send_schedule(self):

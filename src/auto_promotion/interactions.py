@@ -416,7 +416,9 @@ class Interactions(InteractionSchedule, JointInteractions):
                         account["hourly_limit"],
                         config.publishing.max_per_account_hour or account["hourly_limit"],
                     ),
-                    "daily_limit": min(
+                    "daily_limit": None
+                    if account.get("daily_limit_unlimited_locally")
+                    else min(
                         account["daily_limit"],
                         config.publishing.max_per_account_day or account["daily_limit"],
                     ),

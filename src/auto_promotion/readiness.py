@@ -9,6 +9,10 @@ DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
     "account_outbound_blocked": "账号外发已暂停，请在账号中心处理原因并检查恢复",
+    "meta_source_unknown": "旧流程状态或回执无法确认，先只读核验",
+    "meta_source_busy": "该账号的旧互动或回复观察仍未结束",
+    "meta_outcome_unknown": "该账号存在未决提交，先核对回执",
+    "meta_duplicate_target": "该原帖已被其他任务互动或占用，已阻止重复提交",
     "execution_account_mismatch": "发送清单账号与当前执行归属不一致，已阻止提交",
     "conversation_owner_mismatch": "P0 执行账号必须与原会话账号一致",
     "joint_priority_not_dispatched": "联合策略仅处理已确认的 P0/P1 需求",
@@ -51,6 +55,8 @@ REASONS = {
     "join_wait_pending": "尚未满足入群后等待时间",
     "manifest_integrity_failed": "任务配置或发送清单完整性检查未通过",
     "interaction_dependencies_pending": "前置互动尚未全部核验实际发布，暂不开始计时",
+    "interaction_dependencies_failed": "前置任务已失败、取消或错过窗口，不能满足发布依赖",
+    "interaction_dependency_deadline_elapsed": "等待前置任务已超过截止时间，请重新安排",
     "interaction_dependencies_invalid": "前置互动任务或账号范围不匹配",
     "interaction_schedule_elapsed": "互动完成后的目标时间已过，需要创建新排期",
     "interaction_schedule_outside_window": "互动完成后的目标时间超出本任务窗口",
@@ -128,13 +134,7 @@ def task_workflow(task, blockers, item_blockers, now):
         and global_at is not None
         and global_at < observed_at
     )
-    local_until = timestamp(channel.get("until"))
-    fallback = bool(
-        channel.get("active") == "local"
-        and channel.get("valid_for_task") is True
-        and local_until is not None
-        and local_until > now
-    )
+    fallback = channel.get("valid_for_task") is True
 
     def step(status, label, message, action=None, next_at=None, next_at_kind=None):
         return {
@@ -145,6 +145,11 @@ def task_workflow(task, blockers, item_blockers, now):
             "next_at": next_at,
             "next_at_kind": next_at_kind,
             "schedule_next_at": schedule_at if schedule_at and schedule_at > now else None,
+            "channel_decision": task.get("channel", {}),
+            "execution_location": "local_platform_executor",
+            "wait_scope": "item_or_account"
+            if status not in {"completed", "cancelled", "completed_pending_verification"}
+            else "receipt",
             "service_observation": {
                 "global_state": cloud.get("state"),
                 "global_at": global_at,
@@ -157,10 +162,22 @@ def task_workflow(task, blockers, item_blockers, now):
             }
             if task["mode"] == "live" and cloud
             else None,
+            "blocking_items": item_blockers,
+            "blocked_accounts": [
+                a["account_id"] for a in task.get("account_checks", []) if not a["ready"]
+            ],
             "can_prepare": bool(task["items"] and not item_blockers and not task["manifest_hash"]),
             "counts": counts,
         }
 
+    if task["state"] == "completed" and any(
+        i["status"] in {"unknown", "scheduled", "manual_attention"} for i in task["items"]
+    ):
+        return step(
+            "completed_pending_verification",
+            "执行已结束 · 回执待处理",
+            "执行批次已结束；未知结果只读核验，平台排期仍需核对，人工项目保留待处理状态。",
+        )
     if task["state"] in {"cancelled", "completed"}:
         return step(
             task["state"],
@@ -204,7 +221,21 @@ def task_workflow(task, blockers, item_blockers, now):
             "delivery_limit",
         ):
             if reason in blockers:
-                return step(reason, REASONS[reason], REASONS[reason])
+                retry = max(
+                    (
+                        a.get("retry_at") or 0
+                        for a in task.get("account_checks", [])
+                        if not a["ready"]
+                    ),
+                    default=0,
+                )
+                return step(
+                    reason,
+                    REASONS[reason],
+                    REASONS[reason],
+                    next_at=retry if retry > now else None,
+                    next_at_kind="account_retry" if retry > now else None,
+                )
     if not task["items"]:
         return step(
             "prepare_items",
@@ -266,6 +297,23 @@ def task_workflow(task, blockers, item_blockers, now):
     if not task["manifest_hash"]:
         return step("starting", "正在准备发送", "任务已启动，调度器将自动固定清单并继续发送。")
     if pending:
+        choice = task.get("channel", {})
+        if choice.get("local_authority_expired"):
+            return step(
+                "waiting_local_authority",
+                "本机授权已到期",
+                "本任务保持本机选择，等待续期；不会自动改用线上。",
+            )
+        waits = [a for a in choice.get("accounts", []) if a.get("blocking_reason")]
+        if waits:
+            wait = waits[0]
+            return step(
+                "waiting_channel_authority",
+                "等待账号通道核验",
+                wait["blocking_reason"],
+                next_at=wait.get("retry_at") or None,
+                next_at_kind="service_retry",
+            )
         if (
             task["mode"] == "live"
             and not fallback
@@ -298,7 +346,10 @@ def task_workflow(task, blockers, item_blockers, now):
                 next_at=timestamp(scope.get("retry_at")),
                 next_at_kind="service_retry",
             )
-        next_at = schedule_at
+        next_at = max(
+            schedule_at,
+            max((a.get("pacing_until", 0) for a in task.get("account_checks", [])), default=0),
+        )
         if next_at > now:
             return step(
                 "waiting_schedule",
@@ -310,7 +361,11 @@ def task_workflow(task, blockers, item_blockers, now):
         return step(
             "ready",
             "已启动 · 本地通道" if fallback else "已启动 · 待执行",
-            "服务器额度已用尽，按原有本地通道执行；去重、限速和回执核验继续生效。"
+            (
+                "服务器写入额度耗尽，按已授权备用本机通道执行。"
+                if channel.get("reason") == "CloudWriteQuotaExceeded"
+                else "按用户选择及有效授权使用本机通道；去重、限速和回执核验继续生效。"
+            )
             if fallback
             else "按启动时固定的清单执行并逐项核验回执。",
         )
@@ -356,7 +411,11 @@ def telegram_blocker(db, task, payload, at):
         if not isinstance(eligible_at, str):
             return "join_wait_unverified"
         try:
-            eligible = epoch(eligible_at)
+            # Membership receipts retain the legacy one-hour deadline. An
+            # explicitly configured task delay is measured from that same
+            # verified observation, consistently with schedule resolution.
+            delay = policy.get("outbound_after_membership_seconds")
+            eligible = epoch(eligible_at) + (delay - 3600 if delay is not None else 0)
         except (KeyError, TypeError, ValueError):
             return "join_wait_unverified"
         if eligible > at:

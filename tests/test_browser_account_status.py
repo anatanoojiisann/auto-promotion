@@ -76,7 +76,9 @@ class BrowserAccountStatusTests(unittest.TestCase):
             self.assertEqual(self.page.evaluate(STATUS_JS), expected)
 
     def test_verification_in_second_page_survives_before_home_navigation(self):
-        self.context.route("**/*", lambda route: route.fulfill(content_type="text/html", body="<p>offline</p>"))
+        self.context.route(
+            "**/*", lambda route: route.fulfill(content_type="text/html", body="<p>offline</p>")
+        )
         self.page.goto("https://x.com/home")
         second = self.context.new_page()
         second.goto("https://x.com/account/access")

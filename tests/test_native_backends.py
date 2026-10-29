@@ -70,7 +70,7 @@ class PrivateBackendTests(unittest.TestCase):
 
     def test_builtin_catalog_does_not_require_sibling_checkouts(self):
         registry = AdapterRegistry(Path(self.tmp.name) / "missing-workspace")
-        self.assertEqual(len(registry.services()), 6)
+        self.assertEqual(len(registry.services()), 7)
         self.assertTrue(all(service["installed"] for service in registry.services()))
 
     def test_native_health_without_configuration_is_explicitly_unavailable(self):
@@ -640,6 +640,80 @@ class TelegramTests(unittest.TestCase):
         self.assertEqual(self.saved[1]["message_ids"], [123])
         self.assertIsNone(self.client.sends[0][1]["parse_mode"])
         self.assertEqual(len(self.authorized), 1)
+
+    def test_exact_spambot_start_keeps_authorization_and_independent_receipt(self):
+        from unittest.mock import AsyncMock
+
+        from telethon import types as telegram_types
+
+        backend = self.backend()
+        self.client.get_entity = AsyncMock(
+            return_value=telegram_types.User(id=10, username="SpamBot", bot=True)
+        )
+        self.client.get_permissions = AsyncMock(
+            side_effect=AssertionError("Bots have no group membership")
+        )
+        result = self.run_action(backend, target="@SpamBot", text="/start", recipient_id="10")
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(len(self.client.sends), 1)
+        self.assertEqual(self.client.sends[0][0], "/start")
+        self.assertEqual(len(self.authorized), 1)
+        self.assertEqual(self.saved[1]["message_ids"], [123])
+        self.client.get_permissions.assert_not_called()
+
+    def test_spambot_preflight_is_readonly_and_requires_the_pinned_identity(self):
+        from unittest.mock import AsyncMock
+
+        from telethon import types as telegram_types
+
+        backend = self.backend()
+        self.client.get_entity = AsyncMock(
+            return_value=telegram_types.User(id=10, username="SpamBot", bot=True)
+        )
+        for recipient, allowed in [("10", True), ("11", False)]:
+            result = asyncio.run(
+                backend.run(
+                    "preflight",
+                    {
+                        "payload": dict(
+                            action="send_message",
+                            target="@SpamBot",
+                            text="/start",
+                            recipient_id=recipient,
+                        )
+                    },
+                    self.saved.append,
+                    lambda: self.authorized.append(True),
+                )
+            )
+            self.assertEqual(result["allowed"], allowed)
+        self.assertEqual(self.client.sends, [])
+        self.assertEqual(self.authorized, [])
+
+    def test_bot_exception_does_not_allow_other_commands_or_recipients(self):
+        from unittest.mock import AsyncMock
+
+        from telethon import types as telegram_types
+
+        for changes in [
+            dict(text="/help"),
+            dict(recipient_id="11"),
+            dict(target="@OtherBot"),
+            dict(action="reply", reply_to=1),
+            dict(action="schedule_message"),
+        ]:
+            with self.subTest(changes=changes):
+                backend = self.backend()
+                self.client.get_entity = AsyncMock(
+                    return_value=telegram_types.User(id=10, username="SpamBot", bot=True)
+                )
+                fields = dict(target="@SpamBot", text="/start", recipient_id="10")
+                fields.update(changes)
+                action = fields.pop("action", "send_message")
+                result = self.run_action(backend, action=action, **fields)
+                self.assertEqual(result["status"], "failed_known")
+                self.assertEqual(self.client.sends, [])
+                self.assertEqual(self.authorized, [])
 
     def test_submission_marker_failure_prevents_platform_send(self):
         import sqlite3
