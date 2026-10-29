@@ -9,7 +9,7 @@ collect/observe仅用标准库，不import项目Store/Engine；Windows专用合�
 ## Python
 
 ```sh
-python -m pip install -e '.[dev,telegram,mcp]'
+python -m pip install -e '.[dev,telegram,mcp,browser]'
 ruff check src tests
 ruff format --check src tests
 python -m unittest discover -s tests -v
@@ -41,6 +41,11 @@ python -m build
 - MCP 实际 stdio 握手、六个平台工具目录、任务草稿、直接启动与停止限制、单次执行和错误脱敏。
 
 平台调用使用合成数据或 mock。兼容模块单独保存在 `integrations/`，测试从本仓库读取，不从开发者电脑上的其他工程读取。
+
+Python 全量单元测试需要 `browser` extra 中的 Playwright SDK，以便导入真实异常和运行时类型；
+这不安装 Chromium，也不启动真实浏览器。`test_optional_browser_dependency.py` 另在禁止网络、
+阻断 SDK 导入的子进程验证：API 和模拟模式可用，缺少 SDK 的浏览器执行在启动或授权前失败。
+安装 SDK 时还验证真实超时类型只触发只读身份复查，不提交。
 
 Windows 启用全部内置后端及离线 Chromium 测试：
 
@@ -103,6 +108,10 @@ GitHub Actions 在 Python 3.11 / 3.14 上执行自动检查与构建，并另行
 `node scripts/test_offline.cjs test_startup_resilience.py` 覆盖成熟 schema 无写打开、
 DDL 整体回滚、未知 schema 版本拒绝、首次 worker 登记恢复、错误审计再次失败时父循环存活、
 以及启动时冻结的运行指纹和调度 task 存活状态。外置生产 wrapper 不由这些库修复自动替换。
+诊断用 `audit_best_effort` 无锁时应落库；写锁竞争时零等待、不重试，允许丢弃该条诊断，
+后台错误码及后续成功仍必须可见。测试分别控制无锁、真实写锁和审计失败条件，避免要求并发
+后台的一条尽力诊断必然落库。关键操作仍使用事务内 `Store.audit`；该审计失败必须传播并回滚
+同一事务的状态变更，不能改成尽力记录。
 
 Telegram 只读权限失败按实际账号身份、目标和检查种类暂存：明确拒绝等待 5 分钟，
 网络等不确定失败等待 30 秒；FloodWait 继续使用平台返回的账号冷却期。

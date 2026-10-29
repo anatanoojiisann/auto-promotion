@@ -1,5 +1,6 @@
 """Synthetic startup/host failures; never opens an existing account or business database."""
 
+import json
 import sqlite3
 import tempfile
 import threading
@@ -139,11 +140,25 @@ class StartupResilienceTests(unittest.TestCase):
         self.assertEqual(store.one("SELECT value FROM meta WHERE key='global_stop'")["value"], "1")
         self.assertFalse(store.rows("SELECT * FROM attempts"))
 
-    def test_background_sqlite_error_keeps_safe_code_and_later_success(self):
+    def _background_sqlite_error(self, *, reject_audit=False):
         from auto_promotion.interactions import Interactions
         from auto_promotion.meta_browser import MetaBrowser
 
         completed, calls = threading.Event(), []
+        diagnostics = []
+        original = Store.audit_best_effort
+        original_audit = Store.audit
+
+        def capture(store, kind, details, **kwargs):
+            result = original(store, kind, details, **kwargs)
+            if kind == "statistics.error":
+                diagnostics.append((details.copy(), result))
+            return result
+
+        def audit(db, kind, *args, **kwargs):
+            if reject_audit and kind == "statistics.error":
+                raise sqlite3.OperationalError("PRIVATE_AUDIT_LOCK")
+            return original_audit(db, kind, *args, **kwargs)
 
         def schedule(_):
             calls.append(True)
@@ -160,6 +175,8 @@ class StartupResilienceTests(unittest.TestCase):
             patch.object(Interactions, "schedule", schedule),
             patch.object(MetaBrowser, "sync", return_value=None),
             patch.object(PoolScheduler, "tick", return_value=None),
+            patch.object(Store, "audit_best_effort", capture),
+            patch.object(Store, "audit", side_effect=audit),
             patch("auto_promotion.api.WORKER_INTERVAL_SECONDS", 0.01),
         ):
             with TestClient(app) as client:
@@ -171,10 +188,60 @@ class StartupResilienceTests(unittest.TestCase):
                     time.sleep(0.01)
                 self.assertEqual(record["last_error_details"]["sqlite_errorname"], "SQLITE_BUSY")
                 self.assertGreaterEqual(record["last_success_at"], record["last_error_at"])
+                self.assertTrue(record["alive"])
                 self.assertNotIn("PRIVATE_SECRET", str(record))
-        audit = Store(self.path).rows("SELECT details FROM audit WHERE kind='statistics.error'")
-        self.assertTrue(any("SQLITE_BUSY" in row["details"] for row in audit))
-        self.assertNotIn("PRIVATE_SECRET", str(audit))
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0][0]["sqlite_errorname"], "SQLITE_BUSY")
+        self.assertNotIn("PRIVATE", str(diagnostics))
+        store = Store(self.path)
+        self.assertEqual(store.one("SELECT value FROM meta WHERE key='global_stop'")["value"], "1")
+        self.assertFalse(store.rows("SELECT * FROM attempts"))
+        # The concurrent sender may hold the write lock: diagnostic persistence is
+        # checked separately under deterministic unlocked/locked conditions below.
+        return diagnostics[0][1]
+
+    def test_background_sqlite_error_keeps_safe_code_and_later_success(self):
+        self._background_sqlite_error()
+
+    def test_background_report_recovers_when_diagnostic_audit_fails(self):
+        self.assertFalse(self._background_sqlite_error(reject_audit=True))
+
+    def test_diagnostic_audit_persists_when_unlocked(self):
+        store = Store(self.path)
+        details = {"reason": "report_cycle_failed", "sqlite_errorname": "SQLITE_BUSY"}
+        self.assertTrue(store.audit_best_effort("statistics.error", details, now=123))
+        row = store.one("SELECT at,details FROM audit WHERE kind='statistics.error'")
+        self.assertEqual(row["at"], 123)
+        self.assertEqual(json.loads(row["details"]), details)
+
+    def test_locked_diagnostic_audit_does_not_wait_retry_or_change_state(self):
+        store = Store(self.path)
+        with closing(sqlite3.connect(self.path)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with (
+                patch("auto_promotion.store.time.sleep") as sleep,
+                patch("auto_promotion.store.sqlite3.connect", wraps=sqlite3.connect) as connect,
+            ):
+                self.assertFalse(store.audit_best_effort("statistics.error", {"reason": "busy"}))
+            sleep.assert_not_called()
+            self.assertEqual(connect.call_count, 1)
+            self.assertEqual(connect.call_args.kwargs["timeout"], 0)
+            self.assertEqual(writer.execute("SELECT COUNT(*) FROM audit").fetchone()[0], 0)
+        self.assertEqual(store.one("SELECT value FROM meta WHERE key='global_stop'")["value"], "1")
+        self.assertFalse(store.rows("SELECT * FROM attempts"))
+
+    def test_required_audit_failure_rolls_back_the_protected_transaction(self):
+        store = Store(self.path)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "required audit unavailable"):
+            with store.connect(write=True) as db:
+                db.execute(
+                    "CREATE TEMP TRIGGER reject_audit BEFORE INSERT ON audit "
+                    "BEGIN SELECT RAISE(ABORT, 'required audit unavailable'); END"
+                )
+                db.execute("UPDATE meta SET value='0' WHERE key='global_stop'")
+                store.audit(db, "synthetic.required", {"reason": "test_only"})
+        self.assertEqual(store.one("SELECT value FROM meta WHERE key='global_stop'")["value"], "1")
+        self.assertFalse(store.rows("SELECT * FROM audit"))
 
     def test_health_freezes_runtime_fingerprint_and_tracks_actual_task_liveness(self):
         app = create_app(db_path=self.path, worker=False, report_worker=False)
