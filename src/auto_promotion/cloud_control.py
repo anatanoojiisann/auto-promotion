@@ -601,7 +601,21 @@ class CloudControl:
                     (health_key, canonical(value)),
                 )
 
-    def _sync(self, engine, *, force=False, task_ids=None, metadata_only=False):
+    def sync_channel_authorization(self, engine, job):
+        """Narrow explicit coordination; never mark a full task snapshot healthy."""
+        from .local_authorization import owns_authorization, validate_scope
+
+        with engine.store.connect() as db:
+            if not job.get("authorization_only") or not owns_authorization(db, job, engine.clock()):
+                raise CloudUnavailable("LocalAuthorizationLeaseExpired")
+            validate_scope(engine, db, job["task_id"], job["account_id"], engine.clock())
+        return self._sync(
+            engine, task_ids=[job["task_id"]], authorization_account=job["account_id"]
+        )
+
+    def _sync(
+        self, engine, *, force=False, task_ids=None, metadata_only=False, authorization_account=None
+    ):
         from .execution_channels import binding
 
         self._block_engine = engine
@@ -616,7 +630,11 @@ class CloudControl:
 
         def snapshot_for_scope():
             snapshot = (
-                export_snapshot(engine, task_ids=task_ids)
+                export_snapshot(
+                    engine, task_ids=task_ids, authorization_account=authorization_account
+                )
+                if authorization_account is not None
+                else export_snapshot(engine, task_ids=task_ids)
                 if task_ids is not None
                 else export_snapshot(engine)
             )
@@ -629,6 +647,13 @@ class CloudControl:
                 snapshot["accounts"] = [a for a in snapshot["accounts"] if a["id"] in accounts]
                 snapshot["jobs"] = [j for j in snapshot["jobs"] if j["task_id"] in selected]
                 # Retain the whole recent ledger: global limits span all tasks.
+            if authorization_account is not None:
+                snapshot["accounts"] = [
+                    a for a in snapshot["accounts"] if a["id"] == authorization_account
+                ]
+                snapshot["jobs"] = [
+                    j for j in snapshot["jobs"] if j["account_id"] == authorization_account
+                ]
             if metadata_only:
                 snapshot["jobs"] = []
             return snapshot
@@ -706,6 +731,17 @@ class CloudControl:
                     error.diagnostics = diagnostic
                     error.sync_revision = revision
                     raise
+                if authorization_account is not None and isinstance(
+                    result.get("account_blocks"), list
+                ):
+                    result = {
+                        **result,
+                        "account_blocks": [
+                            r
+                            for r in result["account_blocks"]
+                            if r.get("account_id") == authorization_account
+                        ],
+                    }
                 self.import_account_blocks(engine, result)
                 if result.get("stale"):
                     raise CloudUnavailable("CloudSnapshotStale")
@@ -785,14 +821,16 @@ def queue_settings(engine, changes):
         )
 
 
-def export_snapshot(engine, *, task_ids=None):
+def export_snapshot(engine, *, task_ids=None, authorization_account=None):
     """Export business data and immutable references, never credential profiles or sessions."""
     with engine.store.connect() as db:
         # One WAL read snapshot for parents, children, routes and quota evidence.
         # A concurrent task creation must not leave a child outside its parents.
         db.execute("BEGIN")
         try:
-            result, new_routes = _export_snapshot(engine, db, task_ids=task_ids)
+            result, new_routes = _export_snapshot(
+                engine, db, task_ids=task_ids, authorization_account=authorization_account
+            )
         except (KeyError, TypeError, ValueError):
             # Imported or partially migrated definitions must fail closed with
             # a stable code, never export an incomplete authorization boundary.
@@ -803,7 +841,7 @@ def export_snapshot(engine, *, task_ids=None):
     return result
 
 
-def _export_snapshot(engine, db, *, task_ids=None):
+def _export_snapshot(engine, db, *, task_ids=None, authorization_account=None):
     from .backends.common import BackendError, automatic_actions, read_profile
     from .models import CAPABILITIES
 
@@ -889,6 +927,8 @@ def _export_snapshot(engine, db, *, task_ids=None):
     for a in accounts.values():
         if scoped_accounts is not None and a["id"] not in scoped_accounts:
             continue
+        if authorization_account is not None and a["id"] != authorization_account:
+            continue
         route = route_for(a)
         allowed = a["automatic_actions"] if a["platform"] == "x" else a["capabilities"]
         if route.transport == "desktop":
@@ -939,6 +979,8 @@ def _export_snapshot(engine, db, *, task_ids=None):
             }
         )
     for row in db.execute("SELECT * FROM items").fetchall():
+        if authorization_account is not None and row["account_id"] != authorization_account:
+            continue
         if row["task_id"] in excluded:
             continue
         if task_ids is not None and row["task_id"] not in tasks:
@@ -981,6 +1023,8 @@ def _export_snapshot(engine, db, *, task_ids=None):
             }
         )
     for row in db.execute("SELECT * FROM candidates WHERE decision='qualified'").fetchall():
+        if authorization_account is not None and row["account_id"] != authorization_account:
+            continue
         if row["task_id"] in excluded:
             continue
         if task_ids is not None and row["task_id"] not in tasks:

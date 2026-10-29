@@ -98,9 +98,20 @@ async function scenario(name, options = {}) {
   const captured = gate(),
     release = gate();
   let starts = 0,
+    authorizations = 0,
     holdRead = false,
     heldRead = false;
   let current = task();
+  if (options.localAuthorization) {
+    current.policy.execution_channel = "local";
+    current.channel = {
+      requested: "local",
+      default: "local",
+      accounts: [],
+      local_authorization_accounts: [account.id],
+      local_authorizations: [],
+    };
+  }
   if (options.intentDisplay)
     current.readiness.items = [
       {
@@ -161,6 +172,27 @@ async function scenario(name, options = {}) {
         });
       return route.fulfill({ json: { id: "template-fixture" } });
     }
+    if (url.pathname.endsWith("/authorize-local-channel")) {
+      authorizations++;
+      assert.deepEqual(route.request().postDataJSON(), {
+        account_id: account.id,
+        coordinate_once: true,
+        source: "workbench_local_channel_authorization",
+      });
+      captured.resolve();
+      await release.promise;
+      if (options.failure)
+        return route.fulfill({
+          status: 409,
+          json: { error: "TaskChannelHandoffUnverified" },
+        });
+      current.channel.local_authorizations = [
+        { account_id: account.id, state: "ready" },
+      ];
+      return route.fulfill({
+        json: { authorization_only: true, attempt_created: false },
+      });
+    }
     if (url.pathname.endsWith("/start")) {
       starts++;
       captured.resolve();
@@ -215,7 +247,59 @@ async function scenario(name, options = {}) {
   try {
     await page.goto("http://task-race.test/#tasks/task-fixture");
     await page.locator("#run-task").waitFor();
-    if (options.templateSave) {
+    if (options.localAuthorization) {
+      const selector = "#local-channel-authorization-form";
+      await page
+        .locator(selector)
+        .evaluate((form) =>
+          form.dispatchEvent(new Event("submit", { cancelable: true })),
+        );
+      assert.equal(
+        authorizations,
+        0,
+        "Explicit coordination intent is required",
+      );
+      await page.locator(selector + " input[type=checkbox]").check();
+      await page.locator(selector).evaluate((form) => {
+        window.oldAuthorizationButton = form.querySelector("button");
+        form.requestSubmit(window.oldAuthorizationButton);
+        form.requestSubmit(window.oldAuthorizationButton);
+      });
+      await captured.promise;
+      await page.evaluate(() => window.executionPollTick());
+      await page.locator(selector + " input[type=checkbox]").check();
+      await page
+        .locator(selector)
+        .evaluate((form) => form.requestSubmit(form.querySelector("button")));
+      assert.equal(
+        authorizations,
+        1,
+        "Polling/redraw cannot repeat coordination",
+      );
+      if (options.navigate) {
+        await page.evaluate(() => {
+          location.hash = "tasks/task-other";
+        });
+        await page
+          .getByRole("heading", { name: "task-other", exact: true })
+          .waitFor();
+      }
+      release.resolve();
+      await page.waitForFunction(() => !window.oldAuthorizationButton.disabled);
+      assert.equal(starts, 0, "Authorization cannot start or submit a task");
+      if (options.navigate)
+        assert.equal(await page.locator("#notice").textContent(), "");
+      else {
+        await page.waitForFunction(
+          () => document.querySelector("#notice").textContent.length > 0,
+        );
+        const notice = await page.locator("#notice").textContent();
+        assert.match(
+          notice,
+          options.failure ? /TaskChannelHandoffUnverified/ : /未发送内容/,
+        );
+      }
+    } else if (options.templateSave) {
       await page.locator("#save-task-template").click();
       await page
         .getByRole("button", { name: "保存模板", exact: true })
@@ -385,6 +469,18 @@ async function scenario(name, options = {}) {
   });
   const failures = [];
   for (const [name, options] of [
+    [
+      "local-authorization-explicit-once-across-poll",
+      { localAuthorization: true },
+    ],
+    [
+      "local-authorization-failure-is-not-success",
+      { localAuthorization: true, failure: true },
+    ],
+    [
+      "late-local-authorization-keeps-new-route",
+      { localAuthorization: true, navigate: true },
+    ],
     ["pending-start-survives-redraw", { redraw: true }],
     ["late-start-success-keeps-new-route-draft", { navigate: true }],
     [

@@ -45,6 +45,13 @@ codex mcp add auto-promotion -- "$PWD\.venv\Scripts\python.exe" -m auto_promotio
 
 ## 工具与账号
 
+`authorize_local_channel(task_id, account_id, coordinate_once=true, source=...)`
+只在用户明确请求该账号/任务的一次控制服务协调时调用。它复用已有凭证建立本机通道归属，
+不启动草稿、不创建发送尝试、不操作浏览器、不解除其他账号的严格离线范围。
+任务必须已经明确启动并选择 `local`；纯离线且缺少归属证明仍保持等待。
+完整条件、工作台按钮及 API 流程见[执行通道](execution-channels.md)。加载新增工具及数据库
+迁移需要在安全窗口正常升级服务；源文件修改本身不会刷新旧 MCP 进程。
+
 真实 X 内容发现使用 `search_x_content(account_id, query, lookback_hours=12,
 timeout_seconds=30, max_results=100)`，通过注册账号的统一只读后端读取一页，
 不再使用临时浏览器脚本。结果包含原帖时间、读取预算及耗时；

@@ -47,6 +47,7 @@ from .interaction_models import (
 )
 from .interactions import Interactions
 from .legacy import inventory
+from .local_authorization import authorize_local_channel
 from .meta_browser import MetaBrowser
 from .models import (
     AccountInput,
@@ -114,6 +115,13 @@ class XSearchInput(BaseModel):
 class ResumeAccountBlock(BaseModel):
     model_config = ConfigDict(extra="forbid")
     generation: int = Field(strict=True, gt=0)
+
+
+class LocalChannelAuthorizationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_id: str = Field(min_length=1, max_length=120)
+    coordinate_once: bool = Field(strict=True)
+    source: str = Field(min_length=1, max_length=500)
 
 
 def create_app(
@@ -455,6 +463,15 @@ def create_app(
     @app.get("/api/meta-browser/status")
     def meta_browser_status():
         return meta_browser.status()
+
+    @app.post("/api/tasks/{task_id}/authorize-local-channel")
+    def authorize_task_local_channel(task_id: str, value: LocalChannelAuthorizationInput):
+        from .cloud_control import CloudUnavailable
+
+        try:
+            return authorize_local_channel(engine, task_id, **value.model_dump())
+        except CloudUnavailable as exc:
+            return JSONResponse({"error": str(exc), "authorization_only": True}, status_code=409)
 
     @app.post("/api/meta-browser/import-existing")
     def meta_browser_import():

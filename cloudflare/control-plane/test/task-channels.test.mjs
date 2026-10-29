@@ -45,7 +45,7 @@ function fixture() {
   k.registerNode({
     id: "node",
     token_hash: "a".repeat(64),
-    pools: ["x.edge"],
+    pools: ["x.edge", "facebook.desktop"],
     account_ids: ["a", "b", "alias"],
   });
   const node = k.node("node", "a".repeat(64));
@@ -55,11 +55,12 @@ function fixture() {
     channel = "inherit",
     identity = "x:" + account,
     executionMode = "automatic",
+    platform = "x",
   ) {
     const a = {
       id: account,
       identity,
-      platform: "x",
+      platform,
       mode: "live",
       limits: { daily: 50, hourly: 20 },
       min_interval: 0,
@@ -84,7 +85,7 @@ function fixture() {
       kind: "send",
       task_id: t.id,
       account_id: account,
-      pool: "x.edge",
+      pool: platform === "facebook" ? "facebook.desktop" : "x.edge",
       version: "payload-" + id,
       payload: { text: "synthetic", execution_mode: executionMode },
       action: "reply",
@@ -125,6 +126,35 @@ function fixture() {
     },
   };
 }
+
+test("first Facebook local handoff needs no prior route and does not attempt a job", () => {
+  const f = fixture();
+  const s = f.seed(
+    "facebook-first",
+    "a",
+    "local",
+    "facebook:synthetic",
+    "automatic",
+    "facebook",
+  );
+  assert.equal(f.k.accountChannel("a"), null);
+  const ack = f.handoff(s, "local");
+  assert.equal(ack.channel.channel, "local");
+  assert.equal(ack.channel.store_id, "synthetic-store");
+  assert.equal(ack.channel.node_id, "node");
+  assert.equal(f.k.claim(f.node, "facebook.desktop", s.j.id), null);
+  assert.equal(
+    f.db
+      .prepare("SELECT count(*) n FROM jobs WHERE attempt_at IS NOT NULL")
+      .get().n,
+    0,
+  );
+  assert.deepEqual(f.handoff(s, "local"), ack);
+  assert.throws(
+    () => f.handoff(s, "local", null, "2".repeat(32)),
+    /AccountChannelGenerationConflict/,
+  );
+});
 
 test("one account can return online while other legacy accounts remain fenced", () => {
   const f = fixture(),
@@ -223,17 +253,46 @@ test("handoff is idempotent, requires the current generation and preserves attem
 });
 
 test("same-generation renewal is monotone and bound to the original store and tuple", () => {
-  const f = fixture(), s = f.seed("renew", "a", "local");
+  const f = fixture(),
+    s = f.seed("renew", "a", "local");
   const first = f.handoff(s, "local", null, "1".repeat(32), 1800000050);
-  const renewed = f.k.setAccountChannel({ account_id: "a", task_id: s.t.id, node_id: "node",
-    store_id: "synthetic-store", channel: "local", generation: first.channel.generation,
-    expected_generation: first.channel.generation, until: 1800000100 });
+  const renewed = f.k.setAccountChannel({
+    account_id: "a",
+    task_id: s.t.id,
+    node_id: "node",
+    store_id: "synthetic-store",
+    channel: "local",
+    generation: first.channel.generation,
+    expected_generation: first.channel.generation,
+    until: 1800000100,
+  });
   assert.equal(renewed.channel.until_at, 1800000100);
   assert.equal(renewed.channel.store_id, "synthetic-store");
-  assert.throws(() => f.k.setAccountChannel({ account_id: "a", task_id: s.t.id, node_id: "node",
-    store_id: "wrong-store", channel: "local", generation: first.channel.generation,
-    expected_generation: first.channel.generation, until: 1800000150 }), /AccountChannelGenerationChanged/);
-  assert.throws(() => f.handoff(s, "local", first.channel.generation, first.channel.generation, 1800000090), /AccountChannelGenerationChanged/);
+  assert.throws(
+    () =>
+      f.k.setAccountChannel({
+        account_id: "a",
+        task_id: s.t.id,
+        node_id: "node",
+        store_id: "wrong-store",
+        channel: "local",
+        generation: first.channel.generation,
+        expected_generation: first.channel.generation,
+        until: 1800000150,
+      }),
+    /AccountChannelGenerationChanged/,
+  );
+  assert.throws(
+    () =>
+      f.handoff(
+        s,
+        "local",
+        first.channel.generation,
+        first.channel.generation,
+        1800000090,
+      ),
+    /AccountChannelGenerationChanged/,
+  );
 });
 
 test("channel ownership spans identity aliases and local expiry does not reopen online claims", () => {

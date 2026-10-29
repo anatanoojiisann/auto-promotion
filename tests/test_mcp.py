@@ -109,7 +109,10 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 69)
+        self.assertEqual(len(tools), 70)
+        self.assertIn("authorize_local_channel", tools)
+        self.assertTrue(tools["authorize_local_channel"].annotations.openWorldHint)
+        self.assertFalse(tools["authorize_local_channel"].annotations.readOnlyHint)
         self.assertIn("remove_x_local_account_daily_limits", tools)
         self.assertIn("search_x_content", tools)
         self.assertEqual(
@@ -318,7 +321,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
                     tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-                    self.assertEqual(len(tools), 69)
+                    self.assertEqual(len(tools), 70)
                     self.assertEqual(
                         set(tools), {tool.name for tool in await self.server.list_tools()}
                     )

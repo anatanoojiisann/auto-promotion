@@ -252,7 +252,7 @@ def extend_offline_scope(engine, account_ids, *, source="explicit_user_local_ret
             account = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
             if (
                 not account
-                or account["platform"] != "x"
+                or not independent_account_supported(db, dict(account))
                 or account["mode"] != "live"
                 or account["status"] != "healthy"
                 or account["disabled"]
@@ -335,6 +335,18 @@ def extend_offline_scope(engine, account_ids, *, source="explicit_user_local_ret
                 now=now,
             )
     return {"added": added, "account_ids": merged, "until": state["until"], "offline_only": True}
+
+
+def independent_account_supported(db, account):
+    from .routing import supports_independent_local
+
+    if not supports_independent_local(account):
+        return False
+    return account["platform"] == "x" or bool(
+        db.execute(
+            "SELECT 1 FROM meta_browser_accounts WHERE account_id=?", (account["id"],)
+        ).fetchone()
+    )
 
 
 def recover_local_renewal(engine, account_id):

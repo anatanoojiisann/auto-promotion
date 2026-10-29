@@ -102,3 +102,24 @@ def route_for(account, payload=None, *, profile=None):
     if payload.get("execution_mode") == "manual" or payload.get("action") == "manual_comment":
         transport, resource = "manual", None
     return ExecutionRoute(platform, transport, f"{platform}.{transport}", identity, resource)
+
+
+def supports_independent_local(account, *, profile=None):
+    """Reviewed execution routes, separate from platform/action capabilities."""
+    if profile is None:
+        try:
+            profile = read_profile(account["platform"], account["backend_label"])
+        except BackendError:
+            profile = {}
+    try:
+        route = route_for(account, profile=profile)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        account["platform"] == "x"
+        and route.transport in {"playwright", "edge", "tabbit", "browser_use", "api"}
+    ) or (
+        account["platform"] in {"facebook", "instagram"}
+        and profile.get("connection_type") == "meta_desktop"
+        and route.transport == "desktop"
+    )

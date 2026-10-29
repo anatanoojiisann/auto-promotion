@@ -1151,6 +1151,16 @@ function taskChannelPanel(t) {
     LocalOfflineModeActive: "此账号已指定独立本机，不能改用线上",
     OfflinePriorOwnershipUnverified: "本机归属证明未核实，保持等待",
     AccountChannelGenerationConflict: "通道状态已更新，等待核对",
+    OfflinePriorOwnershipUnresolved:
+      "缺少先前归属证明；可明确请求本任务的一次控制服务协调",
+    LocalAuthorizationBusy: "该账号正在交接或执行，请稍后核对",
+    LocalAuthorizationLeaseExpired:
+      "本次授权操作已中断，请核对同一任务的交接结果",
+    LocalAuthorizationRequiresStartedLocalTask:
+      "请先明确启动使用本地通道的任务",
+    LocalAuthorizationOtherControlPending:
+      "另有设置或交接尚待完成，请先处理原操作",
+    TaskChannelHandoffUnverified: "归属响应与本次交接不一致，保持等待",
   };
   const accounts = channel.accounts
     .map((a) => {
@@ -1171,7 +1181,61 @@ function taskChannelPanel(t) {
       return `<li>${esc(label)}：${esc(actual)}${reason ? " · " + esc(reason) : ""}${a.until_at ? " · 授权截止 " + fmt(a.until_at) : ""}</li>`;
     })
     .join("");
-  return `<div class="surface padded mt-20" id="task-channel"><h2>执行通道</h2><p>任务选择：${esc(labels[channel.requested] || "跟随默认")}${channel.requested === "inherit" ? "（当前默认：" + esc(labels[channel.default]) + "）" : ""}</p>${accounts ? "<ul>" + accounts + "</ul>" : '<p class="help">开始任务后确定账号的实际通道。</p>'}<p class="help">线上队列负责授权和账本，本机执行器操作平台；本机队列是否依赖线上交接取决于账号授权。明确选择的通道不会因报错反向切换。</p></div>`;
+  const eligible = (channel.local_authorization_accounts || []).filter((id) =>
+    t.account_snapshot.some((a) => a.id === id),
+  );
+  const authorization =
+    t.state === "active" &&
+    t.phase === "ready" &&
+    channel.requested === "local" &&
+    eligible.length
+      ? `<form id="local-channel-authorization-form"><label for="local-authorization-account">本次授权账号</label><select id="local-authorization-account" name="account_id" required>${eligible.map((id) => `<option value="${esc(id)}">${esc(t.account_snapshot.find((a) => a.id === id).label)}</option>`).join("")}</select><label class="mt-14"><input type="checkbox" name="coordinate_once" required>仅为所选账号与本任务联系控制服务，建立本机通道</label><p class="help">只授权，不创建发送尝试、不操作浏览器。其他账号的离线范围保持原样；实际发送仍需当前浏览器身份核验及原队列检查。</p><button type="submit" class="secondary compact">建立或核对本机通道（不发送）</button></form>`
+      : "";
+  const requests = (channel.local_authorizations || [])
+    .map((r) => {
+      const label =
+        t.account_snapshot.find((a) => a.id === r.account_id)?.label || "账号";
+      return `<li>${esc(label)}：${r.state === "ready" ? "通道授权已记录，尚不代表发送" : "授权交接待核对"}${r.error ? " · " + esc(reasons[r.error] || "保持等待，请核对归属") : ""}</li>`;
+    })
+    .join("");
+  return `<div class="surface padded mt-20" id="task-channel"><h2>执行通道</h2><p>任务选择：${esc(labels[channel.requested] || "跟随默认")}${channel.requested === "inherit" ? "（当前默认：" + esc(labels[channel.default]) + "）" : ""}</p>${accounts ? "<ul>" + accounts + "</ul>" : '<p class="help">开始任务后确定账号的实际通道。</p>'}<p class="help">线上队列负责授权和账本，本机执行器操作平台；本机队列是否依赖线上交接取决于账号授权。明确选择的通道不会因报错反向切换。</p>${requests ? "<ul>" + requests + "</ul>" : ""}${authorization}</div>`;
+}
+
+const localAuthorizationOperations = new Map();
+function bindLocalChannelAuthorization(t) {
+  const form = $("#local-channel-authorization-form");
+  if (!form) return;
+  form.onsubmit = (event) => {
+    event.preventDefault();
+    if (!form.elements.coordinate_once.checked) return;
+    const accountId = form.elements.account_id.value;
+    const key = t.id + ":" + accountId;
+    if (localAuthorizationOperations.has(key))
+      return localAuthorizationOperations.get(key);
+    const generation = panelGeneration;
+    const isCurrent = () =>
+      location.hash === "#tasks/" + t.id &&
+      generation === panelGeneration &&
+      !$("#panel").open;
+    const operation = busy(
+      event.submitter,
+      async () => {
+        try {
+          await api(`/tasks/${t.id}/authorize-local-channel`, "POST", {
+            account_id: accountId,
+            coordinate_once: true,
+            source: "workbench_local_channel_authorization",
+          });
+          if (isCurrent()) toast("本机通道授权已记录；本次操作未发送内容。");
+        } finally {
+          if (isCurrent()) await renderTask(t.id);
+        }
+      },
+      isCurrent,
+    ).finally(() => localAuthorizationOperations.delete(key));
+    localAuthorizationOperations.set(key, operation);
+    return operation;
+  };
 }
 
 async function taskControlRequest(id, action, body) {
@@ -1258,6 +1322,7 @@ async function renderTask(id) {
         : ""
     }${t.candidates.length ? '<div class="table-wrap" role="region" aria-label="数据表格，可横向滚动" tabindex="0"><table><thead><tr><th>候选目标</th><th>资格判断</th><th>原因</th></tr></thead><tbody>' + t.candidates.map((c) => `<tr><td>${esc(c.target)}</td><td>${badge(c.decision)}</td><td>${esc(c.reasons.join(" · ") || "通过发现政策")}<span class="sub">${esc(c.state)}</span>${["unknown", "pending_admin_approval", "joined", "already_joined"].includes(c.state) ? `<button class="text-button" data-join-reconcile="${c.id}">只读核对入群</button>` : ""}</td></tr>`).join("") + "</tbody></table></div>" : '<p class="muted mt-14">搜索结果先经过资格筛选，低置信度候选会被记录为拒绝。</p>'}</div></div><div class="surface mt-24"><div class="section-header"><h2>任务日志</h2></div><div class="padded" id="task-audit">正在读取…</div></div></div><aside class="detail-aside"><div class="surface padded"><h2>任务范围</h2><details><summary>查看完整范围</summary><p class="help">账号：${t.account_snapshot.map((a) => esc(a.label) + " (" + names[a.platform] + ")").join("、")}</p><pre>${esc(JSON.stringify(t.policy, null, 2))}</pre></details>${t.manifest ? `<details><summary>查看发送清单</summary><pre>${esc(JSON.stringify(t.manifest, null, 2))}</pre></details>` : '<p class="help">点击开始发送时自动固定清单，无需审批或确认短语。</p>'}</div><div class="surface padded mt-20"><h2>执行控制</h2><p class="help">${state.overview.global_stop ? "全局执行已暂停。请使用顶部开关恢复。" : "任务启动后按计划时间执行。"}</p><div class="actions mt-14">${!ended ? `<button id="run-task" class="compact" ${taskStartOperations.has(id) ? "disabled" : ""}>${t.items.length ? "开始发送" : t.policy.max_joins ? "开始入群" : "开始任务"}</button><button class="secondary compact" id="pause-task">${t.state === "paused" ? "恢复任务" : "暂停任务"}</button><button class="danger compact" id="cancel-task">取消任务</button>` : ""}</div><p class="native-note">停止本地任务不会撤回已经提交给 Telegram 的原生排期。</p></div></aside></div>`;
   bindTaskTools(t);
+  bindLocalChannelAuthorization(t);
   if (t.legacy_source) {
     ["#run-task", "#pause-task", "#cancel-task"].forEach((selector) =>
       $(selector)?.remove(),
@@ -1465,6 +1530,7 @@ setInterval(async () => {
       $("#task-execution").innerHTML = taskExecutionPanel(task);
       if ($("#task-channel"))
         $("#task-channel").outerHTML = taskChannelPanel(task);
+      bindLocalChannelAuthorization(task);
       $("#task-state").innerHTML = taskExecutionBadge(task);
       if ($("#task-readiness"))
         $("#task-readiness").outerHTML = taskReadinessPanel(task);

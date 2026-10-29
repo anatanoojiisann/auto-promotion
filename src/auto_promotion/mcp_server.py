@@ -249,6 +249,31 @@ def create_server(engine=None):
         """Synchronize existing Meta workflow states without starting any task."""
         return invoke(meta_browser.status)
 
+    @server.tool(annotations=remote_read)
+    def authorize_local_channel(
+        task_id: str, account_id: str, coordinate_once: bool, source: str
+    ) -> dict:
+        """Only on an explicit human request: coordinate this account/task with cloud
+        control once to establish local ownership. Does not start a task, operate
+        a browser, create an outbound attempt or submit. Preserve global offline
+        scopes. source must identify the human instruction; coordinate_once=true
+        explicitly permits this narrow control handshake. No credentials created.
+        """
+        from .cloud_control import CloudUnavailable
+        from .local_authorization import authorize_local_channel as authorize
+        from .task_channels import safe_channel_code
+
+        try:
+            return authorize(
+                engine, task_id, account_id, coordinate_once=coordinate_once, source=source
+            )
+        except CloudUnavailable as exc:
+            raise ToolError(safe_channel_code(str(exc))) from None
+        except ValueError:
+            raise ToolError("ExplicitLocalCoordinationRequired") from None
+        except Exception:
+            raise ToolError("LocalAuthorizationUnavailable") from None
+
     @server.tool(annotations=local)
     def meta_browser_jobs() -> dict:
         """Read due Facebook/IG desktop jobs and unknown receipts; never submit."""

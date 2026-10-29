@@ -113,6 +113,10 @@ def safe_channel_code(value):
 
 
 def owns_job(db, job, now):
+    if job.get("authorization_only") is True:
+        from .local_authorization import owns_authorization
+
+        return owns_authorization(db, job, now)
     row = db.execute("SELECT * FROM execution_jobs WHERE id=?", (job["id"],)).fetchone()
     return bool(
         row
@@ -153,6 +157,14 @@ def binding_matches(row, value, node_id, store_id):
 
 
 def original_fence_valid(db, value, now, task_id):
+    if value.get("coordination_task_id"):
+        task = db.execute("SELECT manifest_hash FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if (
+            value["coordination_task_id"] != task_id
+            or not task
+            or task[0] != value.get("coordination_manifest_hash")
+        ):
+            return False
     if value.get("fence_source") == "cloud_acknowledged":
         return value.get("until_at", 0) > now
     if value.get("fence_source") == "standalone":
@@ -314,6 +326,18 @@ def snapshot(engine, task):
     from .execution_channels import read_state
 
     state, now = read_state(engine.store), engine.clock()
+    from .execution_channels import independent_account_supported
+
+    with engine.store.connect() as db:
+        supported_accounts = [
+            account_id
+            for account_id in task["account_ids"]
+            if (
+                account := db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            )
+            and account["mode"] == "live"
+            and independent_account_supported(db, dict(account))
+        ]
     selected = {a: effective(engine, task["policy"], task["id"], a) for a in task["account_ids"]}
     for row in rows:
         row["authorization_valid_until"] = row["until_at"]
@@ -342,6 +366,12 @@ def snapshot(engine, task):
         "execution_location": "local_platform_executor",
         "intent_source": task["policy"].get("execution_channel_source", ""),
         "accounts": rows,
+        "local_authorization_accounts": supported_accounts,
+        "local_authorizations": engine.store.rows(
+            "SELECT account_id,task_id,state,error,until_at,updated_at FROM channel_authorization_requests "
+            "WHERE task_id=?",
+            (task["id"],),
+        ),
     }
 
 
@@ -352,6 +382,8 @@ class TaskChannelRouter:
     def handoff_tasks(self, job, prior):
         from .execution_channels import read_state
 
+        if job.get("authorization_only"):
+            return [job["task_id"]]
         task_ids = {job["task_id"]}
         task_ids.update(
             r["task_id"]
@@ -397,13 +429,26 @@ class TaskChannelRouter:
                 task_id=job["task_id"],
             )
             raise
-        audit_route(self.engine, job, context)
+        audit_route(
+            self.engine,
+            job,
+            context,
+            stage="authorization_only" if job.get("authorization_only") else "authorized",
+        )
         return context, cloud
 
     def _prepare(self, job):
         from .execution_channels import binding, independent_active, offline_only, read_state
 
         now = self.engine.clock()
+        authorization_only = job.get("authorization_only") is True
+        if authorization_only:
+            from .local_authorization import validate_scope
+
+            with self.store.connect() as db:
+                if not owns_job(db, job, now):
+                    raise CloudUnavailable("LocalAuthorizationLeaseExpired")
+                validate_scope(self.engine, db, job["task_id"], job["account_id"], now)
         task = self.store.one("SELECT policy FROM tasks WHERE id=?", (job["task_id"],))
         if not task:
             raise CloudUnavailable("TaskChannelTaskMissing")
@@ -417,17 +462,27 @@ class TaskChannelRouter:
         no_cloud = offline_only(self.store, job["account_id"]) or (
             channel == "local" and offline_only(self.store)
         )
+        if authorization_only:
+            no_cloud = False  # Only this durable, explicitly requested control operation.
         if no_cloud and channel == "cloud":
             raise CloudUnavailable("LocalOfflineModeActive")
         cloud = None if no_cloud else CloudControl.configured()
         local_state = read_state(self.store)
-        node_id = (local_state.get("node_id") if no_cloud else None) or (
-            cloud.node_id if cloud else os.getenv("AP_NODE_ID", socket.gethostname())
-        )
+        node_id = (
+            local_state.get("node_id")
+            if no_cloud and offline_only(self.store, job["account_id"])
+            else None
+        ) or (cloud.node_id if cloud else os.getenv("AP_NODE_ID", socket.gethostname()))
         store_id = binding(self.engine)
-        if cloud and self.store.one(
-            "SELECT 1 FROM cloud_receipt_outbox WHERE json_extract(lease,'$.account_id')=? LIMIT 1",
-            (job["account_id"],),
+        if authorization_only and (node_id != job["node_id"] or store_id != job["store_id"]):
+            raise CloudUnavailable("LocalChannelBindingMismatch")
+        if (
+            not authorization_only
+            and cloud
+            and self.store.one(
+                "SELECT 1 FROM cloud_receipt_outbox WHERE json_extract(lease,'$.account_id')=? LIMIT 1",
+                (job["account_id"],),
+            )
         ):
             CloudJournal(self.engine, cloud).flush(account_id=job["account_id"])
         with self.store.connect(write=True) as db:
@@ -445,6 +500,12 @@ class TaskChannelRouter:
             if handoff_blocks(db, prior, job["task_id"], now):
                 raise CloudUnavailable("TaskChannelHandoffPending")
             old_binding = channel_binding(db, job["account_id"])
+            if (
+                no_cloud
+                and old_binding.get("coordination_task_id")
+                and old_binding["coordination_task_id"] != job["task_id"]
+            ):
+                raise CloudUnavailable("LocalAuthorizationTaskScopeMismatch")
             bound = binding_matches(prior, old_binding, node_id, store_id)
             if no_cloud and prior and prior["channel"] == "cloud":
                 proof = local_state.get("offline_fences", {}).get(job["account_id"], {})
@@ -507,6 +568,11 @@ class TaskChannelRouter:
                     "transition": uuid.uuid4().hex,
                     "fence_source": "pending",
                 }
+                if authorization_only:
+                    authority.update(
+                        coordination_task_id=job["task_id"],
+                        coordination_manifest_hash=job["version"],
+                    )
                 db.execute(
                     "INSERT INTO account_task_channels VALUES(?,?,?,?,?,'handoff','pending',?,NULL,0) "
                     "ON CONFLICT(account_id) DO UPDATE SET channel=excluded.channel,generation=excluded.generation,"
@@ -529,6 +595,14 @@ class TaskChannelRouter:
                     )
         try:
             if reusable:
+                if authorization_only:
+                    if not cloud:
+                        raise CloudUnavailable("CloudControlConfigurationMissing")
+                    observed = cloud.request(
+                        "/v1/account-channel/status", {"account_id": job["account_id"]}
+                    ).get("channel")
+                    if not ack_matches(observed, authority):
+                        raise CloudUnavailable("TaskChannelHandoffUnverified")
                 if channel == "cloud":
                     if not cloud:
                         raise CloudUnavailable("CloudControlConfigurationMissing")
@@ -548,7 +622,7 @@ class TaskChannelRouter:
                     and legacy.get("node_id") == node_id
                 )
                 standalone = not cloud and not (required and required["value"] == "1")
-                if channel == "local" and (legacy_fence or standalone):
+                if not authorization_only and channel == "local" and (legacy_fence or standalone):
                     fence_source = "legacy" if legacy_fence else "standalone"
                     if legacy_fence:
                         authority["legacy_generation"] = legacy.get("generation")
@@ -567,9 +641,12 @@ class TaskChannelRouter:
                                 and self.engine.clock() < observed["until_at"] < until
                             ):
                                 raise CloudUnavailable("TaskChannelHandoffUnverified")
-                        cloud.flush_settings(self.engine, account_id=job["account_id"])
-                        CloudJournal(self.engine, cloud).flush(account_id=job["account_id"])
-                        cloud.sync(self.engine, task_ids=self.handoff_tasks(job, prior))
+                        if authorization_only:
+                            cloud.sync_channel_authorization(self.engine, job)
+                        else:
+                            cloud.flush_settings(self.engine, account_id=job["account_id"])
+                            CloudJournal(self.engine, cloud).flush(account_id=job["account_id"])
+                            cloud.sync(self.engine, task_ids=self.handoff_tasks(job, prior))
                         observed = cloud.request(
                             "/v1/account-channel",
                             {
@@ -590,6 +667,10 @@ class TaskChannelRouter:
                         raise CloudUnavailable("TaskChannelHandoffUnverified")
                     fence_source = "cloud_acknowledged"
                 with self.store.connect(write=True) as db:
+                    if authorization_only:
+                        validate_scope(
+                            self.engine, db, job["task_id"], job["account_id"], self.engine.clock()
+                        )
                     if not transition_current(db, job, authority, self.engine.clock()):
                         raise CloudUnavailable("PersistentJobClaimExpired")
                     authority["fence_source"] = fence_source
@@ -626,6 +707,8 @@ class TaskChannelRouter:
             "account_id": job["account_id"],
             "task_id": job["task_id"],
         }
+        if authorization_only:
+            return {**context, "task_channel": False, "authorization_only": True}, cloud
         with self.store.connect(write=True) as db:
             if not owns_job(db, job, self.engine.clock()):
                 raise CloudUnavailable("PersistentJobClaimExpired")
