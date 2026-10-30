@@ -1,6 +1,8 @@
 # 手机执行后端：观察与草稿验收开发接入
 
-2026-10-29；独立分支 `codex/phone-fleet-backend`，基线 `88c0277924273e5f55abbdb23bd8ed4f481550c2`。代码不在原 Auto Promotion 主目录运行，未使用其未提交 browser 修改、凭证、数据库或推广任务。
+2026-10-30 更新：兼容 B 0.2.0.dev1 和共享内部协议包 0.1.0。AP→B→HTTP A→模拟 Portal 的观察/草稿回读联调已通过；真机和真实社交身份尚待验收。
+
+原开发记录：2026-10-29；独立分支 `codex/phone-fleet-backend`，基线 `88c0277924273e5f55abbdb23bd8ed4f481550c2`。代码不在原 Auto Promotion 主目录运行，未使用其未提交 browser 修改、凭证、数据库或推广任务。
 
 ## 当前能力
 
@@ -14,12 +16,12 @@
 
 ## 安装和离线演示
 
-两个服务分别安装共享协议包与 B 的 `phone-fleet-management==0.1.0` wheel。开发时可从本轮群控副本安装；不要依赖原生产副本：
+两个服务分别安装共享协议包与 B 的 `phone-fleet-management==0.2.0.dev1` wheel。开发时可从本轮群控副本安装；不要依赖原生产副本：
 
 ```powershell
 python -m venv .venv
 .venv/Scripts/python -m pip install -e '.[dev]'
-.venv/Scripts/python -m pip install <shared-contracts-wheel> <phone-fleet-management-wheel>
+.venv/Scripts/python -m pip install <shared-contracts-wheel> <phone-fleet-protocol-wheel> <phone-fleet-management-wheel>
 .venv/Scripts/python -m auto_promotion.phone_fleet_demo
 ```
 
