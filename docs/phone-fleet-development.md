@@ -1,6 +1,6 @@
 # 手机执行后端：观察与草稿验收开发接入
 
-2026-10-30 更新：兼容 B 0.2.0.dev6 和共享内部协议包 0.1.0。AP→B→HTTP A→模拟 Portal 的观察/草稿回读联调已通过；真机和真实社交身份尚待验收。
+2026-10-31 更新：兼容 B 0.2.0.dev11、A 0.5.0.dev11 和共享内部协议包 0.1.0。AP→B→A→真实 Android 的观察回传已通过。Reddit 当前账号已通过真机个人页两个字段核对，选定帖子的标题和评论入口已读到；这些是开发预检证据，尚未登记为 AP 的真实 phone 账号绑定，也未填写或提交评论。完整外发与独立业务回执仍未实现。此前模拟 Portal 的观察/草稿回读联调不作为真机发布证据。
 
 原开发记录：2026-10-29；独立分支 `codex/phone-fleet-backend`，基线 `88c0277924273e5f55abbdb23bd8ed4f481550c2`。代码不在原 Auto Promotion 主目录运行，未使用其未提交 browser 修改、凭证、数据库或推广任务。
 
@@ -16,7 +16,7 @@
 
 ## 安装和离线演示
 
-两个服务分别安装共享协议包与 B 的 `phone-fleet-management==0.2.0.dev6` wheel。开发时可从本轮群控副本安装；不要依赖原生产副本：
+两个服务分别安装共享协议包与 B 的 `phone-fleet-management==0.2.0.dev11` wheel。开发时可从本轮群控副本安装；不要依赖原生产副本：
 
 ```powershell
 python -m venv .venv
@@ -70,4 +70,4 @@ python -m venv .venv
 
 修改：models.py、routing.py、adapters.py、api.py、queue_store.py、pyproject.toml；新增 phone 后端、phone_fleet 准备队列、离线 demo、本说明和测试。没有修改 browser.py 或 test_browser_contracts.py，没有推送/合并/部署。
 
-需先接收 B 协议包，再实现 A 的 fenced runtime 与不可变证据导入。公共 `auto-promotion-mcp` 原 PhoneFleetProvider 仍 observe-only，另有显式开发 `InternalPhoneFleetProvider`；不能描述为真实 AP 手机推广已经打通。真正开放 phone 账号还需要 ConnectionManager 的正式登记、账号观察、TaskChannelRouter 最终授权、发布许可、平台逐项验收和独立原生业务回执。目前全部真实互动提交关闭。
+B 协议包、A 的 fenced runtime 与不可变证据导入已在独立副本完成观察联调。公共 `auto-promotion-mcp` 原 PhoneFleetProvider 仍 observe-only，另有显式开发 `InternalPhoneFleetProvider`；不能描述为真实 AP 手机推广已经打通。真正开放 phone 账号还需要 ConnectionManager 的正式登记、账号观察的可信传递、TaskChannelRouter 最终授权、发布许可、具体评论提交动作、平台逐项验收和独立原生业务回执。目前全部真实互动提交关闭。测试账号身份、帖子链接、截图与本地草稿只保存在忽略的私有验收目录，不提交到仓库。
