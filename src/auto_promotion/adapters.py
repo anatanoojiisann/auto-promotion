@@ -137,10 +137,11 @@ class AdapterRegistry:
             return self.simulation.call(account, operation, payload)
         from .routing import route_for
         if route_for(account).transport == "phone":
-            # Preparation uses the durable phone_prepare job path. No direct native
-            # adapter call may create a promotion or consume a once-only attempt.
+            # The explicitly configured Reddit service reuses the original claimed
+            # send job. Unconfigured phone routes remain preparation-only.
             from .backends.phone import PhoneBackend
-            return PhoneBackend().call(account, operation, payload)
+            return PhoneBackend(service=getattr(self, "phone_reddit", None),
+                                execution_job=getattr(self.context, "job", None)).call(account, operation, payload)
         if account["platform"] == "tiktok":
             from .tiktok_browser import TikTokBrowser
 

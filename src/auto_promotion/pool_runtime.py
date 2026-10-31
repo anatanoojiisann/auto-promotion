@@ -168,6 +168,8 @@ class PoolScheduler:
                     stdout=handles[0],
                     stderr=handles[1],
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    **({"env": {**os.environ, "AP_PHONE_REDDIT_CONFIG": self.engine.adapters.phone_reddit.worker_config()}}
+                       if pool == "reddit.phone" and getattr(self.engine.adapters, "phone_reddit", None) else {}),
                 )
                 self.children[key], self.handles[key] = child, handles
                 spawn_budget -= 1
@@ -317,6 +319,10 @@ class PoolScheduler:
 
 
 def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
+    if pool == "reddit.phone" and not getattr(engine.adapters, "phone_reddit", None):
+        from .phone_reddit import attach_worker
+
+        attach_worker(engine)
     if pool not in POOLS:
         raise ValueError("UnknownExecutionPool")
     queue = JobQueue(engine)

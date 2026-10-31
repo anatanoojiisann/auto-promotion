@@ -1651,7 +1651,7 @@ class Engine:
         if (
             account["mode"] == "live"
             and (
-                account["platform"] == "reddit"
+                (account["platform"] == "reddit" and not automatic_action_allowed(account, value.action, task["policy"]))
                 or (
                     account["platform"] == "x"
                     and not automatic_action_allowed(account, value.action, task["policy"])
@@ -2318,7 +2318,7 @@ class Engine:
             if (
                 account["mode"] == "live"
                 and (
-                    account["platform"] == "reddit"
+                    (account["platform"] == "reddit" and not automatic_action_allowed(account, payload["action"], policy))
                     or (
                         account["platform"] == "x"
                         and not automatic_action_allowed(account, payload["action"], policy)

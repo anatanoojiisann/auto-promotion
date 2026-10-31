@@ -90,6 +90,8 @@ def x_api_channel(account):
 
 def automatic_actions(account):
     """Account-local opt-in; existing X connections remain read-only by default."""
+    if account.get("platform") == "reddit":
+        return ["reply"] if reddit_phone_enabled(account, "reply") else []
     if account["mode"] == "live" and account["platform"] in {"instagram", "facebook", "tiktok"}:
         try:
             profile = read_profile(account["platform"], account["backend_label"])
@@ -115,6 +117,18 @@ def automatic_actions(account):
     if profile.get("browser_channel") == "browser_use":
         return []
     return ["reply"] if "reply" in profile.get("automatic_actions", []) else []
+
+
+def reddit_phone_enabled(account, action):
+    if account.get("platform") != "reddit" or account.get("mode") != "live" or action != "reply":
+        return False
+    try:
+        profile = read_profile("reddit", account["backend_label"])
+    except BackendError:
+        return False
+    binding = profile.get("phone_fleet", {})
+    return bool(profile.get("connection_type") == "phone_fleet" and binding.get("device_id")
+                and binding.get("reddit_comments_enabled") is True)
 
 
 def automatic_action_allowed(account, action, policy):
@@ -360,7 +374,7 @@ def verify_claim(request):
                 raise BackendError("ManualActionMustNotUseBackend")
             current_account = dict(account)
             current_account["automatic_actions"] = automatic_actions(current_account)
-            if account["platform"] == "reddit" or (
+            if (account["platform"] == "reddit" and not reddit_phone_enabled(current_account, item["action"])) or (
                 account["platform"] == "x"
                 and not automatic_action_allowed(current_account, item["action"], policy)
             ):

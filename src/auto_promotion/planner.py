@@ -105,6 +105,8 @@ def execution_mode(account, opportunity):
             return "automatic", "账号已启用自动回复；提交前核对登录身份与目标回复权限"
         return "manual", "X 浏览器自动执行未开放，保留人工清单"
     if platform == "reddit":
+        if opportunity["action"] == "reply" and "reply" in account.get("automatic_actions", []):
+            return "automatic", "已绑定 Reddit 手机账号；提交仍需正常任务及单次许可"
         return "manual", "Reddit 首版保留人工社区互动"
     if platform == "instagram" and opportunity["action"] == "manual_comment":
         return "manual", "Instagram 第三方评论需人工处理"
