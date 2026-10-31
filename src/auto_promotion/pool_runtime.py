@@ -162,14 +162,22 @@ class PoolScheduler:
                     "--node-id",
                     self.node,
                 ]
+                phone_env = {}
+                if pool.endswith(".phone"):
+                    # Never inherit another App's private runtime config into a pool.
+                    phone_env = {k: v for k, v in os.environ.items()
+                                 if k not in {"AP_PHONE_REDDIT_CONFIG", "AP_PHONE_SOCIAL_CONFIG"}}
+                    service = getattr(self.engine.adapters,
+                        "phone_reddit" if pool == "reddit.phone" else "phone_social", None)
+                    if service:
+                        phone_env["AP_PHONE_REDDIT_CONFIG" if pool == "reddit.phone" else "AP_PHONE_SOCIAL_CONFIG"] = service.worker_config()
                 child = self.popen(
                     argv,
                     cwd=Path(__file__).resolve().parents[2],
                     stdout=handles[0],
                     stderr=handles[1],
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    **({"env": {**os.environ, "AP_PHONE_REDDIT_CONFIG": self.engine.adapters.phone_reddit.worker_config()}}
-                       if pool == "reddit.phone" and getattr(self.engine.adapters, "phone_reddit", None) else {}),
+                    **({"env": phone_env} if pool.endswith(".phone") else {}),
                 )
                 self.children[key], self.handles[key] = child, handles
                 spawn_budget -= 1
@@ -323,6 +331,10 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
         from .phone_reddit import attach_worker
 
         attach_worker(engine)
+    if pool.endswith(".phone") and pool != "reddit.phone" and not getattr(engine.adapters, "phone_social", None):
+        from .phone_social import attach_worker as attach_social_worker
+
+        attach_social_worker(engine)
     if pool not in POOLS:
         raise ValueError("UnknownExecutionPool")
     queue = JobQueue(engine)

@@ -1,4 +1,4 @@
-"""Unconfigured phone methods deny writes; the explicit Reddit service uses AP's queue."""
+"""Unconfigured phone methods deny writes; explicit services use AP's original queue."""
 
 from .common import BackendError
 
@@ -8,7 +8,7 @@ class PhoneBackend:
         self.service, self.execution_job = service, execution_job
 
     def call(self, account, operation, payload):
-        if self.service is not None and account.get("platform") == "reddit":
+        if self.service is not None:
             return self.service.backend(account, operation, payload, self.execution_job)
         if operation in {"health", "preflight"}:
             return {

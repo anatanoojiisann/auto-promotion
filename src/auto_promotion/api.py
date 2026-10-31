@@ -128,6 +128,7 @@ def create_app(
     statistics_only=False,
     phone_fleet_config=None,
     phone_reddit_config=None,
+    phone_social_config=None,
 ):
     if statistics_only:
         worker, report_worker = False, True
@@ -158,6 +159,12 @@ def create_app(
 
         phone_reddit = PhoneReddit(engine, phone_reddit_config)
         registry.phone_reddit = phone_reddit
+    phone_social = None
+    if phone_social_config is not None:
+        from .phone_social import PhoneSocial
+
+        phone_social = PhoneSocial(engine, phone_social_config)
+        registry.phone_social = phone_social
     interactions = Interactions(
         engine,
         worker_available=lambda: (
@@ -322,6 +329,10 @@ def create_app(
         from .phone_reddit_api import mount
 
         mount(app, phone_reddit)
+    if phone_social is not None:
+        from .phone_social_api import mount as mount_social
+
+        mount_social(app, phone_social)
     app.state.store = store
     app.state.connections = connections
     app.state.statistics = statistics

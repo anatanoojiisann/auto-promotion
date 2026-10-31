@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS phone_reddit_accounts(
 
 
 class PhoneReddit:
+    operations_table = "phone_reddit_operations"
+
     def __init__(self, engine, config, *, transport=None, reader=None):
         from phone_fleet.client import trusted_url
         from phone_fleet_protocol.reddit import RedditReader
@@ -149,13 +151,16 @@ class PhoneReddit:
         """Persist intent before create; an uncertain POST is only looked up thereafter."""
         from phone_fleet_protocol import ExecutionSnapshot, fingerprint
 
+        table = self.operations_table
+        if table not in {"phone_reddit_operations", "phone_social_operations"}:
+            raise ValueError("Untrusted operation table")
         value = request.model_dump(mode="json")
         with self.store.connect(write=True) as db:
-            old = db.execute("SELECT * FROM phone_reddit_operations WHERE id=?", (operation_id,)).fetchone()
+            old = db.execute(f"SELECT * FROM {table} WHERE id=?", (operation_id,)).fetchone()
             if old and json.loads(old["request"]) != value:
                 raise Conflict("PhoneRedditImmutableRequestChanged")
             if not old:
-                db.execute("INSERT INTO phone_reddit_operations(id,account_id,item_id,kind,request,phase,created_at) VALUES(?,?,?,?,?,'dispatching',?)",
+                db.execute(f"INSERT INTO {table}(id,account_id,item_id,kind,request,phase,created_at) VALUES(?,?,?,?,?,'dispatching',?)",
                            (operation_id, account_id, item_id, request.operation, canonical(value), time.time()))
         try:
             if old:
@@ -174,7 +179,7 @@ class PhoneReddit:
                 if fingerprint(checked.request) != fingerprint(request):
                     raise Conflict("PhoneRedditFleetCorrelationMismatch")
                 with self.store.connect(write=True) as db:
-                    db.execute("UPDATE phone_reddit_operations SET execution_id=?,result=?,phase='linked' WHERE id=?",
+                    db.execute(f"UPDATE {table} SET execution_id=?,result=?,phase='linked' WHERE id=?",
                                (checked.id, canonical(snapshot), operation_id))
                 if checked.status in {"succeeded", "failed", "cancelled", "unknown"} or time.time() >= until:
                     return snapshot
@@ -183,7 +188,7 @@ class PhoneReddit:
         except (httpx.HTTPError, BackendError):
             # No resend, even if lookup is 404 after a lost initial response.
             with self.store.connect(write=True) as db:
-                db.execute("UPDATE phone_reddit_operations SET phase='uncertain' WHERE id=?", (operation_id,))
+                db.execute(f"UPDATE {table} SET phase='uncertain' WHERE id=?", (operation_id,))
             return {"status": "unknown", "result": None}
 
     def make_request(self, account_id, operation, context, *, task_id=None, item_id=None,

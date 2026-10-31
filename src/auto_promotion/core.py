@@ -201,6 +201,11 @@ class Engine:
                 )
             except BackendError:
                 value["owned_target_id"] = ""
+        from .backends.common import social_phone_actions
+        phone_actions = social_phone_actions(value)
+        if phone_actions:
+            value["execution_backend"] = "phone"
+            value["capabilities"] = phone_actions
         from .account_blocks import active_block
 
         with self.store.connect() as db:
@@ -1648,6 +1653,13 @@ class Engine:
         if value.account_id not in task["account_ids"]:
             raise Conflict("账号不在该任务范围内")
         account = account or self.account(value.account_id)
+        if account.get("execution_backend") == "phone" and account["platform"] != "reddit":
+            from .phone_social import validate_item as validate_phone_item
+
+            try:
+                validate_phone_item(account, value.model_dump())
+            except (BackendError, ValueError) as exc:
+                raise Conflict(getattr(exc, "safe_code", str(exc))) from None
         if (
             account["mode"] == "live"
             and (
@@ -1749,7 +1761,10 @@ class Engine:
             from .tiktok_browser import validate_browser_item
 
             try:
-                if account.get("execution_backend") == "desktop":
+                if account.get("execution_backend") == "phone":
+                    # Already validated by the narrow phone text flow above.
+                    pass
+                elif account.get("execution_backend") == "desktop":
                     if (
                         task["policy"].get("execution_channel") != "local"
                         or value.action not in account["automatic_actions"]

@@ -90,6 +90,9 @@ def x_api_channel(account):
 
 def automatic_actions(account):
     """Account-local opt-in; existing X connections remain read-only by default."""
+    phone_actions = social_phone_actions(account)
+    if phone_actions:
+        return phone_actions
     if account.get("platform") == "reddit":
         return ["reply"] if reddit_phone_enabled(account, "reply") else []
     if account["mode"] == "live" and account["platform"] in {"instagram", "facebook", "tiktok"}:
@@ -129,6 +132,21 @@ def reddit_phone_enabled(account, action):
     binding = profile.get("phone_fleet", {})
     return bool(profile.get("connection_type") == "phone_fleet" and binding.get("device_id")
                 and binding.get("reddit_comments_enabled") is True)
+
+
+def social_phone_actions(account):
+    actions = {"telegram": "send_message", "x": "reply", "instagram": "comment",
+               "facebook": "comment", "tiktok": "comment"}
+    if account.get("mode") != "live" or account.get("platform") not in actions:
+        return []
+    try:
+        profile = read_profile(account["platform"], account["backend_label"])
+    except BackendError:
+        return []
+    binding = profile.get("phone_fleet", {})
+    expected = actions[account["platform"]]
+    return [expected] if (profile.get("connection_type") == "phone_fleet"
+        and binding.get("device_id") and binding.get("social_actions") == [expected]) else []
 
 
 def automatic_action_allowed(account, action, policy):
@@ -374,6 +392,13 @@ def verify_claim(request):
                 raise BackendError("ManualActionMustNotUseBackend")
             current_account = dict(account)
             current_account["automatic_actions"] = automatic_actions(current_account)
+            try:
+                current_profile = read_profile(account["platform"], account["backend_label"])
+            except BackendError:
+                current_profile = {}
+            if (current_profile.get("connection_type") == "phone_fleet" and account["platform"] != "reddit"
+                    and item["action"] not in social_phone_actions(current_account)):
+                raise BackendError("PhoneSocialActionNotCommissioned")
             if (account["platform"] == "reddit" and not reddit_phone_enabled(current_account, item["action"])) or (
                 account["platform"] == "x"
                 and not automatic_action_allowed(current_account, item["action"], policy)
