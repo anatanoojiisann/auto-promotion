@@ -37,7 +37,7 @@ def same_native_account(me,identity):
 
 
 class TelegramPhoneObserver:
-    READ_RPCS = {"GetStateRequest","GetUsersRequest","ResolveUsernameRequest","GetChannelsRequest","GetChatsRequest",
+    READ_RPCS = {"GetStateRequest","GetDifferenceRequest","GetUsersRequest","ResolveUsernameRequest","GetChannelsRequest","GetChatsRequest",
         "GetParticipantRequest","GetFullChannelRequest","GetFullChatRequest","GetHistoryRequest","GetMessagesRequest",
         "GetConfigRequest","GetNearestDcRequest"}
 

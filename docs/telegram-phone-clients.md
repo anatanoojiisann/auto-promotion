@@ -38,3 +38,10 @@ they cannot issue new writes. AP reconciliation never rewrites B's unknown resul
 No global live switch or stop is changed by installing this code. The real phone has
 only the official Telegram client installed; third-party clients and the independent
 API observer require commissioning. Synthetic test success is not hardware acceptance.
+
+The observer permits Telethon's read-only `updates.getDifference` bootstrap for an
+existing authorized session; mutation RPCs remain denied. Membership success does not
+grant send permission: per-user `send_messages` / `send_plain` restrictions stop the
+workflow before a send. The inherited shared local read policy defaults to 120 logical
+RPC reads per hour. Use the existing account-policy context and revisioned settings;
+never reset counters or silently raise limits to finish a task.

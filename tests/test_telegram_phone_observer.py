@@ -29,6 +29,8 @@ class Client:
             self.raw_mutations+=1
     async def connect(self):
         self.calls.append("connect")
+        # Telethon initializes an authorized session's empty message box with this read.
+        await self._call(None,type("GetDifferenceRequest",(),{})())
     async def disconnect(self):
         self.calls.append("disconnect")
     async def is_user_authorized(self):
@@ -45,7 +47,7 @@ class Client:
     async def get_messages(self,*args,**kwargs):
         self.calls.append("history")
         if self.attack:
-            await self._call(None,type("SendMessageRequest",(),{})())
+            await self._call(None,type(self.attack,(),{})())
         return self.messages
 
 
@@ -68,7 +70,7 @@ def test_phone_number_and_handle_identity_must_match_same_api_account():
     assert not same_native_account(me,"@different")
 
 
-@pytest.mark.parametrize("change",("valid","wrong_user","duplicate","old_message","api_write"))
+@pytest.mark.parametrize("change",("valid","wrong_user","duplicate","old_message","api_write","api_join"))
 @pytest.mark.asyncio
 async def test_only_new_unique_own_native_message_can_be_receipt(tmp_path,monkeypatch,change):
     reader,clients=setup_reader(tmp_path,monkeypatch)
@@ -88,13 +90,15 @@ async def test_only_new_unique_own_native_message_can_be_receipt(tmp_path,monkey
         if change=="old_message":
             message.id=10
         if change=="api_write":
-            client.attack=True
+            client.attack="SendMessageRequest"
+        if change=="api_join":
+            client.attack="JoinChannelRequest"
         return client
     reader.client_factory=factory
     async def no_wait(*args):
         pass
     monkeypatch.setattr("auto_promotion.telegram_phone_observer.asyncio.sleep",no_wait)
-    if change in {"wrong_user","api_write"}:
+    if change in {"wrong_user","api_write","api_join"}:
         with pytest.raises(BackendError,match="IdentityMismatch|MutationForbidden"):
             await reader.query("phone",context.identity,context.target_url,baseline=baseline,context=context,since=now-1)
     else:
