@@ -181,7 +181,7 @@ class PhoneReddit:
                 with self.store.connect(write=True) as db:
                     db.execute(f"UPDATE {table} SET execution_id=?,result=?,phase='linked' WHERE id=?",
                                (checked.id, canonical(snapshot), operation_id))
-                if checked.status in {"succeeded", "failed", "cancelled", "unknown"} or time.time() >= until:
+                if checked.status in {"succeeded", "failed", "cancelled", "unknown","waiting_for_human"} or time.time() >= until:
                     return snapshot
                 time.sleep(0.2)
                 snapshot = self.request("GET", "/executions/" + checked.id)

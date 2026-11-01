@@ -1217,6 +1217,9 @@ class Engine:
         checks = []
         for account_id in task["account_ids"]:
             account = self.account(account_id)
+            phone = getattr(self.adapters,"phone_social",None)
+            if refresh and phone is not None and account_id in phone.config.bindings:
+                phone.ensure_identity(account_id,task_id=task["id"])
             if account["mode"] == "live" or account["status"] == "unchecked":
                 # Explicit starts refresh positive observations. Failed probes
                 # retain their bounded backoff; cooldowns never trigger a probe.
@@ -2701,6 +2704,9 @@ class Engine:
                 continue
             if not manual and account["id"] not in checked:
                 # A fresh read-only health check before a live claim; simulation needs one too.
+                phone = getattr(self.adapters,"phone_social",None)
+                if phone is not None and account["id"] in phone.config.bindings:
+                    phone.ensure_identity(account["id"],task_id=row["task_id"])
                 checked[account["id"]] = self.check_account(account["id"], force=True)
             if not manual and checked[account["id"]]["connection_state"] != "healthy":
                 self._skip(row["id"], "account_unhealthy")
@@ -3681,6 +3687,9 @@ class Engine:
                     candidate=True,
                 )
                 continue
+            phone = getattr(self.adapters,"phone_social",None)
+            if phone is not None and account["id"] in phone.config.bindings:
+                phone.ensure_identity(account["id"],task_id=task_id)
             probe = self.check_account(account["id"], force=True)
             if probe["connection_state"] != "healthy":
                 self._skip(candidate["id"], "account_unhealthy", candidate=True)
