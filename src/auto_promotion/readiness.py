@@ -262,6 +262,14 @@ def task_workflow(task, blockers, item_blockers, now):
             "执行服务恢复后，按账号节奏与入群满一小时的条件安排互动。",
         )
     if task["phase"] != "ready" and task["phase"] != "starting":
+        if task.get("channel", {}).get("local_authority_expired"):
+            return step(
+                "local_authorization_required",
+                "启动前需处理本机通道授权",
+                "本机通道授权已到期。启动只会固定清单并进入等待；随后需为本任务建立或核对本机通道，"
+                "通道就绪前不会发送，原计划时间仍会到期。",
+                "start_task",
+            )
         return step(
             "ready_to_start",
             "等待开始发送",
@@ -303,7 +311,9 @@ def task_workflow(task, blockers, item_blockers, now):
             return step(
                 "waiting_local_authority",
                 "本机授权已到期",
-                "本任务保持本机选择，等待续期；不会自动改用线上。",
+                "任务已入队但尚不能发送。请为本任务建立或核对本机通道；"
+                "原计划时间仍会到期，过期项目需要重新核对并创建新任务。",
+                "authorize_local_channel",
             )
         waits = [a for a in choice.get("accounts", []) if a.get("blocking_reason")]
         if waits:

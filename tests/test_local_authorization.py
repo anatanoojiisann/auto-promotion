@@ -28,8 +28,11 @@ class LocalAuthorizationTests(unittest.TestCase):
 
     def setUp(self):
         fixtures.MetaBrowserTests.setUp(self)
-        patch.dict("os.environ", {"AP_NODE_ID": "synthetic-node"}).start()
         self.task, self.item = self.ready()
+        self.setup_coordination()
+
+    def setup_coordination(self):
+        patch.dict("os.environ", {"AP_NODE_ID": "synthetic-node"}).start()
         self.now = time.time()
         self.engine.clock = lambda: self.now
         self.store_id = binding(self.engine)
@@ -590,6 +593,28 @@ class ReviewedLocalRouteTests(unittest.TestCase):
                     profile={},
                 )
             )
+
+    def test_tiktok_only_supports_registered_desktop_connection_type(self):
+        account = {
+            "id": "synthetic",
+            "platform": "tiktok",
+            "backend_label": "synthetic",
+            "mode": "live",
+        }
+        self.assertTrue(
+            supports_independent_local(
+                account,
+                profile={"connection_type": "tiktok_desktop", "browser_channel": "tabbit"},
+            )
+        )
+        for profile in (
+            {},
+            {"connection_type": "tiktok_desktop"},
+            {"connection_type": "meta_desktop", "browser_channel": "tabbit"},
+            {"connection_type": "organic", "browser_channel": "tabbit"},
+        ):
+            with self.subTest(profile=profile):
+                self.assertFalse(supports_independent_local(account, profile=profile))
 
 
 if __name__ == "__main__":

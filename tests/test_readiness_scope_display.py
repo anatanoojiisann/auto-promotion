@@ -62,6 +62,19 @@ class ScopedReadinessDisplayTests(unittest.TestCase):
     def workflow(self, blockers=None):
         return task_workflow(self.task, blockers or [], [], self.now)
 
+    def test_expired_local_authority_is_visible_before_start_and_has_recovery_action(self):
+        self.task.update(state="draft", phase="discovery", manifest_hash=None)
+        self.task["channel"] = {"local_authority_expired": True}
+        value = self.workflow()
+        self.assertEqual(value["status"], "local_authorization_required")
+        self.assertEqual(value["next_action"], "start_task")
+        self.assertIn("原计划时间仍会到期", value["message"])
+        self.task.update(state="active", phase="ready", manifest_hash="fixture-manifest")
+        value = self.workflow()
+        self.assertEqual(value["status"], "waiting_local_authority")
+        self.assertEqual(value["next_action"], "authorize_local_channel")
+        self.assertEqual(value["counts"]["verified_sent"], 0)
+
     def test_fresh_bound_scope_keeps_future_schedule_and_old_global_observation(self):
         value = self.workflow()
         self.assertEqual(value["status"], "waiting_schedule")

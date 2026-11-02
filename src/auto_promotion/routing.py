@@ -119,7 +119,11 @@ def supports_independent_local(account, *, profile=None):
         account["platform"] == "x"
         and route.transport in {"playwright", "edge", "tabbit", "browser_use", "api"}
     ) or (
-        account["platform"] in {"facebook", "instagram"}
-        and profile.get("connection_type") == "meta_desktop"
+        profile.get("connection_type")
+        == {
+            "facebook": "meta_desktop",
+            "instagram": "meta_desktop",
+            "tiktok": "tiktok_desktop",
+        }.get(account["platform"], "unsupported")
         and route.transport == "desktop"
     )

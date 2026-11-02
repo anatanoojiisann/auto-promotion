@@ -328,6 +328,7 @@ def snapshot(engine, task):
     state, now = read_state(engine.store), engine.clock()
     from .execution_channels import independent_account_supported
 
+    current_local_accounts = set()
     with engine.store.connect() as db:
         supported_accounts = [
             account_id
@@ -338,6 +339,23 @@ def snapshot(engine, task):
             and account["mode"] == "live"
             and independent_account_supported(db, dict(account))
         ]
+        store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
+        node = os.getenv("AP_NODE_ID", socket.gethostname())
+        for account_id in task["account_ids"]:
+            row = db.execute(
+                "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
+            ).fetchone()
+            bound = channel_binding(db, account_id)
+            if (
+                store
+                and row
+                and row["channel"] == "local"
+                and row["state"] == "ready"
+                and row["until_at"] > now
+                and binding_matches(row, bound, node, store[0])
+                and original_fence_valid(db, bound, now, task["id"])
+            ):
+                current_local_accounts.add(account_id)
     selected = {a: effective(engine, task["policy"], task["id"], a) for a in task["account_ids"]}
     for row in rows:
         row["authorization_valid_until"] = row["until_at"]
@@ -353,7 +371,9 @@ def snapshot(engine, task):
         state.get("active") == "local"
         and state.get("until", 0) <= now
         and any(
-            c == "local" and (not scoped_accounts or a in scoped_accounts)
+            c == "local"
+            and a not in current_local_accounts
+            and (not scoped_accounts or a in scoped_accounts)
             for a, c in selected.items()
         )
     )

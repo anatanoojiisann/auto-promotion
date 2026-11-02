@@ -1154,6 +1154,8 @@ function taskChannelPanel(t) {
     OfflinePriorOwnershipUnresolved:
       "缺少先前归属证明；可明确请求本任务的一次控制服务协调",
     LocalAuthorizationBusy: "该账号正在交接或执行，请稍后核对",
+    LocalAuthorizationRouteUnsupported:
+      "当前账号连接不支持本机通道核对，请检查连接方式及服务版本",
     LocalAuthorizationLeaseExpired:
       "本次授权操作已中断，请核对同一任务的交接结果",
     LocalAuthorizationRequiresStartedLocalTask:
