@@ -1,5 +1,23 @@
 # Explicit task execution
 
+On 2026-11-03 the user explicitly requested repair of TikTok local-channel
+recovery after an expired authority returned `LocalAuthorizationRouteUnsupported`.
+Registered `tiktok_desktop` connections now support the existing task-scoped
+control coordination, including comments, replies and enabled direct messages.
+This repair does not authorize automatic renewals, new task starts, changed
+quotas, or replay of expired/unknown work. Do not ask again for commissioning
+approval already granted for this repair.
+
+Before continuing after an update, verify the running sender and MCP startup
+fingerprints against the current source. An old MCP process can retain the old
+route checks even when the workbench sender was reloaded. Reconnect it or use
+the official fresh stdio MCP entrypoint from this checkout with the SAME local
+database/configuration. Keep the normal task queue, explicit scoped coordination,
+fresh browser proof, one-use guard and independent receipts; never use a direct
+adapter call or reset state to work around a stale connection. Task start/queued
+is not publication. Inspect the returned readiness and resolve authority before
+spending the original delivery window on browser work.
+
 On 2026-10-26 the user explicitly approved: "启用 TikTok 真实外发，仅执行明确启动的任务".
 Setting `AP_TIKTOK_OWNER=auto-promotion` and adding the registered TikTok desktop
 account/pool to the existing executor node are authorized for this commissioning.
