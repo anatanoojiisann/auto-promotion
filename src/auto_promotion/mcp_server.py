@@ -540,6 +540,20 @@ def create_server(engine=None):
         """Read saved UTC+8 3-hour, 20:00 and full-day reports, including later revisions."""
         return invoke(lambda: {"reports": Statistics(engine.store).reports(limit)})
 
+    @server.tool(annotations=read)
+    def engagement_statistics(limit: int = 50, offset: int = 0) -> dict:
+        """Read saved views, likes and replies for our verified publications, with coverage and changes."""
+        from .engagement import Engagement
+
+        return invoke(lambda: Engagement(engine).snapshot(limit=limit, offset=offset))
+
+    @server.tool(annotations=read)
+    def engagement_history(item_id: str, limit: int = 100) -> dict:
+        """Read the saved metric samples for one publication; never opens or sends to a platform."""
+        from .engagement import Engagement
+
+        return invoke(lambda: {"samples": Engagement(engine).history(item_id, limit=limit)})
+
     @server.tool(annotations=local)
     def create_task(name: str, account_ids: list[str], policy: dict) -> dict:
         """Create a draft without execution; preserve the user's explicit channel choice.

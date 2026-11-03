@@ -155,6 +155,16 @@ CREATE TABLE IF NOT EXISTS statistical_reports(
  content_hash TEXT NOT NULL, content TEXT NOT NULL,
  PRIMARY KEY(kind,cutoff)
 );
+CREATE TABLE IF NOT EXISTS engagement_snapshots(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,item_id TEXT NOT NULL REFERENCES items(id),
+ observed_at REAL NOT NULL,external_reference TEXT NOT NULL,source TEXT NOT NULL,
+ status TEXT NOT NULL,metrics TEXT NOT NULL,estimated TEXT NOT NULL,reason TEXT
+);
+CREATE INDEX IF NOT EXISTS engagement_item_time ON engagement_snapshots(item_id,observed_at,id);
+CREATE TABLE IF NOT EXISTS engagement_polls(
+ item_id TEXT PRIMARY KEY REFERENCES items(id),checked_at REAL NOT NULL DEFAULT 0,
+ next_at REAL NOT NULL DEFAULT 0,lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS reporting_state(
  id INTEGER PRIMARY KEY CHECK(id=1), last_tick REAL NOT NULL, source_revision INTEGER NOT NULL
 );

@@ -42,11 +42,12 @@ class ReportingServiceTests(unittest.TestCase):
         )
         self.assertEqual((status, body), (200, {"issues": []}))
 
-    def test_reports_only_starts_only_statistics_and_reports(self):
+    def test_reports_only_starts_statistics_reports_and_readonly_metrics(self):
         app = create_app(db_path=self.db, statistics_only=True, token="test")
         with (
             patch.object(app.state.engine, "collect_statistics", return_value={}) as collect,
             patch.object(app.state.statistics, "run_due", return_value={}) as reports,
+            patch.object(app.state.engagement, "run_due", return_value={}) as engagement,
             patch("auto_promotion.api.Growth.sync_inbox") as inbox,
             patch("auto_promotion.api.Growth.poll_feeds") as feeds,
             patch("auto_promotion.api.TikTokManager.reconcile_due") as tiktok,
@@ -60,6 +61,7 @@ class ReportingServiceTests(unittest.TestCase):
             asyncio.run(run())
         collect.assert_called_once()
         reports.assert_called_once()
+        engagement.assert_called_once()
         for blocked in (inbox, feeds, tiktok, sender):
             blocked.assert_not_called()
         self.assertEqual(

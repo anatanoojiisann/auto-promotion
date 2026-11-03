@@ -31,6 +31,7 @@ OPERATIONS = {
     "feedback",
     "content",
     "insights",
+    "engagement",
 }
 RESULT_FIELDS = {
     "status",
@@ -78,6 +79,15 @@ RESULT_FIELDS = {
     "message_chat_id",
 }
 RESULT_FIELDS.update(FIELDS)
+RESULT_FIELDS.update(
+    {
+        "engagement_metrics",
+        "engagement_estimated",
+        "engagement_subject_verified",
+        "engagement_observed_at",
+        "engagement_source",
+    }
+)
 RESULT_FIELDS.update(BLOCK_FIELDS)
 RESULT_FIELDS.add("progress_mirror_deferred")
 RESULT_FIELDS.update(
@@ -249,7 +259,11 @@ def dispatch(request):
             progress("backend_start", False)
 
         try:
-            if platform == "telegram":
+            if platform == "x" and operation == "engagement":
+                from .backends.engagement import call_x
+
+                result = call_x(label, payload, checkpoint)
+            elif platform == "telegram":
                 from .backends.telegram import call
 
                 backend_payload = dict(payload)

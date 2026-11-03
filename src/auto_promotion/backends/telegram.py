@@ -363,6 +363,8 @@ class TelegramBackend:
                 return await self.membership(client, operation, payload, checkpoint, authorize)
             if operation == "feedback":
                 return await self.feedback(client, payload)
+            if operation == "engagement":
+                return await self.engagement(client, payload)
             if operation == "content":
                 return await self.content(client, payload)
             return await self.outbound(client, operation, payload, checkpoint, authorize)
@@ -1029,6 +1031,46 @@ class TelegramBackend:
             "published_at": observed_timestamp(matches[0].date),
             "external_reference": f"telegram:{item['target']}:{message_id}",
             "reason": "scheduled_delivery_verified",
+        }
+
+    async def engagement(self, client, payload):
+        from telethon import utils
+
+        if payload.get("read_only") is not True:
+            raise BackendError("MetricsReadOnlyRequired")
+        item, receipt = payload["payload"], payload["result"]
+        ids = receipt.get("message_ids", [])
+        if len(ids) != 1 or type(ids[0]) is not int or ids[0] <= 0:
+            return {"verified": False, "reason": "MetricsRequireSingleMessageReceipt"}
+        entity = await client.get_entity(self.target(item["target"]))
+        peer = receipt.get("message_chat_id")
+        if not peer or str(utils.get_peer_id(entity)) != str(peer):
+            return {"verified": False, "reason": "MetricsPeerUnverified"}
+        messages = await client.get_messages(entity, ids=ids)
+        message = messages[0] if len(messages) == 1 else None
+        if message is None or not message_matches(message, item):
+            return {"verified": False, "reason": "MetricsSubjectUnverified"}
+        reactions = getattr(message, "reactions", None)
+        counts = getattr(reactions, "results", []) if reactions else None
+        # A thumbs-up/heart count is distinct from the total of all emoji reactions.
+        likes = (
+            sum(r.count for r in counts if getattr(r.reaction, "emoticon", "") in {"👍", "❤", "❤️"})
+            if counts is not None
+            else None
+        )
+        return {
+            "verified": True,
+            "engagement_subject_verified": True,
+            "external_reference": payload["external_reference"],
+            "engagement_source": "telegram_message",
+            "engagement_observed_at": time.time(),
+            "engagement_metrics": {
+                "views": getattr(message, "views", None),
+                "likes": likes,
+                "reactions": sum(r.count for r in counts) if counts is not None else None,
+                "replies": getattr(getattr(message, "replies", None), "replies", None),
+                "reposts": getattr(message, "forwards", None),
+            },
         }
 
     async def feedback(self, client, payload):

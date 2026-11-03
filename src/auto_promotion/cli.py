@@ -43,6 +43,9 @@ def main():
     sub.add_parser("init")
     sub.add_parser("worker-once")
     sub.add_parser(
+        "collect-engagement", help="Read due publication metrics without outbound execution"
+    )
+    sub.add_parser(
         "interaction-once",
         help="Advance durable high-frequency jobs once; publish through existing sender",
     )
@@ -435,6 +438,10 @@ def main():
         with WorkerRun(engine.store, live_enabled=engine.live_enabled) as sender:
             sender.phase("executing")
             result = engine.run_cycle()
+    elif args.command == "collect-engagement":
+        from .engagement import Engagement
+
+        result = Engagement(engine).run_due()
     elif args.command == "collect-statistics":
         result = engine.collect_statistics()
     else:

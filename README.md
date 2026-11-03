@@ -171,6 +171,8 @@ auto-promotion serve --reports-only
 
 统一接口：`GET /api/statistics?day=YYYY-MM-DD`、`GET /api/statistics/reports`、`POST /api/statistics/run`、`POST /api/items/{item_id}/feedback`。MCP 提供只读 `interaction_statistics` 和 `statistical_reports`，与页面、命令行共用统计逻辑。
 
+新增 [观看、点赞与回复的定期快照](docs/engagement-metrics.md)：按已核验发布的互动，每三小时读取 X、Telegram 的可用指标，保存累计值、变化和历史；未接入的平台或缺失指标保持未知，私信不适用公开指标。
+
 - Swagger：`http://127.0.0.1:8780/docs`
 - OpenAPI：`http://127.0.0.1:8780/openapi.json`
 - 健康检查：`GET /health`

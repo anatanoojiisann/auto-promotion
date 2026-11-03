@@ -1176,3 +1176,31 @@ td code {
   font-family: ui-monospace, monospace;
   width: 100%;
 }
+
+#engagement-metrics .stat {
+  display: grid;
+  gap: 6px;
+}
+#engagement-metrics
+  > .table-wrap
+  > table
+  > tbody
+  > tr:not(.engagement-history-row)
+  > td {
+  vertical-align: top;
+}
+#engagement-metrics td:nth-child(2),
+#engagement-metrics td:nth-child(3),
+#engagement-metrics td:nth-child(4) {
+  min-width: 90px;
+  white-space: nowrap;
+}
+#engagement-metrics td:first-child {
+  min-width: 170px;
+}
+#engagement-metrics .engagement-history-row td {
+  white-space: normal;
+}
+#engagement-metrics details {
+  padding: 12px 0;
+}

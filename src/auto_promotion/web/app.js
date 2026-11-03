@@ -351,6 +351,16 @@ async function renderStatistics(day = "") {
     renderStatistics(e.target.value).catch((error) =>
       toast(error.message, true),
     );
+  const engagementHost = document.createElement("section");
+  engagementHost.id = "engagement-metrics";
+  $("#main").append(engagementHost);
+  try {
+    await renderEngagement();
+  } catch {
+    engagementHost.className = "surface padded mt-24";
+    engagementHost.innerHTML =
+      '观看、点赞与回复：<a href="http://127.0.0.1:8782/#statistics">打开定期采集统计工作台 ↗</a>';
+  }
 }
 async function metaBrowserPanel() {
   const [status, queue] = await Promise.all([
@@ -2062,8 +2072,14 @@ window.addEventListener("hashchange", () => {
 (async () => {
   try {
     await api("/session", "POST");
-    await refresh();
-    await render();
+    if (location.hash === "#statistics") {
+      // Render read-only statistics before loading the complete task catalogue.
+      await render();
+      refresh().catch((e) => toast(e.message, true));
+    } else {
+      await refresh();
+      await render();
+    }
   } catch (e) {
     $("#main").innerHTML = empty(
       "工作区连接失败",

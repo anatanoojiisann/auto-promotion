@@ -27,6 +27,7 @@ from .config import database_path, workspace_path
 from .connections import ConnectionInput, ConnectionManager
 from .core import Conflict, Engine, NotFound
 from .dispatcher import AccountBusy
+from .engagement import Engagement
 from .execution_diagnostics import exception_details
 from .growth import Growth
 from .growth_models import (
@@ -148,6 +149,7 @@ def create_app(
     )
     connections = ConnectionManager(engine)
     statistics = Statistics(store, clock=clock)
+    engagement = Engagement(engine)
     pools, campaigns = Pools(engine), Campaigns(engine)
     growth = Growth(engine)
     task_tools = TaskTools(engine)
@@ -276,6 +278,10 @@ def create_app(
                     background_tasks[kind] = asyncio.create_task(report_loop(callback, kind))
                     jobs.append(background_tasks[kind])
             if report_worker:
+                background_tasks["engagement"] = asyncio.create_task(
+                    report_loop(engagement.run_due, "engagement")
+                )
+                jobs.append(background_tasks["engagement"])
                 callbacks = (
                     (
                         (engine.collect_statistics, "statistics"),
@@ -317,6 +323,7 @@ def create_app(
     app.state.store = store
     app.state.connections = connections
     app.state.statistics = statistics
+    app.state.engagement = engagement
     app.state.pools, app.state.campaigns = pools, campaigns
     app.state.tiktok = tiktok
     app.state.interactions = interactions
@@ -831,6 +838,24 @@ def create_app(
     def statistics_reports(limit: int = 30):
         try:
             return {"reports": statistics.reports(limit), "scheduler_running": report_worker}
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @app.get("/api/engagement")
+    def engagement_snapshot(limit: int = 50, offset: int = 0):
+        try:
+            job = background_tasks.get("engagement")
+            return {
+                **engagement.snapshot(limit=limit, offset=offset),
+                "scheduler_running": bool(job and not job.done()),
+            }
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @app.get("/api/items/{item_id}/engagement")
+    def engagement_history(item_id: str, limit: int = 100):
+        try:
+            return {"item_id": item_id, "samples": engagement.history(item_id, limit=limit)}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
 
