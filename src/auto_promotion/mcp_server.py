@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from .adapters import AdapterRegistry
 from .campaigns import Campaigns
+from .cloud_control import CloudUnavailable
 from .config import database_path, load_environment, workspace_path
 from .core import Conflict, Engine
 from .growth import Growth
@@ -233,6 +234,10 @@ def create_server(engine=None):
     def invoke(function, *args):
         try:
             return function(*args)
+        except CloudUnavailable as exc:
+            from .execution_diagnostics import admission_failure_reason
+
+            raise ToolError(admission_failure_reason(exc)) from None
         except Conflict as exc:
             raise ToolError(str(exc)) from None
         except ValidationError:

@@ -543,6 +543,82 @@ class JobQueue:
             stop.set()
             thread.join(timeout=2)
 
+    def mark_cloud_unknown(self, job):
+        """Reflect a currently owned remote-unknown claim without inventing an attempt.
+
+        Historical jobs and non-send sources are not reconciled here. A cloud
+        terminal observation is not a verified platform receipt.
+        """
+        with self.store.connect(write=True) as db:
+            current = db.execute("SELECT * FROM execution_jobs WHERE id=?", (job["id"],)).fetchone()
+            fields = ("id", "kind", "reference_id", "task_id", "account_id", "pool", "version")
+            if (
+                not current
+                or current["state"] != "leased"
+                or current["owner"] != job["owner"]
+                or current["lease_until"] <= self.clock()
+                or any(current[key] != job[key] for key in fields)
+            ):
+                return False
+            db.execute(
+                "UPDATE execution_jobs SET state='unknown',owner=NULL,lease_until=0,result=? "
+                "WHERE id=? AND owner=?",
+                (canonical({"reason": "cloud_job_already_settled"}), job["id"], job["owner"]),
+            )
+            if current["kind"] != "send":
+                return True
+            item = db.execute(
+                "SELECT * FROM items WHERE id=?", (current["reference_id"],)
+            ).fetchone()
+            if (
+                not item
+                or item["status"] != "not_attempted"
+                or item["attempt_id"] is not None
+                or item["external_reference"]
+                or item["task_id"] != current["task_id"]
+                or item["account_id"] != current["account_id"]
+                or item["payload_hash"] != current["version"]
+                or db.execute("SELECT 1 FROM attempts WHERE item_id=?", (item["id"],)).fetchone()
+            ):
+                return True
+            try:
+                result = json.loads(item["result"])
+                payload = json.loads(item["payload"])
+            except (ValueError, TypeError):
+                return True
+            if (
+                not isinstance(result, dict)
+                or result.get("verified") is True
+                or result.get("external_reference")
+                or digest(payload) != current["version"]
+            ):
+                return True
+            result.update(
+                status="unknown",
+                verified=False,
+                reason="cloud_outcome_unknown",
+                previous_status=item["status"],
+                cloud_state="unknown",
+            )
+            db.execute(
+                "UPDATE items SET status='unknown',result=? WHERE id=?",
+                (canonical(result), item["id"]),
+            )
+            self.store.audit(
+                db,
+                "queue.cloud_outcome_unknown",
+                {
+                    "item_id": item["id"],
+                    "job_id": current["id"],
+                    "previous_status": item["status"],
+                    "queue_snapshot_mismatch": False,
+                },
+                current["task_id"],
+                self.clock(),
+            )
+            self.engine._mark_completed(db, current["task_id"])
+            return True
+
     def settle(self, job, error=None):
         now = self.clock()
         with self.store.connect(write=True) as db:

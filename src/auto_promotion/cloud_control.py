@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import socket
+import sqlite3
 import ssl
 import time
 import uuid
@@ -271,7 +272,7 @@ class CloudControl:
             else None
         )
 
-    def request(self, path, data=None, *, operator=False, method="POST"):
+    def request(self, path, data=None, *, operator=False, method="POST", import_blocks=True):
         request_id = str(uuid.uuid4())
         started = time.monotonic()
         token = self.operator_token if operator else self.node_token
@@ -336,10 +337,6 @@ class CloudControl:
                     payload=result,
                     context=data,
                 )
-                engine = getattr(self, "_block_engine", None)
-                if engine is not None:
-                    self.import_account_blocks(engine, result)
-                return result
         except HTTPError as exc:
             # Provider responses and URLs may contain secrets. Only expose our allowlisted code.
             parse_error = None
@@ -396,10 +393,42 @@ class CloudControl:
                 request_id, path, started, "transport_failed", error=exc, context=data
             )
             raise CloudUnavailable("CloudTransportUnavailable", diagnostics=diagnostic) from None
+        engine = getattr(self, "_block_engine", None)
+        if engine is not None and import_blocks:
+            self._import_blocks(engine, result, request_id=request_id)
+        return result
+
+    def _import_blocks(self, engine, result, *, request_id=None):
+        try:
+            self.import_account_blocks(engine, result)
+        except sqlite3.Error as exc:
+            code = getattr(exc, "sqlite_errorcode", 0) or 0
+            diagnostic = {
+                "schema": 1,
+                "operation": "account_block_import",
+                "outcome": "local_persistence_failed",
+                "cause": "sqlite_busy" if code & 255 in {5, 6} else "sqlite_error",
+            }
+            if request_id:
+                diagnostic["request_id"] = request_id
+            self.last_request_diagnostics = diagnostic
+            raise CloudUnavailable("LocalDatabaseUnavailable", diagnostics=diagnostic) from None
 
     def claim(self, pool, expected_id):
         started = time.monotonic()
-        result = self.request("/v1/claim", {"pool": pool, "expected_id": expected_id}).get("job")
+        nonce = str(uuid.uuid4())
+        payload = {"pool": pool, "expected_id": expected_id, "claim_nonce": nonce}
+        try:
+            result = self.request("/v1/claim", payload, import_blocks=False).get("job")
+        except CloudUnavailable as exc:
+            if str(exc) not in {"CloudTransportUnavailable", "LocalDatabaseUnavailable"}:
+                raise
+            # Recover this exact unexecuted claim; this never asks for another job.
+            result = self.request("/v1/claim/recover", payload, import_blocks=False).get("job")
+            if not result:
+                raise exc
+        if result:
+            result["claim_nonce"] = nonce
         if result and result["id"] != expected_id:
             self.complete(result, "pending", {}, None)
             return None
@@ -410,6 +439,17 @@ class CloudControl:
         if result:
             self._renewal_deadline(result, result, started)
         return result
+
+    def release_claim(self, lease):
+        return self.request(
+            "/v1/claim/release",
+            {
+                "id": lease["id"],
+                "lease_token": lease["lease_token"],
+                "claim_nonce": lease["claim_nonce"],
+            },
+            import_blocks=False,
+        )
 
     def guard(self, context, attempt_id):
         if (
@@ -710,7 +750,7 @@ class CloudControl:
                 if len(canonical(payload).encode()) > 3_500_000:
                     raise CloudUnavailable("CloudSnapshotBatchTooLarge")
                 try:
-                    result = self.request("/v1/sync", payload, operator=True)
+                    result = self.request("/v1/sync", payload, operator=True, import_blocks=False)
                 except CloudUnavailable as error:
                     diagnostic = dict(error.diagnostics or {})
                     conflict = diagnostic.get("sync_conflict", {})
@@ -742,7 +782,7 @@ class CloudControl:
                             if r.get("account_id") == authorization_account
                         ],
                     }
-                self.import_account_blocks(engine, result)
+                self._import_blocks(engine, result)
                 if result.get("stale"):
                     raise CloudUnavailable("CloudSnapshotStale")
                 # Commit each acknowledged slice, so failure resumes at the first
@@ -765,8 +805,39 @@ class CloudControl:
 
         if not isinstance(response, dict) or not isinstance(response.get("account_blocks"), list):
             return
+        records = response["account_blocks"]
+        if not records:
+            return
+        # Read-only prefilter avoids taking SQLite's writer lock on every heartbeat.
+        pending = []
+        with engine.store.connect() as db:
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                account = db.execute(
+                    "SELECT * FROM accounts WHERE id=?", (record.get("account_id"),)
+                ).fetchone()
+                state = record.get("outbound_block_state")
+                if (
+                    not account
+                    or route_for(dict(account)).identity != record.get("identity")
+                    or not isinstance(state, dict)
+                ):
+                    continue
+                current = db.execute(
+                    "SELECT generation FROM account_blocks WHERE account_id=?", (account["id"],)
+                ).fetchone()
+                generation = state.get("generation")
+                if (
+                    type(generation) is int
+                    and generation > 0
+                    and (not current or generation > current["generation"])
+                ):
+                    pending.append(record)
+        if not pending:
+            return
         with engine.store.connect(write=True) as db:
-            for record in response["account_blocks"]:
+            for record in pending:
                 if not isinstance(record, dict) or not isinstance(record.get("account_id"), str):
                     continue
                 account = db.execute(

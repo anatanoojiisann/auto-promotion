@@ -395,6 +395,14 @@ def create_app(
             return JSONResponse({"error": "连接信息不完整或格式错误，请核对表单"}, status_code=422)
         return await request_validation_exception_handler(request, exc)
 
+    from .cloud_control import CloudUnavailable
+
+    @app.exception_handler(CloudUnavailable)
+    async def cloud_control_error(request, exc):
+        from .execution_diagnostics import admission_failure_reason
+
+        return JSONResponse({"error": admission_failure_reason(exc)}, status_code=409)
+
     @app.exception_handler(BackendError)
     async def backend_error(request, exc):
         return JSONResponse({"error": exc.safe_code}, status_code=409)

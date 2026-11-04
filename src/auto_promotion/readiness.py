@@ -237,6 +237,17 @@ def task_workflow(task, blockers, item_blockers, now):
                     next_at=retry if retry > now else None,
                     next_at_kind="account_retry" if retry > now else None,
                 )
+    if pending and task["phase"] in {"starting", "ready"}:
+        failed = next((a for a in task.get("account_checks", []) if not a["ready"]), None)
+        if failed:
+            retry = failed.get("retry_at")
+            return step(
+                "account_" + failed["state"],
+                "等待账号核验",
+                failed["message"],
+                next_at=retry if retry and retry > now else None,
+                next_at_kind="account_retry" if retry and retry > now else None,
+            )
     if not task["items"]:
         return step(
             "prepare_items",
@@ -345,6 +356,8 @@ def task_workflow(task, blockers, item_blockers, now):
                 "等待执行服务恢复",
                 "云端数据库当日写入额度已用尽，等待额度重置后重新检查；已冻结的时间窗仍然有效。"
                 if cloud["state"] == "CloudWriteQuotaExceeded"
+                else "本机数据库暂不可写；请检查本机存储和写锁，原计划窗口保持不变。"
+                if cloud["state"] == "LocalDatabaseUnavailable"
                 else "云端授权服务暂不可用，调度器恢复连接后检查原有时间窗与尚未尝试的项目。",
                 next_at=cloud.get("retry_at"),
                 next_at_kind="service_retry",
@@ -353,9 +366,17 @@ def task_workflow(task, blockers, item_blockers, now):
             return step(
                 "waiting_execution_service",
                 "等待本任务同步恢复",
-                "本任务同步未完成；全局连接状态不能证明本任务已就绪，原有排期保持不变。",
+                "本任务同步遇到本机数据库写锁或存储错误；请检查本机存储，原有排期保持不变。"
+                if scope.get("state") == "LocalDatabaseUnavailable"
+                else "本任务同步未完成；全局连接状态不能证明本任务已就绪，原有排期保持不变。",
                 next_at=timestamp(scope.get("retry_at")),
                 next_at_kind="service_retry",
+            )
+        if task.get("desktop_execution"):
+            return step(
+                "waiting_desktop_executor",
+                "需要在场的桌面执行端",
+                "此任务使用已有浏览器的交互会话；后台队列不接管桌面。请在计划窗口内连接桌面执行端并刷新身份与目标核验。",
             )
         next_at = max(
             schedule_at,

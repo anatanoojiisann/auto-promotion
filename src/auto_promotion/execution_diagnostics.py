@@ -46,6 +46,7 @@ def admission_failure_reason(exc):
         "CloudCredentialNotConfigured",
         "CloudOperatorCredentialUnavailable",
         "CloudTransportUnavailable",
+        "LocalDatabaseUnavailable",
         "CloudControlRejected",
         "CloudWriteQuotaExceeded",
         "CloudAuthorizationUnavailable",

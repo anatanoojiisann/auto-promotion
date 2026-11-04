@@ -956,3 +956,61 @@ test("migration interruption rolls back schema and records, then can resume", ()
   }});
   assert.equal(checked,true);assert.equal(f.k.one("SELECT COUNT(*) n FROM quota_events").n,1);f.db.close();
 });
+
+test("nonce recovery binds node, pool, job and nonce and never repeats an attempt", () => {
+  const f = fixture(); f.seed(); const node=f.node();
+  const nonce=crypto.randomUUID(), lease=f.k.claim(node,"x.edge","send:one",nonce);
+  assert.equal(f.k.recoverClaim(node,"x.edge","send:one",nonce).lease_token,lease.lease_token);
+  assert.equal(f.k.recoverClaim(node,"x.edge","send:one",crypto.randomUUID()),null);
+  assert.equal(f.k.recoverClaim(node,"x.chrome","send:one",nonce),null);
+  assert.equal(f.k.recoverClaim(f.node("other"),"x.edge","send:one",nonce),null);
+  assert.equal(f.k.claim(f.node("other"),"x.edge","send:one",crypto.randomUUID()),null);
+  f.k.authorize(node,lease.id,lease.lease_token,"attempt");
+  assert.equal(f.k.recoverClaim(node,"x.edge",lease.id,nonce),null);
+  assert.throws(()=>f.k.releaseClaim(node,lease.id,lease.lease_token,nonce),/AttemptCannotReplay/);
+  f.advance(181); f.k.sweep();
+  assert.equal(f.k.one("SELECT state FROM jobs WHERE id=?",lease.id).state,"unknown");
+  assert.equal(f.k.claim(node,"x.edge",lease.id,nonce),null);
+});
+
+test("unexecuted nonce claim can release only its exact live lease", () => {
+  const f=fixture(); f.seed(); const node=f.node(), nonce=crypto.randomUUID();
+  const lease=f.k.claim(node,"x.edge","send:one",nonce);
+  assert.throws(()=>f.k.releaseClaim(node,lease.id,lease.lease_token,crypto.randomUUID()),/AttemptCannotReplay/);
+  assert.throws(()=>f.k.releaseClaim(node,lease.id,"wrong",nonce),/InvalidLease/);
+  assert.deepEqual(f.k.releaseClaim(node,lease.id,lease.lease_token,nonce),{released:true});
+  assert.equal(f.k.recoverClaim(node,"x.edge",lease.id,nonce),null);
+  const next=f.k.claim(node,"x.edge",lease.id,crypto.randomUUID());
+  assert.notEqual(next.lease_token,lease.lease_token);
+  assert.throws(()=>f.k.authorize(node,lease.id,lease.lease_token,"stale"),/InvalidLease/);
+});
+
+test("expired unexecuted nonce lease recovers only inside delivery window", () => {
+  const f=fixture(); f.seed(); const node=f.node(), nonce=crypto.randomUUID();
+  const lease=f.k.claim(node,"x.edge","send:one",nonce);
+  f.advance(181);
+  assert.equal(f.k.recoverClaim(node,"x.edge",lease.id,nonce),null);
+  f.k.sweep();
+  assert.equal(f.k.one("SELECT state FROM jobs WHERE id=?",lease.id).state,"pending");
+  const next=f.k.claim(node,"x.edge",lease.id,crypto.randomUUID());
+  f.advance(901); f.k.sweep();
+  assert.equal(f.k.one("SELECT state FROM jobs WHERE id=?",next.id).state,"missed");
+  assert.equal(f.k.claim(node,"x.edge",lease.id,crypto.randomUUID()),null);
+});
+
+test("lost authorize response stays unknown after expiry and cannot enter any replay route", () => {
+  const f=fixture(); f.seed(); const node=f.node(), nonce=crypto.randomUUID();
+  const lease=f.k.claim(node,"x.edge","send:one",nonce);
+  // The durable coordinator commits authorization; the executor sees no response.
+  f.k.authorize(node,lease.id,lease.lease_token,"lost-authorize-attempt");
+  assert.equal(f.k.recoverClaim(node,"x.edge",lease.id,nonce),null);
+  assert.throws(()=>f.k.releaseClaim(node,lease.id,lease.lease_token,nonce),/AttemptCannotReplay/);
+  f.advance(181); f.k.sweep();
+  const evidence=f.k.one("SELECT state,attempt_id FROM jobs WHERE id=?",lease.id);
+  assert.deepEqual({...evidence},{state:"unknown",attempt_id:"lost-authorize-attempt"});
+  assert.equal(f.k.recoverClaim(node,"x.edge",lease.id,nonce),null);
+  assert.throws(()=>f.k.releaseClaim(node,lease.id,lease.lease_token,nonce),/LeaseExpired/);
+  assert.equal(f.k.claim(node,"x.edge",lease.id,crypto.randomUUID()),null);
+  assert.throws(()=>f.k.complete(node,lease.id,lease.lease_token,{state:"pending",attempt_id:"lost-authorize-attempt"}),/AttemptCannotReplay/);
+  assert.throws(()=>f.k.authorize(node,lease.id,lease.lease_token,"second-attempt"),/LeaseExpired/);
+});

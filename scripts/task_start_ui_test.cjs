@@ -102,6 +102,20 @@ async function scenario(name, options = {}) {
     holdRead = false,
     heldRead = false;
   let current = task();
+  if (options.accountBlockDisplay || options.desktopDisplay) {
+    current.readiness.workflow = {
+      ...current.readiness.workflow,
+      status: options.desktopDisplay
+        ? "waiting_desktop_executor"
+        : "account_unverified",
+      label: options.desktopDisplay ? "需要在场的桌面执行端" : "等待账号核验",
+      message: options.desktopDisplay
+        ? "后台队列不接管桌面。请在计划窗口内连接桌面执行端。"
+        : "登录身份或授权已失效，请重新连接账号",
+      next_at: null,
+      schedule_next_at: 1793059200,
+    };
+  }
   if (options.localAuthorization) {
     current.policy.execution_channel = "local";
     current.channel = {
@@ -329,6 +343,15 @@ async function scenario(name, options = {}) {
         "",
       );
       assert.equal(await page.locator("#notice").textContent(), "");
+    } else if (options.accountBlockDisplay || options.desktopDisplay) {
+      const message = await page.locator("#task-workflow").innerText();
+      assert.match(
+        message,
+        options.desktopDisplay ? /需要在场的桌面执行端/ : /等待账号核验/,
+      );
+      assert.match(message, /原定下一计划时间/);
+      assert.doesNotMatch(message, /任务已启动，尚未到计划时间/);
+      assert.equal(authorizations, 0);
     } else if (options.intentDisplay) {
       assert.match(
         await page.locator("#task-readiness").innerText(),
@@ -492,6 +515,14 @@ async function scenario(name, options = {}) {
     ["start-shows-current-gate", { currentGate: true }],
     ["start-shows-future-schedule", {}],
     ["blocking-intent-owner-is-visible", { intentDisplay: true }],
+    [
+      "stale-account-is-not-displayed-as-schedule",
+      { accountBlockDisplay: true },
+    ],
+    [
+      "desktop-executor-requirement-keeps-original-schedule",
+      { desktopDisplay: true },
+    ],
     ["late-template-save-keeps-new-draft", { templateSave: true }],
     [
       "late-template-failure-keeps-new-draft",

@@ -199,6 +199,8 @@ export class ControlKernel {
           "CREATE TABLE account_channels(identity TEXT PRIMARY KEY,account_id TEXT NOT NULL,channel TEXT NOT NULL,generation TEXT NOT NULL,until_at REAL NOT NULL,node_id TEXT NOT NULL,task_id TEXT NOT NULL,updated_at REAL NOT NULL,store_id TEXT NOT NULL DEFAULT '')",
         ),
       );
+    if (!this.rows("PRAGMA table_info(jobs)").some(c => c.name === "claim_nonce"))
+      this.tx(() => this.sql.exec("ALTER TABLE jobs ADD COLUMN claim_nonce TEXT"));
     const channelColumns = this.rows("PRAGMA table_info(account_channels)");
     if (channelColumns.length && !channelColumns.some(c => c.name === "store_id"))
       this.tx(() => this.sql.exec("ALTER TABLE account_channels ADD COLUMN store_id TEXT NOT NULL DEFAULT ''"));
@@ -524,9 +526,17 @@ export class ControlKernel {
     return this.tx(() => {
       const now = this.clock();
       for (const j of this.rows(
-        "SELECT id FROM jobs WHERE state='leased' AND lease_until<=?",
+        "SELECT id,attempt_id,claim_nonce,expires_at FROM jobs WHERE state='leased' AND lease_until<=?",
         now,
       )) {
+        // Only the nonce protocol proves that every execution must first authorize.
+        // Legacy leases and anything authorized remain quarantined as unknown.
+        if (j.claim_nonce && !j.attempt_id) {
+          this.sql.exec("UPDATE jobs SET state=?,owner=NULL,lease_token=NULL,claim_nonce=NULL,lease_until=0,result=?,completed_at=? WHERE id=?",
+            j.expires_at > now ? "pending" : "missed",
+            canonical({reason: "unexecuted_claim_expired"}), now, j.id);
+          continue;
+        }
         this.sql.exec(
           "UPDATE jobs SET state='unknown',result=?,completed_at=? WHERE id=?",
           canonical({ reason: "executor_lease_expired", verified: false }),
@@ -781,7 +791,9 @@ export class ControlKernel {
           affected_tasks: this.rows("SELECT DISTINCT task_id FROM jobs WHERE account_id=? AND state IN ('pending','leased','unknown') AND expires_at>?", a.id, this.clock()).map(t => t.task_id) };
       });
   }
-  claim(node, pool, expectedId = null) {
+  claim(node, pool, expectedId = null, nonce = null) {
+    if (nonce !== null && (!expectedId || typeof nonce !== "string" || !/^[0-9a-f-]{36}$/.test(nonce)))
+      throw new ControlError("InvalidClaimNonce", 400);
     if (!node.pools.includes(pool))
       throw new ControlError("PoolNotAssigned", 403);
     this.sweep();
@@ -878,11 +890,12 @@ export class ControlKernel {
         const token = this.uuid(),
           until = now + LEASE_SECONDS;
         this.sql.exec(
-          "UPDATE jobs SET state='leased',owner=?,lease_token=?,lease_until=?,claimed_at=?,completed_at=NULL WHERE id=?",
+          "UPDATE jobs SET state='leased',owner=?,lease_token=?,lease_until=?,claimed_at=?,completed_at=NULL,claim_nonce=? WHERE id=?",
           node.id,
           token,
           until,
           now,
+          nonce,
           j.id,
         );
         return {
@@ -893,6 +906,25 @@ export class ControlKernel {
         };
       }
       return null;
+    });
+  }
+  recoverClaim(node, pool, id, nonce) {
+    const j = this.one("SELECT * FROM jobs WHERE id=?", id);
+    if (!nonce || !j || j.pool !== pool || j.owner !== node.id || j.claim_nonce !== nonce ||
+        !node.pools.includes(pool) || !node.accounts.includes(j.account_id) ||
+        j.state !== "leased" || j.lease_until <= this.clock() || j.attempt_id)
+      return null;
+    return {...JSON.parse(j.payload), lease_token: j.lease_token, lease_until: j.lease_until,
+      renew_after_seconds: 0, claim_nonce: nonce};
+  }
+  releaseClaim(node, id, token, nonce) {
+    return this.tx(() => {
+      const j = this.leased(node, id, token);
+      if (!nonce || j.claim_nonce !== nonce || j.attempt_id)
+        throw new ControlError("AttemptCannotReplay");
+      this.sql.exec("UPDATE jobs SET state=?,owner=NULL,lease_token=NULL,claim_nonce=NULL,lease_until=0 WHERE id=?",
+        j.expires_at > this.clock() ? "pending" : "missed", id);
+      return {released: true};
     });
   }
   leased(node, id, token, { late = false } = {}) {

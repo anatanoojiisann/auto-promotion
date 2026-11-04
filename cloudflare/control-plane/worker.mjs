@@ -477,9 +477,13 @@ export class WorkspaceCoordinator extends DurableObject {
           result = { ready: true, node_id: node.id, account_blocks: this.kernel.accountBlocks(node.accounts) };
         else if (path === "/v1/claim" && request.method === "POST")
           result = {
-            job: this.kernel.claim(node, body.pool, body.expected_id || null),
+            job: this.kernel.claim(node, body.pool, body.expected_id || null, body.claim_nonce ?? null),
             account_blocks: this.kernel.accountBlocks(node.accounts),
           };
+        else if (path === "/v1/claim/recover" && request.method === "POST")
+          result = {job: this.kernel.recoverClaim(node, body.pool, body.expected_id, body.claim_nonce)};
+        else if (path === "/v1/claim/release" && request.method === "POST")
+          result = this.kernel.releaseClaim(node, body.id, body.lease_token, body.claim_nonce);
         else if (path === "/v1/job" && request.method === "POST") {
           this.kernel.sweep();
           const job = this.kernel.one(

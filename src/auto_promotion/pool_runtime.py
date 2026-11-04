@@ -405,20 +405,32 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                         queue.settle(job)
                         time.sleep(1)
                         continue
-                    journal.remember(lease)
-                    if any(
-                        lease[key] != job[key]
-                        for key in (
-                            "id",
-                            "kind",
-                            "reference_id",
-                            "task_id",
-                            "account_id",
-                            "pool",
-                            "version",
-                        )
-                    ):
-                        raise CloudUnavailable("CloudManifestMismatch")
+                    try:
+                        if any(
+                            lease[key] != job[key]
+                            for key in (
+                                "id",
+                                "kind",
+                                "reference_id",
+                                "task_id",
+                                "account_id",
+                                "pool",
+                                "version",
+                            )
+                        ):
+                            raise CloudUnavailable("CloudManifestMismatch")
+                        journal.remember(lease)
+                    except Exception:
+                        # No adapter was entered. Release only this nonce-bound,
+                        # unexecuted cloud lease; failure stays fenced until expiry.
+                        try:
+                            cloud.release_claim(lease)
+                        except Exception as release_error:
+                            worker_error(engine, owner, release_error)
+                        # No receipt journal was accepted. Do not derive an outcome
+                        # from a mismatched reference or manufacture a receipt.
+                        lease = None
+                        raise
                 context = context or {"id": job["id"], "owner": owner}
                 context["cloud"] = lease
                 if local and not is_managed:
@@ -446,16 +458,19 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                     engine.run_reference_job(job)
             except CloudJobClosed as exc:
                 try:
-                    with engine.store.connect(write=True) as db:
-                        db.execute(
-                            "UPDATE execution_jobs SET state=?,owner=NULL,lease_until=0,result=? WHERE id=? AND owner=?",
-                            (
-                                exc.state,
-                                canonical({"reason": "cloud_job_already_settled"}),
-                                job["id"],
-                                owner,
-                            ),
-                        )
+                    if exc.state == "unknown":
+                        queue.mark_cloud_unknown(job)
+                    else:
+                        with engine.store.connect(write=True) as db:
+                            db.execute(
+                                "UPDATE execution_jobs SET state=?,owner=NULL,lease_until=0,result=? WHERE id=? AND owner=?",
+                                (
+                                    exc.state,
+                                    canonical({"reason": "cloud_job_already_settled"}),
+                                    job["id"],
+                                    owner,
+                                ),
+                            )
                 except sqlite3.Error as persistence_error:
                     worker_error(engine, owner, persistence_error)
             except Exception as exc:

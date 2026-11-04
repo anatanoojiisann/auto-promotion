@@ -13,6 +13,11 @@ from auto_promotion.meta_migration import import_existing
 from auto_promotion.store import Store
 
 
+def emit_result(result):
+    # ASCII JSON is lossless and works with Windows GBK consoles.
+    print(json.dumps(result, ensure_ascii=True))
+
+
 def main():
     load_environment(".env")
     parser = argparse.ArgumentParser()
@@ -57,7 +62,7 @@ def main():
         result = skip_unknown(browser, **data)
     else:
         result = getattr(browser, args.action)(**data)
-    print(json.dumps(result, ensure_ascii=False))
+    emit_result(result)
 
 
 if __name__ == "__main__":

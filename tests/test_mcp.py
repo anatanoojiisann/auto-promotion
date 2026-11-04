@@ -109,7 +109,13 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 70)
+        self.assertEqual(len(tools), 72)
+        # Main8a003dd adds these two local read-only tools to the prior70.
+        for name in ("engagement_statistics", "engagement_history"):
+            self.assertIn(name, tools)
+            self.assertTrue(tools[name].annotations.readOnlyHint)
+            self.assertFalse(tools[name].annotations.destructiveHint)
+            self.assertFalse(tools[name].annotations.openWorldHint)
         self.assertIn("authorize_local_channel", tools)
         self.assertTrue(tools["authorize_local_channel"].annotations.openWorldHint)
         self.assertFalse(tools["authorize_local_channel"].annotations.readOnlyHint)
@@ -321,7 +327,12 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
                     tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-                    self.assertEqual(len(tools), 70)
+                    self.assertEqual(len(tools), 72)
+                    for name in ("engagement_statistics", "engagement_history"):
+                        self.assertIn(name, tools)
+                        self.assertTrue(tools[name].annotations.readOnlyHint)
+                        self.assertFalse(tools[name].annotations.destructiveHint)
+                        self.assertFalse(tools[name].annotations.openWorldHint)
                     self.assertEqual(
                         set(tools), {tool.name for tool in await self.server.list_tools()}
                     )

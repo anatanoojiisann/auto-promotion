@@ -613,6 +613,92 @@ class CloudflareHTTPTests(unittest.TestCase):
             method="PUT",
         )
 
+    def test_http_nonce_claim_recover_release_and_old_token_fenced(self):
+        job_id = export_snapshot(self.engine)["jobs"][0]["id"]
+        nonce = str(uuid.uuid4())
+        payload = {"pool": "simulation.x", "expected_id": job_id, "claim_nonce": nonce}
+        lease = self.cloud.request("/v1/claim", payload)["job"]
+        recovered = self.cloud.request("/v1/claim/recover", payload)["job"]
+        self.assertEqual(recovered["lease_token"], lease["lease_token"])
+        wrong = self.cloud.request(
+            "/v1/claim/recover", {**payload, "claim_nonce": str(uuid.uuid4())}
+        )
+        self.assertIsNone(wrong["job"])
+        self.assertTrue(self.cloud.release_claim({**lease, "claim_nonce": nonce})["released"])
+        self.assertIsNone(self.cloud.request("/v1/claim/recover", payload)["job"])
+        second = self.cloud.claim("simulation.x", job_id)
+        self.assertNotEqual(second["lease_token"], lease["lease_token"])
+        with self.assertRaisesRegex(CloudUnavailable, "InvalidLease"):
+            self.cloud.authorize(lease, "stale-attempt")
+        attempt = "attempt-" + uuid.uuid4().hex
+        self.assertTrue(self.cloud.authorize(second, attempt))
+        self.assertIsNone(
+            self.cloud.request(
+                "/v1/claim/recover", {**payload, "claim_nonce": second["claim_nonce"]}
+            )["job"]
+        )
+        with self.assertRaisesRegex(CloudUnavailable, "AttemptCannotReplay"):
+            self.cloud.release_claim(second)
+        self.cloud.complete(second, "unknown", {"verified": False}, attempt)
+
+    def test_http_lost_authorize_response_never_recovers_or_releases_claim(self):
+        from urllib.error import URLError
+
+        from auto_promotion.cloud_control import urlopen as real_open
+
+        job_id = export_snapshot(self.engine)["jobs"][0]["id"]
+        lease = self.cloud.claim("simulation.x", job_id)
+        attempt = "lost-authorize-" + uuid.uuid4().hex
+
+        def interrupted(request, **kwargs):
+            response = real_open(request, **kwargs)
+            if request.full_url.endswith("/v1/authorize"):
+                response.read()
+                response.close()
+                raise URLError(ConnectionResetError("synthetic lost authorization response"))
+            return response
+
+        with patch("auto_promotion.cloud_control.urlopen", side_effect=interrupted):
+            with self.assertRaisesRegex(CloudUnavailable, "CloudTransportUnavailable"):
+                self.cloud.authorize(lease, attempt)
+        payload = {
+            "pool": "simulation.x",
+            "expected_id": job_id,
+            "claim_nonce": lease["claim_nonce"],
+        }
+        self.assertIsNone(self.cloud.request("/v1/claim/recover", payload)["job"])
+        with self.assertRaisesRegex(CloudUnavailable, "AttemptCannotReplay"):
+            self.cloud.release_claim(lease)
+        with self.assertRaisesRegex(CloudUnavailable, "AttemptCannotReplay"):
+            self.cloud.complete(lease, "pending", {}, attempt)
+        # A durable unknown receipt ends the active lease without permitting replay.
+        self.cloud.complete(lease, "unknown", {"verified": False}, attempt)
+        with self.assertRaisesRegex(CloudUnavailable, "AlreadySettled"):
+            self.cloud.claim("simulation.x", job_id)
+
+    def test_http_lost_response_recovers_without_second_claim(self):
+        from urllib.error import URLError
+
+        from auto_promotion.cloud_control import urlopen as real_open
+
+        job_id = export_snapshot(self.engine)["jobs"][0]["id"]
+        paths = []
+
+        def interrupted(request, **kwargs):
+            paths.append(request.full_url.rsplit("/v1/", 1)[-1])
+            response = real_open(request, **kwargs)
+            if paths[-1] == "claim":
+                response.read()
+                response.close()
+                raise URLError(ConnectionResetError("synthetic response lost"))
+            return response
+
+        with patch("auto_promotion.cloud_control.urlopen", side_effect=interrupted):
+            lease = self.cloud.claim("simulation.x", job_id)
+        self.assertEqual(paths, ["claim", "claim/recover"])
+        self.assertEqual(lease["id"], job_id)
+        self.assertTrue(self.cloud.release_claim(lease)["released"])
+
     def test_real_worker_http_execution_and_receipt(self):
         queue = JobQueue(self.engine)
         queue.sync()
