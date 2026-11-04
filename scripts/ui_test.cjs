@@ -676,7 +676,22 @@ async function cleanup() {
   );
   await page.getByRole("link", { name: "互动统计", exact: true }).click();
   await page.getByRole("heading", { name: "互动统计", exact: true }).waitFor();
-  assert.ok((await page.locator(".stats").innerText()).includes("不可统计"));
+  const publicationStats = page.locator("#main > .stats");
+  const engagementStats = page.locator("#engagement-metrics .stats");
+  // Exercise both regions after the asynchronous engagement render completes.
+  await engagementStats.waitFor({ state: "visible" });
+  assert.equal(await publicationStats.count(), 1);
+  assert.equal(await engagementStats.count(), 1);
+  assert.equal(await page.locator("#main .stats").count(), 2);
+  assert.ok((await publicationStats.innerText()).includes("不可统计"));
+  const engagementText = await engagementStats.innerText();
+  for (const label of ["已观察观看", "已观察点赞", "已观察回复"])
+    assert.ok(engagementText.includes(label));
+  assert.deepEqual(
+    await engagementStats.locator(".stat strong").allTextContents(),
+    ["不可获取", "不可获取", "不可获取"],
+    "simulation publications do not create observed live engagement metrics",
+  );
   const statistics = await page.evaluate(() =>
     fetch("/api/statistics").then((r) => r.json()),
   );
@@ -1029,6 +1044,8 @@ async function cleanup() {
           "global_stop_restore",
           "mobile_no_overflow",
           "live_statistics_exclude_simulation",
+          "statistics_regions_are_distinct",
+          "engagement_metrics_exclude_simulation",
           "unavailable_replies_not_zero",
           "growth_goals_and_channel_link",
           "event_cohort_maturity_and_refund",
@@ -1049,7 +1066,7 @@ async function cleanup() {
   );
   assert.deepEqual(errors, [], "browser errors");
   console.log(
-    "UI workflow passed; 45 checks; screenshots " +
+    "UI workflow passed; 47 checks; screenshots " +
       (process.env.AP_UI_SKIP_SCREENSHOTS ? "skipped" : "saved") +
       ".",
   );
