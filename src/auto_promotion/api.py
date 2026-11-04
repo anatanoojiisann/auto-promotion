@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -28,6 +28,7 @@ from .connections import ConnectionInput, ConnectionManager
 from .core import Conflict, Engine, NotFound
 from .dispatcher import AccountBusy
 from .engagement import Engagement
+from .engagement_effects import EngagementEffects
 from .execution_diagnostics import exception_details
 from .growth import Growth
 from .growth_models import (
@@ -848,6 +849,68 @@ def create_app(
             return {"reports": statistics.reports(limit), "scheduler_running": report_worker}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
+
+    def engagement_filters(
+        platform: str = "",
+        account_id: str = "",
+        task_id: str = "",
+        q: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        publication_time: str = "all",
+        status: str = "",
+        sort: str = "published_at",
+        direction: str = "desc",
+    ):
+        return {
+            "platform": platform,
+            "account_id": account_id,
+            "task_id": task_id,
+            "q": q,
+            "date_from": date_from,
+            "date_to": date_to,
+            "publication_time": publication_time,
+            "status": status,
+            "sort": sort,
+            "direction": direction,
+        }
+
+    @app.get("/api/engagement/effects")
+    def engagement_effects(
+        limit: int = 50,
+        offset: int = 0,
+        filters: dict = Depends(engagement_filters),
+    ):
+        try:
+            job = background_tasks.get("engagement")
+            return {
+                **EngagementEffects(engagement).snapshot(limit=limit, offset=offset, **filters),
+                "scheduler_running": bool(job and not job.done()),
+            }
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @app.get("/api/engagement/export")
+    def export_engagement(filters: dict = Depends(engagement_filters)):
+        try:
+            content = EngagementEffects(engagement).export(**filters)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return Response(
+            content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="interaction-effects.csv"'},
+        )
+
+    @app.get("/api/engagement/items/{item_id}")
+    def engagement_detail(item_id: str, limit: int = 100):
+        try:
+            detail = EngagementEffects(engagement).detail(item_id, limit=limit)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        if detail is None:
+            raise HTTPException(404, "EngagementPublicationNotFound")
+        return detail
 
     @app.get("/api/engagement")
     def engagement_snapshot(limit: int = 50, offset: int = 0):

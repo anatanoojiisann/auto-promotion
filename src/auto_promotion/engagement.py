@@ -26,7 +26,7 @@ class Engagement:
     def publications(self):
         rows = self.store.rows(
             "SELECT i.id item_id,i.task_id,i.account_id,i.payload,i.result,i.external_reference,"
-            "i.due_at,a.platform,a.label account_label,p.published_at FROM items i "
+            "i.due_at,a.platform,a.label account_label,t.name task_name,p.published_at FROM items i "
             "JOIN accounts a ON a.id=i.account_id JOIN tasks t ON t.id=i.task_id "
             "LEFT JOIN publication_evidence p ON p.item_id=i.id "
             "WHERE a.mode='live' AND t.mode='live' AND i.status='confirmed' "
@@ -187,9 +187,8 @@ class Engagement:
                     )
         return {"processed": processed, "interval_seconds": INTERVAL, "read_only": True}
 
-    def snapshot(self, *, limit=50, offset=0):
-        if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
-            raise ValueError("InvalidEngagementPage")
+    def items(self):
+        """Build the saved read model without pagination or platform calls."""
         rows = self.publications()
         latest = {}
         for sample in self.store.rows(
@@ -198,9 +197,6 @@ class Engagement:
             if len(latest.setdefault(sample["item_id"], [])) < 2:
                 latest[sample["item_id"]].append(sample)
         polls = {r["item_id"]: r for r in self.store.rows("SELECT * FROM engagement_polls")}
-        totals = {
-            k: {"observed_total": 0, "available_items": 0, "estimated_items": 0} for k in METRICS
-        }
         items = []
         for row in rows:
             samples = latest.get(row["item_id"], [])
@@ -208,19 +204,20 @@ class Engagement:
             values = json.loads(sample["metrics"]) if sample else {k: None for k in METRICS}
             estimates = json.loads(sample["estimated"]) if sample else []
             previous = json.loads(samples[1]["metrics"]) if len(samples) > 1 else {}
-            for k in METRICS:
-                if values[k] is not None:
-                    totals[k]["observed_total"] += values[k]
-                    totals[k]["available_items"] += 1
-                    totals[k]["estimated_items"] += k in estimates
             capability = self.capability(row)
             poll = polls.get(row["item_id"], {})
             items.append(
                 {
                     "item_id": row["item_id"],
                     "task_id": row["task_id"],
+                    "task_name": row["task_name"],
+                    "account_id": row["account_id"],
                     "platform": row["platform"],
                     "account_label": row["account_label"],
+                    "text": row["payload"].get("text", ""),
+                    "title": row["payload"].get("title", ""),
+                    "target": row["payload"].get("target", ""),
+                    "action": row["payload"].get("action", ""),
                     "external_reference": row["external_reference"],
                     "published_at": row["published_at"],
                     "capability": capability,
@@ -246,12 +243,31 @@ class Engagement:
                     "next_at": poll.get("next_at"),
                 }
             )
+        return items
+
+    @staticmethod
+    def totals(items):
+        totals = {
+            k: {"observed_total": 0, "available_items": 0, "estimated_items": 0} for k in METRICS
+        }
+        for item in items:
+            for key in METRICS:
+                if item["metrics"][key] is not None:
+                    totals[key]["observed_total"] += item["metrics"][key]
+                    totals[key]["available_items"] += 1
+                    totals[key]["estimated_items"] += key in item["estimated"]
+        return totals
+
+    def snapshot(self, *, limit=50, offset=0):
+        if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
+            raise ValueError("InvalidEngagementPage")
+        items = self.items()
         return {
             "items": items[offset : offset + limit],
             "total": len(items),
             "limit": limit,
             "offset": offset,
-            "totals": totals,
+            "totals": self.totals(items),
             "interval_seconds": INTERVAL,
             "supported_platforms": sorted(SUPPORTED),
             "scope": "our_verified_publications_all_dates",

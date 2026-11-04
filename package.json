@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "test:ui": "node scripts/ui_test.cjs",
+    "test:ui:effects": "node scripts/effects_ui_test.cjs",
     "test:ui:pools": "node scripts/pool_ui_test.cjs",
     "test:ui:blocks": "node scripts/account_block_ui_test.cjs",
     "test:ui:telegram-reads": "node scripts/telegram_read_ui_test.cjs",
