@@ -347,6 +347,7 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             item_id=claim["item_id"], manifest=task["manifest_hash"], channel=policy["execution_channel"])
         try:
             baseline = self.observer_baseline(account["id"],binding.identity,context["target_url"]) if binding.receipt_reader=="telegram_api" else None
+            reservation = self.telegram_observer.reserve_receipt(account["id"]) if baseline is not None else None
         except BackendError as error:
             return {"status":"failed_known","verified":False,"confirmed_not_submitted":True,"submission_started":False,"reason":error.safe_code}
         with self.store.connect(write=True) as db:
@@ -354,8 +355,11 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 (identifier, claim["item_id"], fingerprint(request), canonical(full_claim), canonical(context),
                  binding.device_id, min(request.deadline, (execution_job or {}).get("lease_until", request.deadline))))
             if baseline is not None:
+                observer_sha256 = fingerprint(self.config.telegram_observers[account["id"]])
                 db.execute("INSERT INTO phone_telegram_observer_receipts(authorization_id,account_id,baseline,observer_sha256) VALUES(?,?,?,?)",
-                    (identifier,account["id"],canonical(baseline),fingerprint(self.config.telegram_observers[account["id"]])))
+                    (identifier,account["id"],canonical(baseline),observer_sha256))
+                db.execute("INSERT INTO phone_telegram_receipt_budgets(authorization_id,account_id,observer_sha256,read_identity,window_end,reserved) VALUES(?,?,?,?,?,?)",
+                    (identifier,account["id"],observer_sha256,reservation["read_identity"],reservation["window_end"],reservation["reserved"]))
         return self.outcome(self.dispatch(request, identifier, account["id"], claim["item_id"]), request.social)
 
     def authorize(self, body, bearer):
@@ -380,6 +384,15 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             if (not baseline or time.time()-json.loads(baseline["baseline"])["observed_at"]>120
                     or fingerprint(self.config.telegram_observers.get(baseline["account_id"]))!=baseline["observer_sha256"]):
                 raise Conflict("PhoneTelegramObserverBaselineRequired")
+            reservation = self.store.one("SELECT * FROM phone_telegram_receipt_budgets WHERE authorization_id=?",(row["id"],))
+            if (not reservation or reservation["account_id"]!=baseline["account_id"]
+                    or reservation["observer_sha256"]!=baseline["observer_sha256"] or reservation["used"]!=0):
+                raise Conflict("PhoneTelegramReceiptBudgetRequired")
+            from .telegram_receipt_budget import MIN_RECEIPT_SECONDS
+            try:
+                self.telegram_observer.check_receipt_reservation(baseline["account_id"],reservation,minimum_seconds=MIN_RECEIPT_SECONDS)
+            except BackendError:
+                raise Conflict("PhoneTelegramReceiptBudgetRequired") from None
         verify_claim(json.loads(row["claim"]))
         if json.loads(row["claim"])["payload"]["task_id"] not in self.config.authorized_task_ids:
             raise Conflict("PhoneSocialTaskOutsideDevelopmentScope")
@@ -389,6 +402,10 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             self.engine._integrity(db, task, "outbound")
             if task["state"] != "active" or db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
                 raise Conflict("PhoneSocialStopped")
+            if context.get("receipt_reader")=="telegram_api":
+                current = db.execute("SELECT used,window_end FROM phone_telegram_receipt_budgets WHERE authorization_id=?",(row["id"],)).fetchone()
+                if not current or current["used"]!=0 or current["window_end"]-time.time()<MIN_RECEIPT_SECONDS:
+                    raise Conflict("PhoneTelegramReceiptBudgetRequired")
             changed = db.execute("UPDATE phone_social_authorizations SET used_at=?,native_id=?,execution_id=? WHERE id=? AND used_at IS NULL AND expires_at>?",
                 (time.time(), body["native_command_id"], body["execution_id"], row["id"], time.time())).rowcount
             if changed != 1:

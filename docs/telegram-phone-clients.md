@@ -45,3 +45,27 @@ grant send permission: per-user `send_messages` / `send_plain` restrictions stop
 workflow before a send. The inherited shared local read policy defaults to 120 logical
 RPC reads per hour. Use the existing account-policy context and revisioned settings;
 never reset counters or silently raise limits to finish a task.
+
+
+## Reserved read budget for phone receipts
+
+Before a new Telegram phone submission is dispatched, the observer charges 16 logical
+reads against the same account's existing shared read ledger. This reserves the maximum
+for one bounded receipt observation without increasing the account policy. The original
+business authorization stores the prepaid amount, account identity, observer binding,
+and read-window expiry in the isolated AP database. The final one-use click grant is
+refused unless the reservation is intact, unused, still valid under the latest policy,
+and has at least 60 seconds left in its original window.
+
+The observer atomically spends its prepaid amount before each allowed read RPC. Other
+readers cannot consume the charged allowance. Unused reads are never refunded, including
+on process failure; near-expiry reservations fail closed. A changed identity, window,
+policy, exhausted reservation, or unavailable read guard prevents further observation.
+The reservation does not promise that Telegram will return a receipt: network errors,
+account restrictions and ambiguous matches still remain unknown and never authorize a
+second send. Already-used historical authorizations without this new reservation remain
+eligible for their original read-only reconciliation using the ordinary shared budget.
+
+This change adds a receipt-budget table only to an explicitly initialized AP database.
+It does not enable live writes, clear a stop, migrate a production service, or commission
+an app profile. Offline fixture tests are not evidence of a successful real submission.

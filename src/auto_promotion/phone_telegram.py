@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS phone_telegram_observer_receipts(
  authorization_id TEXT PRIMARY KEY,account_id TEXT NOT NULL,baseline TEXT NOT NULL,
  observer_sha256 TEXT NOT NULL,receipt TEXT,verified_at REAL
 );
+CREATE TABLE IF NOT EXISTS phone_telegram_receipt_budgets(
+ authorization_id TEXT PRIMARY KEY,account_id TEXT NOT NULL,observer_sha256 TEXT NOT NULL,
+ read_identity TEXT NOT NULL,window_end REAL NOT NULL,reserved INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -77,6 +81,22 @@ class PhoneTelegram:
             raise BackendError("PhoneTelegramNativePreparationRequired")
         return self.preparation(account["id"],claim["payload"])
 
+    def consume_receipt_budget(self,authorization_id,account_id,observer_sha256,reads,count):
+        """Spend prepaid reads durably before starting the corresponding RPC batch."""
+        from .telegram_receipt_budget import validate_receipt_reads
+
+        reservation = self.store.one("SELECT * FROM phone_telegram_receipt_budgets WHERE authorization_id=?",(authorization_id,))
+        if not reservation or reservation["account_id"]!=account_id or reservation["observer_sha256"]!=observer_sha256:
+            raise BackendError("PhoneTelegramReceiptBudgetBindingChanged")
+        if type(count) is not int or count<1:
+            raise BackendError("PhoneTelegramReceiptBudgetUnavailable")
+        validate_receipt_reads(reads,reservation)
+        with self.store.connect(write=True) as db:
+            changed = db.execute("UPDATE phone_telegram_receipt_budgets SET used=used+? WHERE authorization_id=? AND account_id=? AND observer_sha256=? AND window_end>? AND used+?<=reserved AND EXISTS (SELECT 1 FROM phone_social_authorizations WHERE id=? AND used_at IS NOT NULL)",
+                (count,authorization_id,account_id,observer_sha256,time.time(),count,authorization_id)).rowcount
+            if changed!=1:
+                raise BackendError("PhoneTelegramReceiptBudgetUnavailable")
+
     def telegram_receipt(self,body,bearer):
         import hashlib
         import hmac
@@ -99,7 +119,14 @@ class PhoneTelegram:
             raise Conflict("PhoneTelegramObserverBindingChanged")
         receipt = json.loads(stored["receipt"]) if stored["receipt"] else None
         if receipt is None:
-            observed = self.telegram_observer.receipt(stored["account_id"],context,json.loads(stored["baseline"]),float(int(row["used_at"])))
+            reservation = self.store.one("SELECT * FROM phone_telegram_receipt_budgets WHERE authorization_id=?",(row["id"],))
+            if reservation:
+                def consume(reads,count):
+                    self.consume_receipt_budget(row["id"],stored["account_id"],stored["observer_sha256"],reads,count)
+                observed = self.telegram_observer.receipt(stored["account_id"],context,json.loads(stored["baseline"]),float(int(row["used_at"])),consume=consume)
+            else:
+                # Historical, already-consumed authorizations remain read-only recoverable.
+                observed = self.telegram_observer.receipt(stored["account_id"],context,json.loads(stored["baseline"]),float(int(row["used_at"])))
             if observed:
                 if (observed.source!="telegram_api" or not receipt_matches(observed,context,float(int(row["used_at"])))
                         or int(observed.native_id)<=json.loads(stored["baseline"])["last_message_id"]):

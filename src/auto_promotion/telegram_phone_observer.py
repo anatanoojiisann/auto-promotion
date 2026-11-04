@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .backends.common import BackendError, account_lock, profile_path, read_profile
 from .backends.telegram import TelegramBackend
 from .backends.telegram_reads import TelegramReads
+from .telegram_receipt_budget import reserve_receipt_reads, validate_receipt_reads
 
 
 class TelegramObserverConfig(BaseModel):
@@ -49,17 +50,7 @@ class TelegramPhoneObserver:
     def baseline(self,account_id,identity,target_url):
         return asyncio.run(self.query(account_id,identity,target_url))
 
-    def receipt(self,account_id,context,baseline,since):
-        return asyncio.run(self.query(account_id,context.identity,context.target_url,baseline=baseline,context=context,since=since))
-
-    async def query(self,account_id,identity,target_url,*,baseline=None,context=None,since=None):
-        from phone_fleet_protocol import fingerprint
-        from phone_fleet_protocol.social import SocialReceipt, target_parts
-        try:
-            from telethon import errors, utils
-        except ImportError:
-            raise BackendError("PhoneTelegramObserverDependencyUnavailable") from None
-
+    def _configuration(self,account_id):
         config = self.configs.get(account_id)
         if config is None:
             raise BackendError("PhoneTelegramObserverNotConfigured")
@@ -67,25 +58,55 @@ class TelegramPhoneObserver:
         settings = self.settings_loader(config)
         if str(settings.get("identity"))!=str(config.user_id) or not settings.get("api_id") or not settings.get("api_hash"):
             raise BackendError("PhoneTelegramObserverAuthorizationRequired")
+        return config,settings
+
+    @staticmethod
+    def _reads(config,settings):
+        context_read = {"database":config.api_database,"account_id":config.api_account_id} if config.api_account_id and config.api_database else None
+        return TelegramReads(config.backend_label,str(config.user_id),str(settings.get("identity")),scan_limit=16,context=context_read,
+            ledger_root=profile_path("telegram",config.backend_label,accounts_dir=config.accounts_dir).parent)
+
+    def reserve_receipt(self,account_id):
+        config,settings = self._configuration(account_id)
+        return reserve_receipt_reads(self._reads(config,settings))
+
+    def check_receipt_reservation(self,account_id,reservation,*,minimum_seconds=0):
+        config,settings = self._configuration(account_id)
+        validate_receipt_reads(self._reads(config,settings),reservation,minimum_seconds=minimum_seconds)
+
+    def receipt(self,account_id,context,baseline,since,*,consume=None):
+        return asyncio.run(self.query(account_id,context.identity,context.target_url,baseline=baseline,context=context,since=since,consume=consume))
+
+    async def query(self,account_id,identity,target_url,*,baseline=None,context=None,since=None,consume=None):
+        from phone_fleet_protocol import fingerprint
+        from phone_fleet_protocol.social import SocialReceipt, target_parts
+        try:
+            from telethon import errors, utils
+        except ImportError:
+            raise BackendError("PhoneTelegramObserverDependencyUnavailable") from None
+
+        config,settings = self._configuration(account_id)
         username = target_parts("telegram",target_url)[0]
         # This is a separate API authorization. It never opens/copies Android session data.
         with account_lock("telegram",config.backend_label,accounts_dir=config.accounts_dir):
             client = self.client_factory(config,settings)
-            context_read = {"database":config.api_database,"account_id":config.api_account_id} if config.api_account_id and config.api_database else None
-            reads = TelegramReads(config.backend_label,str(config.user_id),str(settings.get("identity")),scan_limit=16,context=context_read,
-                ledger_root=profile_path("telegram",config.backend_label,accounts_dir=config.accounts_dir).parent)
+            reads = self._reads(config,settings)
             original = getattr(client,"_call",None)
-            if original:
-                async def readonly(sender,request,*args,**kwargs):
-                    requests = request if isinstance(request,(tuple,list)) else [request]
-                    for rpc in requests:
-                        while type(rpc).__name__ in {"InvokeWithLayerRequest","InitConnectionRequest","InvokeWithoutUpdatesRequest"}:
-                            rpc = rpc.query
-                        if type(rpc).__name__ not in self.READ_RPCS:
-                            raise BackendError("PhoneTelegramObserverMutationForbidden")
+            if not callable(original):
+                raise BackendError("PhoneTelegramObserverReadGuardUnavailable")
+            async def readonly(sender,request,*args,**kwargs):
+                requests = request if isinstance(request,(tuple,list)) else [request]
+                for rpc in requests:
+                    while type(rpc).__name__ in {"InvokeWithLayerRequest","InitConnectionRequest","InvokeWithoutUpdatesRequest"}:
+                        rpc = rpc.query
+                    if type(rpc).__name__ not in self.READ_RPCS:
+                        raise BackendError("PhoneTelegramObserverMutationForbidden")
+                if consume is None:
                     reads.reserve(len(requests))
-                    return await original(sender,request,*args,**kwargs)
-                client._call = readonly
+                else:
+                    consume(reads,len(requests))
+                return await original(sender,request,*args,**kwargs)
+            client._call = readonly
             try:
                 async with asyncio.timeout(12):
                     await client.connect()

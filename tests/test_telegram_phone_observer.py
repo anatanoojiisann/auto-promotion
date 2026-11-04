@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from phone_fleet_protocol import fingerprint
+from phone_fleet_protocol.social import SocialInteraction
 from telethon import types
 
 from auto_promotion.backends.common import BackendError
@@ -12,8 +14,6 @@ from auto_promotion.telegram_phone_observer import (
     TelegramPhoneObserver,
     same_native_account,
 )
-from phone_fleet_protocol import fingerprint
-from phone_fleet_protocol.social import SocialInteraction
 
 
 class Client:
@@ -108,3 +108,52 @@ async def test_only_new_unique_own_native_message_can_be_receipt(tmp_path,monkey
         else:
             assert receipt is None
     assert clients[-1].raw_mutations==0 and clients[-1].calls[-1]=="disconnect"
+
+
+@pytest.mark.asyncio
+async def test_prepaid_observer_charges_each_rpc_before_read_without_double_charging_account(tmp_path,monkeypatch):
+    from auto_promotion.phone_telegram import JOIN_SCHEMA, PhoneTelegram
+    from auto_promotion.store import Store
+
+    reader,clients=setup_reader(tmp_path,monkeypatch)
+    reservation=reader.reserve_receipt("phone")
+    store=Store(tmp_path/"receipt.db")
+    with store.connect(write=True) as db:
+        db.execute("CREATE TABLE phone_social_authorizations(id TEXT PRIMARY KEY,used_at REAL)")
+        for statement in JOIN_SCHEMA.split(";"):
+            if statement.strip():
+                db.execute(statement)
+        db.execute("INSERT INTO phone_social_authorizations VALUES(?,?)",("auth",time.time()))
+        db.execute("INSERT INTO phone_telegram_receipt_budgets VALUES(?,?,?,?,?,?,0)",
+            ("auth","phone","observer",reservation["read_identity"],reservation["window_end"],reservation["reserved"]))
+    original=reader.client_factory
+    now=time.time()
+    def factory(*args):
+        client=original(*args)
+        client.messages=[SimpleNamespace(id=11,out=True,sender_id=44,message="hi",date=datetime.fromtimestamp(now,timezone.utc),
+            media=None,reply_to_msg_id=None,fwd_from=None)]
+        return client
+    reader.client_factory=factory
+    context=SocialInteraction(platform="telegram",identity="@test_sender",receipt_reader="telegram_api",action="send_message",
+        target_url="https://t.me/test_group",target_id="test_group",target_author="@test_group",target_text="Test group",text="hi")
+    baseline={"api_user_id":"44","peer_id":"-1000000000123","identity_sha256":fingerprint({"account":"@test_sender"}),"last_message_id":10}
+    phone=SimpleNamespace(store=store)
+    def consume(reads,count):
+        PhoneTelegram.consume_receipt_budget(phone,"auth","phone","observer",reads,count)
+    receipt=await reader.query("phone",context.identity,context.target_url,baseline=baseline,context=context,since=now-1,consume=consume)
+    assert receipt.native_id=="11"
+    assert store.one("SELECT used FROM phone_telegram_receipt_budgets WHERE authorization_id='auth'")["used"]==2
+    config,settings=reader._configuration("phone")
+    reads=reader._reads(config,settings)
+    with reads.connect() as db:
+        assert db.execute("SELECT used FROM budgets WHERE identity=?",(reads.identity,)).fetchone()[0]==16
+    assert clients[-1].raw_mutations==0
+
+
+@pytest.mark.asyncio
+async def test_observer_without_rpc_guard_fails_before_connecting(tmp_path,monkeypatch):
+    reader,_=setup_reader(tmp_path,monkeypatch)
+    client=SimpleNamespace()
+    reader.client_factory=lambda *args:client
+    with pytest.raises(BackendError,match="ReadGuardUnavailable"):
+        await reader.query("phone","@test_sender","https://t.me/test_group")
