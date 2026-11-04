@@ -55,6 +55,10 @@ jobs:
         env:
           AUTO_PROMOTION_PYTHON: python
           AP_UI_SKIP_SCREENSHOTS: '1'
+      - run: npm run test:ui:effects
+        env:
+          AUTO_PROMOTION_PYTHON: python
+          AP_UI_SKIP_SCREENSHOTS: '1'
       - run: npm run test:ui:pools
         env:
           AUTO_PROMOTION_PYTHON: python
