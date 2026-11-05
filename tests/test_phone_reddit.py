@@ -278,3 +278,30 @@ def test_fleet_oauth_refreshes_before_expiry_without_retrying_mutations(pilot):
     assert len(calls) == 1
     s.service.token_until = 0
     assert s.service.fleet_token() == "synthetic-fresh-token" and len(calls) == 2
+
+
+def test_round_stop_between_claim_check_and_reddit_native_grant_is_fenced(pilot):
+    import auto_promotion.phone_reddit as module
+    from auto_promotion.phone_rounds import PhoneRounds
+
+    s = pilot
+    claim, context = claim_from_original_queue(s)
+    rounds = PhoneRounds(s.engine)
+    now = time.time()
+    task = s.store.one("SELECT manifest_hash FROM tasks WHERE id=?", (s.task["id"],))
+    with s.store.connect(write=True) as db:
+        db.execute("INSERT INTO phone_rounds(id,request_key,manifest_hash,state,created_at,started_at,submit_deadline,deadline) VALUES('synthetic-race','synthetic-race','fixture','running',?,?,?,?)", (now,now,now+480,now+600))
+        db.execute("INSERT INTO phone_round_members(round_id,task_id,item_id,platform,position,payload_hash,manifest_hash,state) VALUES('synthetic-race',?,?,'reddit',0,?,?,'queued')", (s.task["id"],s.item["id"],s.item["payload_hash"],task["manifest_hash"]))
+    original = module.verify_claim
+    def authorize(body):
+        def stop_after_read(request):
+            original(request)
+            rounds.stop("synthetic-race")
+        with s.monkeypatch.context() as patch:
+            patch.setattr(module,"verify_claim",stop_after_read)
+            return s.service.authorize(body,"synthetic-runtime-token")
+    s.fake.submit_authorize = authorize
+    with pytest.raises(Conflict,match="PhoneRoundNotRunning"):
+        s.service.execute(s.engine.account(s.account["id"]),claim,context)
+    grant = s.store.one("SELECT * FROM phone_reddit_authorizations")
+    assert grant and grant["used_at"] is None

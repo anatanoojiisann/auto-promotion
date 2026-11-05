@@ -355,6 +355,11 @@ class PhoneReddit:
             claim = json.loads(row["claim"])
             task = db.execute("SELECT * FROM tasks WHERE id=?", (claim["payload"]["task_id"],)).fetchone()
             self.engine._integrity(db, task, "outbound")
+            from .phone_rounds import submission_blocker
+
+            reason = submission_blocker(db, task["id"], time.time())
+            if reason:
+                raise Conflict(reason)
             if task["state"] != "active" or db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
                 raise Conflict("PhoneRedditStopped")
             changed = db.execute("UPDATE phone_reddit_authorizations SET used_at=?,native_id=?,execution_id=? WHERE id=? AND used_at IS NULL AND expires_at>?",

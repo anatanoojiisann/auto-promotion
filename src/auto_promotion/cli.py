@@ -27,6 +27,7 @@ def main():
     serve = sub.add_parser("serve")
     serve.add_argument("--port", type=int, default=8780)
     serve.add_argument("--no-worker", action="store_true")
+    serve.add_argument("--phone-rounds", action="store_true", help="Enable six-app timed rounds on the existing pooled sender")
     serve.add_argument(
         "--execution-mode",
         choices=("legacy", "pooled"),
@@ -212,6 +213,7 @@ def main():
                 report_worker=args.reports_only or not args.no_worker,
                 pooled_worker=args.execution_mode == "pooled",
                 statistics_only=args.reports_only,
+                phone_rounds_enabled=args.phone_rounds,
             ),
             host="127.0.0.1",
             port=args.port,

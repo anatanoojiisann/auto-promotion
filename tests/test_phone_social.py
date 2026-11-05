@@ -7,17 +7,17 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from auto_promotion.cloud_control import CloudControl
-from auto_promotion.models import AccountInput, ItemInput, TaskInput
-from auto_promotion.queue_store import JobQueue, job_scope
-from auto_promotion.store import Store
-from auto_promotion.task_channels import TaskChannelRouter
 from phone_fleet_protocol import ExecutionRequest, fingerprint
 
 from auto_promotion.adapters import AdapterRegistry
 from auto_promotion.backends.common import BackendError, read_profile, save_profile
+from auto_promotion.cloud_control import CloudControl
 from auto_promotion.core import Conflict, Engine
+from auto_promotion.models import AccountInput, ItemInput, TaskInput
 from auto_promotion.phone_social import ACTIONS, PhoneSocial, attach_worker
+from auto_promotion.queue_store import JobQueue, job_scope
+from auto_promotion.store import Store
+from auto_promotion.task_channels import TaskChannelRouter
 
 URLS = {"telegram": "https://t.me/test_group", "x": "https://x.com/source/status/12345",
         "instagram": "https://www.instagram.com/p/ABC123/",
@@ -240,3 +240,47 @@ def test_global_stop_blocks_final_permission_and_retains_unused_grant(pilot):
         s.service.execute(s.engine.account(s.account["id"]), claim, context)
     assert s.store.one("SELECT COUNT(*) n FROM phone_social_authorizations WHERE used_at IS NOT NULL")["n"] == 0
 
+
+
+def test_preparation_lookup_retains_original_beyond_thousand_other_operations(pilot):
+    s = pilot
+    s.service.prepare(s.item["id"], s.metadata)
+    original, request, _ = s.service.preparation(s.account["id"], s.item["payload"], item_id=s.item["id"], task_id=s.task["id"])
+    assert original
+    with s.store.connect(write=True) as db:
+        for index in range(1001):
+            other = {**request, "business_task_id": "other-task-"+str(index),
+                     "social": {**request["social"], "text":"other immutable draft " + str(index)}}
+            db.execute("INSERT INTO phone_social_operations(id,account_id,item_id,kind,request,phase,result,created_at) VALUES(?,?,?,'social_prepare',?,'linked','{}',?)",
+                ("synthetic-unrelated-"+str(index), s.account["id"], "other-item", json.dumps(other), time.time()+index))
+    selected, _, _ = s.service.preparation(s.account["id"], s.item["payload"], item_id=s.item["id"], task_id=s.task["id"])
+    assert selected["id"] == original["id"]
+    assert s.service.preparation(s.account["id"], s.item["payload"], item_id="wrong-item", task_id=s.task["id"])[0] is None
+
+
+def test_round_stop_between_claim_check_and_native_grant_is_fenced(pilot):
+    import auto_promotion.phone_social as module
+    from auto_promotion.phone_rounds import PhoneRounds
+
+    s = pilot
+    claim, context = claim_original(s)
+    rounds = PhoneRounds(s.engine)
+    now = time.time()
+    task = s.store.one("SELECT manifest_hash FROM tasks WHERE id=?", (s.task["id"],))
+    with s.store.connect(write=True) as db:
+        # A single member is sufficient to exercise the original final-grant transaction.
+        db.execute("INSERT INTO phone_rounds(id,request_key,manifest_hash,state,created_at,started_at,submit_deadline,deadline) VALUES('synthetic-race','synthetic-race','fixture','running',?,?,?,?)", (now,now,now+480,now+600))
+        db.execute("INSERT INTO phone_round_members(round_id,task_id,item_id,platform,position,payload_hash,manifest_hash,state) VALUES('synthetic-race',?,?,?,0,?,?,'queued')", (s.task["id"],s.item["id"],s.app,s.item["payload_hash"],task["manifest_hash"]))
+    original = module.verify_claim
+    def authorize(body):
+        def stop_after_read(request):
+            original(request)
+            rounds.stop("synthetic-race")
+        with s.monkeypatch.context() as patch:
+            patch.setattr(module,"verify_claim",stop_after_read)
+            return s.service.authorize(body,"synthetic-runtime-token-of-sufficient-length")
+    s.fake.authorize = authorize
+    with pytest.raises(Conflict,match="PhoneRoundNotRunning"):
+        s.service.execute(s.engine.account(s.account["id"]),claim,context)
+    grant = s.store.one("SELECT * FROM phone_social_authorizations")
+    assert grant and grant["used_at"] is None

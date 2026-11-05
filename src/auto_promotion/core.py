@@ -1338,6 +1338,17 @@ class Engine:
                 _transition["changed"] = False
             return self.task(task_id)
         task = self.task(task_id)
+        from .phone_rounds import submission_blocker
+
+        with self.store.connect() as db:
+            reason = submission_blocker(db, task_id, self.clock())
+            if reason:
+                raise Conflict(reason)
+            round_start = source == "phone_round" and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='phone_round_members'"
+            ).fetchone() and db.execute(
+                "SELECT 1 FROM phone_round_members WHERE task_id=?", (task_id,)
+            ).fetchone()
         if task["state"] in {"cancelled", "completed"}:
             raise Conflict("任务已结束")
         if self.clock() >= epoch(task["policy"]["ends_at"]):
@@ -1355,7 +1366,7 @@ class Engine:
             }
             self.validate_item(task, ItemInput(**payload))
         initial_state = task["state"]
-        self._check_start_accounts(task, refresh=source != "scheduler")
+        self._check_start_accounts(task, refresh=source != "scheduler" and not round_start)
         with self.store.connect(write=True) as db:
             task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if self._start_stop_revision(task_id, db) != stop_revision or (
@@ -1366,6 +1377,11 @@ class Engine:
                 raise Conflict("任务已暂停或启动状态已变化")
             if task["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
+            from .phone_rounds import submission_blocker
+
+            reason = submission_blocker(db, task_id, self.clock())
+            if reason:
+                raise Conflict(reason)
             self._integrity(db, task, "discovery_join")
             current_items = [
                 (row["id"], row["payload_hash"], digest(json.loads(row["payload"])))
@@ -2308,6 +2324,11 @@ class Engine:
             ):
                 raise Conflict("执行项在检查期间发生变化")
             task = db.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+            from .phone_rounds import submission_blocker
+
+            reason = submission_blocker(db, task["id"], now)
+            if reason:
+                return self._skip(item_id, reason, db)
             if task["state"] != "active":
                 return self._skip(item_id, "task_not_active", db)
             if task["campaign_id"]:

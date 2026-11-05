@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS phone_social_operations(
  request TEXT NOT NULL,phase TEXT NOT NULL,execution_id TEXT,result TEXT NOT NULL DEFAULT '{}',
  created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS phone_social_preparation_lookup ON phone_social_operations(account_id,kind,item_id,created_at);
 CREATE TABLE IF NOT EXISTS phone_social_authorizations(
  id TEXT PRIMARY KEY,item_id TEXT NOT NULL UNIQUE,request_hash TEXT NOT NULL,
  claim TEXT NOT NULL,context TEXT NOT NULL,device_id TEXT NOT NULL,expires_at REAL NOT NULL,
@@ -265,21 +266,30 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                     and json.loads(row["observation"]).get("request",{}).get("social",{}).get("client_id") == binding.client_id
                     and 0 <= time.time() - row["observed_at"] < 300)
 
-    def preparation(self, account_id, payload):
-        # Select by immutable content, not whichever item happened to prepare last.
-        rows = self.store.rows("SELECT * FROM phone_social_operations WHERE account_id=? AND kind='social_prepare' ORDER BY created_at DESC LIMIT 1000", (account_id,))
-        for row in rows:
-            request = json.loads(row["request"])
-            context = request["social"]
-            binding = self.config.bindings.get(account_id)
-            if not binding or context.get("client_id") != binding.client_id or request.get("device_id") != binding.device_id:
-                continue
-            if context.get("receipt_reader")!=binding.receipt_reader:
-                continue
-            if (context["text"] == payload.get("text") and context["target_url"] == payload.get("target")
-                    and context["action"] == payload.get("action")):
-                return row, request, json.loads(row["result"])
-        return None, None, None
+    def preparation(self, account_id, payload, *, item_id=None, task_id=None):
+        # Bind to the original item when executing; do not scan unrelated account history.
+        binding = self.config.bindings.get(account_id)
+        if not binding:
+            return None, None, None
+        sql = ("SELECT * FROM phone_social_operations WHERE account_id=? AND kind='social_prepare' "
+               "AND json_extract(request,'$.social.text')=? "
+               "AND json_extract(request,'$.social.target_url')=? "
+               "AND json_extract(request,'$.social.action')=? "
+               "AND json_extract(request,'$.social.client_id') IS ? "
+               "AND json_extract(request,'$.social.receipt_reader') IS ? "
+               "AND json_extract(request,'$.device_id')=?")
+        params = [account_id, payload.get("text"), payload.get("target"), payload.get("action"),
+                  binding.client_id, binding.receipt_reader, binding.device_id]
+        if item_id is not None:
+            sql += " AND item_id=?"
+            params.append(item_id)
+        if task_id is not None:
+            sql += " AND json_extract(request,'$.business_task_id')=?"
+            params.append(task_id)
+        row = self.store.one(sql + " ORDER BY created_at DESC,id DESC LIMIT 1", params)
+        if not row:
+            return None, None, None
+        return row, json.loads(row["request"]), json.loads(row["result"])
 
     def backend(self, account, operation, payload, execution_job=None):
         _, binding = self.binding(account["id"])
@@ -330,7 +340,7 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         old = self.store.one("SELECT * FROM phone_social_authorizations WHERE item_id=?", (claim["item_id"],))
         if old:
             return self.verify(account, claim)
-        row, prepared, snapshot = self.preparation(account["id"], claim["payload"])
+        row, prepared, snapshot = self.preparation(account["id"], claim["payload"], item_id=claim["item_id"], task_id=claim["task_id"])
         if binding.platform=="telegram" and binding.receipt_reader=="telegram_api" and (not row or row["item_id"]!=claim["item_id"] or prepared["business_task_id"]!=claim["task_id"]):
             try:
                 row,prepared,snapshot = self.prepare_telegram_claim(account,claim)
@@ -400,6 +410,11 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             claim = json.loads(row["claim"])
             task = db.execute("SELECT * FROM tasks WHERE id=?", (claim["payload"]["task_id"],)).fetchone()
             self.engine._integrity(db, task, "outbound")
+            from .phone_rounds import submission_blocker
+
+            reason = submission_blocker(db, task["id"], time.time())
+            if reason:
+                raise Conflict(reason)
             if task["state"] != "active" or db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0] != "0":
                 raise Conflict("PhoneSocialStopped")
             if context.get("receipt_reader")=="telegram_api":

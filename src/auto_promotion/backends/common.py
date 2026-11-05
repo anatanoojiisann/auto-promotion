@@ -367,6 +367,11 @@ def verify_claim(request):
             ).fetchone()
             if not campaign or campaign[0] in {"paused", "cancelled"}:
                 raise BackendError("ExecutionStopped")
+        from ..phone_rounds import submission_blocker
+
+        reason = submission_blocker(db, task["id"], time.time())
+        if reason:
+            raise BackendError(reason)
         policy = Engine._integrity(None, db, task, "discovery_join" if join else "outbound")
         now = time.time()
         if not epoch(policy["starts_at"]) <= now < epoch(policy["ends_at"]):

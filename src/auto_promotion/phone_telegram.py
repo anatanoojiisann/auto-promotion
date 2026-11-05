@@ -79,7 +79,7 @@ class PhoneTelegram:
                 or not proof.get("receipt_capable") or proof.get("client_id")!=binding.client_id
                 or observed.get("observed_identity_sha256")!=fingerprint({"account":binding.identity})):
             raise BackendError("PhoneTelegramNativePreparationRequired")
-        return self.preparation(account["id"],claim["payload"])
+        return self.preparation(account["id"],claim["payload"],item_id=claim["item_id"],task_id=claim["task_id"])
 
     def consume_receipt_budget(self,authorization_id,account_id,observer_sha256,reads,count):
         """Spend prepaid reads durably before starting the corresponding RPC batch."""

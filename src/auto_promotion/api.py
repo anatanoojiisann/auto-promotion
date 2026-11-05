@@ -129,6 +129,7 @@ def create_app(
     phone_fleet_config=None,
     phone_reddit_config=None,
     phone_social_config=None,
+    phone_rounds_enabled=False,
 ):
     if statistics_only:
         worker, report_worker = False, True
@@ -206,6 +207,23 @@ def create_app(
     )
     pool_scheduler = PoolScheduler(engine) if worker and pooled_worker else None
 
+    from .phone_rounds import PhoneRounds
+
+    phone_rounds = PhoneRounds(engine) if phone_rounds_enabled else None
+
+    async def rounds_loop():
+        while not stop.is_set():
+            try:
+                await asyncio.to_thread(phone_rounds.tick)
+                background_success_at["phone_rounds"] = time.time()
+            except Exception as exc:
+                background_errors["phone_rounds"] = type(exc).__name__
+                background_error_at["phone_rounds"] = time.time()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=1)
+            except TimeoutError:
+                pass
+
     async def work_loop():
         nonlocal pool_scheduler
         while not stop.is_set():
@@ -275,6 +293,9 @@ def create_app(
                 sender = stack.enter_context(WorkerRun(store, live_enabled=engine.live_enabled))
                 background_tasks["sender"] = asyncio.create_task(work_loop())
                 jobs.append(background_tasks["sender"])
+                if phone_rounds is not None:
+                    background_tasks["phone_rounds"] = asyncio.create_task(rounds_loop())
+                    jobs.append(background_tasks["phone_rounds"])
                 callbacks = [
                     (interactions.schedule, "hf_schedule"),
                     (meta_browser.sync, "meta_browser_sync"),
@@ -325,6 +346,10 @@ def create_app(
         redoc_url=None,
     )
     app.state.engine = engine
+    if phone_rounds is not None:
+        from .phone_rounds_api import mount as mount_rounds
+
+        mount_rounds(app, phone_rounds)
     if phone_reddit is not None:
         from .phone_reddit_api import mount
 

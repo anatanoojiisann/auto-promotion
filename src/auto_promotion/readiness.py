@@ -8,6 +8,9 @@ from .models import epoch
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "PhoneRoundNotRunning": "整轮验证未运行或已停止",
+    "PhoneRoundSubmissionDeadlineElapsed": "本轮新的发送授权时间已结束，继续只读核验原回执",
+    "PhoneRoundManifestChanged": "本轮冻结的任务内容已变化，禁止发送",
     "account_outbound_blocked": "账号外发已暂停，请在账号中心处理原因并检查恢复",
     "meta_source_unknown": "旧流程状态或回执无法确认，先只读核验",
     "meta_source_busy": "该账号的旧互动或回复观察仍未结束",
