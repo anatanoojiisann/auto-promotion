@@ -1,4 +1,4 @@
-"""Opt-in six-app round coordinator. Original tasks remain the only send authority."""
+"""Opt-in scoped round coordinator. Original tasks remain the only send authority."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from .models import canonical, digest
 from .store import Store
 
 PLATFORMS = frozenset({"telegram", "reddit", "instagram", "facebook", "x", "tiktok"})
+WITHOUT_FACEBOOK = PLATFORMS - {"facebook"}
+SUPPORTED_PLATFORM_SETS = frozenset({PLATFORMS, WITHOUT_FACEBOOK})
 TOTAL_SECONDS = 600
 SUBMIT_SECONDS = 480
 PREFLIGHT_SECONDS = 30
@@ -79,11 +81,11 @@ class PhoneRounds:
 
     def create(self, task_ids, request_key):
         if (
-            len(task_ids) != 6
-            or len(set(task_ids)) != 6
+            len(task_ids) not in {5, 6}
+            or len(set(task_ids)) != len(task_ids)
             or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_key)
         ):
-            raise Conflict("PhoneRoundSixDistinctTasksAndRequestKeyRequired")
+            raise Conflict("PhoneRoundDistinctTasksAndRequestKeyRequired")
         # Sorting is stable across request retries; execution order is explicit platform order.
         manifest = digest(sorted(task_ids))
         now, identifier = self.clock(), "phone-round-" + uuid.uuid4().hex
@@ -154,8 +156,8 @@ class PhoneRounds:
                             task["manifest_hash"],
                         )
                     )
-                if platforms != PLATFORMS:
-                    raise Conflict("PhoneRoundSixPlatformsRequired")
+                if frozenset(platforms) not in SUPPORTED_PLATFORM_SETS:
+                    raise Conflict("PhoneRoundSupportedPlatformsRequired")
                 db.execute(
                     "INSERT INTO phone_rounds(id,request_key,manifest_hash,state,created_at) VALUES(?,?,?,'draft',?)",
                     (identifier, request_key, manifest, now),
@@ -179,12 +181,20 @@ class PhoneRounds:
 
     def start(self, round_id):
         # Start one non-renewable clock before readiness checks. No native work is admitted yet.
-        now, checking, check_id = self.clock(), False, None
+        now, checking, check_id, expected = self.clock(), False, None, frozenset()
         with self.store.connect(write=True) as db:
             row = self._round(db, round_id)
             if row["state"] in {"draft", "blocked"}:
                 if row["submit_deadline"] is not None and now >= row["submit_deadline"]:
                     raise Conflict("PhoneRoundSubmissionDeadlineElapsed")
+                expected = frozenset(
+                    member[0]
+                    for member in db.execute(
+                        "SELECT platform FROM phone_round_members WHERE round_id=?", (round_id,)
+                    )
+                )
+                if expected not in SUPPORTED_PLATFORM_SETS:
+                    raise Conflict("PhoneRoundSupportedPlatformsRequired")
                 runtime = db.execute(
                     "SELECT value FROM meta WHERE key='execution_runtime'"
                 ).fetchone()
@@ -215,8 +225,8 @@ class PhoneRounds:
             valid = (
                 snapshot.get("round_id") == round_id
                 and isinstance(members, list)
-                and len(members) == 6
-                and {m.get("platform") for m in members} == PLATFORMS
+                and len(members) == len(expected)
+                and {m.get("platform") for m in members} == expected
                 and snapshot.get("submission_authorized") is False
             )
             if not valid:
@@ -269,7 +279,7 @@ class PhoneRounds:
             # Stop/cancel during a check wins. A completed check never revives a stopped round.
             if row["state"] == "checking":
                 by_platform = {m["platform"]: m for m in members}
-                for platform in PLATFORMS:
+                for platform in expected:
                     member = by_platform.get(platform, {})
                     allowed = (
                         not blockers and member.get("ready") is True and not member.get("blockers")
@@ -439,6 +449,7 @@ class PhoneRounds:
                 "timing_scope": "prepared_tasks_including_preflight",
                 "preparation_included": False,
                 "end_to_end_six_app_pass": False,
+                "end_to_end_selected_apps_pass": False,
                 "preflight_seconds": max(
                     0, (check["finished_at"] or row["finished_at"] or now) - check["started_at"]
                 )
@@ -449,7 +460,12 @@ class PhoneRounds:
                 "remaining_seconds": max(0, TOTAL_SECONDS - elapsed),
                 "confirmed_count": sum(m["verified"] for m in members),
                 "within_budget_count": sum(m["within_budget"] for m in members),
-                "all_six_within_budget": len(members) == 6
+                "expected_platform_count": len(members),
+                "selected_platforms": sorted(m["platform"] for m in members),
+                "all_members_within_budget": frozenset(m["platform"] for m in members)
+                in SUPPORTED_PLATFORM_SETS
+                and all(m["within_budget"] for m in members),
+                "all_six_within_budget": frozenset(m["platform"] for m in members) == PLATFORMS
                 and all(m["within_budget"] for m in members),
                 "members": members,
                 "cutoff_snapshot": cutoff,
@@ -465,7 +481,9 @@ class PhoneRounds:
             ).fetchall()
             for row in rounds:
                 members = self._members(db, row, now)
-                complete = len(members) == 6 and all(m["verified"] for m in members)
+                complete = frozenset(
+                    m["platform"] for m in members
+                ) in SUPPORTED_PLATFORM_SETS and all(m["verified"] for m in members)
                 if complete or now >= row["deadline"]:
                     db.execute(
                         "UPDATE phone_rounds SET state=?,finished_at=?,cutoff_snapshot=? WHERE id=?",

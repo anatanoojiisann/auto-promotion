@@ -22,7 +22,10 @@ def ready(rounds, identifier):
     return {
         "round_id": identifier,
         "submission_authorized": False,
-        "members": [{"platform": p, "ready": True, "blockers": []} for p in sorted(PLATFORMS)],
+        "members": [
+            {"platform": m["platform"], "ready": True, "blockers": []}
+            for m in rounds.get(identifier)["members"]
+        ],
     }
 
 

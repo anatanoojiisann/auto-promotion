@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class RoundInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    task_ids: list[str] = Field(min_length=6, max_length=6)
+    task_ids: list[str] = Field(min_length=5, max_length=6)
     request_key: str = Field(pattern=r"^[A-Za-z0-9_-]{8,100}$")
 
 

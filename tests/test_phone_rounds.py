@@ -89,9 +89,12 @@ def make_lab(tmp_path):
     def synthetic_readiness(rounds, round_id):
         return {
             "round_id": round_id,
-            "ready_count": 6,
+            "ready_count": len(rounds.get(round_id)["members"]),
             "submission_authorized": False,
-            "members": [{"platform": p, "ready": True, "blockers": []} for p in sorted(PLATFORMS)],
+            "members": [
+                {"platform": m["platform"], "ready": True, "blockers": []}
+                for m in rounds.get(round_id)["members"]
+            ],
         }
 
     rounds = PhoneRounds(engine, preflight_check=synthetic_readiness)

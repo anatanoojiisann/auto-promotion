@@ -1,16 +1,16 @@
-# Six-app timed rounds: development handoff
+# Scoped phone rounds: development handoff
 
 This is an opt-in development feature, not a production deployment or a measured ten-minute real-device result.
 
 ## Delivered behavior
 
-- One durable round links six original, frozen, unattempted live phone tasks. Each task has one automatic interaction and one account, covering Telegram, Reddit, Instagram, Facebook, X and TikTok exactly once.
+- One durable round links original, frozen, unattempted live phone tasks. Each task has one automatic interaction and one account. The supported scopes are all six platforms or exactly the five excluding Facebook, with each selected platform present once.
 - Creation never starts a task. Explicit start sets one non-renewable 600-second clock and a 480-second cutoff for new send grants. Queue waiting, stopped time, startup failures and account cooldowns are not subtracted.
 - Admission uses the existing Engine and persistent JobQueue. There is no second sender. A round start reuses fresh cached identity; stale identity fails the normal health/preflight checks. The device still verifies identity, target, exact text and separate one-use permission immediately before sending.
 - Transactional guards apply at original start, item claim, provider claim verification, and final native permission for both Social and Reddit. The gates enforce the cutoff even if the coordinator or status client is down. Round stop fences future grants, preserves uncertain outcomes and leaves original read-only receipt lookup available. A previously accepted native permit may already be in flight; stop is not a retraction.
 - An interrupted start is never automatically replayed. Active original tasks can rejoin their original queue; unstarted interrupted tasks are blocked for inspection. Admission is serialized between coordinator workers. Actual execution continues to use existing account/device locks.
 - Status keeps original task/item/attempt/execution IDs, queue time, time before native authorization and receipt waiting time. Only a verified original item with an external reference and an original completed attempt is counted. Late receipts update current status without turning a missed deadline into a pass. The terminal cutoff snapshot is retained.
-- Local preflight reports blockers for all six apps without navigating a phone, calling a social platform or granting submission permission.
+- Local preflight reports blockers for all selected apps without navigating a phone, calling a social platform or granting submission permission.
 - Candidate shortlist reuses up to three existing content records per account. It requires recent data, current-version review, explicit account-bound permission evidence, a contextual draft, enough remaining lifetime, and no historical attempt or active scheduled duplicate. Unknown attempts remain query-only. Empty pools are reported; no automatic generic promotional text is generated.
 - Prepared evidence is looked up by immutable content, original task/item and device/client/reader binding with an index, including when more than 1,000 unrelated historical operations exist.
 
@@ -20,7 +20,7 @@ API factory: `create_app(..., phone_rounds_enabled=True, worker=True, pooled_wor
 
 Existing local API authentication and cross-origin/CSRF checks apply to every route:
 
-- `POST /api/phone-rounds` with `task_ids` (six original task IDs) and a stable `request_key`.
+- `POST /api/phone-rounds` with `task_ids` (six original task IDs, or five when explicitly excluding Facebook) and a stable `request_key`.
 - `GET /api/phone-rounds/{id}/preflight` checks cached evidence/configuration only. It does not prove live remote authorization or current target permissions.
 - `POST /api/phone-rounds/{id}/start` records explicit intent and begins timing. `worker=False` records waiting without secretly starting an executor.
 - `GET /api/phone-rounds/{id}` returns JSON status and timing suitable for exporting as diagnostic evidence. Native permit time is not itself a confirmed publication.
@@ -161,3 +161,10 @@ Independent worktree `D:/Projects/auto-promotion-verification-repair`, branch `c
 A bounded check using synthetic business tasks and the current real fleet's read-only capabilities returned all six missing-prerequisite summaries in **0.907 seconds**, with two metadata GETs, zero original task starts and zero attempts. This verifies fast rejection under the current configuration; it is not real publication acceptance. Real-device read-only connection/IME diagnostics took 0.516 seconds in the companion control branch.
 
 No live writes, old tasks, global stops, production services or platform authorizations were changed. Current full publication remains unverified. Source timing analysis is in `docs/PHONE_VALIDATION_TIMING_2026-11-06.md`; raw sanitized timings remain outside the commit.
+
+
+## 2026-11-06 explicit round without Facebook
+
+A round may contain either the established six platforms or exactly the five remaining platforms when Facebook is explicitly excluded: Telegram, Reddit, Instagram, X and TikTok. Other five-platform combinations are rejected. Task, account, manifest and one-attempt protections are unchanged. Readiness is evaluated against the persisted selected set; a missing or extra platform cannot satisfy it.
+
+A five-member result may report `all_members_within_budget` only after all five original items have independently verified receipts. `all_six_within_budget` remains false, and both `end_to_end_six_app_pass` and `end_to_end_selected_apps_pass` remain false because the current timer starts after preparation. Individual ready platforms can proceed while other selected platforms remain blocked. This change does not authorize or enable external sending.
