@@ -29,6 +29,8 @@ def test_original_join_lane_uses_one_permission_and_records_membership(pilot,pen
     candidate_id=s.store.one("SELECT id FROM candidates WHERE task_id=?",(task["id"],))["id"]
     s.service.config=s.service.config.model_copy(update={"join_enabled":True,"authorized_task_ids":[task["id"]]})
     def fleet(request):
+        if request.url.path.endswith("/capabilities"):
+            return s.fake(request)
         if request.method=="POST":
             body=json.loads(request.content)
             if body["operation"] not in {"social_membership","social_join"}:

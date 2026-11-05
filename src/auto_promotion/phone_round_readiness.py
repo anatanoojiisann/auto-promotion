@@ -174,6 +174,8 @@ def shortlist(engine, account_id, *, limit=3):
         "submission_authorized": False,
         "candidates": found,
         "blockers": [] if found else ["ReviewedCandidatePoolEmpty"],
+        "refresh_required": not bool(found),
+        "next_actions": [] if found else ["collect_fresh_content", "review_account_permission", "prepare_contextual_draft"],
         "excluded": excluded,
         "scan_limit": 2000,
     }

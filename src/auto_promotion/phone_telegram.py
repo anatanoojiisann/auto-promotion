@@ -282,5 +282,8 @@ class PhoneTelegram:
         request = self.store.one("SELECT * FROM phone_social_operations WHERE id=?",(row["id"],))
         if not request or request["account_id"]!=account["id"]:
             raise Conflict("PhoneTelegramJoinAccountMismatch")
+        from .phone_protocol import is_legacy
+        if is_legacy(json.loads(request["request"])):
+            return self.read_legacy_operation(request)
         typed = ExecutionRequest.model_validate_json(request["request"])
         return self.membership_outcome(self.dispatch(typed,request["id"],account["id"]),typed.social)

@@ -26,3 +26,6 @@ output/
 # Independent device secrets (DPAPI-encrypted, still private)
 *.dpapi
 *.pending
+
+# Isolated development services, private credentials and test output
+.local/

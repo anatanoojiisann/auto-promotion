@@ -215,6 +215,10 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 if previous["phase"] != "linked" or snapshot.get("status") in {"queued","leased","running","unknown"}:
                     from phone_fleet_protocol import ExecutionRequest
 
+                    from .phone_protocol import is_legacy
+                    if is_legacy(json.loads(previous["request"])):
+                        self.read_legacy_operation(previous)
+                        raise Conflict("PhoneSocialIdentityReconciliationRequired")
                     snapshot = self.dispatch(ExecutionRequest.model_validate_json(previous["request"]),previous["id"],account_id)
                     if snapshot.get("status") not in {"succeeded","failed","cancelled"} and not snapshot.get("resource_released"):
                         raise Conflict("PhoneSocialIdentityReconciliationRequired")
@@ -258,11 +262,13 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             raise BackendError("PhoneSocialExecutionMethodOrNodeMismatch")
 
     def fresh(self, account):
+        from .phone_protocol import expected_version
         row = self.store.one("SELECT * FROM phone_social_accounts WHERE account_id=?", (account["id"],))
         binding = self.config.bindings.get(account["id"])
         return bool(row and binding and account["platform"] == binding.platform
                     and row["platform"] == binding.platform and row["identity"] == binding.identity
                     and row["device_id"] == binding.device_id
+                    and json.loads(row["observation"]).get("request",{}).get("version") == expected_version()
                     and json.loads(row["observation"]).get("request",{}).get("social",{}).get("client_id") == binding.client_id
                     and 0 <= time.time() - row["observed_at"] < 300)
 
@@ -466,6 +472,9 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             return {"status": "unknown", "verified": False, "reason": "PhoneSocialNoOriginalSubmission"}
         if row["account_id"] != account["id"]:
             raise Conflict("PhoneSocialReceiptAccountMismatch")
+        from .phone_protocol import is_legacy
+        if is_legacy(json.loads(row["request"])):
+            return self.read_legacy_operation(row)
         request = ExecutionRequest.model_validate_json(row["request"])
         # dispatch on an existing durable record only GETs its original execution.
         snapshot=self.dispatch(request,row["id"],account["id"],row["item_id"])

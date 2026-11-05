@@ -34,6 +34,10 @@ class SyntheticFleet:
 
     def __call__(self, request):
         self.requests.append(request)
+        if request.url.path.endswith("/capabilities"):
+            from phone_fleet_protocol import VERSION
+            return httpx.Response(200, json={"version": VERSION, "operations": {x: "supported" for x in (
+                "observe", "draft_validate", "social_identity", "social_prepare", "social_submit", "social_membership", "social_join", "reddit_identity", "reddit_prepare", "reddit_submit")}})
         if request.method == "POST":
             body = json.loads(request.content)
             typed = ExecutionRequest.model_validate(body)
@@ -284,3 +288,56 @@ def test_round_stop_between_claim_check_and_native_grant_is_fenced(pilot):
         s.service.execute(s.engine.account(s.account["id"]),claim,context)
     grant = s.store.one("SELECT * FROM phone_social_authorizations")
     assert grant and grant["used_at"] is None
+
+
+
+def test_protocol_mismatch_blocks_before_new_intent_or_post(pilot):
+    s = pilot
+    original = s.service.request
+
+    def request(method, path, body=None, key=None):
+        if path == "/capabilities":
+            return {"version": "fleet.internal/0.1", "operations": {"observe": "supported"}}
+        return original(method, path, body, key)
+
+    s.service.request = request
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+    request = s.service.make_request(
+        s.account["id"], "social_prepare", {**s.metadata, "target_url": URLS[s.app], "text": TEXT}
+    )
+    with pytest.raises(BackendError, match="ProtocolMismatch"):
+        s.service.dispatch(request, "blocked-version", s.account["id"])
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before
+    assert not s.store.one("SELECT id FROM phone_social_operations WHERE id='blocked-version'")
+
+
+def test_legacy_social_receipt_only_queries_original_execution(pilot):
+    s = pilot
+    claim, context = claim_original(s)
+    s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    row = s.store.one("SELECT * FROM phone_social_operations WHERE kind='social_submit'")
+    request = json.loads(row["request"])
+    request["version"] = "fleet.internal/0.1"
+    s.fake.snapshots[row["execution_id"]]["request"] = request
+    with s.store.connect(write=True) as db:
+        db.execute(
+            "UPDATE phone_social_operations SET request=? WHERE id=?",
+            (json.dumps(request), row["id"]),
+        )
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+    verified = s.service.verify(s.engine.account(s.account["id"]), claim)
+    assert verified["legacy_read_only"] and not verified["verified"]
+    assert verified["original_execution_id"] == row["execution_id"]
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before
+
+
+
+def test_legacy_identity_observation_is_not_fresh_after_upgrade(pilot):
+    s = pilot
+    assert s.service.fresh(s.engine.account(s.account["id"]))
+    row = s.store.one("SELECT * FROM phone_social_accounts WHERE account_id=?", (s.account["id"],))
+    observation = json.loads(row["observation"])
+    observation["request"]["version"] = "fleet.internal/0.1"
+    with s.store.connect(write=True) as db:
+        db.execute("UPDATE phone_social_accounts SET observation=? WHERE account_id=?", (json.dumps(observation), s.account["id"]))
+    assert not s.service.fresh(s.engine.account(s.account["id"]))

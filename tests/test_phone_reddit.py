@@ -36,6 +36,10 @@ class SyntheticFleet:
 
     def __call__(self, request):
         self.requests.append(request)
+        if request.url.path.endswith("/capabilities"):
+            from phone_fleet_protocol import VERSION
+            return httpx.Response(200, json={"version": VERSION, "operations": {x: "supported" for x in (
+                "observe", "draft_validate", "social_identity", "social_prepare", "social_submit", "social_membership", "social_join", "reddit_identity", "reddit_prepare", "reddit_submit")}})
         if request.method == "POST":
             body = json.loads(request.content)
             typed = ExecutionRequest.model_validate(body)
@@ -305,3 +309,21 @@ def test_round_stop_between_claim_check_and_reddit_native_grant_is_fenced(pilot)
         s.service.execute(s.engine.account(s.account["id"]),claim,context)
     grant = s.store.one("SELECT * FROM phone_reddit_authorizations")
     assert grant and grant["used_at"] is None
+
+
+
+def test_legacy_reddit_receipt_queries_original_without_resubmission(pilot):
+    s = pilot
+    claim, context = claim_from_original_queue(s)
+    s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    row = s.store.one("SELECT * FROM phone_reddit_operations WHERE kind='reddit_submit'")
+    original = json.loads(row["request"])
+    original["version"] = "fleet.internal/0.1"
+    s.fake.snapshots[row["execution_id"]]["request"] = original
+    with s.store.connect(write=True) as db:
+        db.execute("UPDATE phone_reddit_operations SET request=? WHERE id=?", (json.dumps(original), row["id"]))
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+    result = s.service.verify(s.engine.account(s.account["id"]), claim)
+    assert result["legacy_read_only"] and not result["verified"]
+    assert result["original_execution_id"] == row["execution_id"]
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before

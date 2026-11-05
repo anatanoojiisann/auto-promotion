@@ -138,11 +138,13 @@ class PhoneReddit:
 
     def request(self, method, path, body=None, key=None):
         token = self.fleet_token()
-        with httpx.Client(base_url=self.url, timeout=12, trust_env=False,
+        with httpx.Client(base_url=self.url, timeout=3 if path == "/capabilities" else 12, trust_env=False,
                           follow_redirects=False, transport=self.transport) as client:
             response = client.request(method, "/internal/fleet/v1" + path, json=body,
                 headers={"Authorization": "Bearer " + token,
                          **({"Idempotency-Key": key} if key else {})})
+        if response.status_code in {401, 403}:
+            raise BackendError("PhoneFleetAuthorizationRequired")
         if response.status_code != 200 or len(response.content) > 1_000_000:
             raise BackendError("PhoneRedditFleetReadOrDispatchUnavailable")
         return response.json()
@@ -155,6 +157,11 @@ class PhoneReddit:
         if table not in {"phone_reddit_operations", "phone_social_operations"}:
             raise ValueError("Untrusted operation table")
         value = request.model_dump(mode="json")
+        from .phone_protocol import require_capabilities
+
+        # Do not create an intent or POST a command against a different protocol.
+        if not self.store.one(f"SELECT id FROM {table} WHERE id=?", (operation_id,)):
+            require_capabilities(self.request("GET", "/capabilities"), request.operation)
         with self.store.connect(write=True) as db:
             old = db.execute(f"SELECT * FROM {table} WHERE id=?", (operation_id,)).fetchone()
             if old and json.loads(old["request"]) != value:
@@ -190,6 +197,16 @@ class PhoneReddit:
             with self.store.connect(write=True) as db:
                 db.execute(f"UPDATE {table} SET phase='uncertain' WHERE id=?", (operation_id,))
             return {"status": "unknown", "result": None}
+
+    def read_legacy_operation(self, row):
+        from urllib.parse import quote, urlencode
+
+        from .phone_protocol import legacy_result
+
+        request = json.loads(row["request"])
+        path = "/executions/" + quote(row["execution_id"], safe="") if row["execution_id"] else "/executions/lookup?" + urlencode({
+            "business_task_id": request["business_task_id"], "task_item_id": request["task_item_id"], "operation": request["operation"]})
+        return legacy_result(self.request("GET", path), request, row["execution_id"])
 
     def make_request(self, account_id, operation, context, *, task_id=None, item_id=None,
                      manifest=None, channel="local"):
@@ -263,11 +280,18 @@ class PhoneReddit:
                     (canonical(snapshot), observed["observed_at"], item["account_id"], request.reddit.identity, request.device_id))
         return snapshot
 
-    def backend(self, account, operation, payload, execution_job=None):
+    def fresh(self, account):
+        from .phone_protocol import expected_version
         observed = self.store.one("SELECT * FROM phone_reddit_accounts WHERE account_id=?", (account["id"],))
         binding = self.config.bindings.get(account["id"])
-        fresh = bool(observed and binding and observed["identity"] == binding.identity
-                     and observed["device_id"] == binding.device_id and 0 <= time.time() - observed["observed_at"] < 300)
+        return bool(observed and binding and observed["identity"] == binding.identity
+                    and observed["device_id"] == binding.device_id
+                    and json.loads(observed["observation"]).get("request", {}).get("version") == expected_version()
+                    and 0 <= time.time() - observed["observed_at"] < 300)
+
+    def backend(self, account, operation, payload, execution_job=None):
+        binding = self.config.bindings.get(account["id"])
+        fresh = self.fresh(account)
         if operation == "health":
             return {"healthy": fresh, "identity_verified": fresh, "service_ready": True,
                     "permissions": ["reply"] if fresh else [],
@@ -403,6 +427,9 @@ class PhoneReddit:
             return {"status": "unknown", "verified": False, "reason": "PhoneRedditNoOriginalSubmission"}
         if row["account_id"] != account["id"]:
             raise Conflict("PhoneRedditReceiptAccountMismatch")
+        from .phone_protocol import is_legacy
+        if is_legacy(json.loads(row["request"])):
+            return self.read_legacy_operation(row)
         request = ExecutionRequest.model_validate_json(row["request"])
         snapshot = self.dispatch(request, row["id"], account["id"], item_id)
         outcome = self.outcome(snapshot, request.reddit)

@@ -130,17 +130,18 @@ def create_app(
     phone_reddit_config=None,
     phone_social_config=None,
     phone_rounds_enabled=False,
+    disable_live_writes=False,
 ):
     if statistics_only:
         worker, report_worker = False, True
-    workspace = workspace_path()
+    workspace = registry.workspace if registry is not None else workspace_path()
     store = Store(db_path or database_path())
     registry = registry or AdapterRegistry(workspace)
     engine = Engine(
         store,
         registry,
         clock=clock,
-        live_enabled=not statistics_only and os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
+        live_enabled=not statistics_only and not disable_live_writes and os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
     )
     connections = ConnectionManager(engine)
     statistics = Statistics(store, clock=clock)
@@ -346,6 +347,23 @@ def create_app(
         redoc_url=None,
     )
     app.state.engine = engine
+
+    @app.get("/api/phone-readiness")
+    async def phone_readiness():
+        from .phone_protocol import capability_status
+        from .phone_readiness import readiness
+        result = await asyncio.to_thread(readiness, engine)
+        if phone_preparations is not None:
+            try:
+                status = capability_status(await phone_preparations.client.request("GET", "/capabilities"))
+            except Exception:
+                status = {"state": "service_unavailable", "software_ready": False, "device_ready": False,
+                          "reason": "PhoneFleetReadinessUnavailable"}
+            result["services"].append(status)
+            result["configured"] = True
+            result["state"] = "software_ready" if all(s["software_ready"] for s in result["services"]) else "setup_required"
+        return result
+
     if phone_rounds is not None:
         from .phone_rounds_api import mount as mount_rounds
 
@@ -358,6 +376,7 @@ def create_app(
         from .phone_social_api import mount as mount_social
 
         mount_social(app, phone_social)
+    app.state.phone_preparations = phone_preparations
     app.state.store = store
     app.state.connections = connections
     app.state.statistics = statistics
