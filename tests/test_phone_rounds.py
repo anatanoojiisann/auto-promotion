@@ -85,7 +85,16 @@ def make_lab(tmp_path):
         calls.append(task_id)
 
     engine.start_and_run = synthetic_start
-    rounds = PhoneRounds(engine)
+
+    def synthetic_readiness(rounds, round_id):
+        return {
+            "round_id": round_id,
+            "ready_count": 6,
+            "submission_authorized": False,
+            "members": [{"platform": p, "ready": True, "blockers": []} for p in sorted(PLATFORMS)],
+        }
+
+    rounds = PhoneRounds(engine, preflight_check=synthetic_readiness)
     return SimpleNamespace(
         engine=engine, rounds=rounds, now=now, ids=ids, calls=calls, store=engine.store
     )

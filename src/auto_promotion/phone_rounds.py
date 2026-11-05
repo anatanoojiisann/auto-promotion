@@ -13,11 +13,16 @@ from .store import Store
 PLATFORMS = frozenset({"telegram", "reddit", "instagram", "facebook", "x", "tiktok"})
 TOTAL_SECONDS = 600
 SUBMIT_SECONDS = 480
+PREFLIGHT_SECONDS = 30
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS phone_rounds(
  id TEXT PRIMARY KEY, request_key TEXT NOT NULL UNIQUE, manifest_hash TEXT NOT NULL,
  state TEXT NOT NULL, created_at REAL NOT NULL, started_at REAL, submit_deadline REAL,
  deadline REAL, finished_at REAL, cutoff_snapshot TEXT
+);
+CREATE TABLE IF NOT EXISTS phone_round_preflights(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, round_id TEXT NOT NULL REFERENCES phone_rounds(id),
+ started_at REAL NOT NULL, finished_at REAL, result TEXT
 );
 CREATE TABLE IF NOT EXISTS phone_round_members(
  round_id TEXT NOT NULL REFERENCES phone_rounds(id), task_id TEXT NOT NULL UNIQUE,
@@ -57,8 +62,9 @@ def submission_blocker(db, task_id, now):
 
 
 class PhoneRounds:
-    def __init__(self, engine):
+    def __init__(self, engine, *, preflight_check=None):
         self.engine, self.store, self.clock = engine, engine.store, engine.clock
+        self.preflight_check = preflight_check
         with self.store.connect(write=True) as db:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
@@ -172,11 +178,13 @@ class PhoneRounds:
         return self.get(identifier)
 
     def start(self, round_id):
-        # This intent starts the end-to-end clock. Never clears a stop or grants live permission.
-        now = self.clock()
+        # Start one non-renewable clock before readiness checks. No native work is admitted yet.
+        now, checking, check_id = self.clock(), False, None
         with self.store.connect(write=True) as db:
             row = self._round(db, round_id)
-            if row["state"] == "draft":
+            if row["state"] in {"draft", "blocked"}:
+                if row["submit_deadline"] is not None and now >= row["submit_deadline"]:
+                    raise Conflict("PhoneRoundSubmissionDeadlineElapsed")
                 runtime = db.execute(
                     "SELECT value FROM meta WHERE key='execution_runtime'"
                 ).fetchone()
@@ -185,17 +193,127 @@ class PhoneRounds:
                 if not self.engine.live_enabled:
                     raise Conflict("PhoneRoundLiveWritesDisabled")
                 db.execute(
-                    "UPDATE phone_rounds SET state='running',started_at=?,submit_deadline=?,deadline=? WHERE id=?",
+                    "UPDATE phone_rounds SET state='checking',started_at=COALESCE(started_at,?),submit_deadline=COALESCE(submit_deadline,?),deadline=COALESCE(deadline,?),finished_at=NULL WHERE id=?",
                     (now, now + SUBMIT_SECONDS, now + TOTAL_SECONDS, round_id),
                 )
-                Store.audit(db, "phone_round.started", {"round_id": round_id}, now=now)
+                check_id = db.execute(
+                    "INSERT INTO phone_round_preflights(round_id,started_at) VALUES(?,?)",
+                    (round_id, now),
+                ).lastrowid
+                Store.audit(db, "phone_round.start_requested", {"round_id": round_id}, now=now)
+                checking = True
+        if not checking:
+            return self.get(round_id)
+        try:
+            if self.preflight_check is None:
+                from .phone_round_readiness import preflight
+
+                snapshot = preflight(self, round_id)
+            else:
+                snapshot = self.preflight_check(self, round_id)
+            members = snapshot.get("members", [])
+            valid = (
+                snapshot.get("round_id") == round_id
+                and isinstance(members, list)
+                and len(members) == 6
+                and {m.get("platform") for m in members} == PLATFORMS
+                and snapshot.get("submission_authorized") is False
+            )
+            if not valid:
+                raise ValueError("Invalid readiness summary")
+        except Exception:
+            snapshot = {
+                "round_id": round_id,
+                "ready_count": 0,
+                "members": [],
+                "submission_authorized": False,
+                "blockers": ["PhoneRoundPreflightUnavailable"],
+            }
+            members = []
+        finished = self.clock()
+        blockers = list(snapshot.get("blockers", []))
+        eligible = [m for m in members if m.get("ready") is True and not m.get("blockers")]
+        ready = not blockers and bool(eligible)
+        if finished < now:
+            blockers.append("PhoneRoundClockInvalid")
+            ready = False
+        if finished - now >= PREFLIGHT_SECONDS:
+            blockers.append("PhoneRoundPreflightBudgetElapsed")
+            ready = False
+        with self.store.connect(write=True) as db:
+            row = self._round(db, round_id)
+            stop = db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()
+            runtime = db.execute("SELECT value FROM meta WHERE key='execution_runtime'").fetchone()
+            if not stop or stop[0] != "0":
+                blockers.append("GlobalStop")
+                ready = False
+            if not runtime or runtime[0] != "pooled" or not self.engine.live_enabled:
+                blockers.append("PhoneRoundRuntimeChanged")
+                ready = False
+            if finished >= row["deadline"]:
+                blockers.append("PhoneRoundDeadlineElapsed")
+                ready = False
+            if row["state"] != "checking":
+                blockers.append("PhoneRoundNotRunning")
+                ready = False
+            snapshot["blockers"] = list(dict.fromkeys(blockers))
+            snapshot["ready_count"] = (
+                sum(m.get("ready") is True and not m.get("blockers") for m in members)
+                if not blockers
+                else 0
+            )
+            db.execute(
+                "UPDATE phone_round_preflights SET finished_at=?,result=? WHERE id=?",
+                (finished, canonical(snapshot), check_id),
+            )
+            # Stop/cancel during a check wins. A completed check never revives a stopped round.
+            if row["state"] == "checking":
+                by_platform = {m["platform"]: m for m in members}
+                for platform in PLATFORMS:
+                    member = by_platform.get(platform, {})
+                    allowed = (
+                        not blockers and member.get("ready") is True and not member.get("blockers")
+                    )
+                    reasons = (
+                        blockers or member.get("blockers") or ["PhoneRoundPrerequisitesMissing"]
+                    )
+                    reason = reasons[0]
+                    if not isinstance(reason, str) or not re.fullmatch(
+                        r"[A-Za-z0-9_]{1,100}", reason
+                    ):
+                        reason = "PhoneRoundPrerequisitesMissing"
+                    db.execute(
+                        "UPDATE phone_round_members SET state=?,error=? WHERE round_id=? AND platform=? "
+                        "AND start_requested_at IS NULL AND state IN ('pending','blocked') "
+                        "AND item_id IN (SELECT id FROM items WHERE status='not_attempted' AND attempt_id IS NULL)",
+                        (
+                            "pending" if allowed else "blocked",
+                            None if allowed else reason,
+                            round_id,
+                            platform,
+                        ),
+                    )
+                db.execute(
+                    "UPDATE phone_rounds SET state=?,finished_at=? WHERE id=?",
+                    ("running" if ready else "blocked", None, round_id),
+                )
+                Store.audit(
+                    db,
+                    "phone_round.preflight_completed",
+                    {
+                        "round_id": round_id,
+                        "ready": ready,
+                        "duration_seconds": max(0, finished - now),
+                    },
+                    now=finished,
+                )
         return self.get(round_id)
 
     def stop(self, round_id):
         now = self.clock()
         with self.store.connect(write=True) as db:
             row = self._round(db, round_id)
-            if row["state"] in {"draft", "running"}:
+            if row["state"] in {"draft", "checking", "running", "blocked"}:
                 db.execute(
                     "UPDATE phone_rounds SET state='stopped',finished_at=? WHERE id=?",
                     (now, round_id),
@@ -294,6 +412,14 @@ class PhoneRounds:
             row = self._round(db, round_id)
             members = self._members(db, row, now)
             cutoff = json.loads(row["cutoff_snapshot"]) if row["cutoff_snapshot"] else None
+            check = db.execute(
+                "SELECT * FROM phone_round_preflights WHERE round_id=? ORDER BY id DESC LIMIT 1",
+                (round_id,),
+            ).fetchone()
+            check_count = db.execute(
+                "SELECT COUNT(*) FROM phone_round_preflights WHERE round_id=?", (round_id,)
+            ).fetchone()[0]
+            readiness = json.loads(check["result"]) if check and check["result"] else None
             elapsed = (
                 max(0, (row["finished_at"] or now) - row["started_at"])
                 if row["started_at"] is not None
@@ -302,7 +428,7 @@ class PhoneRounds:
             return {
                 "id": row["id"],
                 "state": "expired"
-                if row["state"] == "running" and now >= row["deadline"]
+                if row["state"] in {"checking", "running", "blocked"} and now >= row["deadline"]
                 else row["state"],
                 "stored_state": row["state"],
                 "created_at": row["created_at"],
@@ -310,6 +436,16 @@ class PhoneRounds:
                 "submit_deadline": row["submit_deadline"],
                 "deadline": row["deadline"],
                 "elapsed_seconds": elapsed,
+                "timing_scope": "prepared_tasks_including_preflight",
+                "preparation_included": False,
+                "end_to_end_six_app_pass": False,
+                "preflight_seconds": max(
+                    0, (check["finished_at"] or row["finished_at"] or now) - check["started_at"]
+                )
+                if check
+                else None,
+                "preflight": readiness,
+                "preflight_checks": check_count,
                 "remaining_seconds": max(0, TOTAL_SECONDS - elapsed),
                 "confirmed_count": sum(m["verified"] for m in members),
                 "within_budget_count": sum(m["within_budget"] for m in members),
@@ -325,7 +461,7 @@ class PhoneRounds:
         repair = []
         with self.store.connect(write=True) as db:
             rounds = db.execute(
-                "SELECT * FROM phone_rounds WHERE state='running' ORDER BY started_at,id"
+                "SELECT * FROM phone_rounds WHERE state IN ('checking','running','blocked') ORDER BY started_at,id"
             ).fetchall()
             for row in rounds:
                 members = self._members(db, row, now)
@@ -343,6 +479,8 @@ class PhoneRounds:
                         ),
                     )
                     continue
+                if row["state"] in {"checking", "blocked"}:
+                    continue  # Waiting never stops the clock or starts native work.
                 # Native start may have completed before a process died. Repair the original queue only.
                 for member in db.execute(
                     "SELECT * FROM phone_round_members WHERE round_id=? AND state='starting' AND start_lease_until<=?",

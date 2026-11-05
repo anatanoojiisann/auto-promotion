@@ -141,3 +141,23 @@ Validation commands from this worktree:
 Final measured regression after the 0.2 upgrade: **179 passed in 123.84 seconds**. The full command above includes Telegram observed-receipt and original single-join permission coverage. `tests/test_phone_telegram_join.py` now advertises the synthetic peer's capabilities before the original one-use join test. The new software-check timeout defaults to 90 seconds; a cancellation test verifies a stalled check cannot return a pass. Targeted protocol cases also passed (14 cases). Dependency consistency (`pip check`), the explicitly checked changed Python modules/tests, and `git diff --check` passed.
 
 Runtime proof after commit is stored separately in ignored `.local/software-integration/runtime-status.json`; it records the exact loaded source commit and readiness without exporting the local development tokens. Local ports are 18452 (new AP) and 18450 (new Fleet); the existing 18442/18440 services are not changed. The new private runtime directory is restricted to the current Windows user at launch. Hardware and real publication remain unverified.
+
+
+## 2026-11-06 readiness admission and honest timing
+
+Explicit round start now records `checking` and the first 600-second clock before querying readiness. Each member must pass configuration, identity, receipt and authenticated fleet-capability checks before its original task can be admitted. Safe ready members continue while missing requirements block only their own members; shared stop/runtime/time blockers still fence the whole round. One authenticated capability request is shared across the social service's five members; the separate Reddit service retains its own authentication scope. A provider failure still returns every platform's blockers. These are service metadata reads, not platform navigation or submission.
+
+A check costing 30 seconds or more cannot admit tasks. Original service HTTP/token timeouts remain bounded. Results and durations persist in `phone_round_preflights`; no provider exception text or credentials are logged. If no members are ready the round is `blocked`; otherwise ready members can run and the others remain explicitly `blocked`. Partial progress never satisfies the six-publication goal. Explicit recheck may proceed before the original send cutoff, but cannot reset the first start, submission cutoff or deadline. Waiting in `blocked` consumes that same clock. A check interrupted by process loss never causes automatic task starts; stop during checking wins.
+
+Status now states `timing_scope=prepared_tasks_including_preflight`, `preparation_included=false` and `end_to_end_six_app_pass=false`. This prevents the prepared-task timer being mistaken for the full command-to-publication target. Candidate collection, account onboarding and prior preparation still require a higher-level, authoritative integration if a true cold-start claim is desired.
+
+The six-app ten-minute criterion remains six independently confirmed original publications within the full intended interval. Observations, identity matches, typed drafts and successful metadata checks cannot satisfy it. No live or stop setting is enabled by this change. Shared real-account scheduling and unknown deduplication across the old sender and phone environment, plus allowed independent readers, remain integration prerequisites.
+
+
+### Repair validation evidence
+
+Independent worktree `D:/Projects/auto-promotion-verification-repair`, branch `codex/aurax-verification-repair`. Initial affected-feature regression: **193 passed in 125.22 seconds**, XML `.local/repair-qa/promotion.xml`. After the final per-platform admission refinement, **129 passed in 88.83 seconds**, XML `.local/repair-qa/admission-final.xml`; it covers original one-use grants, stop-before-final-grant, queued-start recovery, preflight races, deadlines and partial platform progress. These are overlapping suites, not additive publication results.
+
+A bounded check using synthetic business tasks and the current real fleet's read-only capabilities returned all six missing-prerequisite summaries in **0.907 seconds**, with two metadata GETs, zero original task starts and zero attempts. This verifies fast rejection under the current configuration; it is not real publication acceptance. Real-device read-only connection/IME diagnostics took 0.516 seconds in the companion control branch.
+
+No live writes, old tasks, global stops, production services or platform authorizations were changed. Current full publication remains unverified. Source timing analysis is in `docs/PHONE_VALIDATION_TIMING_2026-11-06.md`; raw sanitized timings remain outside the commit.

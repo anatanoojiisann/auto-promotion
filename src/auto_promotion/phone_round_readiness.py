@@ -1,11 +1,24 @@
-"""Local-only readiness and reviewed candidate selection; never refreshes or sends."""
+"""Bounded readiness metadata and reviewed candidates. Never navigates or submits."""
 
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor
 
 from .account_blocks import active_block
 from .core import Conflict
 from .models import digest, epoch
+from .phone_protocol import capability_status
 from .phone_rounds import TOTAL_SECONDS
+
+
+def _fleet_capabilities(service):
+    try:
+        return capability_status(service.request("GET", "/capabilities"))
+    except Exception as exc:
+        reason = getattr(exc, "safe_code", "")
+        if not isinstance(reason, str) or not re.fullmatch(r"Phone[A-Za-z0-9_]{1,90}", reason):
+            reason = "PhoneFleetReadinessUnavailable"
+        return {"software_ready": False, "device_ready": False, "reason": reason}
 
 
 def preflight(rounds, round_id):
@@ -19,6 +32,21 @@ def preflight(rounds, round_id):
     runtime = store.one("SELECT value FROM meta WHERE key='execution_runtime'")
     if not runtime or runtime["value"] != "pooled":
         common.append("PooledRuntimeRequired")
+    sources, platform_services = {}, {}
+    for member in snapshot["members"]:
+        service = getattr(
+            engine.adapters,
+            "phone_reddit" if member["platform"] == "reddit" else "phone_social",
+            None,
+        )
+        platform_services[member["platform"]] = service
+        if service is not None:
+            sources[id(service)] = service
+    # A social binding may cover five apps. Fetch once per authenticated service, not per app.
+    # The established request method bounds token retrieval and /capabilities HTTP timeouts.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {key: pool.submit(_fleet_capabilities, value) for key, value in sources.items()}
+        fleet = {key: future.result() for key, future in futures.items()}
     members = []
     for member in snapshot["members"]:
         reasons = []
@@ -39,19 +67,30 @@ def preflight(rounds, round_id):
             reasons.append("AccountWaitRequired")
         if not policy.get("ends_at") or epoch(policy["ends_at"]) <= now:
             reasons.append("TaskWindowElapsed")
-        service = getattr(
-            engine.adapters,
-            "phone_reddit" if member["platform"] == "reddit" else "phone_social",
-            None,
-        )
+        service = platform_services[member["platform"]]
         if service is None or account["id"] not in service.config.bindings:
             reasons.append("PhoneBindingRequired")
         else:
+            remote = fleet[id(service)]
+            if not remote.get("software_ready"):
+                reasons.append(remote.get("reason") or "PhoneFleetReadinessUnavailable")
+            elif not remote.get("device_ready"):
+                reasons.append("PhoneFleetDeviceNotReady")
+            elif (
+                remote.get("operations", {}).get(
+                    "reddit_submit" if member["platform"] == "reddit" else "social_submit"
+                )
+                != "supported"
+            ):
+                reasons.append("PhoneFleetSubmissionUnsupported")
             if not service.config.submit_enabled:
                 reasons.append("PhoneSubmissionDisabled")
             if task["id"] not in service.config.authorized_task_ids:
                 reasons.append("PhoneTaskOutsideAuthorizedScope")
-            if not service.fresh(account):
+            try:
+                if not service.fresh(account):
+                    reasons.append("FreshPhoneIdentityRequired")
+            except Exception:
                 reasons.append("FreshPhoneIdentityRequired")
             if member["platform"] == "reddit":
                 if not service.config.reddit_read_access_token:
@@ -62,12 +101,15 @@ def preflight(rounds, round_id):
                     if account["id"] not in service.config.telegram_observers:
                         reasons.append("OfficialReadAuthorizationRequired")
                 else:
-                    _, _, observation = service.preparation(
-                        account["id"],
-                        json.loads(item["payload"]),
-                        item_id=item["id"],
-                        task_id=task["id"],
-                    )
+                    try:
+                        _, _, observation = service.preparation(
+                            account["id"],
+                            json.loads(item["payload"]),
+                            item_id=item["id"],
+                            task_id=task["id"],
+                        )
+                    except Exception:
+                        observation = None
                     proof = ((observation or {}).get("result") or {}).get("social") or {}
                     if not (
                         observation
@@ -81,14 +123,15 @@ def preflight(rounds, round_id):
                 "platform": member["platform"],
                 "task_id": task["id"],
                 "ready": not reasons and not common,
-                "blockers": common + reasons,
+                "blockers": common + list(dict.fromkeys(reasons)),
             }
         )
     return {
         "round_id": round_id,
         "observed_at": now,
         "read_only": True,
-        "readiness_scope": "local_configuration_and_cached_evidence",
+        "readiness_scope": "local_configuration_and_authenticated_fleet_capabilities",
+        "capability_sources_checked": len(sources),
         "ready_count": sum(m["ready"] for m in members),
         "members": members,
         "submission_authorized": False,
@@ -175,7 +218,9 @@ def shortlist(engine, account_id, *, limit=3):
         "candidates": found,
         "blockers": [] if found else ["ReviewedCandidatePoolEmpty"],
         "refresh_required": not bool(found),
-        "next_actions": [] if found else ["collect_fresh_content", "review_account_permission", "prepare_contextual_draft"],
+        "next_actions": []
+        if found
+        else ["collect_fresh_content", "review_account_permission", "prepare_contextual_draft"],
         "excluded": excluded,
         "scan_limit": 2000,
     }
