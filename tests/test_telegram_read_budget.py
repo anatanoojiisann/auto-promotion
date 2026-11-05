@@ -36,6 +36,14 @@ class TelegramReadBudgetTests(unittest.TestCase):
             label, identity, revision, {**self.policy, **policy}, clock=lambda: self.now
         )
 
+    def test_target_inspection_preserves_receipt_headroom_atomically(self):
+        self.guard().reserve(1, keep=2)
+        with self.assertRaises(ReadBudgetExceeded):
+            self.guard().reserve(1, keep=2)
+        self.guard().reserve(2)
+        with self.assertRaises(ReadBudgetExceeded):
+            self.guard().reserve(1)
+
     def test_budget_survives_restart_and_session_changes_without_refund(self):
         self.guard().reserve(2)
         changed = self.guard(revision="new-session", label="same-identity-another-label")

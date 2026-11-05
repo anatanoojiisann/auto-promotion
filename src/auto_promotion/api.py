@@ -349,11 +349,13 @@ def create_app(
     app.state.engine = engine
 
     @app.get("/api/phone-readiness")
-    async def phone_readiness():
+    async def phone_readiness(platform: str | None = None):
         from .phone_protocol import capability_status
         from .phone_readiness import readiness
-        result = await asyncio.to_thread(readiness, engine)
-        if phone_preparations is not None:
+        result = await asyncio.to_thread(readiness, engine, platform=platform)
+        sender_job = background_tasks.get("sender")
+        result["sender_running"] = sender_job is not None and not sender_job.done()
+        if phone_preparations is not None and platform is None:
             try:
                 status = capability_status(await phone_preparations.client.request("GET", "/capabilities"))
             except Exception:

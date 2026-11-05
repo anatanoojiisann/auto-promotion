@@ -124,6 +124,17 @@ class AdapterRegistry:
         finally:
             self.context.job = previous
 
+    def call_phone(self, account, operation, payload):
+        from .backends.phone import PhoneBackend
+        from .routing import route_for
+
+        key = "phone_reddit" if account["platform"] == "reddit" else "phone_social"
+        service = getattr(self, key, None)
+        if service and route_for(account).transport != "phone" and (
+                account["platform"] != "telegram" or not service.shared_telegram_binding(account)):
+            service = None
+        return PhoneBackend(service=service, execution_job=getattr(self.context, "job", None)).call(account, operation, payload)
+
     def commissioned(self, account):
         return account["mode"] == "simulation" or (
             os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1"
@@ -139,10 +150,7 @@ class AdapterRegistry:
         if route_for(account).transport == "phone":
             # Explicit native services reuse the original claimed send job.
             # Unconfigured phone routes remain preparation-only.
-            from .backends.phone import PhoneBackend
-            selected = "phone_reddit" if account["platform"] == "reddit" else "phone_social"
-            return PhoneBackend(service=getattr(self, selected, None),
-                                execution_job=getattr(self.context, "job", None)).call(account, operation, payload)
+            return self.call_phone(account, operation, payload)
         if account["platform"] == "tiktok":
             from .tiktok_browser import TikTokBrowser
 

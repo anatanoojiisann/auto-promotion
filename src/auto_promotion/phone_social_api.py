@@ -18,6 +18,11 @@ class RegistrationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class GroupTargetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_url: str = Field(max_length=2048)
+
+
 class MembershipInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target_url: str = Field(max_length=2048)
@@ -25,6 +30,10 @@ class MembershipInput(BaseModel):
 
 
 def mount(app, service):
+    @app.post("/api/phone-social/accounts/{account_id}/telegram-target")
+    def telegram_target(account_id: str, body: GroupTargetInput):
+        return service.inspect_telegram_target(account_id, body.target_url)
+
     @app.post("/api/phone-social/accounts/{account_id}/membership")
     def membership(account_id:str,body:MembershipInput):
         return service.membership(account_id,body.target_url,body.target_title)

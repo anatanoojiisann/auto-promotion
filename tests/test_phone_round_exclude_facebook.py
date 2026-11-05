@@ -3,7 +3,6 @@
 import pytest
 from test_phone_rounds import finish, make_lab
 
-from auto_promotion.core import Conflict
 from auto_promotion.phone_rounds import PLATFORMS
 from auto_promotion.phone_rounds_api import RoundInput
 
@@ -36,11 +35,10 @@ def test_explicit_five_round_keeps_original_tasks_and_requires_five_receipts(lab
     assert result["selected_platforms"] == sorted(PLATFORMS - {"facebook"})
 
 
-def test_any_other_five_platform_subset_is_rejected(lab):
+def test_five_platforms_can_exclude_any_app(lab):
     tasks = [task for task in lab.ids if task != "task-telegram"]
-    with pytest.raises(Conflict, match="SupportedPlatforms"):
-        lab.rounds.create(tasks, "wrong-five-scope")
-    assert lab.store.one("SELECT COUNT(*) n FROM phone_rounds")["n"] == 0
+    result = lab.rounds.create(tasks, "different-five-scope")
+    assert set(result["selected_platforms"]) == PLATFORMS - {"telegram"}
 
 
 def test_mismatched_six_platform_preflight_cannot_admit_five_task_round(lab):
@@ -56,14 +54,16 @@ def test_mismatched_six_platform_preflight_cannot_admit_five_task_round(lab):
     assert not lab.calls and lab.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 0
 
 
-def test_api_input_accepts_five_or_six_but_no_smaller_collection():
+def test_api_input_accepts_one_to_six_tasks_only():
     from pydantic import ValidationError
 
     assert (
         len(RoundInput(task_ids=["a", "b", "c", "d", "e"], request_key="request-123").task_ids) == 5
     )
-    with pytest.raises(ValidationError):
-        RoundInput(task_ids=["a", "b", "c", "d"], request_key="request-123")
+    assert RoundInput(task_ids=["a"], request_key="request-123").task_ids == ["a"]
+    for invalid in ([], [str(i) for i in range(7)]):
+        with pytest.raises(ValidationError):
+            RoundInput(task_ids=invalid, request_key="request-123")
 
 
 def test_five_platforms_continue_only_for_the_ready_member_when_others_block(lab):

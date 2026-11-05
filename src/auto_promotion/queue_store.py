@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 
 from .models import canonical, digest, epoch
-from .routing import route_for
+from .routing import task_route
 
 _CURRENT_JOB = threading.local()
 
@@ -194,7 +194,7 @@ class JobQueue:
                 for row in rows:
                     payload = json.loads(row["payload"])
                     account = self.engine.account(row["account_id"])
-                    route = route_for(account, payload)
+                    route = task_route(account, payload, policy.get("execution_method"), self.engine.adapters)
                     native = payload["action"] in {"schedule_message", "schedule_file"}
                     due = epoch(policy["starts_at"]) if native else row["due_at"]
                     expires = min(
@@ -216,7 +216,7 @@ class JobQueue:
                         row["id"],
                         task,
                         account,
-                        route_for(account),
+                        task_route(account, {}, policy.get("execution_method"), self.engine.adapters),
                         digest(json.loads(row["payload"])),
                         epoch(policy["starts_at"]),
                         epoch(policy["ends_at"]),
@@ -667,3 +667,6 @@ def verify_job_claim(db, request):
         or row["account_id"] != request["account_id"]
     ):
         raise ValueError("PersistentJobClaimExpired")
+    task = db.execute("SELECT json_extract(policy,'$.execution_method') FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+    if task and task[0] == "phone" and row["pool"] != request.get("platform", "") + ".phone":
+        raise ValueError("PhoneOriginalPoolClaimRequired")

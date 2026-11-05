@@ -2,13 +2,14 @@
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from .account_blocks import active_block
-from .core import Conflict
+from .core import Conflict, NotFound
 from .models import digest, epoch
 from .phone_protocol import capability_status
 from .phone_rounds import TOTAL_SECONDS
+from .readiness import DELIVERY_GRACE_SECONDS
 
 
 def _fleet_capabilities(service):
@@ -21,9 +22,97 @@ def _fleet_capabilities(service):
         return {"software_ready": False, "device_ready": False, "reason": reason}
 
 
-def preflight(rounds, round_id):
+def _member_blockers(engine, member, now, service, remote):
+    store = engine.store
+    reasons = []
+    item = store.one("SELECT * FROM items WHERE id=?", (member["item_id"],))
+    task = store.one("SELECT * FROM tasks WHERE id=?", (member["task_id"],))
+    if not task or not item or item["task_id"] != member["task_id"]:
+        return ["PhoneRoundOriginalItemMissing"]
+    if now - item["due_at"] > DELIVERY_GRACE_SECONDS:
+        reasons.append("PhoneItemDeliveryWindowElapsed")
+    account = engine.account(item["account_id"])
+    if account["platform"] != member["platform"]:
+        return ["PhoneRoundAccountBindingChanged"]
+    with store.connect() as db:
+        try:
+            policy = engine._integrity(db, task, "outbound")
+        except Conflict:
+            reasons.append("ManifestChanged")
+            policy = {}
+        if active_block(db, account["id"], now):
+            reasons.append("AccountOutboundBlocked")
+    if account["disabled"] or account["status"] != "healthy":
+        reasons.append("AccountNotHealthy")
+    if max(account["cooldown_until"], account["next_at"]) > now:
+        reasons.append("AccountWaitRequired")
+    if not policy.get("ends_at") or epoch(policy["ends_at"]) <= now:
+        reasons.append("TaskWindowElapsed")
+    if service is None or account["id"] not in service.config.bindings:
+        reasons.append("PhoneBindingRequired")
+    else:
+        if not remote.get("software_ready"):
+            reasons.append(remote.get("reason") or "PhoneFleetReadinessUnavailable")
+        elif not remote.get("device_ready"):
+            reasons.append("PhoneFleetDeviceNotReady")
+        elif (
+            remote.get("operations", {}).get(
+                "reddit_submit" if member["platform"] == "reddit" else "social_submit"
+            )
+            != "supported"
+        ):
+            reasons.append("PhoneFleetSubmissionUnsupported")
+        if not service.config.submit_enabled:
+            reasons.append("PhoneSubmissionDisabled")
+        if task["id"] not in service.config.authorized_task_ids:
+            reasons.append("PhoneTaskOutsideAuthorizedScope")
+        try:
+            if not service.fresh(account):
+                reasons.append("FreshPhoneIdentityRequired")
+        except Exception:
+            reasons.append("FreshPhoneIdentityRequired")
+        if member["platform"] == "reddit":
+            if not service.config.reddit_read_access_token:
+                reasons.append("OfficialReadAuthorizationRequired")
+        else:
+            binding = service.config.bindings[account["id"]]
+            if member["platform"] == "telegram" and binding.receipt_reader == "telegram_api":
+                if account["id"] not in service.config.telegram_observers:
+                    reasons.append("OfficialReadAuthorizationRequired")
+                elif reason := service.telegram_queue_blocker(account["id"]):
+                    reasons.append(reason)
+            else:
+                try:
+                    _, _, observation = service.preparation(
+                        account["id"],
+                        json.loads(item["payload"]),
+                        item_id=item["id"],
+                        task_id=task["id"],
+                    )
+                except Exception:
+                    observation = None
+                proof = ((observation or {}).get("result") or {}).get("social") or {}
+                if not (
+                    observation
+                    and observation.get("status") == "succeeded"
+                    and (observation.get("result") or {}).get("simulated") is False
+                    and proof.get("receipt_capable") is True
+                ):
+                    reasons.append("IndependentReceiptCommissioningRequired")
+    return reasons
+
+
+# Leave time in the admission budget to save healthy peers if one provider stalls.
+FLEET_CHECK_SECONDS = 15
+
+
+def preflight(rounds, round_id, *, platforms=None):
     engine, store, now = rounds.engine, rounds.store, rounds.clock()
     snapshot = rounds.get(round_id)
+    selected = set(snapshot["selected_platforms"])
+    if platforms is not None and (not platforms or not set(platforms) <= selected):
+        raise NotFound("PhoneRoundPlatformNotSelected")
+    scoped = [m for m in snapshot["members"] if platforms is None or m["platform"] in platforms]
     common = []
     if not engine.live_enabled:
         common.append("LiveWritesDisabled")
@@ -33,7 +122,7 @@ def preflight(rounds, round_id):
     if not runtime or runtime["value"] != "pooled":
         common.append("PooledRuntimeRequired")
     sources, platform_services = {}, {}
-    for member in snapshot["members"]:
+    for member in scoped:
         service = getattr(
             engine.adapters,
             "phone_reddit" if member["platform"] == "reddit" else "phone_social",
@@ -42,86 +131,30 @@ def preflight(rounds, round_id):
         platform_services[member["platform"]] = service
         if service is not None:
             sources[id(service)] = service
-    # A social binding may cover five apps. Fetch once per authenticated service, not per app.
-    # The established request method bounds token retrieval and /capabilities HTTP timeouts.
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
         futures = {key: pool.submit(_fleet_capabilities, value) for key, value in sources.items()}
-        fleet = {key: future.result() for key, future in futures.items()}
+        done, _ = wait(futures.values(), timeout=FLEET_CHECK_SECONDS)
+        fleet = {
+            key: f.result()
+            if f in done
+            else {"software_ready": False, "reason": "PhoneFleetReadinessTimeout"}
+            for key, f in futures.items()
+        }
+    finally:
+        # These calls only fetch metadata and have their own HTTP timeouts.
+        pool.shutdown(wait=False, cancel_futures=True)
     members = []
-    for member in snapshot["members"]:
-        reasons = []
-        item = store.one("SELECT * FROM items WHERE id=?", (member["item_id"],))
-        task = store.one("SELECT * FROM tasks WHERE id=?", (member["task_id"],))
-        account = engine.account(item["account_id"])
-        with store.connect() as db:
-            try:
-                policy = engine._integrity(db, task, "outbound")
-            except Conflict:
-                reasons.append("ManifestChanged")
-                policy = {}
-            if active_block(db, account["id"], now):
-                reasons.append("AccountOutboundBlocked")
-        if account["disabled"] or account["status"] != "healthy":
-            reasons.append("AccountNotHealthy")
-        if max(account["cooldown_until"], account["next_at"]) > now:
-            reasons.append("AccountWaitRequired")
-        if not policy.get("ends_at") or epoch(policy["ends_at"]) <= now:
-            reasons.append("TaskWindowElapsed")
+    for member in scoped:
         service = platform_services[member["platform"]]
-        if service is None or account["id"] not in service.config.bindings:
-            reasons.append("PhoneBindingRequired")
-        else:
-            remote = fleet[id(service)]
-            if not remote.get("software_ready"):
-                reasons.append(remote.get("reason") or "PhoneFleetReadinessUnavailable")
-            elif not remote.get("device_ready"):
-                reasons.append("PhoneFleetDeviceNotReady")
-            elif (
-                remote.get("operations", {}).get(
-                    "reddit_submit" if member["platform"] == "reddit" else "social_submit"
-                )
-                != "supported"
-            ):
-                reasons.append("PhoneFleetSubmissionUnsupported")
-            if not service.config.submit_enabled:
-                reasons.append("PhoneSubmissionDisabled")
-            if task["id"] not in service.config.authorized_task_ids:
-                reasons.append("PhoneTaskOutsideAuthorizedScope")
-            try:
-                if not service.fresh(account):
-                    reasons.append("FreshPhoneIdentityRequired")
-            except Exception:
-                reasons.append("FreshPhoneIdentityRequired")
-            if member["platform"] == "reddit":
-                if not service.config.reddit_read_access_token:
-                    reasons.append("OfficialReadAuthorizationRequired")
-            else:
-                binding = service.config.bindings[account["id"]]
-                if member["platform"] == "telegram" and binding.receipt_reader == "telegram_api":
-                    if account["id"] not in service.config.telegram_observers:
-                        reasons.append("OfficialReadAuthorizationRequired")
-                else:
-                    try:
-                        _, _, observation = service.preparation(
-                            account["id"],
-                            json.loads(item["payload"]),
-                            item_id=item["id"],
-                            task_id=task["id"],
-                        )
-                    except Exception:
-                        observation = None
-                    proof = ((observation or {}).get("result") or {}).get("social") or {}
-                    if not (
-                        observation
-                        and observation.get("status") == "succeeded"
-                        and (observation.get("result") or {}).get("simulated") is False
-                        and proof.get("receipt_capable") is True
-                    ):
-                        reasons.append("IndependentReceiptCommissioningRequired")
+        try:
+            reasons = _member_blockers(engine, member, now, service, fleet.get(id(service), {}))
+        except Exception:
+            reasons = ["PhoneMemberReadinessUnavailable"]
         members.append(
             {
                 "platform": member["platform"],
-                "task_id": task["id"],
+                "task_id": member["task_id"],
                 "ready": not reasons and not common,
                 "blockers": common + list(dict.fromkeys(reasons)),
             }

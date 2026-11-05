@@ -39,7 +39,7 @@ from .models import (
     epoch,
 )
 from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_blocker
-from .routing import route_for
+from .routing import route_for, task_route
 from .runtime_identity import result_runtime
 from .statistics import ZONE, Statistics, publication_time, record_publication
 from .store import Store, decode
@@ -309,16 +309,23 @@ class Engine:
             )
         return self.account(account_id)
 
+    def _execution_method(self, task_id):
+        if not task_id:
+            return None
+        row = self.store.one("SELECT json_extract(policy,'$.execution_method') AS method FROM tasks WHERE id=?", (task_id,))
+        return row["method"] if row else None
+
     def call(self, account, operation, payload=None, task_id=None):
         from .target_checks import TargetChecks
 
         account = self.account(account["id"])
-        route = route_for(account, (payload or {}).get("payload", {}))
+        method = self._execution_method(task_id) if operation in {"preflight","execute","join","verify","verify_join"} else None
+        route = task_route(account, (payload or {}).get("payload", {}), method, self.adapters)
         with self.lanes.acquire(account["id"], resource=route.resource):
             # Another caller can record a FloodWait/disable while this caller is
             # acquiring its lane. Never authorize a read with a stale account.
             account = self.account(account["id"])
-            if route_for(account, (payload or {}).get("payload", {})) != route:
+            if task_route(account, (payload or {}).get("payload", {}), method, self.adapters) != route:
                 raise Conflict("账号连接已变化，请重新核验")
             if account["platform"] == "x":
                 from .read_cooldowns import x_read_until
@@ -397,7 +404,10 @@ class Engine:
             if cached is not None:
                 return self._observe_telegram_read(account, operation, task_id, cached)
             try:
-                result = self._call_unlocked(account, operation, payload, task_id)
+                if method == "phone" and account["mode"] == "live":
+                    result = self._call_unlocked(account, operation, payload, task_id, phone=True)
+                else:
+                    result = self._call_unlocked(account, operation, payload, task_id)
             except Conflict as exc:
                 if not checks.enabled:
                     raise
@@ -484,7 +494,7 @@ class Engine:
             logging.getLogger(__name__).warning("Telegram read diagnostics unavailable")
         return result
 
-    def _call_unlocked(self, account, operation, payload=None, task_id=None):
+    def _call_unlocked(self, account, operation, payload=None, task_id=None, *, phone=False):
         started = time.monotonic()
         provider_invoked = False
         try:
@@ -528,7 +538,8 @@ class Engine:
                         attempt_id = attempt["id"] if attempt else None
                     cloud.guard(getattr(self.adapters.context, "job", None), attempt_id)
             provider_invoked = True
-            result = {**RUNTIME, **self.adapters.call(account, operation, payload or {})}
+            call = self.adapters.call_phone if phone else self.adapters.call
+            result = {**RUNTIME, **call(account, operation, payload or {})}
         except Exception as exc:
             # Never expose provider exceptions: they may include tokens, URLs or browser state.
             outbound = (payload or {}).get("payload", {})
@@ -1218,7 +1229,11 @@ class Engine:
         for account_id in task["account_ids"]:
             account = self.account(account_id)
             phone = getattr(self.adapters,"phone_social",None)
-            if refresh and phone is not None and account_id in phone.config.bindings:
+            method = task["policy"].get("execution_method")
+            if method == "phone" and account["mode"] == "live" and not task_route(account, {}, method, self.adapters).resource:
+                raise Conflict("PhoneAccountBindingRequired")
+            if refresh and phone is not None and account_id in phone.config.bindings and (
+                    method == "phone" or route_for(account).transport == "phone"):
                 phone.ensure_identity(account_id,task_id=task["id"])
             if account["mode"] == "live" or account["status"] == "unchecked":
                 # Explicit starts refresh positive observations. Failed probes
@@ -1672,7 +1687,9 @@ class Engine:
         if value.account_id not in task["account_ids"]:
             raise Conflict("账号不在该任务范围内")
         account = account or self.account(value.account_id)
-        if account.get("execution_backend") == "phone" and account["platform"] != "reddit":
+        if account["mode"] == "live" and account["platform"] != "reddit" and (
+                account.get("execution_backend") == "phone" or task["policy"].get("execution_method") == "phone"):
+
             from .phone_social import validate_item as validate_phone_item
 
             try:
@@ -1775,7 +1792,6 @@ class Engine:
         ):
             raise Conflict("TikTok 字段仅用于 TikTok")
         if platform == "tiktok":
-            from .backends.common import BackendError
             from .backends.tiktok import validate_item
             from .tiktok_browser import validate_browser_item
 
@@ -1814,7 +1830,6 @@ class Engine:
         if platform != "discord" and value.discord_reply_to:
             raise Conflict("Discord 原消息 ID 仅用于 Discord")
         if platform == "discord":
-            from .backends.common import BackendError
             from .backends.discord import MAX_FILE_BYTES, MAX_TOTAL_BYTES, snowflake
 
             try:
@@ -2632,7 +2647,7 @@ class Engine:
             return []
         try:
             account = self.account(rows[0]["account_id"])
-            route = route_for(account, json.loads(rows[0]["payload"]))
+            route = task_route(account, json.loads(rows[0]["payload"]), self._execution_method(rows[0]["task_id"]), self.adapters)
             with self.lanes.acquire(rows[0]["account_id"], limits, resource=route.resource):
                 return self._run_account_rows(rows, stopped)["processed"]
         except AccountBusy:
@@ -2726,7 +2741,8 @@ class Engine:
             if not manual and account["id"] not in checked:
                 # A fresh read-only health check before a live claim; simulation needs one too.
                 phone = getattr(self.adapters,"phone_social",None)
-                if phone is not None and account["id"] in phone.config.bindings:
+                if phone is not None and account["id"] in phone.config.bindings and (
+                        self._execution_method(row["task_id"]) == "phone" or route_for(account).transport == "phone"):
                     phone.ensure_identity(account["id"],task_id=row["task_id"])
                 checked[account["id"]] = self.check_account(account["id"], force=True)
             if not manual and checked[account["id"]]["connection_state"] != "healthy":
