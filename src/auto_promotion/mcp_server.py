@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -254,6 +255,16 @@ def create_server(engine=None):
         """Synchronize existing Meta workflow states without starting any task."""
         return invoke(meta_browser.status)
 
+    @server.tool(annotations=local)
+    def acknowledge_unrelated_x_history(task_id: str, account_id: str, source: str) -> dict:
+        """Only on an explicit user instruction: acknowledge unrelated old X unknowns
+        for this exact frozen local task and account. Never alter old outcomes, permit
+        old targets, grant account ownership, start a task, or send a message.
+        """
+        from .x_history_ack import record_ack
+
+        return invoke(lambda: record_ack(engine, task_id, account_id, source=source))
+
     @server.tool(annotations=remote_read)
     def authorize_local_channel(
         task_id: str, account_id: str, coordinate_once: bool, source: str
@@ -276,6 +287,14 @@ def create_server(engine=None):
             raise ToolError(safe_channel_code(str(exc))) from None
         except ValueError:
             raise ToolError("ExplicitLocalCoordinationRequired") from None
+        except sqlite3.OperationalError as exc:
+            try:
+                locked = Store.locked(exc)
+            except (AttributeError, TypeError, ValueError):
+                locked = False
+            if locked:
+                raise ToolError("LocalDatabaseUnavailable") from None
+            raise ToolError("LocalAuthorizationUnavailable") from None
         except Exception:
             raise ToolError("LocalAuthorizationUnavailable") from None
 

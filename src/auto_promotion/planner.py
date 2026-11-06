@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from .core import RISK, Conflict
-from .models import CAPABILITIES, ItemInput, digest, epoch
+from .models import CAPABILITIES, ItemInput, digest, epoch, target_allowed
 from .quotas import Calendar, event, events, scopes, settings
 
 
@@ -184,7 +184,7 @@ def build_plan(engine, campaign, pool, opportunities, profiles):
             any(w in content for w in q.casefold().split()) for q in policy["queries"]
         ):
             common.append("内容与活动主题不相关")
-        if policy["target_allowlist"] and value["target"] not in policy["target_allowlist"]:
+        if not target_allowed(value["platform"], value["target"], policy["target_allowlist"]):
             common.append("目标超出活动白名单")
         end = min(
             epoch(policy["ends_at"]),

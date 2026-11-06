@@ -63,6 +63,7 @@ def cli(arguments, instance, *, code=None, timeout_seconds=75):
                 env=env,
                 timeout=timeout_seconds,
                 check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         value = json.loads(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -768,6 +769,7 @@ def reply(settings, operation, payload, checkpoint, authorize):
     if inventory.get("task", {}).get("reused"):
         raise BackendError("TabbitCheckPending")
     settled = True
+    completed_result = None
     prefix = (
         "await page.setViewportSize({width:1440,height:1000});\n"
         + "const expected = "
@@ -834,9 +836,27 @@ def reply(settings, operation, payload, checkpoint, authorize):
         result = program("verify", "const receipt = " + json.dumps(receipt) + ";\n" + VERIFY_JS)
         result["published_at"] = observed_timestamp(result.get("published_at"))
         checkpoint(result)
+        if result.get("status") == "confirmed" and result.get("verified") is True:
+            completed_result = result
         return result
     finally:
         if settled:
-            finished = cli(["finish", "--task", task], instance)
-            if finished.get("forcedCleanup") or finished.get("ok") is False:
-                raise BackendError("TabbitFinishIncomplete")
+            # This route only creates task pages: it never acquires a user tab
+            # with --tab/--group. Close them after the independent receipt has
+            # been saved. Pending requests, drafts and unknown outcomes stay open.
+            arguments = ["finish", "--task", task]
+            if completed_result is not None:
+                arguments.append("--discard")
+            try:
+                finished = cli(arguments, instance)
+                if finished.get("forcedCleanup") or finished.get("ok") is False:
+                    raise BackendError("TabbitFinishIncomplete")
+            except BackendError:
+                if completed_result is None:
+                    raise
+                # Cleanup cannot turn an already verified publication into a
+                # failed send. Expose the incomplete cleanup for diagnostics.
+                completed_result["browser_cleanup_state"] = "incomplete"
+            else:
+                if completed_result is not None:
+                    completed_result["browser_cleanup_state"] = "closed"

@@ -134,8 +134,13 @@ const api = async (path, method = "GET", body, extraHeaders = {}) => {
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   const result = await response.json();
-  if (!response.ok)
-    throw Error(result.error || JSON.stringify(result.detail) || "请求失败");
+  if (!response.ok) {
+    const error = Error(
+      result.error || JSON.stringify(result.detail) || "请求失败",
+    );
+    error.status = response.status;
+    throw error;
+  }
   return result;
 };
 function toast(text, error = false) {
@@ -272,7 +277,7 @@ $("#global-stop").onclick = (e) =>
   });
 async function render() {
   const hash = location.hash.slice(1) || "tasks";
-  const section = hash.split("/")[0];
+  const section = hash.split(/[/?]/)[0];
   document.querySelectorAll("[data-nav]").forEach((el) => {
     const on = el.dataset.nav === section;
     el.classList.toggle("active", on);
@@ -285,6 +290,7 @@ async function render() {
       tasks: "任务中心",
       api: "API 中心",
       statistics: "互动统计",
+      effects: "互动效果",
       pools: "号池与人设",
       content: "共享内容池",
       campaigns: "推广活动",
@@ -307,6 +313,7 @@ async function render() {
   if (section === "templates") return renderTaskTemplates();
   if (section === "accounts") return renderAccounts();
   if (section === "api") return renderAPI();
+  if (section === "effects") return renderEngagementEffects();
   if (section === "statistics") return renderStatistics();
   return renderTasks();
 }
@@ -351,16 +358,10 @@ async function renderStatistics(day = "") {
     renderStatistics(e.target.value).catch((error) =>
       toast(error.message, true),
     );
-  const engagementHost = document.createElement("section");
-  engagementHost.id = "engagement-metrics";
-  $("#main").append(engagementHost);
-  try {
-    await renderEngagement();
-  } catch {
-    engagementHost.className = "surface padded mt-24";
-    engagementHost.innerHTML =
-      '观看、点赞与回复：<a href="http://127.0.0.1:8782/#statistics">打开定期采集统计工作台 ↗</a>';
-  }
+  $("#main").insertAdjacentHTML(
+    "beforeend",
+    '<section class="surface padded mt-24"><h2>逐条互动效果</h2><p>按内容查看观看、点赞、回复及历史变化。</p><a href="#effects">打开互动效果 →</a></section>',
+  );
 }
 async function metaBrowserPanel() {
   const [status, queue] = await Promise.all([
@@ -1405,8 +1406,17 @@ async function renderTask(id) {
     (b) =>
       (b.onclick = () =>
         busy(b, async () => {
-          await api(`/candidates/${b.dataset.joinReconcile}/reconcile`, "POST");
-          if (await renderTask(id)) toast("已只读核对成员状态；不会重新入群");
+          const result = await api(
+            `/candidates/${b.dataset.joinReconcile}/reconcile`,
+            "POST",
+          );
+          const message =
+            result.reason === "not_current_member"
+              ? "Telegram 当前显示账号不是群成员；原入群结果仍保留，不会重复申请。"
+              : result.reason === "membership_state_unrecognized"
+                ? "Telegram 返回了未识别的成员状态；原入群结果仍保留，不会重复申请。"
+                : "已只读核对成员状态；不会重新入群";
+          if (await renderTask(id)) toast(message);
         })),
   );
   $("#add-candidate")?.addEventListener("click", () => candidateForm(t));
@@ -2072,7 +2082,11 @@ window.addEventListener("hashchange", () => {
 (async () => {
   try {
     await api("/session", "POST");
-    if (location.hash === "#statistics") {
+    if (
+      ["statistics", "effects"].includes(
+        location.hash.slice(1).split(/[/?]/)[0],
+      )
+    ) {
       // Render read-only statistics before loading the complete task catalogue.
       await render();
       refresh().catch((e) => toast(e.message, true));

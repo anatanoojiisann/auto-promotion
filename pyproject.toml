@@ -13,9 +13,9 @@ dependencies = ["fastapi>=0.115,<1", "pydantic>=2.10,<3", "uvicorn>=0.34,<1", "t
 [project.optional-dependencies]
 dev = ["ruff>=0.12,<1", "build>=1.2,<2", "httpx>=0.28,<1"]
 telegram = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3"]
-browser = ["playwright>=1.55,<2"]
+browser = ["playwright>=1.55,<2", "pywin32>=306,<400; sys_platform == 'win32'"]
 mcp = ["mcp>=1.30,<2"]
-all = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3", "playwright>=1.55,<2", "mcp>=1.30,<2"]
+all = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3", "playwright>=1.55,<2", "mcp>=1.30,<2", "pywin32>=306,<400; sys_platform == 'win32'"]
 
 [project.scripts]
 auto-promotion = "auto_promotion.cli:main"

@@ -674,7 +674,9 @@ async function cleanup() {
       headers: { "X-AP-Client": "local-ui" },
     }).then((r) => r.json()),
   );
-  await page.getByRole("link", { name: "互动统计", exact: true }).click();
+  await page.getByRole("link", { name: "互动效果", exact: true }).click();
+  await page.getByRole("heading", { name: "互动效果", exact: true }).waitFor();
+  await page.getByRole("link", { name: "发布与定时报告", exact: true }).click();
   await page.getByRole("heading", { name: "互动统计", exact: true }).waitFor();
   assert.ok((await page.locator(".stats").innerText()).includes("不可统计"));
   const statistics = await page.evaluate(() =>

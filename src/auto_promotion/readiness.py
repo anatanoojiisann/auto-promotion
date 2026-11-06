@@ -179,6 +179,14 @@ def task_workflow(task, blockers, item_blockers, now):
             "执行已结束 · 回执待处理",
             "执行批次已结束；未知结果只读核验，平台排期仍需核对，人工项目保留待处理状态。",
         )
+    if task["state"] == "completed":
+        unsent = sum(i["status"] == "missed" and not i.get("attempt_id") for i in task["items"])
+        if unsent:
+            return step(
+                "completed",
+                "已结束 · 有项目未发送",
+                f"有 {unsent} 项未尝试发送；请查看逐项结果及未执行原因。",
+            )
     if task["state"] in {"cancelled", "completed"}:
         return step(
             task["state"],

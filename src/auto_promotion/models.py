@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -9,6 +10,25 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 PLATFORMS = ("telegram", "reddit", "instagram", "facebook", "x", "discord", "tiktok")
+
+
+def telegram_public_handle(target: str) -> bool:
+    """Recognize only public @usernames, not case-sensitive invite links or IDs."""
+    return bool(re.fullmatch(r"@[A-Za-z0-9_]{5,32}", target, flags=re.ASCII))
+
+
+def target_allowed(platform: str, target: str, allowlist: list[str]) -> bool:
+    """Match Telegram public usernames without changing frozen target strings."""
+    if not allowlist or target in allowlist:
+        return True
+    if platform != "telegram" or not telegram_public_handle(target):
+        return False
+    return any(
+        telegram_public_handle(allowed) and target.lower() == allowed.lower()
+        for allowed in allowlist
+    )
+
+
 CAPABILITIES = {
     "telegram": {
         "discover",

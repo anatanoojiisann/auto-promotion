@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import getpass
 import math
+import re
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +21,107 @@ from .common import (
     save_profile,
 )
 from .telegram_reads import ReadBudgetExceeded, TelegramReads
+
+
+def telegram_language_evidence(title, about, sample):
+    """Use strong public group metadata for English/Russian, otherwise stay conservative."""
+    metadata = unicodedata.normalize("NFKC", f"{title} {about}").casefold()
+    if re.search(
+        r"\bnot\s+(?:only\s+)?(?:english|russian|en|ru)(?:\s+only)?\b"
+        r"|не\s+только\s+(?:на\s+)?(?:русском|русский|английском|английский)",
+        metadata,
+    ):
+        return "unknown", 0.0
+    if re.search(
+        r"\b(?:english|en)\s*(?:/|&|and)\s*(?:russian|ru)\b"
+        r"|\b(?:russian|ru)\s*(?:/|&|and)\s*(?:english|en)\b"
+        r"|(?:русский|русском)\s*(?:/|и)\s*(?:английский|английском)"
+        r"|(?:английский|английском)\s*(?:/|и)\s*(?:русский|русском)",
+        metadata,
+    ):
+        return "unknown", 0.0
+    russian_only = bool(
+        re.search(
+            r"\b(?:ru|russian)\s*[-:]?\s*only\b|\bonly\s+(?:ru|russian)\b"
+            r"|только\s+(?:на\s+)?рус(?:ский|ском)(?:\s+язык\w*)?",
+            metadata,
+        )
+    )
+    english_only = bool(
+        re.search(
+            r"\b(?:en|english)\s*[-:]?\s*only\b|\bonly\s+(?:en|english)\b"
+            r"|только\s+(?:на\s+)?английск(?:ий|ом)\b",
+            metadata,
+        )
+    )
+    if russian_only and english_only:
+        return "unknown", 0.0
+    if russian_only:
+        return "ru", 0.95
+    if english_only:
+        return "en", 0.95
+
+    original = language_evidence(sample)
+    if original[0] == "zh":
+        return original
+
+    letters = [c for c in metadata if c.isalpha()]
+    if not letters:
+        return original
+    cyrillic = sum("\u0400" <= c <= "\u04ff" for c in letters)
+    russian_words = set(re.findall(r"[а-яё]+", metadata)) & {
+        "которая",
+        "который",
+        "которые",
+        "упрощает",
+        "объявлений",
+        "объявления",
+        "пользователи",
+        "пользователь",
+        "обсуждение",
+        "пожалуйста",
+        "нельзя",
+        "сегодня",
+        "ссылки",
+        "сообщение",
+        "привет",
+        "новости",
+    }
+    other_cyrillic = any(c in metadata for c in "іїєґўәғқңөұүһ")
+    if (
+        cyrillic >= 20
+        and cyrillic / len(letters) >= 0.55
+        and not other_cyrillic
+        and (any(c in metadata for c in "ыэё") or len(russian_words) >= 2)
+    ):
+        return "ru", 0.7
+
+    english_words = re.findall(r"[a-z]+", metadata)
+    english_signals = set(english_words) & {
+        "the",
+        "and",
+        "you",
+        "your",
+        "for",
+        "with",
+        "this",
+        "that",
+        "are",
+        "have",
+        "please",
+        "only",
+        "will",
+        "from",
+        "our",
+        "here",
+        "english",
+        "welcome",
+        "members",
+    }
+    latin = sum("a" <= c <= "z" for c in letters)
+    if len(english_words) >= 10 and len(english_signals) >= 5 and latin / len(letters) >= 0.8:
+        return "en", 0.7
+    return original
 
 
 def make_client(label, settings, *, for_login=False):
@@ -569,7 +672,7 @@ class TelegramBackend:
                 evidence = (
                     chat.title + " " + about + " " + " ".join((m.message or "") for m in recent)
                 )
-                language, confidence = language_evidence(evidence)
+                language, confidence = telegram_language_evidence(chat.title, about, evidence)
                 row = {
                     "target": key,
                     "title": chat.title,
@@ -765,13 +868,20 @@ class TelegramBackend:
         if not getattr(entity, "username", None) or not getattr(entity, "megagroup", False):
             return {"status": "failed_known", "reason": "public_group_required"}
         already = False
+        not_current_member = False
         try:
             observed = await client(functions.channels.GetParticipantRequest(entity, "me"))
             already = self.is_member(observed)
         except errors.UserNotParticipantError:
-            pass
+            not_current_member = True
         if not already and operation == "verify_join":
-            return {"status": "unknown", "verified": False}
+            return {
+                "status": "unknown",
+                "verified": False,
+                "reason": "not_current_member"
+                if not_current_member
+                else "membership_state_unrecognized",
+            }
         if not already:
             authorize()
             self.submission_started = True

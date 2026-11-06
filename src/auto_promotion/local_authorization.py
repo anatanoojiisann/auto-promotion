@@ -45,7 +45,14 @@ def validate_scope(engine, db, task_id, account_id, now):
         (account_id, now),
     ).fetchone():
         raise CloudUnavailable("OfflineAccountBlocked")
-    blocker = _account_blocker(db, account_id, now, task_id=task_id)
+    from .x_history_ack import allowed_unknown_ids, has_ack
+
+    acknowledged = allowed_unknown_ids(db, task_id, account_id, now)
+    if has_ack(db, task_id, account_id) and acknowledged is None:
+        raise CloudUnavailable("XHistoryAcknowledgementChanged")
+    blocker = _account_blocker(
+        db, account_id, now, task_id=task_id, acknowledged_unknown_ids=acknowledged
+    )
     if blocker:
         raise CloudUnavailable(blocker)
     if account["identity_hash"]:
@@ -53,7 +60,7 @@ def validate_scope(engine, db, task_id, account_id, now):
             "SELECT id FROM accounts WHERE platform=? AND identity_hash=? AND id<>?",
             (account["platform"], account["identity_hash"], account_id),
         ).fetchall():
-            if _account_blocker(db, alias[0], now):
+            if _account_blocker(db, alias[0], now, acknowledged_unknown_ids=acknowledged):
                 raise CloudUnavailable("LocalAuthorizationAliasUnresolved")
     route = route_for(dict(account))
     if db.execute(

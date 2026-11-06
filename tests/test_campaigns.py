@@ -201,6 +201,22 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["summary"]["unassigned"], 3)
         self.assertTrue(all(a["reasons"] and a["payload"] is None for a in result["assignments"]))
 
+    def test_telegram_campaign_matches_public_username_case_only(self):
+        opportunity = self.opportunity(1, target="@TEST_GROUP_1")
+        campaign = self.campaign(values=[opportunity], target_allowlist=["@test_group_1"])
+        result = self.campaigns.plan(campaign["id"])
+        self.assertEqual(result["summary"], {"planned": 1})
+
+    def test_nsfw_content_is_planned_but_other_risk_categories_remain_blocked(self):
+        values = [
+            self.opportunity(1, title="NSFW AI video", context="adult AI 18+ video question"),
+            self.opportunity(2, title="NSFW casino video", context="casino video question"),
+        ]
+        result = self.campaigns.plan(self.campaign(values=values)["id"])
+        self.assertEqual(result["summary"], {"planned": 1, "unassigned": 1})
+        rejected = next(a for a in result["assignments"] if a["payload"] is None)
+        self.assertIn("内容包含禁止类别信号", rejected["reasons"])
+
     def test_persona_change_invalidates_unmaterialized_plan(self):
         campaign = self.campaigns.plan(self.campaign()["id"])
         self.pools.set_profile(self.accounts[0]["id"], AccountProfile(role="new role"))

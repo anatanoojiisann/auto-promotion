@@ -14,7 +14,9 @@ from .cloud_control import CloudControl, CloudUnavailable, task_scope_health
 from .task_channels import ack_matches, binding_matches, channel_binding, original_fence_valid
 
 
-def _account_blocker(db, account_id, now, *, task_id=None, item_ids=None):
+def _account_blocker(
+    db, account_id, now, *, task_id=None, item_ids=None, acknowledged_unknown_ids=None
+):
     if item_ids is not None:
         selected = set(item_ids)
         available = {
@@ -35,10 +37,14 @@ def _account_blocker(db, account_id, now, *, task_id=None, item_ids=None):
         (account_id, now),
     ).fetchone():
         return "account_lease_active"
-    if db.execute(
-        "SELECT 1 FROM items WHERE account_id=? AND status IN ('executing','unknown','scheduled') LIMIT 1",
+    unresolved = db.execute(
+        "SELECT id,status FROM items WHERE account_id=? AND status IN ('executing','unknown','scheduled')",
         (account_id,),
-    ).fetchone():
+    ).fetchall()
+    if unresolved and not all(
+        r["status"] == "unknown" and r["id"] in (acknowledged_unknown_ids or set())
+        for r in unresolved
+    ):
         # Apply exactly the same target-bound legacy skip / moderation proof as
         # submission. Missing or ambiguous proposed items remain fail-closed.
         connection = db.execute(
@@ -153,11 +159,23 @@ def local_handoff_preflight(
     ):
         return {"ready": False, "reason": "invalid_execution_window"}
     with engine.store.connect() as db:
+        from .x_history_ack import allowed_unknown_ids, has_ack
+
         row = db.execute(
             "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
         ).fetchone()
         store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
-        blocker = _account_blocker(db, account_id, now, task_id=task_id, item_ids=item_ids)
+        acknowledged = allowed_unknown_ids(db, task_id, account_id, now)
+        if has_ack(db, task_id, account_id) and acknowledged is None:
+            return {"ready": False, "reason": "XHistoryAcknowledgementChanged"}
+        blocker = _account_blocker(
+            db,
+            account_id,
+            now,
+            task_id=task_id,
+            item_ids=item_ids,
+            acknowledged_unknown_ids=acknowledged,
+        )
         if blocker:
             return {"ready": False, "reason": blocker}
         if not _local_task_scope(db, account_id, task_id):
@@ -264,8 +282,16 @@ def local_handoff_preflight(
                 or current_grant["until_at"] < required_until
             ):
                 return {"ready": False, "reason": "local_coordination_pending"}
+        acknowledged = allowed_unknown_ids(db, task_id, account_id, engine.clock())
+        if has_ack(db, task_id, account_id) and acknowledged is None:
+            return {"ready": False, "reason": "XHistoryAcknowledgementChanged"}
         blocker = _account_blocker(
-            db, account_id, engine.clock(), task_id=task_id, item_ids=item_ids
+            db,
+            account_id,
+            engine.clock(),
+            task_id=task_id,
+            item_ids=item_ids,
+            acknowledged_unknown_ids=acknowledged,
         )
         if blocker:
             return {"ready": False, "reason": blocker}

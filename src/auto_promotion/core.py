@@ -37,6 +37,8 @@ from .models import (
     canonical,
     digest,
     epoch,
+    target_allowed,
+    telegram_public_handle,
 )
 from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_blocker
 from .routing import route_for
@@ -68,7 +70,7 @@ TERMINAL = {
     "cancelled",
 }
 RISK = re.compile(
-    r"\b(?:nsfw|porn|adult|escort|dating|casino|gambling|scam)\b|18\+|色情|赌博|博彩|约炮|诈骗",
+    r"\b(?:escort|dating|casino|gambling|scam)\b|赌博|博彩|约炮|诈骗",
     re.I,
 )
 NON_ADULT = re.compile(r"(?<![\w-])non-adult(?![\w-])", re.I)
@@ -1757,7 +1759,7 @@ class Engine:
         policy = task["policy"]
         if not epoch(policy["starts_at"]) <= epoch(value.scheduled_at) < epoch(policy["ends_at"]):
             raise Conflict("计划时间超出任务执行窗口")
-        if policy["target_allowlist"] and value.target not in policy["target_allowlist"]:
+        if not target_allowed(account["platform"], value.target, policy["target_allowlist"]):
             raise Conflict("目标不在任务的目标边界内")
         if RISK.search(value.target):
             raise Conflict("目标包含被禁止的类别信号")
@@ -3417,8 +3419,15 @@ class Engine:
         if value.account_id not in task["account_ids"]:
             raise Conflict("候选账号超出任务范围")
         p = task["policy"]
-        # Only the literal annotation "non-adult" is negative evidence. Titles,
-        # targets and any other adult/NSFW signals still pass through the risk gate.
+        snapshot = next(
+            (a for a in (task.get("account_snapshot") or []) if a.get("id") == value.account_id),
+            None,
+        )
+        platform = snapshot.get("platform") if snapshot else None
+        if not platform:
+            platform = self.account(value.account_id)["platform"]
+        # Keep the existing treatment of the literal "non-adult" annotation for
+        # task-specific keyword policies; the original candidate text is retained.
         content = (
             value.title + " " + NON_ADULT.sub("", value.text) + " " + value.target
         ).casefold()
@@ -3441,7 +3450,7 @@ class Engine:
             any(w in content for w in q.casefold().split()) for q in p["queries"]
         ):
             reasons.append("unrelated_topic")
-        if p["target_allowlist"] and value.target not in p["target_allowlist"]:
+        if not target_allowed(platform, value.target, p["target_allowlist"]):
             reasons.append("target_boundary")
         decision = "rejected" if reasons else "qualified"
         with (
@@ -3451,10 +3460,21 @@ class Engine:
             self._integrity(db, row, "discovery_join")
             if row["state"] in {"paused", "cancelled", "completed"}:
                 raise Conflict("任务已暂停或结束")
+            target_predicate = (
+                "lower(target)=lower(?)"
+                if platform == "telegram" and telegram_public_handle(value.target)
+                else "target=?"
+            )
             existing = db.execute(
-                "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND target=?",
+                "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND "
+                + target_predicate
+                + " ORDER BY CASE WHEN state='not_attempted' THEN 1 ELSE 0 END,id LIMIT 1",
                 (task_id, value.account_id, value.target),
             ).fetchone()
+            if existing and existing["target"] != value.target:
+                # Preserve the first spelling and identity; never create another
+                # candidate or join attempt merely because Telegram changed case.
+                value = value.model_copy(update={"target": existing["target"]})
             payload = canonical(value.model_dump())
             if existing:
                 if existing["payload"] == payload:
@@ -3980,6 +4000,12 @@ class Engine:
             "joined",
             "already_joined",
         }:
+            reason = result.get("reason")
+            if not isinstance(reason, str) or reason not in {
+                "not_current_member",
+                "membership_state_unrecognized",
+            }:
+                reason = "not_conclusively_verified"
             if row["state"] in {"joined", "already_joined"}:
                 with self.store.connect(write=True) as db:
                     db.execute(
@@ -3992,8 +4018,8 @@ class Engine:
                             row["result"],
                         ),
                     )
-                return {"status": "unknown", "reason": "not_conclusively_verified"}
-            return {"status": row["state"], "reason": "not_conclusively_verified"}
+                return {"status": "unknown", "reason": reason}
+            return {"status": row["state"], "reason": reason}
         # Membership lookup may confirm joining, but never grants another attempt.
         safe = {
             k: result[k]

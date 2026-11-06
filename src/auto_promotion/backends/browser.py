@@ -674,7 +674,27 @@ class BrowserBackend:
 
     def check_state(self):
         if self.platform == "x":
-            check_x_context_state(self.context, self.page)
+            try:
+                before = urlparse(self.page.url)
+            except Exception:
+                return check_x_context_state(self.context, self.page)
+            try:
+                check_x_context_state(self.context, self.page)
+            except BackendError as exc:
+                if exc.safe_code != "XStateObservationUnavailable":
+                    raise
+                after = urlparse(self.page.url)
+                if not (
+                    before.scheme == after.scheme == "https"
+                    and before.hostname == after.hostname
+                    and before.hostname in {"x.com", "www.x.com"}
+                    and before.path in {"", "/"}
+                    and after.path.rstrip("/") == "/home"
+                ):
+                    raise
+                # Recheck every page with the same guard after the ordinary
+                # root-to-home navigation. A second failure stays blocked.
+                check_x_context_state(self.context, self.page)
 
     def navigate_x(self, url):
         response = self.page.goto(

@@ -405,7 +405,21 @@ def main():
     request = json.load(sys.stdin)
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = dispatch(request)
+            from .background_desktop import (
+                BackgroundDesktopUnavailable,
+                dispatch_on_background_desktop,
+                needs_background_desktop,
+            )
+
+            if needs_background_desktop(request):
+                try:
+                    result = dispatch_on_background_desktop(request)
+                except BackgroundDesktopUnavailable:
+                    # Keep read-only collection available if Windows cannot
+                    # prepare a private desktop; no child has been started.
+                    result = dispatch(request)
+            else:
+                result = dispatch(request)
     except Exception as exc:
         code = getattr(exc, "safe_code", type(exc).__name__)
         result = {

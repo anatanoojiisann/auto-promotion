@@ -157,6 +157,11 @@ def binding_matches(row, value, node_id, store_id):
 
 
 def original_fence_valid(db, value, now, task_id):
+    if value.get("x_history_ack_required"):
+        from .x_history_ack import allowed_unknown_ids
+
+        if allowed_unknown_ids(db, task_id, value.get("account_id"), now) is None:
+            return False
     if value.get("coordination_task_id"):
         task = db.execute("SELECT manifest_hash FROM tasks WHERE id=?", (task_id,)).fetchone()
         if (
@@ -438,14 +443,28 @@ class TaskChannelRouter:
         try:
             context, cloud = self._prepare(job)
         except Exception as exc:
+            details = {
+                "job_id": job["id"],
+                "account_id": job["account_id"],
+                "stage": "authorization",
+                "reason": safe_channel_code(str(exc)),
+            }
+            diagnostic = getattr(exc, "diagnostics", None)
+            if isinstance(diagnostic, dict):
+                if diagnostic.get("remote_response_received") is True:
+                    details["execution_step"] = "account_block_import"
+                    if diagnostic.get("cause") in {
+                        "database_locked",
+                        "database_error",
+                        "sqlite_busy",
+                        "sqlite_error",
+                    }:
+                        details["exception_type"] = "SQLiteError"
+                elif diagnostic.get("operation") == "snapshot_sync":
+                    details["execution_step"] = "cloud_snapshot_sync"
             self.store.audit_best_effort(
                 "execution.channel_failed",
-                {
-                    "job_id": job["id"],
-                    "account_id": job["account_id"],
-                    "stage": "authorization",
-                    "reason": safe_channel_code(str(exc)),
-                },
+                details,
                 task_id=job["task_id"],
             )
             raise
@@ -527,6 +546,9 @@ class TaskChannelRouter:
             ):
                 raise CloudUnavailable("LocalAuthorizationTaskScopeMismatch")
             bound = binding_matches(prior, old_binding, node_id, store_id)
+            from .x_history_ack import has_ack
+
+            x_history_ack = authorization_only and has_ack(db, job["task_id"], job["account_id"])
             if no_cloud and prior and prior["channel"] == "cloud":
                 proof = local_state.get("offline_fences", {}).get(job["account_id"], {})
                 if (
@@ -545,6 +567,7 @@ class TaskChannelRouter:
                 and prior["until_at"] >= until
                 and original_fence_valid(db, old_binding, now, job["task_id"])
                 and not (old_binding.get("fence_source") == "standalone" and cloud)
+                and not (x_history_ack and not old_binding.get("x_history_ack_required"))
             )
             if reusable:
                 generation = prior["generation"]
@@ -593,6 +616,8 @@ class TaskChannelRouter:
                         coordination_task_id=job["task_id"],
                         coordination_manifest_hash=job["version"],
                     )
+                    if x_history_ack:
+                        authority["x_history_ack_required"] = True
                 db.execute(
                     "INSERT INTO account_task_channels VALUES(?,?,?,?,?,'handoff','pending',?,NULL,0) "
                     "ON CONFLICT(account_id) DO UPDATE SET channel=excluded.channel,generation=excluded.generation,"

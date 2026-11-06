@@ -144,6 +144,7 @@ class DiscordBackendTests(unittest.TestCase):
             {
                 "id": "890123456789012345",
                 "type": 0,
+                "nsfw": True,
                 "permission_overwrites": [
                     {"id": GUILD, "type": 0, "deny": str(VIEW), "allow": "0"}
                 ],
@@ -151,10 +152,18 @@ class DiscordBackendTests(unittest.TestCase):
         ]
         self.assertTrue(self.run_backend("health")["identity_verified"])
         catalog = self.run_backend("targets")
-        self.assertEqual([c["id"] for c in catalog["targets"]], [CHANNEL])
+        self.assertEqual([c["id"] for c in catalog["targets"]], [CHANNEL, "678901234567890123"])
         self.assertTrue(catalog["targets"][0]["can_attach"])
         self.assertFalse(catalog["truncated"])
         self.assertFalse(any(body for _, body, _ in self.http.calls))
+
+    def test_nsfw_channel_still_requires_channel_permissions(self):
+        self.http.channels[0]["nsfw"] = True
+        self.assertTrue(self.run_backend("preflight")["allowed"])
+        self.http.channels[0]["permission_overwrites"] = [
+            {"id": GUILD, "type": 0, "deny": str(VIEW), "allow": "0"}
+        ]
+        self.assertFalse(self.run_backend("preflight")["allowed"])
 
     def test_member_overwrites_take_precedence_over_roles_and_admin_bypasses_denies(self):
         self.http.channels[0]["permission_overwrites"] = [
