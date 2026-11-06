@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS worker_runs(
 );
 CREATE INDEX IF NOT EXISTS workers_task ON worker_runs(task_id,started_at);
 CREATE INDEX IF NOT EXISTS attempts_limits ON attempts(account_id,started_at);
+CREATE INDEX IF NOT EXISTS attempts_target_history ON attempts(account_id,target_key);
 CREATE TABLE IF NOT EXISTS connection_jobs(
  id TEXT PRIMARY KEY, platform TEXT NOT NULL, username TEXT NOT NULL,
  backend_label TEXT NOT NULL, stage TEXT NOT NULL, created_at REAL NOT NULL,

@@ -50,6 +50,9 @@ class TelegramPhoneObserver:
     def baseline(self,account_id,identity,target_url):
         return asyncio.run(self.query(account_id,identity,target_url))
 
+    def inspect_target(self, account_id, identity, target_url):
+        return asyncio.run(self.query(account_id, identity, target_url, inspect_target=True))
+
     def _configuration(self,account_id):
         config = self.configs.get(account_id)
         if config is None:
@@ -77,7 +80,7 @@ class TelegramPhoneObserver:
     def receipt(self,account_id,context,baseline,since,*,consume=None):
         return asyncio.run(self.query(account_id,context.identity,context.target_url,baseline=baseline,context=context,since=since,consume=consume))
 
-    async def query(self,account_id,identity,target_url,*,baseline=None,context=None,since=None,consume=None):
+    async def query(self,account_id,identity,target_url,*,baseline=None,context=None,since=None,consume=None,inspect_target=False):
         from phone_fleet_protocol import fingerprint
         from phone_fleet_protocol.social import SocialReceipt, target_parts
         try:
@@ -102,7 +105,8 @@ class TelegramPhoneObserver:
                     if type(rpc).__name__ not in self.READ_RPCS:
                         raise BackendError("PhoneTelegramObserverMutationForbidden")
                 if consume is None:
-                    reads.reserve(len(requests))
+                    from .telegram_receipt_budget import RECEIPT_READ_LIMIT
+                    reads.reserve(len(requests), keep=RECEIPT_READ_LIMIT if baseline is None else 0)
                 else:
                     consume(reads,len(requests))
                 return await original(sender,request,*args,**kwargs)
@@ -119,6 +123,9 @@ class TelegramPhoneObserver:
                     entity = await client.get_entity(username)
                     if not getattr(entity,"megagroup",False) or not getattr(entity,"username",None) or entity.username.casefold()!=username.casefold():
                         raise BackendError("PhoneTelegramPublicGroupRequired")
+                    # A group-root task cannot authorize a particular forum topic.
+                    if baseline is None and not inspect_target and getattr(entity, "forum", False):
+                        raise BackendError("PhoneTelegramForumTopicRequired")
                     peer_id = str(utils.get_peer_id(entity))
                     try:
                         permissions = await client.get_permissions(entity,"me")
@@ -130,10 +137,27 @@ class TelegramPhoneObserver:
                     except errors.UserNotParticipantError:
                         joined,can_send = False,False
                     if baseline is None:
+                        from telethon import functions
+                        full = (await client(functions.channels.GetFullChannelRequest(entity))).full_chat
+                        sender = getattr(full, "default_send_as", None)
+                        anonymous = bool(getattr(getattr(getattr(permissions, "participant", None), "admin_rights", None), "anonymous", False)) if joined else False
+                        sends_as_self = (sender.user_id == me.id if getattr(sender, "user_id", None) is not None
+                                         else sender is None and not anonymous)
+                        if not inspect_target and not sends_as_self:
+                            raise BackendError("PhoneTelegramSenderIdentityMismatch")
+                    if inspect_target:
+                        pinned_id = getattr(full, "pinned_msg_id", None)
+                        pinned = await client.get_messages(entity, ids=pinned_id) if pinned_id else None
+                        return {"peer_username":entity.username, "peer_title":entity.title, "joined":joined,
+                                "can_send":can_send, "sends_as_self":sends_as_self, "forum":bool(getattr(entity,"forum",False)),
+                                "about":str(getattr(full,"about","") or "")[:1500],
+                                "pinned_text":str(getattr(pinned,"message","") or "")[:2000],
+                                "observed_at":time.time()}
+                    if baseline is None:
                         newest = await client.get_messages(entity,limit=1)
                         return {"api_user_id":str(me.id),"identity_sha256":fingerprint({"account":identity}),
                             "peer_id":peer_id,"peer_username":entity.username,"peer_title":entity.title,
-                            "joined":joined,"can_send":can_send,"last_message_id":max([m.id for m in newest],default=0),"observed_at":time.time()}
+                            "joined":joined,"can_send":can_send,"sends_as_self":sends_as_self,"last_message_id":max([m.id for m in newest],default=0),"observed_at":time.time()}
                     if (peer_id!=baseline["peer_id"] or str(me.id)!=baseline["api_user_id"]
                             or baseline["identity_sha256"]!=fingerprint({"account":identity})):
                         raise BackendError("PhoneTelegramObserverPeerChanged")

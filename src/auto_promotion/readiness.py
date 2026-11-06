@@ -3,12 +3,18 @@
 import json
 import math
 
-from .models import epoch
+from .models import digest, epoch, telegram_target_aliases
 
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
     "tiktok_video_evidence_invalid": "TikTok 视频目标证据已失效或变化，请检查原候选与授权并重新准备新任务",
+    "PhoneTelegramAuthoritativeQueueRequired": "手机与 Telegram 只读账号需要使用同一推广库和原账号",
+    "PhoneTelegramPriorSubmissionUnresolved": "该群已有未决提交，请核对原发布回执",
+    "PhoneTelegramOriginalAlreadyAttempted": "该群的同一文案已有执行记录",
+    "PhoneTelegramForumTopicRequired": "该群按话题组织，需要冻结具体话题及对应的回执",
+    "PhoneItemDeliveryWindowElapsed": "原互动条目的可投递时间已过",
+    "PhoneRoundPlatformStopped": "该平台已停止",
     "PhoneRoundNotRunning": "整轮验证未运行或已停止",
     "PhoneRoundSubmissionDeadlineElapsed": "本轮新的发送授权时间已结束，继续只读核验原回执",
     "PhoneRoundManifestChanged": "本轮冻结的任务内容已变化，禁止发送",
@@ -420,10 +426,28 @@ def telegram_blocker(db, task, payload, at):
     if payload["platform"] != "telegram":
         return None
     policy = json.loads(task["policy"])
+    aliases = telegram_target_aliases(payload["target"])
+    slots = ",".join("?" for _ in aliases)
+    # Phone and API workers may spell the same group differently. Check both on the original ledger.
+    if payload.get("action") == "send_message":
+        keys = [digest(["telegram", variant]) for name in aliases for variant in (name, name + "/")]
+        hash_slots = ",".join("?" for _ in keys)
+        recent = db.execute(
+            "SELECT i.status,i.payload,i.result FROM attempts a JOIN items i ON i.id=a.item_id "
+            "JOIN tasks prior ON prior.id=i.task_id WHERE a.account_id=? AND i.task_id<>? "
+            "AND (?='phone' OR json_extract(prior.policy,'$.execution_method')='phone') "
+            f"AND a.target_key IN ({hash_slots})",
+            (payload["account_id"], task["id"], policy.get("execution_method"), *keys))
+        for prior in recent:
+            if prior["status"] in {"unknown","executing"} or (prior["status"]=="cancelled"
+                    and json.loads(prior["result"]).get("submission_started") is True):
+                return "PhoneTelegramPriorSubmissionUnresolved"
+            if json.loads(prior["payload"]).get("text") == payload.get("text"):
+                return "PhoneTelegramOriginalAlreadyAttempted"
     candidate = db.execute(
-        "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND lower(target)=lower(?) "
+        f"SELECT * FROM candidates WHERE task_id=? AND account_id=? AND lower(rtrim(target,'/')) IN ({slots}) "
         "ORDER BY CASE WHEN decision='qualified' THEN 1 ELSE 0 END,rowid DESC LIMIT 1",
-        (task["id"], payload["account_id"], payload["target"]),
+        (task["id"], payload["account_id"], *aliases),
     ).fetchone()
     if candidate and candidate["decision"] != "qualified":
         return "candidate_rejected"
@@ -435,9 +459,9 @@ def telegram_blocker(db, task, payload, at):
         return "candidate_missing"
     if not candidate:
         candidate = db.execute(
-            "SELECT * FROM candidates WHERE account_id=? AND lower(target)=lower(?) "
+            f"SELECT * FROM candidates WHERE account_id=? AND lower(rtrim(target,'/')) IN ({slots}) "
             "ORDER BY rowid DESC LIMIT 1",
-            (payload["account_id"], payload["target"]),
+            (payload["account_id"], *aliases),
         ).fetchone()
     if not candidate:
         return "membership_unverified" if requires_membership else None

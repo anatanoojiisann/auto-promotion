@@ -1,27 +1,29 @@
-# Six-app timed rounds: development handoff
+# Scoped phone rounds: development handoff
 
 This is an opt-in development feature, not a production deployment or a measured ten-minute real-device result.
 
 ## Delivered behavior
 
-- One durable round links six original, frozen, unattempted live phone tasks. Each task has one automatic interaction and one account, covering Telegram, Reddit, Instagram, Facebook, X and TikTok exactly once.
+- One durable round links original, frozen, unattempted live phone tasks. Each task has one automatic interaction and one account. Select any nonempty subset of the six supported platforms. Each selected platform appears once.
 - Creation never starts a task. Explicit start sets one non-renewable 600-second clock and a 480-second cutoff for new send grants. Queue waiting, stopped time, startup failures and account cooldowns are not subtracted.
 - Admission uses the existing Engine and persistent JobQueue. There is no second sender. A round start reuses fresh cached identity; stale identity fails the normal health/preflight checks. The device still verifies identity, target, exact text and separate one-use permission immediately before sending.
 - Transactional guards apply at original start, item claim, provider claim verification, and final native permission for both Social and Reddit. The gates enforce the cutoff even if the coordinator or status client is down. Round stop fences future grants, preserves uncertain outcomes and leaves original read-only receipt lookup available. A previously accepted native permit may already be in flight; stop is not a retraction.
-- An interrupted start is never automatically replayed. Active original tasks can rejoin their original queue; unstarted interrupted tasks are blocked for inspection. Admission is serialized between coordinator workers. Actual execution continues to use existing account/device locks.
+- An interrupted start is never automatically replayed. Active original tasks can rejoin their original queue; unstarted interrupted tasks are blocked for inspection. Each original has one transactional start intent. Separate workers can enqueue different original tasks. Actual execution continues to use existing account/device locks.
 - Status keeps original task/item/attempt/execution IDs, queue time, time before native authorization and receipt waiting time. Only a verified original item with an external reference and an original completed attempt is counted. Late receipts update current status without turning a missed deadline into a pass. The terminal cutoff snapshot is retained.
-- Local preflight reports blockers for all six apps without navigating a phone, calling a social platform or granting submission permission.
+- Local preflight reports blockers for all selected apps without navigating a phone, calling a social platform or granting submission permission.
 - Candidate shortlist reuses up to three existing content records per account. It requires recent data, current-version review, explicit account-bound permission evidence, a contextual draft, enough remaining lifetime, and no historical attempt or active scheduled duplicate. Unknown attempts remain query-only. Empty pools are reported; no automatic generic promotional text is generated.
 - Prepared evidence is looked up by immutable content, original task/item and device/client/reader binding with an index, including when more than 1,000 unrelated historical operations exist.
 
 ## Entry points
 
-API factory: `create_app(..., phone_rounds_enabled=True, worker=True, pooled_worker=True, phone_social_config=..., phone_reddit_config=...)`. Supply existing protected service configuration through the normal deployment composition. Do not put tokens in requests or this document. CLI: `auto-promotion serve --execution-mode pooled --phone-rounds` enables routes; actual phone bindings still need the existing protected configuration. The CLI flag does not commission readers or enable live writes.
+API factory: `create_app(..., phone_rounds_enabled=True, worker=True, pooled_worker=True, phone_social_config=..., phone_reddit_config=...)`. Supply existing protected service configuration through the normal deployment composition. Do not put tokens in requests or this document. CLI: `auto-promotion --db PATH serve --execution-mode pooled --phone-rounds --phone-social-config PRIVATE_SOCIAL.json --phone-reddit-config PRIVATE_REDDIT.json` loads the supplied validated bindings into the existing queue. Supply only the relevant configuration files. The CLI flag does not commission readers or enable live writes.
 
 Existing local API authentication and cross-origin/CSRF checks apply to every route:
 
-- `POST /api/phone-rounds` with `task_ids` (six original task IDs) and a stable `request_key`.
-- `GET /api/phone-rounds/{id}/preflight` checks cached evidence/configuration only. It does not prove live remote authorization or current target permissions.
+- `POST /api/phone-rounds` with `task_ids` (one to six original task IDs, each for a different platform) and a stable `request_key`.
+- `GET /api/phone-readiness?platform=telegram` reports the current service, device capability, stop, worker and binding settings before preparing tasks.
+- `GET /api/phone-rounds/{id}/preflight` checks task prerequisites and authenticated Fleet capabilities. Append `/platforms/{platform}/preflight` to the round URL to check one selected member.
+- `POST /api/phone-rounds/{id}/platforms/{platform}/start` starts or rechecks only that unattempted member. Use `/stop` on the same member to fence its future grants. Other members and the original deadline are preserved.
 - `POST /api/phone-rounds/{id}/start` records explicit intent and begins timing. `worker=False` records waiting without secretly starting an executor.
 - `GET /api/phone-rounds/{id}` returns JSON status and timing suitable for exporting as diagnostic evidence. Native permit time is not itself a confirmed publication.
 - `POST /api/phone-rounds/{id}/stop` blocks further grants. It cannot resume or reset a timed-out round.
@@ -150,3 +152,41 @@ Runtime proof after commit is stored separately in ignored `.local/software-inte
 手机功能、API、MCP、持久队列与原任务恢复组合：280 passed、4 subtests passed，416.88 秒。补充启动指纹、账号健康、启动恢复、Windows 只读验证和 MCP：67 passed、2 skipped、51 subtests passed，71.59 秒。新增指纹测试逐个验证手机源文件变更会改变指纹，缺失手机文件不会返回部分证据；旧代码的两项失败已先行复现并修正。跳过项与精确命令保存在忽略提交的 `.local/integration/`。
 
 首次六 App 隔离软件联调在 11.578 秒完成 12 次观察/草稿回读，原项目保持 not_attempted，零发送和零真实发布。整合提交后再记录实际加载提交与指纹。它不是硬件、平台回执或十分钟实发验收；没有启动真实发送、激活服务或推送分支。
+## 2026-11-06 readiness admission and honest timing
+
+Explicit round start now records `checking` and the first 600-second clock before querying readiness. Each member must pass configuration, identity, receipt and authenticated fleet-capability checks before its original task can be admitted. Safe ready members continue while missing requirements block only their own members; shared stop/runtime/time blockers still fence the whole round. One authenticated capability request is shared across the social service's five members; the separate Reddit service retains its own authentication scope. A provider failure still returns every platform's blockers. These are service metadata reads, not platform navigation or submission.
+
+A check costing 30 seconds or more cannot admit tasks. Original service HTTP/token timeouts remain bounded. Results and durations persist in `phone_round_preflights`; no provider exception text or credentials are logged. If no members are ready the round is `blocked`; otherwise ready members can run and the others remain explicitly `blocked`. Partial progress never satisfies the six-publication goal. Explicit recheck may proceed before the original send cutoff, but cannot reset the first start, submission cutoff or deadline. Waiting in `blocked` consumes that same clock. A check interrupted by process loss never causes automatic task starts; stop during checking wins.
+
+Status now states `timing_scope=prepared_tasks_including_preflight`, `preparation_included=false` and `end_to_end_six_app_pass=false`. This prevents the prepared-task timer being mistaken for the full command-to-publication target. Candidate collection, account onboarding and prior preparation still require a higher-level, authoritative integration if a true cold-start claim is desired.
+
+The six-app ten-minute criterion remains six independently confirmed original publications within the full intended interval. Observations, identity matches, typed drafts and successful metadata checks cannot satisfy it. No live or stop setting is enabled by this change. Shared real-account scheduling and unknown deduplication across the old sender and phone environment, plus allowed independent readers, remain integration prerequisites.
+
+
+### Repair validation evidence
+
+Independent worktree `D:/Projects/auto-promotion-verification-repair`, branch `codex/aurax-verification-repair`. Initial affected-feature regression: **193 passed in 125.22 seconds**, XML `.local/repair-qa/promotion.xml`. After the final per-platform admission refinement, **129 passed in 88.83 seconds**, XML `.local/repair-qa/admission-final.xml`; it covers original one-use grants, stop-before-final-grant, queued-start recovery, preflight races, deadlines and partial platform progress. These are overlapping suites, not additive publication results.
+
+A bounded check using synthetic business tasks and the current real fleet's read-only capabilities returned all six missing-prerequisite summaries in **0.907 seconds**, with two metadata GETs, zero original task starts and zero attempts. This verifies fast rejection under the current configuration; it is not real publication acceptance. Real-device read-only connection/IME diagnostics took 0.516 seconds in the companion control branch.
+
+No live writes, old tasks, global stops, production services or platform authorizations were changed. Current full publication remains unverified. Source timing analysis is in `docs/PHONE_VALIDATION_TIMING_2026-11-06.md`; raw sanitized timings remain outside the commit.
+
+
+## Platform independence and deployment
+
+The stdio MCP entry accepts the same protected binding-file options together with `--phone-rounds`. Point both processes at the same authoritative AP database. Chat clients use `phone_platform_status`, `create_phone_round`, `check_phone_round`, `start_phone_round`, `stop_phone_round` and `get_phone_round`. The AP worker handles execution after the client disconnects.
+
+A round accepts any of the 63 nonempty subsets of Telegram, Reddit, Instagram, Facebook, X and TikTok. An operator may use separate single-platform rounds for independent deadlines, or a selected group with one deadline. Group and member starts validate only the previously unadmitted originals in scope. A stopped member is terminal. A worker restart or stale preflight cannot grant a second start to a previously attempted item. The existing device lock serializes native actions.
+
+Mixed Telegram API and phone execution requires one authoritative AP database and the same registered account ID in the observer and sender configuration. An explicitly bound phone task uses the native pool and device resource. The same registered MTProto connection continues to serve other tasks. Old or unknown publications retain their original IDs for read-only verification. Use the same trusted database and account ID on the node, Fleet and AP before commissioning a task. Quiesce older sender versions during the integration release.
+
+The authenticated `POST /api/phone-social/accounts/{account_id}/telegram-target` accepts a public group URL in `target_url`. It reads the group type, membership, description and pinned message using the existing authorized observer. Target discovery leaves 16 reads available in the account window for a receipt. Group-root phone tasks require an ordinary chat. Forum topics need their own frozen topic ID and matching receipt in a future shared contract.
+
+`all_members_within_budget` uses the frozen original selection. `all_six_within_budget` applies only to a six-member round. The 600-second timer starts with the first start of the prepared original tasks. Measuring the user's full ten-minute goal also requires discovery, preparation and an independently confirmed publication.
+
+
+## 2026-11-06 单平台手机执行整合
+
+在本地整合提交 `a217ba9` 上接收 `8dac2cd`：手机轮次可选 1–6 个平台，并按平台独立预检、启动和停止；设备动作仍由同一设备控制权串行保护。Telegram 只读观察和发送必须绑定同一个权威数据库与原账号，未知提交保持原任务查询，不自动重发。保留现有 TikTok API、Tabbit 和目标证据校验。
+
+本地回归：手机隔离、原始回执与身份测试 272 passed，另有 17 subtests passed；队列、API/MCP、限额及 TikTok 校验 234 passed、1 skipped、72 subtests passed。跳过项为未启用的隔离浏览器用例。该候选未经正式服务切换或真实发布验收。

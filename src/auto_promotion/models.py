@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -43,6 +44,17 @@ def canonical(value) -> str:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     )
+
+
+def telegram_target_aliases(target):
+    """Equivalent public group spellings, without equating invites, posts or forum topics."""
+    value = target.casefold().rstrip("/")
+    match = re.fullmatch(r"(?:@|(?:https?://)?(?:t\.me|telegram\.me)/)([a-z][a-z0-9_]{3,31})", value)
+    if not match:
+        return (value,)
+    name = match[1]
+    return ("@" + name, *(p + name for p in ("https://t.me/", "http://t.me/", "t.me/",
+                                               "https://telegram.me/", "http://telegram.me/", "telegram.me/")))
 
 
 def digest(value) -> str:

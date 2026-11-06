@@ -164,9 +164,30 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             execution_channel=channel, node_os=binding.node_os, not_before=now, deadline=now + 115,
             expected_identity_sha256=fingerprint({"account": binding.identity}), social=context)
 
+    def shared_telegram_binding(self, account, profile=None):
+        """Allow one existing API identity to use its own AP queue for explicit phone tasks."""
+        account_id = account["id"]
+        binding = self.config.bindings.get(account_id)
+        observer = self.config.telegram_observers.get(account_id)
+        if (account["platform"] != "telegram" or not binding or binding.receipt_reader != "telegram_api"
+                or not observer or self.telegram_queue_blocker(account_id)
+                or observer.backend_label != account["backend_label"]):
+            return None
+        if profile is None:
+            try:
+                profile = read_profile("telegram", account["backend_label"])
+            except BackendError:
+                return None
+        if (profile.get("connection_type") not in (None, "mtproto")
+                or str(profile.get("identity")) != str(observer.user_id)
+                or not profile.get("api_id") or not profile.get("api_hash")):
+            return None
+        return binding
+
     def register(self, account_id, context=None):
         account, binding = self.binding(account_id)
         previous = {}
+        shared = False
         try:
             previous = read_profile(account["platform"], account["backend_label"])
         except BackendError as exc:
@@ -174,10 +195,13 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 raise
         else:
             if previous.get("connection_type") != "phone_fleet":
-                raise Conflict("PhoneSocialExistingConnectionPreserved")
-            old = previous.get("phone_fleet", {})
-            if old.get("device_id") != binding.device_id or previous.get("identity") != binding.identity or old.get("client_id") != binding.client_id:
-                raise Conflict("PhoneSocialExistingBindingPreserved")
+                shared = bool(self.shared_telegram_binding(account, previous))
+                if not shared:
+                    raise Conflict("PhoneSocialExistingConnectionPreserved")
+            else:
+                old = previous.get("phone_fleet", {})
+                if old.get("device_id") != binding.device_id or previous.get("identity") != binding.identity or old.get("client_id") != binding.client_id:
+                    raise Conflict("PhoneSocialExistingBindingPreserved")
         request = self.make_request(account_id, "social_identity", context)
         snapshot = self.dispatch(request, "phone-social-identity:" + uuid4().hex, account_id)
         result = snapshot.get("result") or {}
@@ -190,12 +214,13 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         with self.store.connect(write=True) as db:
             db.execute("INSERT INTO phone_social_accounts VALUES(?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET platform=excluded.platform,identity=excluded.identity,device_id=excluded.device_id,observation=excluded.observation,observed_at=excluded.observed_at",
                 (account_id, binding.platform, binding.identity, binding.device_id, canonical(snapshot), time.time()))
-        save_profile(binding.platform, account["backend_label"], {
-            **previous,
-            "identity": binding.identity, "connection_type": "phone_fleet",
-            "phone_fleet": {**previous.get("phone_fleet", {}), "device_id": binding.device_id, "node_os": binding.node_os,
-                            "social_actions": [ACTIONS[binding.platform]], "client_id":binding.client_id}})
-        self.engine.check_account(account_id, force=True)
+        if not shared:
+            save_profile(binding.platform, account["backend_label"], {
+                **previous,
+                "identity": binding.identity, "connection_type": "phone_fleet",
+                "phone_fleet": {**previous.get("phone_fleet", {}), "device_id": binding.device_id, "node_os": binding.node_os,
+                                "social_actions": [ACTIONS[binding.platform]], "client_id":binding.client_id}})
+            self.engine.check_account(account_id, force=True)
         return {"identity_verified": True, "identity": binding.identity, "platform": binding.platform,
                 "submission_enabled": self.config.submit_enabled, "source_execution_id": snapshot["id"]}
 
@@ -240,6 +265,8 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         task = self.store.one("SELECT * FROM tasks WHERE id=?", (item["task_id"],))
         policy = json.loads(task["policy"])
         self.check_method(policy, binding)
+        if binding.platform == "telegram" and binding.receipt_reader == "telegram_api":
+            self.observer_baseline(account["id"], binding.identity, payload["target"])
         identifier = "phone-social-prepare:" + uuid4().hex
         request = self.make_request(account["id"], "social_prepare", {**metadata,
             "text": payload["text"], "target_url": payload["target"], "discard_after_prepare": discard},
@@ -310,6 +337,9 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 "account_identity": binding.identity if fresh else None,
                 "reason": "phone_social_identity_observed" if fresh else "PhoneSocialFreshIdentityRequired"}
         if operation == "preflight":
+            queue_blocker = self.telegram_queue_blocker(account["id"])
+            if queue_blocker:
+                return {"allowed":False, "confirmed_not_submitted":True, "reason":queue_blocker}
             if binding.platform=="telegram" and binding.receipt_reader=="telegram_api" and self.observer_preflight(account,payload.get("payload",{}),execution_job):
                 return {"allowed":True,"confirmed_not_submitted":True,"reason":"PhoneTelegramPrepareWithinClaim"}
             _, request, snapshot = self.preparation(account["id"], payload.get("payload", {}))
@@ -334,6 +364,9 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         if not self.config.submit_enabled or not self.engine.live_enabled:
             raise BackendError("PhoneSocialSubmissionDisabled")
         _, binding = self.binding(account["id"])
+        queue_blocker = self.telegram_queue_blocker(account["id"])
+        if queue_blocker:
+            raise BackendError(queue_blocker)
         if claim["task_id"] not in self.config.authorized_task_ids:
             raise BackendError("PhoneSocialTaskOutsideDevelopmentScope")
         task = self.store.one("SELECT * FROM tasks WHERE id=?", (claim["task_id"],))
@@ -400,6 +433,11 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             if (not baseline or time.time()-json.loads(baseline["baseline"])["observed_at"]>120
                     or fingerprint(self.config.telegram_observers.get(baseline["account_id"]))!=baseline["observer_sha256"]):
                 raise Conflict("PhoneTelegramObserverBaselineRequired")
+            if json.loads(baseline["baseline"]).get("sends_as_self") is not True:
+                raise Conflict("PhoneTelegramSenderIdentityUnverified")
+            queue_blocker = self.telegram_queue_blocker(baseline["account_id"])
+            if queue_blocker:
+                raise Conflict(queue_blocker)
             reservation = self.store.one("SELECT * FROM phone_telegram_receipt_budgets WHERE authorization_id=?",(row["id"],))
             if (not reservation or reservation["account_id"]!=baseline["account_id"]
                     or reservation["observer_sha256"]!=baseline["observer_sha256"] or reservation["used"]!=0):

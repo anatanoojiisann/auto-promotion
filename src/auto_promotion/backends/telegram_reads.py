@@ -144,10 +144,10 @@ class TelegramReads:
                     for key, value in self.requested_policy.items()
                 }
 
-    def reserve(self, count):
+    def reserve(self, count, *, keep=0):
         """Reserve a whole _call batch before any logical read attempt is started."""
         self.refresh_policy()
-        if type(count) is not int or count < 0:
+        if type(count) is not int or count < 0 or type(keep) is not int or keep < 0:
             raise ValueError("Invalid read reservation")
         if not count:
             return
@@ -190,7 +190,7 @@ class TelegramReads:
                 start, end, used = now, now + self.policy["window_seconds"], 0
             # A shorter policy cannot end the persisted active window early.
             end = max(end, start + self.policy["window_seconds"])
-            rejected = used + count > self.policy["requests_per_window"]
+            rejected = used + count + keep > self.policy["requests_per_window"]
             if not rejected:
                 used += count
             db.execute(

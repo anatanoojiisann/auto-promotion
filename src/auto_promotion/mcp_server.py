@@ -61,7 +61,10 @@ def client_config(project_dir, python=None):
     }
 
 
-def create_server(engine=None):
+PhonePlatform = Literal["telegram", "reddit", "instagram", "facebook", "x", "tiktok"]
+
+
+def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_config=None, phone_reddit_config=None):
     from .runtime_identity import capture_runtime
 
     runtime = capture_runtime("mcp")
@@ -70,6 +73,12 @@ def create_server(engine=None):
         AdapterRegistry(workspace_path()),
         live_enabled=os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
     )
+    if phone_social_config is not None:
+        from .phone_social import PhoneSocial
+        PhoneSocial(engine, phone_social_config)
+    if phone_reddit_config is not None:
+        from .phone_reddit import PhoneReddit
+        PhoneReddit(engine, phone_reddit_config)
     server = FastMCP(
         "Auto Promotion",
         instructions=(
@@ -651,6 +660,43 @@ def create_server(engine=None):
         """Pause a local task; platform-accepted schedules require separate reconciliation."""
         return invoke(engine.change_state, task_id, "paused")
 
+    if phone_rounds_enabled:
+        from .phone_readiness import readiness as phone_settings
+        from .phone_round_readiness import preflight as phone_preflight
+        from .phone_rounds import PhoneRounds
+
+        rounds = PhoneRounds(engine)
+
+        @server.tool(annotations=remote_read)
+        def phone_platform_status(platform: PhonePlatform) -> dict:
+            """Read one phone channel's bindings, Fleet capabilities and stops."""
+            return invoke(lambda: phone_settings(engine, platform=platform))
+
+        @server.tool(annotations=local)
+        def create_phone_round(task_ids: list[str], request_key: str) -> dict:
+            """Group one to six distinct frozen phone tasks. Each platform may be selected independently."""
+            return invoke(rounds.create, task_ids, request_key)
+
+        @server.tool(annotations=read)
+        def get_phone_round(round_id: str) -> dict:
+            """Read original per-platform outcomes, timing and verified receipt counts."""
+            return invoke(rounds.get, round_id)
+
+        @server.tool(annotations=remote_read)
+        def check_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
+            """Check the selected platform or round without starting an interaction."""
+            return invoke(lambda: phone_preflight(rounds, round_id, platforms={platform} if platform else None))
+
+        @server.tool(annotations=outbound)
+        def start_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
+            """Only on an explicit instruction, start all selected originals or one specified platform."""
+            return invoke(rounds.start, round_id, platform)
+
+        @server.tool(annotations=local)
+        def stop_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
+            """Fence future submissions for one platform or the whole round. Keep original uncertain results."""
+            return invoke(rounds.stop_platform, round_id, platform) if platform else invoke(rounds.stop, round_id)
+
     return server
 
 
@@ -659,6 +705,9 @@ def main():
     parser.add_argument("--project-dir", type=Path, default=Path.cwd())
     parser.add_argument("--db", type=Path)
     parser.add_argument("--print-config", action="store_true")
+    parser.add_argument("--phone-rounds", action="store_true")
+    parser.add_argument("--phone-social-config", type=Path)
+    parser.add_argument("--phone-reddit-config", type=Path)
     parser.add_argument("--no-env", action="store_true", help="Do not load the project .env")
     args = parser.parse_args()
     project = args.project_dir.resolve()
@@ -674,7 +723,10 @@ def main():
         os.environ["AP_DB"] = str(args.db.resolve())
     if not args.no_env:
         load_environment(database_path().parent / "cloud-node.env")
-    create_server().run(transport="stdio")
+    from .phone_readiness import load_bindings
+    social, reddit = load_bindings(args.phone_social_config, args.phone_reddit_config, parser)
+    create_server(phone_rounds_enabled=args.phone_rounds, phone_social_config=social,
+                  phone_reddit_config=reddit).run(transport="stdio")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ import json
 from bisect import bisect_left, bisect_right, insort
 from collections import defaultdict
 
-from .models import ExecutionSettings, QuotaLimit, canonical, digest
+from .models import ExecutionSettings, QuotaLimit, canonical, digest, telegram_target_aliases
 
 # A manual handoff has not contacted the platform. Keep its audit attempt, but do
 # not charge a delivery until a manual outcome or an actual submission is recorded.
@@ -239,8 +239,23 @@ def check_claim(db, account, task, payload, due, now, item_id):
     limits = scopes(db, account, task, payload)
     proof = explicit_unsent_retry_source(db, account, task, payload, item_id)
 
+    # Project historical @handle/URL records onto the current candidate at claim time.
+    # Existing hashes and delivery history stay usable across a sender upgrade.
+    equivalent = set()
+    if account["platform"] == "telegram":
+        aliases = telegram_target_aliases(payload["target"])
+        equivalent = {digest(["telegram", spelling]) for a in aliases for spelling in (a, a+"/")}
+    target_scope = digest([account["platform"], payload["target"].casefold()])
+
+    user_key = payload.get("recipient_id") or payload["target"].casefold()
+    user_scope = digest([account["platform"], user_key])
+    equivalent_users = equivalent if user_scope in equivalent else set()
+
     def records(*, delivery):
         rows = events(db, account["mode"], delivery=delivery, exclude_item=item_id)
+        if equivalent:
+            rows = [{**r, "target":target_scope if r.get("target") in equivalent else r.get("target"),
+                     "user":user_scope if r.get("user") in equivalent_users else r.get("user")} for r in rows]
         if not proof:
             return rows
         at = proof["due_at"] if delivery else proof["attempt_at"]

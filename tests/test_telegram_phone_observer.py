@@ -27,6 +27,9 @@ class Client:
     async def _call(self,sender,request,*args,**kwargs):
         if type(request).__name__=="SendMessageRequest":
             self.raw_mutations+=1
+    async def __call__(self, request):
+        await self._call(None,request)
+        return SimpleNamespace(full_chat=SimpleNamespace(default_send_as=getattr(self,"send_as",None)))
     async def connect(self):
         self.calls.append("connect")
         # Telethon initializes an authorized session's empty message box with this read.
@@ -61,6 +64,34 @@ def setup_reader(tmp_path,monkeypatch):
         return client
     reader=TelegramPhoneObserver({"phone":config},client_factory=factory,settings_loader=lambda _: {"identity":"44","api_id":1,"api_hash":"synthetic"})
     return reader,clients
+
+
+@pytest.mark.asyncio
+async def test_forum_group_root_requires_a_frozen_topic_before_drafting(tmp_path, monkeypatch):
+    reader, clients = setup_reader(tmp_path, monkeypatch)
+    original_factory = reader.client_factory
+    def forum(*args):
+        client = original_factory(*args)
+        client.entity.forum = True
+        return client
+    reader.client_factory = forum
+    with pytest.raises(BackendError, match="PhoneTelegramForumTopicRequired"):
+        await reader.query("phone", "@test_sender", "https://t.me/test_group")
+    assert "history" not in clients[0].calls and clients[0].raw_mutations == 0
+
+
+@pytest.mark.asyncio
+async def test_personal_send_cannot_use_a_group_channel_alias(tmp_path, monkeypatch):
+    reader, clients = setup_reader(tmp_path, monkeypatch)
+    original_factory = reader.client_factory
+    def alias(*args):
+        client = original_factory(*args)
+        client.send_as = types.PeerChannel(channel_id=100)
+        return client
+    reader.client_factory = alias
+    with pytest.raises(BackendError, match="PhoneTelegramSenderIdentityMismatch"):
+        await reader.query("phone", "@test_sender", "https://t.me/test_group")
+    assert clients[0].raw_mutations == 0
 
 
 def test_phone_number_and_handle_identity_must_match_same_api_account():

@@ -53,6 +53,18 @@ class ExecutionRoute:
         return value
 
 
+def task_route(account, payload, method, registry):
+    default = route_for(account, payload)
+    if method != "phone" or default.transport in {"phone", "simulation"}:
+        return default
+    # Keep explicit phone work in the native pool even when a binding is missing.
+    service = getattr(registry, "phone_social", None)
+    binding = service.shared_telegram_binding(account) if service and account["platform"] == "telegram" else None
+    return ExecutionRoute(account["platform"], "phone", account["platform"] + ".phone", default.identity,
+                          "phone:" + digest(binding.device_id) if binding else None,
+                          "phone", binding.node_os if binding else "any")
+
+
 def route_for(account, payload=None, *, profile=None):
     platform = account["platform"]
     if platform not in PLATFORMS:

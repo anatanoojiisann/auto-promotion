@@ -27,7 +27,9 @@ def main():
     serve = sub.add_parser("serve")
     serve.add_argument("--port", type=int, default=8780)
     serve.add_argument("--no-worker", action="store_true")
-    serve.add_argument("--phone-rounds", action="store_true", help="Enable six-app timed rounds on the existing pooled sender")
+    serve.add_argument("--phone-social-config", type=Path, help="Path to the protected phone social account bindings")
+    serve.add_argument("--phone-reddit-config", type=Path, help="Path to the protected Reddit phone account bindings")
+    serve.add_argument("--phone-rounds", action="store_true", help="Enable timed rounds for selected phone platforms on the existing pooled sender")
     serve.add_argument(
         "--execution-mode",
         choices=("legacy", "pooled"),
@@ -208,7 +210,9 @@ def main():
         import uvicorn
 
         from .api import create_app
+        from .phone_readiness import load_bindings
 
+        social, reddit = load_bindings(args.phone_social_config, args.phone_reddit_config, parser)
         uvicorn.run(
             create_app(
                 db_path=args.db,
@@ -217,6 +221,8 @@ def main():
                 pooled_worker=args.execution_mode == "pooled",
                 statistics_only=args.reports_only,
                 phone_rounds_enabled=args.phone_rounds,
+                phone_social_config=social,
+                phone_reddit_config=reddit,
             ),
             host="127.0.0.1",
             port=args.port,

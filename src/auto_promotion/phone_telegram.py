@@ -26,6 +26,23 @@ CREATE TABLE IF NOT EXISTS phone_telegram_receipt_budgets(
 
 
 class PhoneTelegram:
+    def inspect_telegram_target(self, account_id, target_url):
+        from phone_fleet_protocol.social import target_parts
+
+        account, binding = self.binding(account_id)
+        if (binding.platform != "telegram" or binding.receipt_reader != "telegram_api"
+                or not self.telegram_observer or account["disabled"] or account["cooldown_until"] > time.time()):
+            raise Conflict("PhoneTelegramObserverUnavailable")
+        try:
+            target_parts("telegram", target_url)
+            return self.telegram_observer.inspect_target(account_id, binding.identity, target_url)
+        except ValueError:
+            raise Conflict("PhoneTelegramPublicGroupRequired") from None
+        except BackendError as exc:
+            if getattr(exc, "retry_after_seconds", 0):
+                self.engine.apply_cooldown(account_id, {"rate_limited":True, "retry_after_seconds":exc.retry_after_seconds})
+            raise Conflict(exc.safe_code) from None
+
     def observer_baseline(self,account_id,identity,target_url):
         if self.telegram_observer is None or account_id not in self.config.telegram_observers:
             raise BackendError("PhoneTelegramObserverNotConfigured")
@@ -40,11 +57,25 @@ class PhoneTelegram:
             raise BackendError("PhoneTelegramMembershipOrWritePermissionRequired")
         return baseline
 
+    def telegram_queue_blocker(self, account_id):
+        """An external API observer must use the sender's authoritative account and queue."""
+        from pathlib import Path
+
+        binding = self.config.bindings.get(account_id)
+        if not binding or binding.platform != "telegram" or binding.receipt_reader != "telegram_api":
+            return None
+        observer = self.config.telegram_observers.get(account_id)
+        if (not observer or not observer.api_database or observer.api_account_id != account_id
+                or not Path(observer.api_database).is_absolute()
+                or Path(observer.api_database).resolve() != Path(self.store.path).resolve()):
+            return "PhoneTelegramAuthoritativeQueueRequired"
+        return None
+
     def observer_preflight(self,account,payload,execution_job):
         """The normal leased item may prepare after its claim; arbitrary preflight cannot."""
         from .queue_store import verify_job_claim
 
-        if not execution_job or not self.config.submit_enabled or not self.engine.live_enabled or not self.fresh(account):
+        if self.telegram_queue_blocker(account['id']) or not execution_job or not self.config.submit_enabled or not self.engine.live_enabled or not self.fresh(account):
             return False
         with self.store.connect() as db:
             job = db.execute("SELECT * FROM execution_jobs WHERE id=?",(execution_job.get("id"),)).fetchone()
