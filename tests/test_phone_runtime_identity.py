@@ -12,6 +12,7 @@ PHONE_RUNTIME_FILES = {
     "phone_fleet_demo.py",
     "phone_lab.py",
     "phone_protocol.py",
+    "phone_private.py",
     "phone_readiness.py",
     "phone_reddit.py",
     "phone_reddit_api.py",
