@@ -498,9 +498,23 @@ class TaskChannelRouter:
         )
         if until <= now:
             raise CloudUnavailable("TaskChannelWindowExpired")
-        no_cloud = offline_only(self.store, job["account_id"]) or (
-            channel == "local" and offline_only(self.store)
-        )
+        no_cloud = offline_only(self.store, job["account_id"])
+        if not no_cloud and channel == "local" and offline_only(self.store):
+            # Preserve already granted local authority and task-scoped fences.
+            # Another account's offline scope must not suppress coordination
+            # for a new local handoff. The transaction below rechecks the proof.
+            with self.store.connect() as db:
+                prior_local = db.execute(
+                    "SELECT channel,state FROM account_task_channels WHERE account_id=?",
+                    (job["account_id"],),
+                ).fetchone()
+                existing_binding = channel_binding(db, job["account_id"])
+            no_cloud = bool(
+                existing_binding.get("coordination_task_id")
+                or prior_local
+                and prior_local["channel"] == "local"
+                and prior_local["state"] == "ready"
+            )
         if authorization_only:
             no_cloud = False  # Only this durable, explicitly requested control operation.
         if no_cloud and channel == "cloud":
