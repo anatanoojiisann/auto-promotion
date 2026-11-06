@@ -8,11 +8,34 @@ import uuid
 from .cloud_control import CloudUnavailable
 from .continuation_preflight import _account_blocker
 from .execution_channels import binding, independent_account_supported
-from .models import epoch
-from .routing import route_for
+from .models import digest, epoch
+from .routing import route_for, task_route
 from .store import Store
 
 LEASE_SECONDS = 180
+
+
+def authorization_route(engine, db, account, policy):
+    if policy.get("execution_method") != "phone":
+        if not independent_account_supported(db, account):
+            raise CloudUnavailable("LocalAuthorizationRouteUnsupported")
+        return route_for(account)
+    service = getattr(
+        engine.adapters, "phone_reddit" if account["platform"] == "reddit" else "phone_social", None
+    )
+    if not service or account["id"] not in service.config.bindings:
+        raise CloudUnavailable("PhoneBindingRequired")
+    if not service.fresh(account):
+        raise CloudUnavailable("FreshPhoneIdentityRequired")
+    route = task_route(account, {}, "phone", engine.adapters)
+    binding = service.config.bindings[account["id"]]
+    if (
+        route.transport != "phone"
+        or route.resource != "phone:" + digest(binding.device_id)
+        or policy.get("execution_node_os", "any") not in {"any", binding.node_os}
+    ):
+        raise CloudUnavailable("LocalAuthorizationRouteUnsupported")
+    return route
 
 
 def validate_scope(engine, db, task_id, account_id, now):
@@ -30,7 +53,7 @@ def validate_scope(engine, db, task_id, account_id, now):
         or epoch(policy["ends_at"]) <= now
     ):
         raise CloudUnavailable("LocalAuthorizationRequiresStartedLocalTask")
-    if account["mode"] != "live" or not independent_account_supported(db, dict(account)):
+    if account["mode"] != "live":
         raise CloudUnavailable("LocalAuthorizationRouteUnsupported")
     if (
         not engine.live_enabled
@@ -55,7 +78,7 @@ def validate_scope(engine, db, task_id, account_id, now):
         ).fetchall():
             if _account_blocker(db, alias[0], now):
                 raise CloudUnavailable("LocalAuthorizationAliasUnresolved")
-    route = route_for(dict(account))
+    route = authorization_route(engine, db, dict(account), policy)
     if db.execute(
         "SELECT 1 FROM account_lanes WHERE account_id=? AND expires_at>?",
         (account_id, now),

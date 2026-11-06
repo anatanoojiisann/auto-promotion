@@ -5,11 +5,13 @@ import re
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from .account_blocks import active_block
+from .cloud_control import CloudUnavailable
 from .core import Conflict, NotFound
 from .models import digest, epoch
 from .phone_protocol import capability_status
 from .phone_rounds import TOTAL_SECONDS
 from .readiness import DELIVERY_GRACE_SECONDS
+from .task_channels import control_preflight, safe_channel_code
 
 
 def _fleet_capabilities(service):
@@ -121,6 +123,22 @@ def preflight(rounds, round_id, *, platforms=None):
     runtime = store.one("SELECT value FROM meta WHERE key='execution_runtime'")
     if not runtime or runtime["value"] != "pooled":
         common.append("PooledRuntimeRequired")
+    # Resolve local control before spending time on remote capability checks.
+    # Each member owns its failures; a bad account never hides healthy peers.
+    controls, control_errors = {}, {}
+    for member in scoped:
+        task = store.one("SELECT policy FROM tasks WHERE id=?", (member["task_id"],))
+        item = store.one("SELECT account_id FROM items WHERE id=?", (member["item_id"],))
+        try:
+            if not task or not item:
+                raise CloudUnavailable("PhoneRoundOriginalItemMissing")
+            controls[member["task_id"]] = control_preflight(
+                engine, member["task_id"], item["account_id"], json.loads(task["policy"])
+            )
+        except CloudUnavailable as exc:
+            control_errors[member["task_id"]] = safe_channel_code(str(exc))
+        except Exception:
+            control_errors[member["task_id"]] = "PhoneControlReadinessUnavailable"
     sources, platform_services = {}, {}
     for member in scoped:
         service = getattr(
@@ -129,7 +147,7 @@ def preflight(rounds, round_id, *, platforms=None):
             None,
         )
         platform_services[member["platform"]] = service
-        if service is not None:
+        if service is not None and not common and member["task_id"] not in control_errors:
             sources[id(service)] = service
     pool = ThreadPoolExecutor(max_workers=2)
     try:
@@ -148,7 +166,12 @@ def preflight(rounds, round_id, *, platforms=None):
     for member in scoped:
         service = platform_services[member["platform"]]
         try:
-            reasons = _member_blockers(engine, member, now, service, fleet.get(id(service), {}))
+            if member["task_id"] in control_errors:
+                reasons = [control_errors[member["task_id"]]]
+            elif common:
+                reasons = []
+            else:
+                reasons = _member_blockers(engine, member, now, service, fleet.get(id(service), {}))
         except Exception:
             reasons = ["PhoneMemberReadinessUnavailable"]
         members.append(
@@ -156,6 +179,7 @@ def preflight(rounds, round_id, *, platforms=None):
                 "platform": member["platform"],
                 "task_id": member["task_id"],
                 "ready": not reasons and not common,
+                "account_control": controls.get(member["task_id"]),
                 "blockers": common + list(dict.fromkeys(reasons)),
             }
         )
@@ -163,7 +187,7 @@ def preflight(rounds, round_id, *, platforms=None):
         "round_id": round_id,
         "observed_at": now,
         "read_only": True,
-        "readiness_scope": "local_configuration_and_authenticated_fleet_capabilities",
+        "readiness_scope": "account_control_local_configuration_and_authenticated_fleet_capabilities",
         "capability_sources_checked": len(sources),
         "ready_count": sum(m["ready"] for m in members),
         "members": members,

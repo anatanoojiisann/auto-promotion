@@ -87,11 +87,6 @@ def route_for(account, payload=None, *, profile=None):
     transport = TRANSPORTS[platform]
     resource = None
     if platform in {"facebook", "instagram", "tiktok"}:
-        if profile is None:
-            try:
-                profile = read_profile(platform, account["backend_label"])
-            except BackendError:
-                profile = {}
         if profile.get("connection_type") in {"meta_desktop", "tiktok_desktop"}:
             transport = "desktop"
             resource = (
@@ -106,11 +101,6 @@ def route_for(account, payload=None, *, profile=None):
             transport = "tabbit"
             resource = tabbit_resource(profile)
     if platform == "x":
-        if profile is None:
-            try:
-                profile = read_profile(platform, account["backend_label"])
-            except BackendError:
-                profile = {}
         channel = profile.get("browser_channel", "chromium")
         transport = {"tabbit": "tabbit", "browser_use": "browser_use", "msedge": "edge"}.get(
             channel, "playwright"
