@@ -135,6 +135,14 @@ class AdapterRegistry:
             return self.overrides[account["platform"]].call(account, operation, payload)
         if account["mode"] == "simulation":
             return self.simulation.call(account, operation, payload)
+        from .routing import route_for
+        if route_for(account).transport == "phone":
+            # Explicit native services reuse the original claimed send job.
+            # Unconfigured phone routes remain preparation-only.
+            from .backends.phone import PhoneBackend
+            selected = "phone_reddit" if account["platform"] == "reddit" else "phone_social"
+            return PhoneBackend(service=getattr(self, selected, None),
+                                execution_job=getattr(self.context, "job", None)).call(account, operation, payload)
         if account["platform"] == "tiktok":
             from .tiktok_browser import TikTokBrowser
 

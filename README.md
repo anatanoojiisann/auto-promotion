@@ -1,5 +1,12 @@
 # Auto Promotion
 
+## 本地手机任务接入整合（2026-11-06）
+
+接收手机开发提交 `9a6523a`，与群控 `f9c1ad2` 配套；手机功能仍需显式开发配置。它沿用原业务任务、持久队列、账号许可、额度、去重与一次提交边界，不新增第二个发送器。包括整轮截止、原任务恢复、候选预检、Telegram 有界回执读取及旧协议只读核查。
+
+依赖为 Python 3.12、`phone-fleet-management==0.2.0.dev18`、`phone-fleet-protocol==0.2.0`。本地检查命令为 `python -m auto_promotion.phone_software_check --output REPORT.json`，仅使用临时数据库和模拟节点，输出不代表真实发布成功。部署和真实互动需要另行验证，不随代码合并自动启动。详见 [手机任务说明](docs/PHONE_ROUNDS.md)。 本次还将 17 个手机模块纳入启动源码指纹，后续验证需核对进程启动时记录的提交和指纹。
+
+
 新增 **Facebook / IG 统一浏览器互动**：沿用 Kore 的 Tabbit、Loo 的 Chrome 和
 christina225559 的 Edge，接入统一任务队列、账号节奏、回执、统计与三小时播报。
 旧任务只读迁入，停止与未知结果不重新排队；IG 沿用原共享锁与冷却。

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-promotion"
-version = "0.1.0"
+version = "0.1.1.dev1"
 description = "Local account, task and API control plane for six social platforms"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ dependencies = ["fastapi>=0.115,<1", "pydantic>=2.10,<3", "uvicorn>=0.34,<1", "t
 
 [project.optional-dependencies]
 dev = ["ruff>=0.12,<1", "build>=1.2,<2", "httpx>=0.28,<1"]
+phone = ["phone-fleet-management==0.2.0.dev18", "phone-fleet-protocol==0.2.0"]
 telegram = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3"]
 browser = ["playwright>=1.55,<2"]
 mcp = ["mcp>=1.30,<2"]
@@ -19,6 +20,8 @@ all = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3", "playwright>=1.55,<
 
 [project.scripts]
 auto-promotion = "auto_promotion.cli:main"
+auto-promotion-phone-check = "auto_promotion.phone_software_check:main"
+auto-promotion-phone-lab = "auto_promotion.phone_lab:main"
 auto-promotion-mcp = "auto_promotion.mcp_server:main"
 
 [tool.setuptools.packages.find]

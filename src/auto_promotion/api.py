@@ -135,17 +135,22 @@ def create_app(
     token=None,
     pooled_worker=None,
     statistics_only=False,
+    phone_fleet_config=None,
+    phone_reddit_config=None,
+    phone_social_config=None,
+    phone_rounds_enabled=False,
+    disable_live_writes=False,
 ):
     if statistics_only:
         worker, report_worker = False, True
-    workspace = workspace_path()
+    workspace = registry.workspace if registry is not None else workspace_path()
     store = Store(db_path or database_path())
     registry = registry or AdapterRegistry(workspace)
     engine = Engine(
         store,
         registry,
         clock=clock,
-        live_enabled=not statistics_only and os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
+        live_enabled=not statistics_only and not disable_live_writes and os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
     )
     connections = ConnectionManager(engine)
     statistics = Statistics(store, clock=clock)
@@ -156,6 +161,22 @@ def create_app(
     tiktok = TikTokManager(engine)
     meta_browser = MetaBrowser(engine)
     tiktok_browser = TikTokBrowser(engine)
+    phone_preparations = None
+    if phone_fleet_config is not None:
+        from .phone_fleet import configured
+        phone_preparations = configured(engine, phone_fleet_config)
+    phone_reddit = None
+    if phone_reddit_config is not None:
+        from .phone_reddit import PhoneReddit
+
+        phone_reddit = PhoneReddit(engine, phone_reddit_config)
+        registry.phone_reddit = phone_reddit
+    phone_social = None
+    if phone_social_config is not None:
+        from .phone_social import PhoneSocial
+
+        phone_social = PhoneSocial(engine, phone_social_config)
+        registry.phone_social = phone_social
     interactions = Interactions(
         engine,
         worker_available=lambda: (
@@ -196,6 +217,23 @@ def create_app(
         else pooled_worker
     )
     pool_scheduler = PoolScheduler(engine) if worker and pooled_worker else None
+
+    from .phone_rounds import PhoneRounds
+
+    phone_rounds = PhoneRounds(engine) if phone_rounds_enabled else None
+
+    async def rounds_loop():
+        while not stop.is_set():
+            try:
+                await asyncio.to_thread(phone_rounds.tick)
+                background_success_at["phone_rounds"] = time.time()
+            except Exception as exc:
+                background_errors["phone_rounds"] = type(exc).__name__
+                background_error_at["phone_rounds"] = time.time()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=1)
+            except TimeoutError:
+                pass
 
     async def work_loop():
         nonlocal pool_scheduler
@@ -266,6 +304,9 @@ def create_app(
                 sender = stack.enter_context(WorkerRun(store, live_enabled=engine.live_enabled))
                 background_tasks["sender"] = asyncio.create_task(work_loop())
                 jobs.append(background_tasks["sender"])
+                if phone_rounds is not None:
+                    background_tasks["phone_rounds"] = asyncio.create_task(rounds_loop())
+                    jobs.append(background_tasks["phone_rounds"])
                 callbacks = [
                     (interactions.schedule, "hf_schedule"),
                     (meta_browser.sync, "meta_browser_sync"),
@@ -320,6 +361,36 @@ def create_app(
         redoc_url=None,
     )
     app.state.engine = engine
+
+    @app.get("/api/phone-readiness")
+    async def phone_readiness():
+        from .phone_protocol import capability_status
+        from .phone_readiness import readiness
+        result = await asyncio.to_thread(readiness, engine)
+        if phone_preparations is not None:
+            try:
+                status = capability_status(await phone_preparations.client.request("GET", "/capabilities"))
+            except Exception:
+                status = {"state": "service_unavailable", "software_ready": False, "device_ready": False,
+                          "reason": "PhoneFleetReadinessUnavailable"}
+            result["services"].append(status)
+            result["configured"] = True
+            result["state"] = "software_ready" if all(s["software_ready"] for s in result["services"]) else "setup_required"
+        return result
+
+    if phone_rounds is not None:
+        from .phone_rounds_api import mount as mount_rounds
+
+        mount_rounds(app, phone_rounds)
+    if phone_reddit is not None:
+        from .phone_reddit_api import mount
+
+        mount(app, phone_reddit)
+    if phone_social is not None:
+        from .phone_social_api import mount as mount_social
+
+        mount_social(app, phone_social)
+    app.state.phone_preparations = phone_preparations
     app.state.store = store
     app.state.connections = connections
     app.state.statistics = statistics
@@ -410,6 +481,25 @@ def create_app(
     @app.get("/api/interactions")
     def interaction_policies():
         return interactions.list()
+
+    @app.post("/api/tasks/{task_id}/items/{item_id}/phone-preparations/{operation}")
+    def phone_prepare(task_id: str, item_id: str, operation: str):
+        if phone_preparations is None:
+            raise Conflict("PhoneFleetDevelopmentDisabled")
+        job_id = phone_preparations.enqueue(task_id, item_id, operation)
+        return phone_preparations.view(job_id)
+
+    @app.get("/api/phone-preparations/{job_id}")
+    def phone_preparation(job_id: str):
+        if phone_preparations is None:
+            raise Conflict("PhoneFleetDevelopmentDisabled")
+        return phone_preparations.view(job_id)
+
+    @app.post("/api/phone-preparations/{job_id}/{action}")
+    async def phone_preparation_control(job_id: str, action: str):
+        if phone_preparations is None:
+            raise Conflict("PhoneFleetDevelopmentDisabled")
+        return await phone_preparations.control(job_id, action)
 
     @app.get("/api/interactions/defaults")
     def interaction_defaults(profile: str = "legacy"):

@@ -23,6 +23,7 @@ POOLS = frozenset(
     + ["tiktok.tabbit"]
     + [f"{p}.manual" for p in PLATFORMS]
     + [f"simulation.{p}" for p in PLATFORMS]
+    + [f"{p}.phone" for p in PLATFORMS]
 )
 
 
@@ -41,9 +42,15 @@ class ExecutionRoute:
     pool: str
     identity: str
     resource: str | None = None
+    execution_method: str = "inherit"
+    node_os: str = "any"
 
     def public(self):
-        return asdict(self)
+        value = asdict(self)
+        if self.transport != "phone":
+            value.pop("execution_method")
+            value.pop("node_os")
+        return value
 
 
 def route_for(account, payload=None, *, profile=None):
@@ -54,6 +61,17 @@ def route_for(account, payload=None, *, profile=None):
     if account["mode"] == "simulation":
         return ExecutionRoute(platform, "simulation", f"simulation.{platform}", identity)
     payload = payload or {}
+    if profile is None:
+        try:
+            profile = read_profile(platform, account["backend_label"])
+        except BackendError:
+            profile = {}
+    if profile.get("connection_type") == "phone_fleet":
+        binding = profile.get("phone_fleet", {})
+        if not binding.get("device_id") or binding.get("node_os", "any") not in {"any", "windows", "macos"}:
+            raise BackendError("PhoneFleetBindingInvalid")
+        return ExecutionRoute(platform, "phone", platform + ".phone", identity,
+            "phone:" + digest(binding["device_id"]), "phone", binding.get("node_os", "any"))
     transport = TRANSPORTS[platform]
     resource = None
     if platform in {"facebook", "instagram", "tiktok"}:

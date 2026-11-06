@@ -104,6 +104,8 @@ class Policy(Model):
     account_daily_limit: int | None = Field(default=None, ge=1, le=300)
     execution_channel: Literal["inherit", "cloud", "local"] = "inherit"
     execution_channel_source: str = Field(default="", max_length=240)
+    execution_method: Literal["inherit", "api", "browser", "phone"] = "inherit"
+    execution_node_os: Literal["any", "windows", "macos"] = "any"
     outbound_dependency_mode: Literal["published", "finished"] = "published"
     outbound_dependency_deadline: str | None = None
     queries: list[str] = Field(default_factory=list, max_length=20)

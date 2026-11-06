@@ -400,7 +400,7 @@ class JobQueue:
                 "SELECT j.* FROM execution_jobs j JOIN tasks t ON t.id=j.task_id "
                 "JOIN accounts a ON a.id=j.account_id LEFT JOIN items i "
                 "ON j.kind='send' AND i.id=j.reference_id WHERE j.pool=? "
-                "AND j.state='pending' AND j.available_at<=? AND t.state='active' "
+                "AND j.kind IN ('send','join') AND j.state='pending' AND j.available_at<=? AND t.state='active' "
                 "AND a.disabled=0 AND a.cooldown_until<=? AND a.next_at<=? "
                 "AND NOT EXISTS(SELECT 1 FROM account_blocks b WHERE b.account_id=a.id "
                 "AND b.state='active' AND (b.until_at IS NULL OR b.until_at>?)) "
