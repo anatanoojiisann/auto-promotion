@@ -230,6 +230,7 @@ def create_app(
             except Exception as exc:
                 background_errors["phone_rounds"] = type(exc).__name__
                 background_error_at["phone_rounds"] = time.time()
+                background_error_details["phone_rounds"] = exception_details(exc)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1)
             except TimeoutError:
@@ -723,7 +724,7 @@ def create_app(
                         **(
                             {
                                 "last_error_at": background_error_at[kind],
-                                "last_error_details": background_error_details[kind],
+                                "last_error_details": background_error_details.get(kind, {}),
                             }
                             if kind in background_error_at
                             else {}

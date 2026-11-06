@@ -583,6 +583,12 @@ class PhoneRounds:
 
     def tick(self):
         """One bounded admission per tick; existing pool owns execution/device/account locks."""
+        # Idle rounds must not contend with unrelated platform writers.
+        # A round started after this read is picked up on the next tick.
+        if not self.store.one(
+            "SELECT 1 FROM phone_rounds WHERE state IN ('checking','running','blocked') LIMIT 1"
+        ):
+            return
         now, chosen = self.clock(), None
         repair = []
         with self.store.connect(write=True) as db:
