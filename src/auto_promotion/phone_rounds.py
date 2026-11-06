@@ -302,11 +302,25 @@ class PhoneRounds:
 
         checker = self.preflight_check or preflight
         try:
-            snapshot = (
-                checker(self, round_id)
-                if scope == selected
-                else checker(self, round_id, platforms=scope)
-            )
+            if self.preflight_check is None:
+
+                def completed(rows):
+                    self._apply_check(
+                        round_id,
+                        check_id,
+                        {m["platform"] for m in rows},
+                        {"round_id": round_id, "members": rows, "submission_authorized": False},
+                        now,
+                        final=False,
+                    )
+
+                snapshot = checker(self, round_id, platforms=scope, on_members=completed)
+            else:
+                snapshot = (
+                    checker(self, round_id)
+                    if scope == selected
+                    else checker(self, round_id, platforms=scope)
+                )
             members = snapshot["members"]
             if (
                 snapshot.get("round_id") != round_id
@@ -323,6 +337,10 @@ class PhoneRounds:
                 "submission_authorized": False,
                 "blockers": ["PhoneRoundPreflightUnavailable"],
             }
+        self._apply_check(round_id, check_id, scope, snapshot, now, final=True)
+        return self.get(round_id)
+
+    def _apply_check(self, round_id, check_id, scope, snapshot, now, *, final):
         finished = self.clock()
         blockers = list(snapshot.get("blockers", []))
         if finished < now:
@@ -344,7 +362,6 @@ class PhoneRounds:
             if row["state"] in {"stopped", "completed", "expired"}:
                 blockers.append("PhoneRoundNotRunning")
             by_platform = {m["platform"]: m for m in snapshot["members"]}
-            admitted = 0
             for app in sorted(scope):
                 member = by_platform.get(app, {})
                 allowed = (
@@ -369,14 +386,17 @@ class PhoneRounds:
                         int(allowed),
                     ),
                 ).rowcount
-                if allowed and changed:
-                    admitted += 1
-                elif allowed:
+                if allowed and not changed:
                     db.execute(
                         "UPDATE phone_round_members SET state='blocked',error='PhoneRoundOriginalChanged' "
                         "WHERE round_id=? AND platform=? AND check_id=? AND state='checking'",
                         (round_id, app, check_id),
                     )
+            admitted = db.execute(
+                "SELECT count(*) FROM phone_round_members WHERE round_id=? AND check_id=? "
+                "AND state IN ('pending','starting','queued')",
+                (round_id, check_id),
+            ).fetchone()[0]
             snapshot.update(
                 platforms=sorted(scope),
                 blockers=list(dict.fromkeys(blockers)),
@@ -384,12 +404,14 @@ class PhoneRounds:
             )
             db.execute(
                 "UPDATE phone_round_preflights SET finished_at=?,result=? WHERE id=?",
-                (finished, canonical(snapshot), check_id),
+                (finished if final else None, canonical(snapshot), check_id),
             )
             self._sync_state(db, round_id, finished)
             Store.audit(
                 db,
-                "phone_round.preflight_completed",
+                "phone_round.preflight_completed"
+                if final
+                else "phone_round.platform_preflight_completed",
                 {
                     "round_id": round_id,
                     "ready": bool(admitted),
@@ -398,7 +420,6 @@ class PhoneRounds:
                 },
                 now=finished,
             )
-        return self.get(round_id)
 
     def stop_platform(self, round_id, platform):
         now = self.clock()
@@ -441,7 +462,7 @@ class PhoneRounds:
         # Existing uncertain submissions and their original receipt lookups are preserved.
         return self.get(round_id)
 
-    def _members(self, db, row, now):
+    def _members(self, db, row, now, *, include_timing=False):
         members = []
         for m in db.execute(
             "SELECT m.*,i.status item_status,i.attempt_id,i.result,i.external_reference,a.started_at attempt_started_at,"
@@ -450,6 +471,22 @@ class PhoneRounds:
             (row["id"],),
         ):
             result = json.loads(m["result"] or "{}")
+            job = db.execute(
+                "SELECT result,state FROM execution_jobs WHERE id=?", ("send:" + m["item_id"],)
+            ).fetchone()
+            control_wait = json.loads(job["result"]).get("control_wait") if job else None
+            waiting = bool(
+                control_wait
+                and job["state"] == "pending"
+                and m["state"] == "queued"
+                and row["state"] == "running"
+                and m["item_status"] == "not_attempted"
+                and now < row["submit_deadline"]
+            )
+            public_wait = (
+                {k: v for k, v in control_wait.items() if k != "revision"} if control_wait else None
+            )
+
             verified = bool(
                 m["item_status"] == "confirmed"
                 and m["attempt_id"]
@@ -466,7 +503,11 @@ class PhoneRounds:
                 <= row["deadline"]
             )
             stage = (
-                "confirmed"
+                "waiting_for_configuration"
+                if waiting and control_wait["waiting_for"] == "configuration_change"
+                else "waiting_for_retry"
+                if waiting
+                else "confirmed"
                 if verified
                 else "unknown"
                 if m["item_status"] == "unknown"
@@ -489,9 +530,14 @@ class PhoneRounds:
                     f"SELECT execution_id,used_at FROM {table} WHERE item_id=?", (m["item_id"],)
                 ).fetchone()
             submitted_at = native["used_at"] if native else None
+            wait_end = min(now, row["finished_at"] or now, row["submit_deadline"] or now)
+            from .execution_timing import report
+
+            timing = report(db, m["task_id"]) if include_timing else None
             members.append(
                 {
                     "platform": m["platform"],
+                    **({"stage_timings": timing} if include_timing else {}),
                     "execution_id": native["execution_id"] if native else None,
                     "submit_authorized_at": submitted_at,
                     "before_authorization_seconds": max(0, submitted_at - m["attempt_started_at"])
@@ -509,12 +555,17 @@ class PhoneRounds:
                     "verified": verified,
                     "within_budget": in_budget,
                     "external_reference": m["external_reference"] if verified else None,
-                    "reason": m["error"] or result.get("reason"),
+                    "reason": m["error"]
+                    or (control_wait or {}).get("reason")
+                    or result.get("reason"),
+                    "control_wait": public_wait,
                     "start_requested_at": m["start_requested_at"],
                     "enqueued_at": m["enqueued_at"],
                     "attempt_started_at": m["attempt_started_at"],
                     "receipt_verified_at": m["attempt_finished_at"] if verified else None,
-                    "queue_seconds": max(0, (m["attempt_started_at"] or now) - m["enqueued_at"])
+                    "queue_seconds": max(
+                        0, (m["attempt_started_at"] or wait_end) - m["enqueued_at"]
+                    )
                     if m["enqueued_at"] is not None
                     else None,
                     "execution_seconds": max(
@@ -530,7 +581,7 @@ class PhoneRounds:
         now = self.clock()
         with self.store.connect() as db:
             row = self._round(db, round_id)
-            members = self._members(db, row, now)
+            members = self._members(db, row, now, include_timing=True)
             cutoff = json.loads(row["cutoff_snapshot"]) if row["cutoff_snapshot"] else None
             check = db.execute(
                 "SELECT * FROM phone_round_preflights WHERE round_id=? ORDER BY id DESC LIMIT 1",
@@ -557,6 +608,7 @@ class PhoneRounds:
                 "deadline": row["deadline"],
                 "elapsed_seconds": elapsed,
                 "timing_scope": "prepared_tasks_including_preflight",
+                "draft_wait_seconds": max(0, (row["started_at"] or now) - row["created_at"]),
                 "preparation_included": False,
                 "end_to_end_six_app_pass": False,
                 "end_to_end_selected_apps_pass": False,

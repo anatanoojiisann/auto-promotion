@@ -534,6 +534,14 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 "reason": "PhoneSocialIndependentNativeReceiptRequired"}
 
     def verify(self, account, payload):
+        from .execution_timing import stage
+
+        item = self.store.one("SELECT task_id FROM items WHERE id=?", (payload.get("item_id"),))
+        with stage(self.engine, item["task_id"] if item else None, "receipt_verification",
+                   account_id=account["id"], item_id=payload.get("item_id")):
+            return self._verify(account, payload)
+
+    def _verify(self, account, payload):
         from phone_fleet_protocol import ExecutionRequest
 
         row = self.store.one("SELECT * FROM phone_social_operations WHERE item_id=? AND kind='social_submit' ORDER BY created_at DESC LIMIT 1", (payload.get("item_id"),))

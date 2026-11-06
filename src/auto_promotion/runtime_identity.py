@@ -13,6 +13,8 @@ FINGERPRINT_FILES = (
     "interaction_intents.py",
     "queue_store.py",
     "task_channels.py",
+    "execution_waits.py",
+    "execution_timing.py",
     "routing.py",
     "execution_channels.py",
     "local_authorization.py",

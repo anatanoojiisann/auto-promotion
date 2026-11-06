@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS candidates(
 CREATE TABLE IF NOT EXISTS audit(
  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, task_id TEXT, kind TEXT NOT NULL, details TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS audit_execution_stages ON audit(task_id,id)
+ WHERE kind IN ('execution.stage_started','execution.stage_finished');
 CREATE TABLE IF NOT EXISTS calls(
  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, platform TEXT NOT NULL,
  operation TEXT NOT NULL, status TEXT NOT NULL, duration_ms INTEGER NOT NULL, task_id TEXT,

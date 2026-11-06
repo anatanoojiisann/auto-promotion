@@ -586,10 +586,14 @@ class TaskChannelRouter:
 
     def prepare(self, job):
         from .channel_decisions import audit_route
+        from .execution_timing import stage
 
         try:
-            context, cloud = self._prepare(job)
+            with stage(self.engine, job["task_id"], "account_control", job_id=job["id"]):
+                context, cloud = self._prepare(job)
         except Exception as exc:
+            if isinstance(exc, CloudUnavailable):
+                exc.account_control_failure = True
             self.store.audit_best_effort(
                 "execution.channel_failed",
                 {

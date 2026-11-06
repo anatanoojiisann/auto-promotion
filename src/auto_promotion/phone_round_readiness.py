@@ -2,7 +2,8 @@
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, wait
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from .account_blocks import active_block
 from .cloud_control import CloudUnavailable
@@ -108,8 +109,9 @@ def _member_blockers(engine, member, now, service, remote):
 FLEET_CHECK_SECONDS = 15
 
 
-def preflight(rounds, round_id, *, platforms=None):
+def preflight(rounds, round_id, *, platforms=None, on_members=None):
     engine, store, now = rounds.engine, rounds.store, rounds.clock()
+    started = time.monotonic()
     snapshot = rounds.get(round_id)
     selected = set(snapshot["selected_platforms"])
     if platforms is not None and (not platforms or not set(platforms) <= selected):
@@ -125,8 +127,9 @@ def preflight(rounds, round_id, *, platforms=None):
         common.append("PooledRuntimeRequired")
     # Resolve local control before spending time on remote capability checks.
     # Each member owns its failures; a bad account never hides healthy peers.
-    controls, control_errors = {}, {}
+    controls, control_errors, control_seconds = {}, {}, {}
     for member in scoped:
+        control_start = time.monotonic()
         task = store.one("SELECT policy FROM tasks WHERE id=?", (member["task_id"],))
         item = store.one("SELECT account_id FROM items WHERE id=?", (member["item_id"],))
         try:
@@ -139,6 +142,7 @@ def preflight(rounds, round_id, *, platforms=None):
             control_errors[member["task_id"]] = safe_channel_code(str(exc))
         except Exception:
             control_errors[member["task_id"]] = "PhoneControlReadinessUnavailable"
+        control_seconds[member["task_id"]] = max(0, time.monotonic() - control_start)
     sources, platform_services = {}, {}
     for member in scoped:
         service = getattr(
@@ -149,40 +153,82 @@ def preflight(rounds, round_id, *, platforms=None):
         platform_services[member["platform"]] = service
         if service is not None and not common and member["task_id"] not in control_errors:
             sources[id(service)] = service
+    members, completed = [], set()
+
+    def publish(selected_members, remote):
+        batch = []
+        for member in selected_members:
+            identifier = member["task_id"]
+            if identifier in completed:
+                continue
+            service = platform_services[member["platform"]]
+            try:
+                if identifier in control_errors:
+                    reasons = [control_errors[identifier]]
+                elif common:
+                    reasons = []
+                else:
+                    reasons = _member_blockers(engine, member, rounds.clock(), service, remote)
+            except Exception:
+                reasons = ["PhoneMemberReadinessUnavailable"]
+            value = {
+                "platform": member["platform"],
+                "task_id": identifier,
+                "ready": not reasons and not common,
+                "account_control": controls.get(identifier),
+                "blockers": common + list(dict.fromkeys(reasons)),
+                "checked_at": rounds.clock(),
+                "timing": {
+                    "control_seconds": control_seconds[identifier],
+                    "preflight_seconds": max(0, time.monotonic() - started),
+                },
+            }
+            completed.add(identifier)
+            batch.append(value)
+            members.append(value)
+        if batch and on_members:
+            on_members(batch)
+
+    # Known local failures are reported immediately, with no remote work.
+    publish(
+        [
+            m
+            for m in scoped
+            if common
+            or m["task_id"] in control_errors
+            or id(platform_services[m["platform"]]) not in sources
+        ],
+        {},
+    )
     pool = ThreadPoolExecutor(max_workers=2)
     try:
-        futures = {key: pool.submit(_fleet_capabilities, value) for key, value in sources.items()}
-        done, _ = wait(futures.values(), timeout=FLEET_CHECK_SECONDS)
-        fleet = {
-            key: f.result()
-            if f in done
-            else {"software_ready": False, "reason": "PhoneFleetReadinessTimeout"}
-            for key, f in futures.items()
+        futures = {
+            pool.submit(_fleet_capabilities, service): key for key, service in sources.items()
         }
+        deadline = time.monotonic() + FLEET_CHECK_SECONDS
+        pending = set(futures)
+        while pending:
+            done, pending = wait(
+                pending, timeout=max(0, deadline - time.monotonic()), return_when=FIRST_COMPLETED
+            )
+            for future in done:
+                key = futures[future]
+                publish(
+                    [m for m in scoped if id(platform_services[m["platform"]]) == key],
+                    future.result(),
+                )
+            if not done:
+                break
+        for future in pending:
+            key = futures[future]
+            publish(
+                [m for m in scoped if id(platform_services[m["platform"]]) == key],
+                {"software_ready": False, "reason": "PhoneFleetReadinessTimeout"},
+            )
     finally:
-        # These calls only fetch metadata and have their own HTTP timeouts.
+        # Never abandon an external submit: these futures only read capabilities.
         pool.shutdown(wait=False, cancel_futures=True)
-    members = []
-    for member in scoped:
-        service = platform_services[member["platform"]]
-        try:
-            if member["task_id"] in control_errors:
-                reasons = [control_errors[member["task_id"]]]
-            elif common:
-                reasons = []
-            else:
-                reasons = _member_blockers(engine, member, now, service, fleet.get(id(service), {}))
-        except Exception:
-            reasons = ["PhoneMemberReadinessUnavailable"]
-        members.append(
-            {
-                "platform": member["platform"],
-                "task_id": member["task_id"],
-                "ready": not reasons and not common,
-                "account_control": controls.get(member["task_id"]),
-                "blockers": common + list(dict.fromkeys(reasons)),
-            }
-        )
+    members.sort(key=lambda m: m["platform"])
     return {
         "round_id": round_id,
         "observed_at": now,

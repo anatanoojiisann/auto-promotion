@@ -244,6 +244,10 @@ class JobQueue:
     def _put(self, kind, reference, task, account, route, version, due, expires):
         now = self.clock()
         with self.store.connect(write=True) as db:
+            from .execution_waits import round_cutoff
+
+            if kind == "send":
+                expires = round_cutoff(db, task["id"], expires)
             before = db.total_changes
             db.execute(
                 "INSERT OR IGNORE INTO execution_jobs(id,kind,reference_id,task_id,account_id,pool,route,version,available_at,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -265,7 +269,20 @@ class JobQueue:
             return int(db.total_changes != before)
 
     def recover(self):
+        from .execution_waits import refresh_control_waits
+
         now = self.clock()
+        if self.store.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_round_members'"):
+            cutoff_sql = ("SELECT j.id,r.submit_deadline FROM execution_jobs j "
+                          "JOIN phone_round_members m ON m.task_id=j.task_id "
+                          "JOIN phone_rounds r ON r.id=m.round_id WHERE j.kind='send' "
+                          "AND j.state='pending' AND r.submit_deadline<j.expires_at")
+            if self.store.one(cutoff_sql + " LIMIT 1"):
+                with self.store.connect(write=True) as db:
+                    for row in db.execute(cutoff_sql).fetchall():
+                        db.execute("UPDATE execution_jobs SET expires_at=? WHERE id=? AND state='pending' AND expires_at>?",
+                                   (row["submit_deadline"], row["id"], row["submit_deadline"]))
+        refresh_control_waits(self)
         terminal = ",".join("?" for _ in WRITE_TERMINAL)
         query = (
             "SELECT j.* FROM execution_jobs j LEFT JOIN items i "
@@ -668,13 +685,27 @@ class JobQueue:
                     if deferred:
                         delay = max(delay, deferred["eligibility_retry_at"])
                 state = "pending"
+            result = {"error_type": type(error).__name__} if error else {}
+            if state == "pending" and source and not source["attempted"]:
+                from .execution_waits import retry_result
+
+                retry = retry_result(db, current, error, now)
+                if retry:
+                    retry_at, result = retry
+                    delay = max(delay, retry_at)
+            delay = min(delay, current["expires_at"])
+            wait_state = result.get("control_wait")
+            if wait_state and wait_state["waiting_for"] == "retry":
+                wait_state["retry_at"] = delay if delay < current["expires_at"] else None
+                if wait_state["retry_at"] is None:
+                    wait_state["waiting_for"] = "deadline"
             db.execute(
                 "UPDATE execution_jobs SET state=?,available_at=?,owner=NULL,lease_until=0,updated_at=?,result=? WHERE id=? AND owner=?",
                 (
                     state,
                     delay,
                     now,
-                    canonical({"error_type": type(error).__name__} if error else {}),
+                    canonical(result),
                     job["id"],
                     job["owner"],
                 ),
@@ -702,6 +733,15 @@ class JobQueue:
             cloud_value["task_scope"] = task_scope_health(self.engine, task_id)
         return {
             "jobs": rows,
+            "control_waits": self.store.rows(
+                "SELECT id job_id,task_id,account_id,pool,expires_at,"
+                "json_extract(result,'$.control_wait.reason') reason,"
+                "json_extract(result,'$.control_wait.waiting_for') waiting_for,"
+                "json_extract(result,'$.control_wait.failures') failures,"
+                "json_extract(result,'$.control_wait.first_failed_at') first_failed_at,"
+                "json_extract(result,'$.control_wait.retry_at') retry_at "
+                "FROM execution_jobs WHERE state='pending' AND json_type(result,'$.control_wait')='object'"
+                + (" AND task_id=?" if task_id else ""), (task_id,) if task_id else ()),
             "account_channels": self.store.rows(
                 "SELECT account_id,channel,state,until_at,task_id,error,retry_at FROM account_task_channels"
             ),

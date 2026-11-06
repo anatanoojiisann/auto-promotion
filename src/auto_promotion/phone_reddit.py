@@ -136,6 +136,13 @@ class PhoneReddit:
         return response.json()
 
     def dispatch(self, request, operation_id, account_id, item_id=None):
+        from .execution_timing import stage
+
+        with stage(self.engine, request.business_task_id, "phone_" + request.operation,
+                   operation_id=operation_id, item_id=item_id):
+            return self._dispatch(request, operation_id, account_id, item_id)
+
+    def _dispatch(self, request, operation_id, account_id, item_id=None):
         """Persist intent before create; an uncertain POST is only looked up thereafter."""
         from phone_fleet_protocol import ExecutionSnapshot, fingerprint
 
@@ -147,12 +154,16 @@ class PhoneReddit:
 
         # Do not create an intent or POST a command against a different protocol.
         if not self.store.one(f"SELECT id FROM {table} WHERE id=?", (operation_id,)):
+            if time.time() >= request.deadline:
+                raise Conflict("PhoneExecutionDeadlineElapsed")
             require_capabilities(self.request("GET", "/capabilities"), request.operation)
         with self.store.connect(write=True) as db:
             old = db.execute(f"SELECT * FROM {table} WHERE id=?", (operation_id,)).fetchone()
             if old and json.loads(old["request"]) != value:
                 raise Conflict("PhoneRedditImmutableRequestChanged")
             if not old:
+                if time.time() >= request.deadline:
+                    raise Conflict("PhoneExecutionDeadlineElapsed")
                 db.execute(f"INSERT INTO {table}(id,account_id,item_id,kind,request,phase,created_at) VALUES(?,?,?,?,?,'dispatching',?)",
                            (operation_id, account_id, item_id, request.operation, canonical(value), time.time()))
         try:
@@ -166,18 +177,30 @@ class PhoneReddit:
                         "operation": request.operation}))
             else:
                 snapshot = self.request("POST", "/executions", value, operation_id)
-            until = min(time.time() + 100, request.deadline)
+            until = time.monotonic() + min(100, max(0, request.deadline - time.time()))
+
+            def remaining():
+                return min(until - time.monotonic(), request.deadline - time.time())
+
+            last_saved = old["result"] if old and old["execution_id"] and old["phase"] == "linked" else None
+            poll_delay = 0.2
             while True:
                 checked = ExecutionSnapshot.model_validate(snapshot)
                 if fingerprint(checked.request) != fingerprint(request):
                     raise Conflict("PhoneRedditFleetCorrelationMismatch")
-                with self.store.connect(write=True) as db:
-                    db.execute(f"UPDATE {table} SET execution_id=?,result=?,phase='linked' WHERE id=?",
-                               (checked.id, canonical(snapshot), operation_id))
-                if checked.status in {"succeeded", "failed", "cancelled", "unknown","waiting_for_human"} or time.time() >= until:
+                encoded = canonical(snapshot)
+                if encoded != last_saved:
+                    with self.store.connect(write=True) as db:
+                        db.execute(f"UPDATE {table} SET execution_id=?,result=?,phase='linked' WHERE id=?",
+                                   (checked.id, encoded, operation_id))
+                    last_saved = encoded
+                if checked.status in {"succeeded", "failed", "cancelled", "unknown","waiting_for_human"} or remaining() <= 0:
                     return snapshot
-                time.sleep(0.2)
+                time.sleep(max(0, min(poll_delay, remaining())))
+                if remaining() <= 0:
+                    return snapshot
                 snapshot = self.request("GET", "/executions/" + checked.id)
+                poll_delay = min(2.0, poll_delay * 2)
         except (httpx.HTTPError, BackendError):
             # No resend, even if lookup is 404 after a lost initial response.
             with self.store.connect(write=True) as db:
@@ -406,6 +429,14 @@ class PhoneReddit:
                 "reason": "PhoneRedditIndependentReceiptRequired"}
 
     def verify(self, account, payload):
+        from .execution_timing import stage
+
+        item = self.store.one("SELECT task_id FROM items WHERE id=?", (payload.get("item_id"),))
+        with stage(self.engine, item["task_id"] if item else None, "receipt_verification",
+                   account_id=account["id"], item_id=payload.get("item_id")):
+            return self._verify(account, payload)
+
+    def _verify(self, account, payload):
         from phone_fleet_protocol import ExecutionRequest
         item_id = payload.get("item_id")
         row = self.store.one("SELECT * FROM phone_reddit_operations WHERE item_id=? AND kind='reddit_submit' ORDER BY created_at DESC LIMIT 1", (item_id,))
