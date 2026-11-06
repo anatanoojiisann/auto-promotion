@@ -247,6 +247,8 @@ def test_synthetic_verified_native_receipt_finishes_original_item_once(pilot):
 
 def test_worker_configuration_is_explicit_and_bound_to_one_database(pilot, tmp_path):
     s = pilot
+    s.monkeypatch.setenv("AP_PHONE_PRIVATE_DIR", str(tmp_path))
+    s.monkeypatch.setattr("auto_promotion.phone_private.private_directory_is_safe", lambda _: True)
     config = s.service.worker_config()
     s.monkeypatch.setenv("AP_PHONE_REDDIT_CONFIG", config)
     another = Engine(Store(tmp_path / "other.db"), AdapterRegistry(tmp_path))

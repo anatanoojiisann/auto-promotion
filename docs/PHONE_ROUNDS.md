@@ -190,3 +190,5 @@ The authenticated `POST /api/phone-social/accounts/{account_id}/telegram-target`
 在本地整合提交 `a217ba9` 上接收 `8dac2cd`：手机轮次可选 1–6 个平台，并按平台独立预检、启动和停止；设备动作仍由同一设备控制权串行保护。Telegram 只读观察和发送必须绑定同一个权威数据库与原账号，未知提交保持原任务查询，不自动重发。保留现有 TikTok API、Tabbit 和目标证据校验。
 
 本地回归：手机隔离、原始回执与身份测试 272 passed，另有 17 subtests passed；队列、API/MCP、限额及 TikTok 校验 234 passed、1 skipped、72 subtests passed。跳过项为未启用的隔离浏览器用例。该候选未经正式服务切换或真实发布验收。
+
+Phone pool workers require `AP_PHONE_PRIVATE_DIR` to name an existing absolute directory protected for the current user and SYSTEM (on Windows, inheritance must be disabled). Their database-bound temporary configuration is written only there. If that directory is missing or unsafe, the affected phone pool stays blocked while unrelated pools continue.

@@ -123,20 +123,9 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         engine.adapters.phone_social = self
 
     def worker_config(self):
-        import os
+        from .phone_private import write_worker_config
 
-        path = Path(self.store.path).parent / "phone-social-worker.private.json"
-        value = self.config.model_dump(mode="json")
-        for name in ("service_token", "runtime_token", "oauth_client_secret", "reddit_read_access_token"):
-            secret = getattr(self.config, name)
-            if secret is not None:
-                value[name] = secret.get_secret_value()
-        temporary = path.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            os.chmod(temporary, 0o600)
-            json.dump({"database": str(Path(self.store.path).resolve()), "config": value}, stream)
-        temporary.replace(path)
-        return str(path)
+        return write_worker_config(self.store.path, self.config, "social")
 
     def binding(self, account_id):
         account = self.engine.account(account_id)

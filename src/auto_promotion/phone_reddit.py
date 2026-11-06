@@ -98,23 +98,9 @@ class PhoneReddit:
         return account, binding
 
     def worker_config(self):
-        import os
-        from pathlib import Path
+        from .phone_private import write_worker_config
 
-        path = Path(self.store.path).parent / "phone-reddit-worker.private.json"
-        value = self.config.model_dump(mode="json")
-        value["service_token"] = self.config.service_token.get_secret_value()
-        value["runtime_token"] = self.config.runtime_token.get_secret_value()
-        if self.config.oauth_client_secret:
-            value["oauth_client_secret"] = self.config.oauth_client_secret.get_secret_value()
-        if self.config.reddit_read_access_token:
-            value["reddit_read_access_token"] = self.config.reddit_read_access_token.get_secret_value()
-        temporary = path.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            os.chmod(temporary, 0o600)
-            json.dump({"database": str(Path(self.store.path).resolve()), "config": value}, stream)
-        temporary.replace(path)
-        return str(path)
+        return write_worker_config(self.store.path, self.config, "reddit")
 
     def fleet_token(self):
         if not self.config.oauth_issuer:

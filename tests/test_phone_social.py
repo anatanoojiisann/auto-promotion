@@ -178,6 +178,8 @@ def test_registration_preserves_an_existing_other_connection(pilot):
 
 def test_worker_config_is_database_bound_and_opt_in(pilot):
     s = pilot
+    s.monkeypatch.setenv("AP_PHONE_PRIVATE_DIR", str(s.root))
+    s.monkeypatch.setattr("auto_promotion.phone_private.private_directory_is_safe", lambda _: True)
     s.monkeypatch.setenv("AP_PHONE_SOCIAL_CONFIG", s.service.worker_config())
     other = Engine(Store(s.root / "other.db"), AdapterRegistry(s.root))
     with pytest.raises(Conflict, match="DatabaseMismatch"):

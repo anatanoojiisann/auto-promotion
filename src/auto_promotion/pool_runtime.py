@@ -164,13 +164,22 @@ class PoolScheduler:
                 ]
                 phone_env = {}
                 if pool.endswith(".phone"):
-                    # Never inherit another App's private runtime config into a pool.
+                    # A broken phone configuration must not hold other platform pools.
                     phone_env = {k: v for k, v in os.environ.items()
                                  if k not in {"AP_PHONE_REDDIT_CONFIG", "AP_PHONE_SOCIAL_CONFIG"}}
                     service = getattr(self.engine.adapters,
                         "phone_reddit" if pool == "reddit.phone" else "phone_social", None)
-                    if service:
+                    try:
+                        if service is None:
+                            raise RuntimeError("Phone worker service unavailable")
                         phone_env["AP_PHONE_REDDIT_CONFIG" if pool == "reddit.phone" else "AP_PHONE_SOCIAL_CONFIG"] = service.worker_config()
+                    except Exception as exc:
+                        for handle in handles:
+                            handle.close()
+                        self.engine.store.audit_best_effort(
+                            "pool.phone_config_unavailable", {"pool": pool, "error_type": type(exc).__name__}
+                        )
+                        continue
                 child = self.popen(
                     argv,
                     cwd=Path(__file__).resolve().parents[2],
