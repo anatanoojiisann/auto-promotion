@@ -438,15 +438,23 @@ export class ControlKernel {
         );
       }
       for (const [jobIndex, j] of snapshot.jobs.entries()) {
+        const taskRow = this.one("SELECT payload FROM tasks WHERE id=?", j.task_id);
+        const accountRow = this.one("SELECT id,platform FROM accounts WHERE id=?", j.account_id);
+        const taskPolicy = taskRow ? JSON.parse(taskRow.payload).policy : null;
+        // Track phone jobs only for explicitly local phone tasks. They remain
+        // outside POOLS so a cloud node cannot register or claim them.
+        const localPhoneJob = accountRow && PLATFORMS.has(accountRow.platform) &&
+          j.pool === accountRow.platform + ".phone" &&
+          taskPolicy?.execution_channel === "local" && taskPolicy?.execution_method === "phone";
         if (
           !j.id ||
-          !POOLS.has(j.pool) ||
+          (!POOLS.has(j.pool) && !localPhoneJob) ||
           !["send", "join"].includes(j.kind) ||
           !j.version ||
           !Number.isFinite(j.available_at) ||
           !Number.isFinite(j.expires_at) ||
-          !this.one("SELECT id FROM tasks WHERE id=?", j.task_id) ||
-          !this.one("SELECT id FROM accounts WHERE id=?", j.account_id)
+          !taskRow ||
+          !accountRow
         )
           throw new ControlError("InvalidJob", 400);
         const prior = this.one("SELECT * FROM jobs WHERE id=?", j.id);

@@ -1014,3 +1014,44 @@ test("lost authorize response stays unknown after expiry and cannot enter any re
   assert.throws(()=>f.k.complete(node,lease.id,lease.lease_token,{state:"pending",attempt_id:"lost-authorize-attempt"}),/AttemptCannotReplay/);
   assert.throws(()=>f.k.authorize(node,lease.id,lease.lease_token,"second-attempt"),/LeaseExpired/);
 });
+
+test("local phone jobs synchronize for all Apps without allowing cloud claims", () => {
+  const f = fixture();
+  f.seed({ id: "existing", pool: "x.edge", account: "existing-account" });
+  f.seed({ id: "old-unknown", pool: "x.edge", account: "other-account", state: "unknown" });
+  const node = f.node("desktop-node", ["existing-account"], ["x.edge"]);
+  const settings = JSON.stringify(f.k.settings());
+  for (const platform of ["telegram", "instagram", "facebook", "x", "reddit", "tiktok", "discord"]) {
+    const id = "phone-" + platform;
+    const account = "account-" + platform;
+    const pool = platform + ".phone";
+    f.seed({ id, account, pool, identity: platform + ":" + account,
+      policy: { execution_channel: "local", execution_method: "phone" } });
+    assert.equal(f.k.one("SELECT pool FROM jobs WHERE id=?", "send:" + id).pool, pool);
+    assert.equal(POOLS.has(pool), false);
+    assert.throws(() => f.k.registerNode({ id: "unsafe-" + platform, token_hash: "a".repeat(64),
+      pools: [pool], account_ids: [account] }), /InvalidNode/);
+  }
+  // The cloud may coordinate ownership, but it cannot execute this phone job.
+  const phoneNode = f.node("phone-coordinator", ["account-telegram"], ["telegram.mtproto"]);
+  const handoff = f.k.setAccountChannel({ account_id: "account-telegram", channel: "local",
+    generation: "b".repeat(32), until: 1800000600, node_id: "phone-coordinator",
+    task_id: "t-phone-telegram", store_id: "phone-store", expected_generation: null });
+  assert.equal(handoff.channel.channel, "local");
+  assert.equal(f.k.claim(phoneNode, "telegram.mtproto"), null);
+  assert.equal(JSON.stringify(f.k.settings()), settings);
+  assert.equal(f.k.one("SELECT state FROM jobs WHERE id=?", "send:old-unknown").state, "unknown");
+  assert.equal(f.k.claim(node, "x.edge").id, "send:existing");
+});
+
+test("phone job synchronization rejects cloud routes, missing phone intent, and mismatched platform", () => {
+  const policy = { execution_channel: "local", execution_method: "phone" };
+  assert.throws(() => fixture().seed({ id: "cloud", pool: "telegram.phone",
+    policy: { ...policy, execution_channel: "cloud" } }), /InvalidJob/);
+  assert.throws(() => fixture().seed({ id: "api", pool: "telegram.phone",
+    policy: { ...policy, execution_method: "api" } }), /InvalidJob/);
+  const f = fixture();
+  const x = f.seed({ id: "tg", pool: "telegram.phone", identity: "telegram:a", policy });
+  x.j.pool = "instagram.phone";
+  assert.throws(() => f.k.sync(x.snapshot), /InvalidJob/);
+});
