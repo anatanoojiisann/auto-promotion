@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS execution_jobs(
 );
 CREATE INDEX IF NOT EXISTS execution_jobs_due ON execution_jobs(pool,state,available_at);
 CREATE INDEX IF NOT EXISTS execution_jobs_task ON execution_jobs(task_id);
+-- An older process may still sync the same task while it is being upgraded.
+-- Ignore its wrong route; a current worker can still enqueue the correct job.
+CREATE TRIGGER IF NOT EXISTS phone_send_route_fence BEFORE INSERT ON execution_jobs
+ WHEN NEW.kind='send' AND EXISTS (
+ SELECT 1 FROM tasks t JOIN accounts a ON a.id=NEW.account_id
+ WHERE t.id=NEW.task_id AND a.mode='live'
+ AND json_extract(t.policy,'$.execution_method')='phone'
+ AND NEW.pool != a.platform || '.phone'
+ )
+ BEGIN SELECT RAISE(IGNORE); END;
 CREATE TABLE IF NOT EXISTS pool_workers(
  id TEXT PRIMARY KEY,pool TEXT NOT NULL,node_id TEXT NOT NULL,pid INTEGER NOT NULL,
  started_at REAL NOT NULL,heartbeat_at REAL NOT NULL,state TEXT NOT NULL,reason TEXT

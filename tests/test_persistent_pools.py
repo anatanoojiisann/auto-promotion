@@ -131,6 +131,33 @@ class PersistentPoolTests(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT COUNT(*) n FROM attempts")["n"], 0)
         self.assertEqual(self.store.one("SELECT COUNT(*) n FROM execution_jobs")["n"], 1)
 
+    def test_older_process_cannot_enqueue_a_phone_task_to_the_desktop_pool(self):
+        task, account = self.ready()
+        now = self.engine.clock()
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE accounts SET mode='live' WHERE id=?", (account["id"],))
+            db.execute(
+                "UPDATE tasks SET policy=json_set(policy,'$.execution_method','phone') WHERE id=?",
+                (task["id"],),
+            )
+            sql = ("INSERT OR IGNORE INTO execution_jobs(id,kind,reference_id,task_id,account_id,"
+                   "pool,route,version,available_at,expires_at,created_at,updated_at) "
+                   "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            def put(key, pool):
+                db.execute(sql, (key, "send", key, task["id"], account["id"], pool, "{}", "1",
+                                 now, now + 60, now, now))
+            put("wrong-phone-route", "x.playwright")
+            put("correct-phone-route", "x.phone")
+            db.execute(
+                "UPDATE tasks SET policy=json_set(policy,'$.execution_method','inherit') WHERE id=?",
+                (task["id"],),
+            )
+            put("ordinary-desktop-route", "x.playwright")
+            found = {r[0] for r in db.execute(
+                "SELECT id FROM execution_jobs WHERE id IN ('wrong-phone-route','correct-phone-route','ordinary-desktop-route')"
+            )}
+        self.assertEqual(found, {"correct-phone-route", "ordinary-desktop-route"})
+
     def test_phone_configuration_failure_does_not_block_another_pool(self):
         from types import SimpleNamespace
         from unittest.mock import Mock, patch
