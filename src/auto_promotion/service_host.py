@@ -101,7 +101,15 @@ class ServiceHost:
         launch=None,
         clock=time.time,
         reports_only=False,
+        phone_social_config=None,
+        phone_reddit_config=None,
+        phone_rounds=False,
     ):
+        if reports_only and (phone_social_config or phone_reddit_config or phone_rounds):
+            raise ValueError("The reporting service cannot enable phone execution")
+        self.phone_social_config = Path(phone_social_config) if phone_social_config else None
+        self.phone_reddit_config = Path(phone_reddit_config) if phone_reddit_config else None
+        self.phone_rounds = phone_rounds
         self.store, self.port, self.log = store, port, log
         self.probe, self.occupied, self.process, self.clock = probe, occupied, process, clock
         self.launch = launch or self._launch
@@ -134,6 +142,12 @@ class ServiceHost:
             "--port",
             str(self.port),
         ]
+        if self.phone_social_config is not None:
+            argv.extend(["--phone-social-config", str(self.phone_social_config)])
+        if self.phone_reddit_config is not None:
+            argv.extend(["--phone-reddit-config", str(self.phone_reddit_config)])
+        if self.phone_rounds:
+            argv.append("--phone-rounds")
         env = None
         if self.reports_only:
             argv.append("--reports-only")
@@ -235,7 +249,14 @@ def main():
     parser.add_argument("--port", type=int, default=8780)
     parser.add_argument("--interval", type=float, default=10)
     parser.add_argument("--reports-only", action="store_true")
+    parser.add_argument("--phone-social-config", type=Path)
+    parser.add_argument("--phone-reddit-config", type=Path)
+    parser.add_argument("--phone-rounds", action="store_true")
     args = parser.parse_args()
+    if args.reports_only and (
+        args.phone_social_config or args.phone_reddit_config or args.phone_rounds
+    ):
+        parser.error("The reporting service cannot enable phone execution")
     if os.name != "nt":
         parser.error("This service host is installed through Windows Task Scheduler")
     repo = Path(__file__).resolve().parents[2]
@@ -267,7 +288,15 @@ def main():
     log = logging.getLogger(service_name)
     log.setLevel(logging.INFO)
     log.addHandler(handler)
-    host = ServiceHost(Store(args.db.resolve()), args.port, log, reports_only=args.reports_only)
+    host = ServiceHost(
+        Store(args.db.resolve()),
+        args.port,
+        log,
+        reports_only=args.reports_only,
+        phone_social_config=args.phone_social_config,
+        phone_reddit_config=args.phone_reddit_config,
+        phone_rounds=args.phone_rounds,
+    )
     host.event("host_started", pid=os.getpid(), host="windows_task_scheduler")
     kernel.SetThreadExecutionState.argtypes = [wintypes.DWORD]
     kernel.SetThreadExecutionState.restype = wintypes.DWORD

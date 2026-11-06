@@ -3,7 +3,7 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from auto_promotion.service_host import ServiceHost, imminent_work
 from auto_promotion.store import Store
@@ -103,6 +103,55 @@ class ServiceHostTests(unittest.TestCase):
 
     def test_no_idle_sleep_request_when_no_pending_items(self):
         self.assertFalse(imminent_work(self.store, 1800000000))
+
+    def test_sender_supervisor_preserves_explicit_phone_config_on_every_restart(self):
+        config = Path(self.temp.name) / "private-phone-config.json"
+        reddit_config = Path(self.temp.name) / "private-reddit-config.json"
+        host = ServiceHost(
+            self.store,
+            8780,
+            logging.getLogger("test-service-phone"),
+            phone_social_config=config,
+            phone_reddit_config=reddit_config,
+            phone_rounds=True,
+        )
+        try:
+            with patch("auto_promotion.service_host.subprocess.Popen") as popen:
+                host._launch()
+                argv = popen.call_args.args[0]
+                self.assertEqual(argv[argv.index("--phone-social-config") + 1], str(config))
+                self.assertEqual(argv[argv.index("--phone-reddit-config") + 1], str(reddit_config))
+                self.assertIn("--phone-rounds", argv)
+                self.assertIsNone(popen.call_args.kwargs["env"])
+        finally:
+            for handle in host.log_handles:
+                handle.close()
+
+    def test_reporting_supervisor_refuses_phone_execution(self):
+        with self.assertRaises(ValueError):
+            ServiceHost(
+                self.store,
+                8782,
+                logging.getLogger("test-report"),
+                reports_only=True,
+                phone_social_config="private.json",
+            )
+        with self.assertRaises(ValueError):
+            ServiceHost(
+                self.store,
+                8782,
+                logging.getLogger("test-report"),
+                reports_only=True,
+                phone_reddit_config="private-reddit.json",
+            )
+        with self.assertRaises(ValueError):
+            ServiceHost(
+                self.store,
+                8782,
+                logging.getLogger("test-report"),
+                reports_only=True,
+                phone_rounds=True,
+            )
 
 
 if __name__ == "__main__":
