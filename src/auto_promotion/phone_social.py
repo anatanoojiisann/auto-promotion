@@ -184,6 +184,48 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             return None
         return binding
 
+    def shared_account_binding(self, account, profile=None):
+        """Use a verified existing account on an explicit phone task without replacing its profile."""
+        if account.get("platform") == "telegram":
+            return self.shared_telegram_binding(account, profile)
+        platform = account.get("platform")
+        binding = self.config.bindings.get(account.get("id"))
+        if account.get("mode") != "live" or not binding or binding.platform != platform:
+            return None
+        if profile is None:
+            try:
+                profile = read_profile(platform, account["backend_label"])
+            except BackendError:
+                return None
+        connection = profile.get("connection_type")
+        supported = (
+            platform in {"instagram", "facebook"} and connection == "meta_desktop"
+            or platform == "tiktok" and connection == "tiktok_desktop"
+            or platform == "x" and connection in (None, "x_api")
+        )
+        if not supported:
+            return None
+        if platform == "x" and connection is None and profile.get("browser_channel", "chromium") not in {
+            "chromium", "chrome", "msedge", "tabbit", "browser_use"
+        }:
+            return None
+        stored = profile.get("identity")
+        if not isinstance(stored, str) or not stored or not account.get("identity_hash"):
+            return None
+        if digest([platform, stored]) != account["identity_hash"]:
+            return None
+        from phone_fleet_protocol.social import SocialIdentity
+
+        try:
+            SocialIdentity(platform=platform, identity=binding.identity, client_id=binding.client_id)
+        except ValueError:
+            return None
+        stored_identity = stored.casefold() if platform == "facebook" else stored.lstrip("@").casefold()
+        bound_identity = binding.identity.casefold() if platform == "facebook" else binding.identity.lstrip("@").casefold()
+        if stored_identity != bound_identity:
+            return None
+        return binding
+
     def register(self, account_id, context=None):
         account, binding = self.binding(account_id)
         previous = {}
@@ -195,7 +237,7 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 raise
         else:
             if previous.get("connection_type") != "phone_fleet":
-                shared = bool(self.shared_telegram_binding(account, previous))
+                shared = bool(self.shared_account_binding(account, previous))
                 if not shared:
                     raise Conflict("PhoneSocialExistingConnectionPreserved")
             else:
