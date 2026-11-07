@@ -5,6 +5,8 @@ import logging
 import re
 import sqlite3
 import time
+import os
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -408,6 +410,8 @@ class Store:
         from .queue_store import bind_connection
 
         bind_connection(db)
+        acquired = None
+        started = time.monotonic()
         try:
             deadline = (
                 time.monotonic()
@@ -450,6 +454,7 @@ class Store:
                         min(self.lock_retry_delays[attempt], max(0, deadline - time.monotonic()))
                     )
             db.execute(f"PRAGMA busy_timeout={int(self.lock_timeout * 1000)}")
+            acquired = time.monotonic()
             yield db
             if write:
                 db.commit()
@@ -458,7 +463,19 @@ class Store:
                 db.rollback()
             raise
         finally:
+            ended = time.monotonic()
             db.close()
+            waited = (acquired or ended) - started
+            held = ended - acquired if acquired is not None else 0
+            if write and (waited >= 0.1 or held >= 0.25):
+                callers = [f for f in traceback.extract_stack(limit=12)
+                           if "auto_promotion" in f.filename and f.name != "connect"]
+                caller = callers[-1] if callers else None
+                logging.getLogger(__name__).warning("database_transaction %s", json.dumps({
+                    "pid": os.getpid(), "wait_seconds": round(waited, 3),
+                    "hold_seconds": round(held, 3), "acquired": acquired is not None,
+                    "operation": caller.name if caller else "unknown",
+                    "module": Path(caller.filename).name if caller else "unknown"}))
 
     def rows(self, sql, params=()):
         with self.connect() as db:

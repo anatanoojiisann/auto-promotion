@@ -1,4 +1,4 @@
-"""Bounded readiness metadata and reviewed candidates. Never navigates or submits."""
+"""Read-only readiness, with explicit-start identity refresh through owned operations."""
 
 import json
 import re
@@ -10,7 +10,7 @@ from .cloud_control import CloudUnavailable
 from .core import Conflict, NotFound
 from .models import digest, epoch
 from .phone_protocol import capability_status
-from .phone_rounds import TOTAL_SECONDS
+from .phone_rounds import TOTAL_SECONDS, PREFLIGHT_SECONDS
 from .readiness import DELIVERY_GRACE_SECONDS
 from .task_channels import control_preflight, safe_channel_code
 
@@ -25,7 +25,7 @@ def _fleet_capabilities(service):
         return {"software_ready": False, "device_ready": False, "reason": reason}
 
 
-def _member_blockers(engine, member, now, service, remote):
+def _member_blockers(engine, member, now, service, remote, *, refresh_identity=False):
     store = engine.store
     reasons = []
     item = store.one("SELECT * FROM items WHERE id=?", (member["item_id"],))
@@ -72,6 +72,11 @@ def _member_blockers(engine, member, now, service, remote):
         if not authorized:
             reasons.append("PhoneTaskOutsideAuthorizedScope")
         try:
+            if (refresh_identity and not reasons and not service.fresh(account)
+                    and callable(getattr(service, "ensure_identity", None))):
+                from .execution_timing import stage
+                with stage(engine, task["id"], "phone_identity_refresh", account_id=account["id"]):
+                    service.ensure_identity(account["id"], task_id=task["id"])
             if not service.fresh(account):
                 reasons.append("FreshPhoneIdentityRequired")
         except Exception:
@@ -111,7 +116,7 @@ def _member_blockers(engine, member, now, service, remote):
 FLEET_CHECK_SECONDS = 15
 
 
-def preflight(rounds, round_id, *, platforms=None, on_members=None):
+def preflight(rounds, round_id, *, platforms=None, on_members=None, refresh_identity=False):
     engine, store, now = rounds.engine, rounds.store, rounds.clock()
     started = time.monotonic()
     snapshot = rounds.get(round_id)
@@ -157,7 +162,7 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None):
             sources[id(service)] = service
     members, completed = [], set()
 
-    def publish(selected_members, remote):
+    def publish(selected_members, remote, member_reasons=None):
         batch = []
         for member in selected_members:
             identifier = member["task_id"]
@@ -170,7 +175,8 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None):
                 elif common:
                     reasons = []
                 else:
-                    reasons = _member_blockers(engine, member, rounds.clock(), service, remote)
+                    reasons = (member_reasons if member_reasons is not None else
+                               _member_blockers(engine, member, rounds.clock(), service, remote))
             except Exception:
                 reasons = ["PhoneMemberReadinessUnavailable"]
             value = {
@@ -207,23 +213,50 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None):
         futures = {
             pool.submit(_fleet_capabilities, service): key for key, service in sources.items()
         }
-        deadline = time.monotonic() + FLEET_CHECK_SECONDS
+        fleet_deadline = time.monotonic() + FLEET_CHECK_SECONDS
+        deadline = time.monotonic() + (PREFLIGHT_SECONDS - 1 if refresh_identity else FLEET_CHECK_SECONDS)
         pending = set(futures)
         while pending:
+            until = min(deadline, fleet_deadline) if any(
+                not isinstance(futures[f], dict) for f in pending) else deadline
             done, pending = wait(
-                pending, timeout=max(0, deadline - time.monotonic()), return_when=FIRST_COMPLETED
+                pending, timeout=max(0, until - time.monotonic()), return_when=FIRST_COMPLETED
             )
             for future in done:
                 key = futures[future]
-                publish(
-                    [m for m in scoped if id(platform_services[m["platform"]]) == key],
-                    future.result(),
-                )
-            if not done:
+                if isinstance(key, dict):
+                    try:
+                        reasons = future.result()
+                    except Exception:
+                        reasons = ["PhoneMemberIdentityRefreshFailed"]
+                    publish([key], {}, reasons)
+                    continue
+                selected = [m for m in scoped if id(platform_services[m["platform"]]) == key]
+                remote = future.result()
+                if refresh_identity:
+                    for member in selected:
+                        job = pool.submit(_member_blockers, engine, member, rounds.clock(),
+                                          platform_services[member["platform"]], remote,
+                                          refresh_identity=True)
+                        futures[job] = member
+                        pending.add(job)
+                else:
+                    publish(selected, remote)
+            if time.monotonic() >= fleet_deadline:
+                for future in list(pending):
+                    key = futures[future]
+                    if isinstance(key, dict):
+                        continue
+                    pending.remove(future)
+                    future.cancel()
+                    publish([m for m in scoped if id(platform_services[m["platform"]]) == key],
+                            {"reason": "PhoneFleetReadinessTimeout"})
+            if not done and time.monotonic() >= deadline:
                 break
         for future in pending:
             key = futures[future]
             publish(
+                [key] if isinstance(key, dict) else
                 [m for m in scoped if id(platform_services[m["platform"]]) == key],
                 {"software_ready": False, "reason": "PhoneFleetReadinessTimeout"},
             )
@@ -234,7 +267,7 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None):
     return {
         "round_id": round_id,
         "observed_at": now,
-        "read_only": True,
+        "read_only": not refresh_identity,
         "readiness_scope": "account_control_local_configuration_and_authenticated_fleet_capabilities",
         "capability_sources_checked": len(sources),
         "ready_count": sum(m["ready"] for m in members),

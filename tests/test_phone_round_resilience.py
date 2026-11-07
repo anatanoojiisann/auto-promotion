@@ -48,3 +48,63 @@ def test_health_survives_phone_round_error_and_reports_recovery(tmp_path):
             assert status["last_error"] == "OperationalError"
             assert status["last_error_details"]["exception_type"] == "OperationalError"
             assert status["last_success_at"] >= status["last_error_at"]
+
+
+def test_known_failed_member_is_visible_and_other_apps_continue(tmp_path):
+    from tests.test_phone_rounds import make_lab, create, finish
+    lab = make_lab(tmp_path)
+    round_ = create(lab)
+    lab.rounds.start(round_["id"])
+    for _ in lab.ids:
+        lab.rounds.tick()
+    finish(lab, "telegram", outcome="failed_known", verified=False)
+    snapshot = lab.rounds.get(round_["id"])
+    member = next(x for x in snapshot["members"] if x["platform"] == "telegram")
+    assert member["stage"] == "failed_known"
+    assert snapshot["state"] == "running"
+    for platform in ("reddit", "instagram", "facebook", "x", "tiktok"):
+        finish(lab, platform)
+    lab.rounds.tick()
+    snapshot = lab.rounds.get(round_["id"])
+    assert snapshot["state"] == "finished"
+    assert snapshot["finished_at"] < snapshot["deadline"]
+    assert snapshot["confirmed_count"] == 5
+    assert not snapshot["all_members_within_budget"]
+
+
+def test_unknown_outcome_ends_round_without_becoming_success_or_requeued(tmp_path):
+    from tests.test_phone_rounds import make_lab, create, finish
+    lab = make_lab(tmp_path)
+    round_ = create(lab)
+    lab.rounds.start(round_["id"])
+    for _ in lab.ids:
+        lab.rounds.tick()
+    for platform in ("telegram", "reddit", "instagram", "facebook", "x", "tiktok"):
+        finish(lab, platform, outcome="unknown", verified=False)
+    lab.rounds.tick()
+    snapshot = lab.rounds.get(round_["id"])
+    assert snapshot["state"] == "finished"
+    assert all(x["stage"] == "unknown" for x in snapshot["members"])
+    starts = list(lab.calls)
+    lab.rounds.start(round_["id"])
+    lab.rounds.tick()
+    assert lab.calls == starts
+
+
+def test_busy_coordinator_writer_returns_control_within_one_short_wait(tmp_path):
+    import sqlite3
+    import time
+    import pytest
+    from tests.test_phone_rounds import make_lab, create
+    lab = make_lab(tmp_path)
+    round_ = create(lab)
+    lab.rounds.start(round_["id"])
+    with sqlite3.connect(lab.store.path, isolation_level=None) as other:
+        other.execute("BEGIN IMMEDIATE")
+        start = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError):
+            lab.rounds.tick()
+        assert time.monotonic() - start < 0.6
+        other.rollback()
+    lab.rounds.tick()
+    assert lab.calls

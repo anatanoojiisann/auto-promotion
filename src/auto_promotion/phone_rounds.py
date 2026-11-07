@@ -238,7 +238,7 @@ class PhoneRounds:
     @classmethod
     def _sync_state(cls, db, round_id, now):
         row = cls._round(db, round_id)
-        if row["state"] in {"stopped", "completed", "expired"}:
+        if row["state"] in {"stopped", "completed", "finished", "expired"}:
             return
         states = {
             m[0]
@@ -270,7 +270,7 @@ class PhoneRounds:
             selected = {m["platform"] for m in members}
             if platform is not None and platform not in selected:
                 raise NotFound("PhoneRoundPlatformNotSelected")
-            if row["state"] in {"completed", "expired", "stopped"}:
+            if row["state"] in {"completed", "finished", "expired", "stopped"}:
                 return None
             if not self._scope_intact(row, members):
                 raise Conflict("PhoneRoundManifestChanged")
@@ -351,7 +351,8 @@ class PhoneRounds:
                         final=False,
                     )
 
-                snapshot = checker(self, round_id, platforms=scope, on_members=completed)
+                snapshot = checker(self, round_id, platforms=scope, on_members=completed,
+                                   refresh_identity=True)
             else:
                 snapshot = (
                     checker(self, round_id)
@@ -396,7 +397,7 @@ class PhoneRounds:
                 blockers.append("PhoneRoundSubmissionDeadlineElapsed")
             if finished >= row["deadline"]:
                 blockers.append("PhoneRoundDeadlineElapsed")
-            if row["state"] in {"stopped", "completed", "expired"}:
+            if row["state"] in {"stopped", "completed", "finished", "expired"}:
                 blockers.append("PhoneRoundNotRunning")
             by_platform = {m["platform"]: m for m in snapshot["members"]}
             for app in sorted(scope):
@@ -469,7 +470,7 @@ class PhoneRounds:
             if not member:
                 raise NotFound("PhoneRoundPlatformNotSelected")
             if (
-                row["state"] not in {"completed", "expired", "stopped"}
+                row["state"] not in {"completed", "finished", "expired", "stopped"}
                 and member["state"] != "stopped"
             ):
                 db.execute(
@@ -548,6 +549,8 @@ class PhoneRounds:
                 if verified
                 else "unknown"
                 if m["item_status"] == "unknown"
+                else m["item_status"]
+                if m["item_status"] in {"failed_known", "cancelled", "missed"}
                 else "executing"
                 if m["item_status"] == "executing"
                 else "blocked"
@@ -641,6 +644,7 @@ class PhoneRounds:
                 "stored_state": row["state"],
                 "created_at": row["created_at"],
                 "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
                 "submit_deadline": row["submit_deadline"],
                 "deadline": row["deadline"],
                 "elapsed_seconds": elapsed,
@@ -680,20 +684,51 @@ class PhoneRounds:
             return
         now, chosen = self.clock(), None
         repair = []
-        with self.store.connect(write=True) as db:
-            rounds = db.execute(
+        # Inspect unchanged waiting rounds without holding the database writer.
+        with self.store.connect() as db:
+            candidates = db.execute(
                 "SELECT * FROM phone_rounds WHERE state IN ('checking','running','blocked') ORDER BY started_at,id"
             ).fetchall()
-            for row in rounds:
+            due = []
+            for row in candidates:
                 members = self._members(db, row, now)
+                terminal = all(m["stage"] in {"confirmed", "failed_known", "unknown", "cancelled", "missed"}
+                               for m in members)
+                pending = db.execute(
+                    "SELECT 1 FROM phone_round_members WHERE round_id=? AND "
+                    "(state='pending' OR (state='starting' AND start_lease_until<=?)) LIMIT 1",
+                    (row["id"], now)).fetchone()
+                if terminal or now >= row["deadline"] or pending:
+                    due.append(row["id"])
+        if not due:
+            return
+        coordinator = Store(self.store.path, initialize=False)
+        coordinator.lock_timeout = min(0.1, self.store.lock_timeout)
+        coordinator.lock_retry_delays = ()
+        # A busy writer delays this coordinator tick, leaving App workers free.
+        with coordinator.connect(write=True) as db:
+            rounds = [self._round(db, identifier) for identifier in due[:16]]
+            for row in rounds:
+                if row["state"] not in {"checking", "running", "blocked"}:
+                    continue
+                members = self._members(db, row, now)
+                for member in members:
+                    if member["stage"] in {"confirmed", "failed_known", "unknown", "cancelled", "missed"}:
+                        db.execute("UPDATE phone_round_members SET state=? WHERE round_id=? AND item_id=?",
+                                   (member["stage"], row["id"], member["item_id"]))
+                        member["admission_state"] = member["stage"]
                 complete = self._scope_intact(row, members) and all(m["verified"] for m in members)
-                if complete or now >= row["deadline"]:
+                finished = self._scope_intact(row, members) and all(
+                    m["stage"] in {"confirmed", "failed_known", "unknown", "cancelled", "missed"}
+                    for m in members
+                )
+                if complete or finished or now >= row["deadline"]:
                     db.execute(
                         "UPDATE phone_rounds SET state=?,finished_at=?,cutoff_snapshot=? WHERE id=?",
                         (
                             "completed"
                             if complete and all(m["within_budget"] for m in members)
-                            else "expired",
+                            else "finished" if finished else "expired",
                             min(now, row["deadline"]),
                             canonical(members),
                             row["id"],

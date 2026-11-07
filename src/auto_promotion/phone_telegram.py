@@ -96,7 +96,9 @@ class PhoneTelegram:
     def prepare_telegram_claim(self,account,claim):
         """Called only after verify_claim, on the same frozen queued item, never as a second sender."""
         _,binding = self.binding(account["id"])
-        baseline = self.observer_baseline(account["id"],binding.identity,claim["payload"]["target"])
+        from .execution_timing import stage
+        with stage(self.engine, claim["task_id"], "phone_target_baseline", account_id=account["id"]):
+            baseline = self.observer_baseline(account["id"],binding.identity,claim["payload"]["target"])
         identifier = "phone-social-prepare:"+uuid4().hex
         request = self.make_request(account["id"],"social_prepare",{"target_url":claim["payload"]["target"],
             "target_id":baseline["peer_username"],"target_author":"@"+baseline["peer_username"],"target_text":baseline["peer_title"],
