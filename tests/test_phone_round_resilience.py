@@ -211,3 +211,5 @@ def test_shared_telegram_health_preserves_numeric_identity_through_phone_route(t
     checked = lab.engine.check_account(aid, force=True, task_id="task-telegram")
     assert checked["status"] == "healthy"
     assert checked["identity_hash"] == original
+    assert checked["connection_state"] == "healthy"
+    lab.engine._check_start_accounts({"id": "task-telegram", "account_ids": [aid], "policy": {"execution_method": "phone"}}, refresh=False)

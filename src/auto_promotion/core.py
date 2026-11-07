@@ -675,8 +675,9 @@ class Engine:
         if account["disabled"] or account["cooldown_until"] > self.clock():
             return account
         if not recovery and cached(
-            account, self.clock(), digest([probe_key(account, self.store.path), "phone"])
-            if task_id and self._execution_method(task_id) == "phone" else probe_key(account, self.store.path), force=force
+            account, self.clock(), probe_key(account, self.store.path), force=force
+        ) and account["health"].get("execution_method", "inherit") == (
+            self._execution_method(task_id) if task_id else "inherit"
         ):
             return {**account, "health": {**account["health"], "probe_cached": True}}
         try:
@@ -715,10 +716,10 @@ class Engine:
         revision = probe_revision(account, self.store.path)
         key = probe_key(account, self.store.path, revision=revision)
         original_key = key
-        if task_id and self._execution_method(task_id) == "phone":
-            key = digest([key, "phone"])
         previous = account["health"]
-        if not recovery and cached(account, now, key, force=force):
+        method = self._execution_method(task_id) if task_id else "inherit"
+        if (not recovery and cached(account, now, key, force=force)
+                and account["health"].get("execution_method", "inherit") == method):
             return {**account, "health": {**previous, "probe_cached": True}}
         try:
             payload = None
@@ -824,8 +825,7 @@ class Engine:
                     {**account, "identity_hash": identity_hash}, self.store.path, revision=revision
                 ),
             )
-            if task_id and self._execution_method(task_id) == "phone":
-                health["probe_key"] = digest([health["probe_key"], "phone"])
+            health["execution_method"] = method
             if status == "healthy":
                 health["last_verified_at"] = now
             elif previous.get("last_verified_at"):
