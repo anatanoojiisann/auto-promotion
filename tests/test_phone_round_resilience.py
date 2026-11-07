@@ -182,3 +182,32 @@ def test_explicit_recheck_recovers_only_start_rejected_while_task_still_draft(tm
     assert check is not None and check[1] == {member["platform"]}
     assert lab.store.one("SELECT count(*) n FROM attempts")["n"] == 0
     assert lab.store.one("SELECT count(*) n FROM audit WHERE kind='phone_round.start_recheck_requested'")["n"] == 1
+
+
+def test_shared_telegram_health_preserves_numeric_identity_through_phone_route(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tests.test_phone_rounds import make_lab
+    from auto_promotion.models import digest
+    from auto_promotion.phone_social import PhoneSocial
+    lab = make_lab(tmp_path)
+    aid = lab.store.one("SELECT id FROM accounts WHERE platform='telegram'")["id"]
+    original = digest(["telegram", "123456"])
+    with lab.store.connect(write=True) as db:
+        db.execute("UPDATE accounts SET identity_hash=? WHERE id=?", (original, aid))
+    binding = SimpleNamespace(platform="telegram", identity="phone_username",
+                              device_id="synthetic-device", node_os="windows")
+    service = SimpleNamespace(
+        binding=lambda account_id: (lab.engine.account(account_id), binding),
+        fresh=lambda account: True,
+        shared_account_binding=lambda account: binding,
+        config=SimpleNamespace(join_enabled=False))
+    monkeypatch.setattr("auto_promotion.phone_social.read_profile",
+                        lambda *args: {"identity": "123456"})
+    lab.engine.adapters.phone_social = service
+    def native(account, operation, payload=None, task_id=None, *, phone=False):
+        assert phone and task_id == "task-telegram"
+        return PhoneSocial.backend(service, account, operation, payload)
+    lab.engine._call_unlocked = native
+    checked = lab.engine.check_account(aid, force=True, task_id="task-telegram")
+    assert checked["status"] == "healthy"
+    assert checked["identity_hash"] == original

@@ -363,9 +363,14 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         if binding.platform == "telegram" and operation == "verify_join":
             return self.verify_join(account,payload)
         if operation == "health":
+            identity = binding.identity
+            if fresh and self.shared_account_binding(account):
+                # The same Telegram account has an API numeric ID and a phone
+                # username. Keep its registered canonical identity and history.
+                identity = read_profile(binding.platform, account["backend_label"])["identity"]
             return {"healthy": fresh, "identity_verified": fresh, "service_ready": True,
                 "permissions": ([ACTIONS[binding.platform]]+(["join"] if binding.platform=="telegram" and self.config.join_enabled else [])) if fresh else [],
-                "account_identity": binding.identity if fresh else None,
+                "account_identity": identity if fresh else None,
                 "reason": "phone_social_identity_observed" if fresh else "PhoneSocialFreshIdentityRequired"}
         if operation == "preflight":
             queue_blocker = self.telegram_queue_blocker(account["id"])
