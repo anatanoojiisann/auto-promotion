@@ -656,7 +656,7 @@ class Engine:
         except sqlite3.Error as exc:
             logging.getLogger(__name__).warning("call audit unavailable: %s", type(exc).__name__)
 
-    def check_account(self, account_id, *, force=False, recovery=False):
+    def check_account(self, account_id, *, force=False, recovery=False, task_id=None):
         from .health_checks import cached, probe_key
 
         account = self.account(account_id)
@@ -675,12 +675,16 @@ class Engine:
         if account["disabled"] or account["cooldown_until"] > self.clock():
             return account
         if not recovery and cached(
-            account, self.clock(), probe_key(account, self.store.path), force=force
+            account, self.clock(), digest([probe_key(account, self.store.path), "phone"])
+            if task_id and self._execution_method(task_id) == "phone" else probe_key(account, self.store.path), force=force
         ):
             return {**account, "health": {**account["health"], "probe_cached": True}}
         try:
-            route = route_for(account)
+            method = self._execution_method(task_id) if task_id else "inherit"
+            route = task_route(account, {}, method, self.adapters)
             with self.lanes.acquire(account_id, resource=route.resource):
+                if task_id:
+                    return self._check_account_locked(account_id, force=force, recovery=recovery, task_id=task_id)
                 return self._check_account_locked(account_id, force=force, recovery=recovery)
         except AccountBusy:
             current = self.account(account_id)
@@ -700,7 +704,7 @@ class Engine:
                 "health": {**account["health"], "reason": "LocalDatabaseUnavailable"},
             }
 
-    def _check_account_locked(self, account_id, *, force=False, recovery=False):
+    def _check_account_locked(self, account_id, *, force=False, recovery=False, task_id=None):
         from .account_checks import normalize_health
         from .health_checks import cached, category, probe_key, probe_revision
 
@@ -710,6 +714,9 @@ class Engine:
             return account
         revision = probe_revision(account, self.store.path)
         key = probe_key(account, self.store.path, revision=revision)
+        original_key = key
+        if task_id and self._execution_method(task_id) == "phone":
+            key = digest([key, "phone"])
         previous = account["health"]
         if not recovery and cached(account, now, key, force=force):
             return {**account, "health": {**previous, "probe_cached": True}}
@@ -720,6 +727,7 @@ class Engine:
                     "account_block_recovery_generation": account["outbound_block"]["generation"]
                 }
             result = (
+                self.call(account, "health", payload, task_id=task_id) if task_id else
                 self.call(account, "health", payload) if payload else self.call(account, "health")
             )
         except AccountBusy:
@@ -761,7 +769,7 @@ class Engine:
                 not current
                 or (current["disabled"] and not result.get("risk_warning"))
                 or (current["cooldown_until"] > self.clock() and not result.get("account_retry_at"))
-                or probe_key(dict(current), self.store.path) != key
+                or probe_key(dict(current), self.store.path) != original_key
             ):
                 # An old result cannot verify a changed connection/configuration.
                 observed = self.account(account_id)
@@ -816,6 +824,8 @@ class Engine:
                     {**account, "identity_hash": identity_hash}, self.store.path, revision=revision
                 ),
             )
+            if task_id and self._execution_method(task_id) == "phone":
+                health["probe_key"] = digest([health["probe_key"], "phone"])
             if status == "healthy":
                 health["last_verified_at"] = now
             elif previous.get("last_verified_at"):
@@ -1282,7 +1292,8 @@ class Engine:
             if account["mode"] == "live" or account["status"] == "unchecked":
                 # Explicit starts refresh positive observations. Failed probes
                 # retain their bounded backoff; cooldowns never trigger a probe.
-                account = self.check_account(account_id, force=refresh)
+                account = (self.check_account(account_id, force=refresh, task_id=task["id"])
+                           if method == "phone" else self.check_account(account_id, force=refresh))
             checks.append(summary(account, self.clock()))
         with self.store.connect(write=True) as db:
             Store.audit(db, "task.account_check", {"accounts": checks}, task["id"], self.clock())
@@ -2849,7 +2860,10 @@ class Engine:
                 if phone is not None and account["id"] in phone.config.bindings and (
                         self._execution_method(row["task_id"]) == "phone" or route_for(account).transport == "phone"):
                     phone.ensure_identity(account["id"],task_id=row["task_id"])
-                checked[account["id"]] = self.check_account(account["id"], force=True)
+                checked[account["id"]] = (
+                    self.check_account(account["id"], force=True, task_id=row["task_id"])
+                    if self._execution_method(row["task_id"]) == "phone"
+                    else self.check_account(account["id"], force=True))
             if not manual and checked[account["id"]]["connection_state"] != "healthy":
                 self._skip(row["id"], "account_unhealthy")
                 continue

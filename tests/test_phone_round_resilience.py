@@ -108,3 +108,43 @@ def test_busy_coordinator_writer_returns_control_within_one_short_wait(tmp_path)
         other.rollback()
     lab.rounds.tick()
     assert lab.calls
+
+
+def test_phone_health_uses_original_phone_task_and_its_own_cache(tmp_path):
+    from types import SimpleNamespace
+    from tests.test_phone_rounds import make_lab
+    lab = make_lab(tmp_path)
+    account = lab.store.one("SELECT a.id FROM accounts a WHERE a.platform='telegram'")
+    binding = SimpleNamespace(device_id="synthetic-device", node_os="windows")
+    lab.engine.adapters.phone_social = SimpleNamespace(shared_account_binding=lambda a: binding)
+    calls = []
+    def call(account, operation, payload=None, task_id=None):
+        calls.append((operation, task_id))
+        return {"healthy": True, "service_ready": True, "identity_verified": True,
+                "account_identity": "@synthetic_phone", "permissions": ["send_message"]}
+    lab.engine.call = call
+    lab.engine.check_account(account["id"], force=True, task_id="task-telegram")
+    lab.engine.check_account(account["id"], task_id="task-telegram")
+    assert calls == [("health", "task-telegram")]
+
+
+def test_completed_identity_refresh_resumes_only_untouched_original_member(tmp_path):
+    from types import SimpleNamespace
+    from tests.test_phone_rounds import make_lab, create
+    lab = make_lab(tmp_path)
+    identifier = create(lab)["id"]
+    lab.rounds.start(identifier)
+    with lab.store.connect(write=True) as db:
+        db.execute("UPDATE phone_round_members SET state='blocked',error='PhoneIdentityRefreshPending' "
+                   "WHERE round_id=? AND platform='telegram'", (identifier,))
+    lab.engine.adapters.phone_social = SimpleNamespace(fresh=lambda account: True)
+    def readiness(rounds, rid, *, platforms=None):
+        return {"round_id": rid, "submission_authorized": False,
+                "members": [{"platform": m["platform"], "ready": True, "blockers": []}
+                            for m in rounds.get(rid)["members"]
+                            if platforms is None or m["platform"] in platforms]}
+    lab.rounds.preflight_check = readiness
+    lab.rounds.tick()
+    member = next(m for m in lab.rounds.get(identifier)["members"] if m["platform"] == "telegram")
+    assert member["admission_state"] == "pending"
+    assert member["attempt_id"] is None
