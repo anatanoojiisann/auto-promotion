@@ -233,7 +233,7 @@ class Calendar:
         return None
 
 
-def check_claim(db, account, task, payload, due, now, item_id):
+def check_claim(db, account, task, payload, due, now, item_id, *, details=None):
     from .interaction_intents import explicit_unsent_retry_source
 
     limits = scopes(db, account, task, payload)
@@ -251,8 +251,33 @@ def check_claim(db, account, task, payload, due, now, item_id):
     user_scope = digest([account["platform"], user_key])
     equivalent_users = equivalent if user_scope in equivalent else set()
 
+    unsent = []
+    if (account["platform"] == "telegram"
+            and json.loads(task["policy"]).get("execution_method") == "phone"
+            and db.execute("SELECT 1 FROM sqlite_master WHERE name='phone_social_authorizations'").fetchone()
+            and db.execute("SELECT 1 FROM sqlite_master WHERE name='execution_jobs'").fetchone()):
+        unsent = db.execute(
+            "SELECT a.account_id,a.task_id,a.started_at,a.target_key,a.user_key,i.due_at "
+            "FROM attempts a JOIN items i ON i.id=a.item_id AND i.attempt_id=a.id "
+            "JOIN tasks t ON t.id=a.task_id JOIN execution_jobs j ON j.reference_id=i.id AND j.kind='send' "
+            "WHERE a.account_id=? AND a.outcome='failed_known' AND a.finished_at IS NOT NULL "
+            "AND i.status='failed_known' AND i.external_reference IS NULL "
+            "AND json_extract(i.result,'$.confirmed_not_submitted')=1 "
+            "AND json_extract(i.result,'$.submission_started')=0 "
+            "AND json_extract(t.policy,'$.execution_method')='phone' "
+            "AND j.state='failed_known' AND j.owner IS NULL AND j.lease_until<=? "
+            "AND NOT EXISTS(SELECT 1 FROM phone_social_authorizations x WHERE x.item_id=i.id)",
+            (account["id"],now)).fetchall()
+
     def records(*, delivery):
         rows = events(db, account["mode"], delivery=delivery, exclude_item=item_id)
+        # Retain operation/account/global usage. A proven pre-submission phone
+        # failure did not contact its target or recipient.
+        excluded = {(r["account_id"],r["task_id"],r["due_at"] if delivery else r["started_at"],
+                     r["target_key"],r["user_key"]) for r in unsent}
+        rows = [{**r,"target":None,"user":None}
+                if (r.get("account"),r.get("task"),r.get("at"),r.get("target"),r.get("user")) in excluded
+                else r for r in rows]
         if equivalent:
             rows = [{**r, "target":target_scope if r.get("target") in equivalent else r.get("target"),
                      "user":user_scope if r.get("user") in equivalent_users else r.get("user")} for r in rows]
@@ -273,10 +298,16 @@ def check_claim(db, account, task, payload, due, now, item_id):
         ]
 
     actual = Calendar(records(delivery=False))
-    if actual.blocker(limits, now, account["mode"], future=False)[0]:
+    reason, retry_at = actual.blocker(limits, now, account["mode"], future=False)
+    if reason:
+        if details is not None:
+            details.update(scope=reason, retry_at=retry_at)
         return "activity_limit"
     delivery = Calendar(records(delivery=True))
-    if delivery.blocker(limits, due, account["mode"])[0]:
+    reason, retry_at = delivery.blocker(limits, due, account["mode"])
+    if reason:
+        if details is not None:
+            details.update(scope=reason, retry_at=retry_at)
         return "delivery_limit"
     return None
 

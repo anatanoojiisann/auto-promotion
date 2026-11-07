@@ -530,6 +530,7 @@ class PhoneRounds:
                 "SELECT result,state FROM execution_jobs WHERE id=?", ("send:" + m["item_id"],)
             ).fetchone()
             control_wait = json.loads(job["result"]).get("control_wait") if job else None
+            quota_wait = json.loads(job["result"]).get("quota_wait") if job else None
             waiting = bool(
                 control_wait
                 and job["state"] == "pending"
@@ -558,7 +559,9 @@ class PhoneRounds:
                 <= row["deadline"]
             )
             stage = (
-                "waiting_for_configuration"
+                "waiting_for_quota"
+                if quota_wait and job["state"] == "pending" and m["item_status"] == "not_attempted"
+                else "waiting_for_configuration"
                 if waiting and control_wait["waiting_for"] == "configuration_change"
                 else "waiting_for_retry"
                 if waiting
@@ -614,8 +617,9 @@ class PhoneRounds:
                     "external_reference": m["external_reference"] if verified else None,
                     "reason": m["error"]
                     or (control_wait or {}).get("reason")
-                    or result.get("reason"),
+                    or result.get("reason") or result.get("skip_reason"),
                     "control_wait": public_wait,
+                    "quota_wait": quota_wait,
                     "start_requested_at": m["start_requested_at"],
                     "enqueued_at": m["enqueued_at"],
                     "attempt_started_at": m["attempt_started_at"],

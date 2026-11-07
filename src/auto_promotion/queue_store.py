@@ -687,6 +687,7 @@ class JobQueue:
             if state == "executing" or (state == "not_attempted" and source["attempted"]):
                 state = "unknown"
             delay = now + (30 if error else 5)
+            quota_wait = None
             if state == "not_attempted":
                 account = db.execute(
                     "SELECT * FROM accounts WHERE id=?",
@@ -701,6 +702,17 @@ class JobQueue:
                     item = db.execute(
                         "SELECT payload FROM items WHERE id=?", (job["reference_id"],)
                     ).fetchone()
+                    full_item = db.execute("SELECT * FROM items WHERE id=?", (job["reference_id"],)).fetchone()
+                    skipped = json.loads(full_item["result"] or "{}").get("skip_reason")
+                    if skipped in {"activity_limit", "delivery_limit"}:
+                        from .quotas import check_claim
+                        task = dict(db.execute("SELECT * FROM tasks WHERE id=?", (job["task_id"],)).fetchone())
+                        detail = {}
+                        reason = check_claim(db, dict(account), task, json.loads(full_item["payload"]),
+                                             full_item["due_at"], now, full_item["id"], details=detail)
+                        if reason and detail.get("retry_at", 0) > now:
+                            quota_wait = {"reason":reason, **detail}
+                            delay = max(delay, detail["retry_at"])
                     deferred = TargetChecks(
                         self.engine,
                         dict(account),
@@ -711,6 +723,8 @@ class JobQueue:
                         delay = max(delay, deferred["eligibility_retry_at"])
                 state = "pending"
             result = {"error_type": type(error).__name__} if error else {}
+            if quota_wait:
+                result["quota_wait"] = quota_wait
             if state == "pending" and source and not source["attempted"]:
                 from .execution_waits import retry_result
 
