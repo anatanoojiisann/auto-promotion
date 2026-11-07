@@ -335,7 +335,7 @@ class Engine:
         from .target_checks import TargetChecks
 
         account = self.account(account["id"])
-        method = self._execution_method(task_id) if operation in {"preflight","execute","join","verify","verify_join"} else None
+        method = self._execution_method(task_id) if operation in {"health","preflight","execute","join","verify","verify_join"} else None
         route = task_route(account, (payload or {}).get("payload", {}), method, self.adapters)
         with self.lanes.acquire(account["id"], resource=route.resource):
             # Another caller can record a FloodWait/disable while this caller is

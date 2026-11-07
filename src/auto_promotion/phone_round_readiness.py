@@ -45,7 +45,7 @@ def _member_blockers(engine, member, now, service, remote, *, refresh_identity=F
             policy = {}
         if active_block(db, account["id"], now):
             reasons.append("AccountOutboundBlocked")
-    if account["disabled"] or account["status"] != "healthy":
+    if account["disabled"] or (account["status"] != "healthy" and not refresh_identity):
         reasons.append("AccountNotHealthy")
     if max(account["cooldown_until"], account["next_at"]) > now:
         reasons.append("AccountWaitRequired")
@@ -77,6 +77,10 @@ def _member_blockers(engine, member, now, service, remote, *, refresh_identity=F
                 from .execution_timing import stage
                 with stage(engine, task["id"], "phone_identity_refresh", account_id=account["id"]):
                     service.ensure_identity(account["id"], task_id=task["id"])
+            if (refresh_identity and not reasons and account["status"] != "healthy"):
+                account = engine.check_account(account["id"], force=True, task_id=task["id"])
+                if account["status"] != "healthy":
+                    reasons.append("AccountNotHealthy")
             if not service.fresh(account):
                 reasons.append("FreshPhoneIdentityRequired")
         except Exception:

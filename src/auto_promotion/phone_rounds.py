@@ -287,6 +287,23 @@ class PhoneRounds:
                 "(SELECT id FROM phone_round_preflights WHERE round_id=? AND started_at<=?)",
                 (round_id, platform, platform, round_id, now - PREFLIGHT_SECONDS),
             )
+            # An explicit recheck can recover a start rejected before its
+            # atomic draft-to-active transition. Any job or attempt stays fenced.
+            untouched = db.execute(
+                "SELECT m.task_id,m.start_requested_at FROM phone_round_members m "
+                "JOIN tasks t ON t.id=m.task_id JOIN items i ON i.id=m.item_id "
+                "WHERE m.round_id=? AND (? IS NULL OR m.platform=?) "
+                "AND m.state='blocked' AND m.error='PhoneRoundStartFailed' "
+                "AND t.state='draft' AND i.status='not_attempted' AND i.attempt_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.item_id=m.item_id) "
+                "AND NOT EXISTS (SELECT 1 FROM execution_jobs j WHERE j.reference_id=m.item_id)",
+                (round_id, platform, platform)).fetchall()
+            for member in untouched:
+                Store.audit(db, "phone_round.start_recheck_requested",
+                            {"previous_start_requested_at": member["start_requested_at"]},
+                            member["task_id"], now)
+                db.execute("UPDATE phone_round_members SET start_requested_at=NULL,start_lease_until=NULL "
+                           "WHERE round_id=? AND task_id=?", (round_id, member["task_id"]))
             scope = {
                 m[0]
                 for m in db.execute(

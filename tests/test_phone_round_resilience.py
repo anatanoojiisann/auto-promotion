@@ -148,3 +148,37 @@ def test_completed_identity_refresh_resumes_only_untouched_original_member(tmp_p
     member = next(m for m in lab.rounds.get(identifier)["members"] if m["platform"] == "telegram")
     assert member["admission_state"] == "pending"
     assert member["attempt_id"] is None
+
+
+def test_health_operation_dispatches_through_phone_task_route(tmp_path):
+    from types import SimpleNamespace
+    from tests.test_phone_rounds import make_lab
+    lab = make_lab(tmp_path)
+    account = lab.engine.account(lab.store.one("SELECT id FROM accounts WHERE platform='telegram'")["id"])
+    binding = SimpleNamespace(device_id="synthetic-device", node_os="windows")
+    lab.engine.adapters.phone_social = SimpleNamespace(shared_account_binding=lambda a: binding)
+    calls = []
+    def backend(account, operation, payload=None, task_id=None, *, phone=False):
+        calls.append((operation, task_id, phone))
+        return {"healthy": True, "identity_verified": True}
+    lab.engine._call_unlocked = backend
+    lab.engine.call(account, "health", task_id="task-telegram")
+    assert calls == [("health", "task-telegram", True)]
+
+
+def test_explicit_recheck_recovers_only_start_rejected_while_task_still_draft(tmp_path):
+    from tests.test_phone_rounds import make_lab, create
+    from auto_promotion.core import Conflict
+    lab = make_lab(tmp_path)
+    rid = create(lab)["id"]
+    lab.rounds.start(rid)
+    def rejected(task_id, **kwargs):
+        raise Conflict("Synthetic health rejection before task activation")
+    lab.engine.start_and_run = rejected
+    chosen = lab.rounds.tick()
+    member = next(m for m in lab.rounds.get(rid)["members"] if m["task_id"] == chosen)
+    assert member["stage"] == "blocked"
+    check = lab.rounds._begin_check(rid, member["platform"], lab.now[0])
+    assert check is not None and check[1] == {member["platform"]}
+    assert lab.store.one("SELECT count(*) n FROM attempts")["n"] == 0
+    assert lab.store.one("SELECT count(*) n FROM audit WHERE kind='phone_round.start_recheck_requested'")["n"] == 1
