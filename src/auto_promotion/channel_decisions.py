@@ -49,6 +49,11 @@ def resolved(engine, policy, task_id=None, account_id=None):
             value = saved(db, task_id)
         if value and account_id in value["resolved"]:
             return value["resolved"][account_id]
+    from .local_primary import configured
+
+    with engine.store.connect() as db:
+        if configured(db):
+            return "local"
     from .execution_channels import read_state
 
     state = read_state(engine.store)

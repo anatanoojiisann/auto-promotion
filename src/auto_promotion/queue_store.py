@@ -370,7 +370,11 @@ class JobQueue:
             return None
         account = db.execute("SELECT * FROM accounts WHERE id=?", (job["account_id"],)).fetchone()
         task = db.execute("SELECT * FROM tasks WHERE id=?", (job["task_id"],)).fetchone()
-        return intent_blocker(db, account, task, json.loads(item["payload"]), job["reference_id"])
+        from .local_primary import uncertain_duplicate
+
+        payload = json.loads(item["payload"])
+        return (uncertain_duplicate(db, account, payload, job["reference_id"])
+                or intent_blocker(db, account, task, payload, job["reference_id"]))
 
     def _wait_for_intent(self, db, job, blocked, now):
         previous = json.loads(job["result"])
@@ -432,7 +436,8 @@ class JobQueue:
                 "AND NOT EXISTS(SELECT 1 FROM account_blocks b WHERE b.account_id=a.id "
                 "AND b.state='active' AND (b.until_at IS NULL OR b.until_at>?)) "
                 "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' "
-                "AND busy.lease_until>? AND busy.account_id=j.account_id) "
+                "AND busy.lease_until>? AND (busy.account_id=j.account_id OR "
+                "(json_extract(j.route,'$.identity') IS NOT NULL AND json_extract(busy.route,'$.identity')=json_extract(j.route,'$.identity')))) "
                 "AND NOT EXISTS(SELECT 1 FROM account_lanes lane "
                 "WHERE lane.account_id=j.account_id AND lane.expires_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM channel_authorization_requests auth "
@@ -441,16 +446,24 @@ class JobQueue:
                 "AND j.expires_at>? AND (j.kind<>'send' OR t.phase='ready') "
                 "AND NOT EXISTS(SELECT 1 FROM execution_resources r WHERE r.resource=json_extract(j.route,'$.resource') AND r.expires_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM account_task_channels ch LEFT JOIN tasks holder ON holder.id=ch.task_id "
-                "WHERE ch.account_id=j.account_id AND (ch.retry_at>? OR (ch.state='handoff' AND ch.task_id<>j.task_id "
+                "WHERE ch.account_id=j.account_id AND ch.until_at>? AND (ch.retry_at>? OR (ch.state='handoff' AND ch.task_id<>j.task_id "
                 "AND holder.state='active' AND unixepoch(json_extract(holder.policy,'$.ends_at'))>?)))"
             )
-            params = [pool, now, now, now, now, now, now, now, now, now, now, now]
+            params = [pool, now, now, now, now, now, now, now, now, now, now, now, now]
             if reference_id is not None:
                 sql += " AND j.reference_id=?"
                 params.append(reference_id)
             from .execution_channels import local_account_scope
 
-            accounts = local_account_scope(db, now)
+            from .local_primary import configured, eligible
+
+            primary = configured(db)
+            accounts = None if primary else local_account_scope(db, now)
+            if primary:
+                permitted = eligible(db)
+                sql += " AND j.account_id IN (" + (",".join("?" for _ in permitted) or "NULL") + ")"
+                sql += " AND COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')<>'cloud'"
+                params.extend(permitted)
             if accounts is not None:
                 sql += " AND (COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')<>'inherit' "
                 sql += "OR EXISTS(SELECT 1 FROM account_task_channels ch WHERE ch.account_id=j.account_id) OR ("
@@ -475,11 +488,23 @@ class JobQueue:
             for row in rows:
                 from .task_channels import handoff_blocks
 
+                if primary:
+                    from .channel_decisions import saved
+                    decision = saved(db, row["task_id"])
+                    if decision and decision.get("resolved", {}).get(row["account_id"]) == "cloud":
+                        continue
+
                 channel = db.execute(
                     "SELECT state,task_id,retry_at FROM account_task_channels WHERE account_id=?",
                     (row["account_id"],),
                 ).fetchone()
-                if channel and (
+                prior_expired = False
+                if primary and channel:
+                    from .local_primary import valid
+                    grant = valid(db, row["account_id"])
+                    old = db.execute("SELECT generation,until_at FROM account_task_channels WHERE account_id=?", (row["account_id"],)).fetchone()
+                    prior_expired = bool(grant and old and old["until_at"] <= now and grant.get("prior_generation") == old["generation"])
+                if channel and not prior_expired and (
                     channel["retry_at"] > now or handoff_blocks(db, channel, row["task_id"], now)
                 ):
                     continue

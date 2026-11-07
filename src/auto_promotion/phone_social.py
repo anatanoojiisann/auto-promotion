@@ -398,7 +398,7 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         queue_blocker = self.telegram_queue_blocker(account["id"])
         if queue_blocker:
             raise BackendError(queue_blocker)
-        if claim["task_id"] not in self.config.authorized_task_ids:
+        if not self.task_authorized(claim["task_id"], account["id"]):
             raise BackendError("PhoneSocialTaskOutsideDevelopmentScope")
         task = self.store.one("SELECT * FROM tasks WHERE id=?", (claim["task_id"],))
         policy = json.loads(task["policy"])
@@ -479,10 +479,12 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             except BackendError:
                 raise Conflict("PhoneTelegramReceiptBudgetRequired") from None
         verify_claim(json.loads(row["claim"]))
-        if json.loads(row["claim"])["payload"]["task_id"] not in self.config.authorized_task_ids:
+        if not self.task_authorized(json.loads(row["claim"])["payload"]["task_id"], json.loads(row["claim"])["account_id"]):
             raise Conflict("PhoneSocialTaskOutsideDevelopmentScope")
         with self.store.connect(write=True) as db:
             claim = json.loads(row["claim"])
+            if not self.task_authorized(claim["payload"]["task_id"], claim["account_id"], db=db):
+                raise Conflict("PhoneSocialTaskOutsideDevelopmentScope")
             task = db.execute("SELECT * FROM tasks WHERE id=?", (claim["payload"]["task_id"],)).fetchone()
             self.engine._integrity(db, task, "outbound")
             from .phone_rounds import submission_blocker

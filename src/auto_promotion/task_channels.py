@@ -20,6 +20,10 @@ def requested(policy):
 
 
 def managed(db, task_id, account_id):
+    from .local_primary import configured
+
+    if configured(db):
+        return True
     task = db.execute("SELECT policy FROM tasks WHERE id=?", (task_id,)).fetchone()
     return bool(
         (task and requested(json.loads(task[0])) != "inherit")
@@ -165,6 +169,14 @@ def original_fence_valid(db, value, now, task_id):
             or task[0] != value.get("coordination_manifest_hash")
         ):
             return False
+    if value.get("fence_source") == "local_primary":
+        from .local_primary import valid
+
+        grant = valid(db, value.get("account_id", ""))
+        return bool(grant and grant["generation"] == value.get("primary_grant_generation")
+                    and value.get("node_id") == grant["node_id"]
+                    and value.get("store_id") == grant["store_id"]
+                    and value.get("until_at", 0) > now)
     if value.get("fence_source") == "cloud_acknowledged":
         return value.get("until_at", 0) > now
     if value.get("fence_source") == "standalone":
@@ -279,6 +291,17 @@ def task_local_scope_valid(engine, task_id):
         ):
             return False
         accounts = json.loads(task["account_ids"])
+        from .local_primary import configured, valid
+
+        if configured(db):
+            if not accounts or not all(valid(db, account) for account in accounts):
+                return False
+            try:
+                for account in accounts:
+                    control_preflight(engine, task_id, account, policy)
+            except CloudUnavailable:
+                return False
+            return True
         node = os.getenv("AP_NODE_ID", socket.gethostname())
         explicit = True
         for account in accounts:
@@ -343,7 +366,11 @@ def snapshot(engine, task):
             supported_accounts.append(account_id)
         store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
         node = os.getenv("AP_NODE_ID", socket.gethostname())
+        from .local_primary import configured, valid
+
         for account_id in task["account_ids"]:
+            if configured(db) and valid(db, account_id):
+                current_local_accounts.add(account_id)
             row = db.execute(
                 "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
             ).fetchone()
@@ -368,6 +395,15 @@ def snapshot(engine, task):
             if row["error"] and row["retry_at"] > now
             else None
         )
+        with engine.store.connect() as db:
+            primary = configured(db)
+        if primary:
+            try:
+                control_preflight(engine, task["id"], row["account_id"], task["policy"])
+            except CloudUnavailable as error:
+                row["blocking_reason"] = "账号通道检查暂未通过：" + safe_channel_code(str(error))
+            else:
+                row["blocking_reason"] = None
     scoped_accounts = state.get("account_ids", [])
     expired = bool(
         state.get("active") == "local"
@@ -409,8 +445,23 @@ def control_plan(engine, task_id, account_id, policy, *, authorization_only=Fals
     until = epoch(policy["ends_at"])
     if until <= engine.clock():
         raise CloudUnavailable("TaskChannelWindowExpired")
+    from .local_primary import configured, valid
+
     with engine.store.connect() as db:
+        primary = configured(db)
+        grant = valid(db, account_id) if primary else None
         bound = channel_binding(db, account_id)
+    if primary:
+        if authorization_only:
+            raise CloudUnavailable("LocalPrimaryTaskAuthorizationNotRequired")
+        if channel != "local":
+            raise CloudUnavailable("LocalPrimaryCloudTaskHeld")
+        if not grant:
+            raise CloudUnavailable("LocalPrimaryAccountNotAuthorized")
+        return dict(task_id=task_id, account_id=account_id, channel=channel, until=until,
+                    no_cloud=True, cloud=None, local_state={}, node_id=grant["node_id"],
+                    store_id=grant["store_id"], authorization_only=False,
+                    primary=True, primary_grant=grant)
     # Explicit task-only coordination is durable local intent for THIS account.
     # A new task cannot borrow it or renew it implicitly through the cloud.
     coordinated_local = channel == "local" and bool(bound.get("coordination_task_id"))
@@ -441,6 +492,12 @@ def control_plan(engine, task_id, account_id, policy, *, authorization_only=Fals
 def local_fence_source(engine, plan):
     from .execution_channels import independent_active
 
+    if plan.get("primary"):
+        from .local_primary import valid
+
+        with engine.store.connect() as db:
+            grant = valid(db, plan["account_id"])
+        return "local_primary" if grant and grant["generation"] == plan["primary_grant"]["generation"] else None
     state = plan["local_state"]
     if (
         plan["channel"] == "local"
@@ -479,22 +536,25 @@ def control_snapshot(engine, db, plan, *, job_id=""):
         "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
     ).fetchone()
     prior = dict(prior) if prior else None
-    if prior and prior["retry_at"] > now:
+    primary_supersede = bool(plan.get("primary") and prior and prior["until_at"] <= now
+                             and plan["primary_grant"].get("prior_generation") == prior["generation"])
+    if prior and prior["retry_at"] > now and not primary_supersede:
         raise CloudUnavailable(
             safe_channel_code(prior["error"] or "TaskChannelHandoffPending"),
             retry_after_seconds=max(1, math.ceil(prior["retry_at"] - now)),
         )
-    if handoff_blocks(db, prior, task_id, now):
+    if handoff_blocks(db, prior, task_id, now) and not primary_supersede:
         raise CloudUnavailable("TaskChannelHandoffPending")
     old_binding = channel_binding(db, account_id)
     if (
         no_cloud
         and old_binding.get("coordination_task_id")
         and old_binding["coordination_task_id"] != task_id
+        and not primary_supersede
     ):
         raise CloudUnavailable("LocalAuthorizationTaskScopeMismatch")
     bound = binding_matches(prior, old_binding, node_id, store_id)
-    if no_cloud and prior and prior["channel"] == "cloud":
+    if no_cloud and prior and prior["channel"] == "cloud" and not primary_supersede:
         proof = local_state.get("offline_fences", {}).get(account_id, {})
         if (
             not bound
@@ -732,6 +792,8 @@ class TaskChannelRouter:
             else:
                 fence_source = local_fence_source(self.engine, plan)
                 if not authorization_only and channel == "local" and fence_source:
+                    if fence_source == "local_primary":
+                        authority["primary_grant_generation"] = plan["primary_grant"]["generation"]
                     if fence_source == "legacy":
                         authority["legacy_generation"] = local_state.get("generation")
                 else:

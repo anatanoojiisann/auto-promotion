@@ -67,7 +67,9 @@ def _member_blockers(engine, member, now, service, remote):
             reasons.append("PhoneFleetSubmissionUnsupported")
         if not service.config.submit_enabled:
             reasons.append("PhoneSubmissionDisabled")
-        if task["id"] not in service.config.authorized_task_ids:
+        authorized = (service.task_authorized(task["id"], account["id"])
+                      if hasattr(service, "task_authorized") else task["id"] in service.config.authorized_task_ids)
+        if not authorized:
             reasons.append("PhoneTaskOutsideAuthorizedScope")
         try:
             if not service.fresh(account):

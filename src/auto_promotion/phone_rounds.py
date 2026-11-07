@@ -34,6 +34,43 @@ CREATE TABLE IF NOT EXISTS phone_round_members(
 """
 
 
+def round_task_authorized(db, task_id, account_id, now):
+    """One explicitly started round grants only its immutable original item."""
+    from .local_primary import configured, valid
+
+    if not configured(db) or not valid(db, account_id):
+        return False
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_round_members'").fetchone():
+        return False
+    row = db.execute(
+        "SELECT r.id round_id,r.state round_state,r.manifest_hash round_manifest,r.submit_deadline,"
+        "m.state member_state,m.check_id,m.payload_hash,m.manifest_hash,i.payload_hash current_payload,"
+        "i.account_id,i.task_id item_task,a.platform account_platform,m.platform,"
+        "t.manifest_hash current_manifest,t.policy,t.state task_state "
+        "FROM phone_round_members m JOIN phone_rounds r ON r.id=m.round_id "
+        "JOIN phone_round_preflights p ON p.id=m.check_id AND p.round_id=r.id "
+        "JOIN tasks t ON t.id=m.task_id JOIN items i ON i.id=m.item_id "
+        "JOIN accounts a ON a.id=i.account_id WHERE m.task_id=?", (task_id,)
+    ).fetchone()
+    if not row or row["round_state"] not in {"checking", "running"} or row["member_state"] not in {"checking", "pending", "starting", "queued"}:
+        return False
+    if (not row["submit_deadline"] or now >= row["submit_deadline"] or row["account_id"] != account_id
+            or row["item_task"] != task_id or row["platform"] != row["account_platform"]
+            or row["task_state"] not in {"draft", "active"}
+            or row["payload_hash"] != row["current_payload"]
+            or row["manifest_hash"] != row["current_manifest"]):
+        return False
+    try:
+        policy = json.loads(row["policy"])
+    except (ValueError, TypeError):
+        return False
+    if policy.get("execution_channel") != "local" or policy.get("execution_method") != "phone":
+        return False
+    members = db.execute("SELECT task_id,platform FROM phone_round_members WHERE round_id=?", (row["round_id"],)).fetchall()
+    return bool(members and len({m["platform"] for m in members}) == len(members)
+                and digest(sorted(m["task_id"] for m in members)) == row["round_manifest"])
+
+
 def submission_blocker(db, task_id, now):
     """Called in the original claim/start/final-grant transaction, even if worker is down."""
     if not db.execute(

@@ -24,6 +24,7 @@ from .execution_channels import (
     read_state,
     use_cloud,
 )
+from .local_primary import configured as local_primary_configured, eligible as local_primary_eligible
 from .models import canonical
 from .queue_store import JobQueue, executor_task_ids, job_scope
 from .routing import POOLS
@@ -38,9 +39,11 @@ class PoolScheduler:
         self.children, self.handles = {}, {}
         self.last_sync = 0
         self.last_heartbeat = None
+        with engine.store.connect() as db:
+            primary = local_primary_configured(db)
         self.cloud = (
             None
-            if independent_active(engine) or offline_only(engine.store)
+            if primary or independent_active(engine) or offline_only(engine.store)
             else CloudControl.configured()
         )
         self.closed = False
@@ -68,8 +71,10 @@ class PoolScheduler:
         required = self.engine.store.one(
             "SELECT value FROM meta WHERE key='cloud_control_required'"
         )
-        independent = independent_active(self.engine)
-        no_cloud = offline_only(self.engine.store)
+        with self.engine.store.connect() as db:
+            primary = local_primary_configured(db)
+        independent = primary or independent_active(self.engine)
+        no_cloud = primary or offline_only(self.engine.store)
         if no_cloud:
             self.cloud = None
         elif not independent and not self.cloud:
@@ -111,7 +116,12 @@ class PoolScheduler:
         )
         params = [now + 2, now]
         with self.engine.store.connect() as db:
-            accounts = local_account_scope(db, now)
+            accounts = None if primary else local_account_scope(db, now)
+            permitted = local_primary_eligible(db) if primary else []
+        if primary:
+            sql += " AND account_id IN (" + (",".join("?" for _ in permitted) or "NULL") + ")"
+            sql += " AND task_id IN (SELECT id FROM tasks WHERE COALESCE(json_extract(policy,'$.execution_channel'),'inherit')<>'cloud')"
+            params.extend(permitted)
         if accounts is not None:
             sql += " AND (account_id IN (" + (",".join("?" for _ in accounts) or "NULL") + ") "
             sql += "OR task_id IN (SELECT id FROM tasks WHERE COALESCE(json_extract(policy,'$.execution_channel'),'inherit')<>'inherit') "
@@ -347,7 +357,9 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
     if pool not in POOLS:
         raise ValueError("UnknownExecutionPool")
     queue = JobQueue(engine)
-    independent = independent_active(engine)
+    with engine.store.connect() as db:
+        primary = local_primary_configured(db)
+    independent = primary or independent_active(engine)
     cloud = None if independent or offline_only(engine.store) else CloudControl.configured()
     journal = CloudJournal(engine, cloud) if cloud else None
     required = engine.store.one("SELECT value FROM meta WHERE key='cloud_control_required'")
@@ -382,7 +394,7 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                             (time.time(), owner),
                         )
                     next_heartbeat = time.monotonic() + 10
-                local = independent_active(engine) or (
+                local = primary or independent_active(engine) or (
                     local_active(engine, cloud) if cloud else False
                 )
                 channel_state = read_state(engine.store)

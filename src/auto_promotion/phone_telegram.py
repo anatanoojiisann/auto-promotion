@@ -83,7 +83,7 @@ class PhoneTelegram:
             if not item or item["account_id"]!=account["id"] or item["status"]!="not_attempted" or json.loads(item["payload"])!=payload:
                 return False
             task = db.execute("SELECT * FROM tasks WHERE id=?",(item["task_id"],)).fetchone()
-            if (not task or task["state"]!="active" or task["phase"]!="ready" or task["id"] not in self.config.authorized_task_ids
+            if (not task or task["state"]!="active" or task["phase"]!="ready" or not self.task_authorized(task["id"], account["id"], db=db)
                     or db.execute("SELECT value FROM meta WHERE key='global_stop'").fetchone()[0]!="0"):
                 return False
             try:

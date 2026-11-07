@@ -18,6 +18,7 @@ FINGERPRINT_FILES = (
     "routing.py",
     "execution_channels.py",
     "local_authorization.py",
+    "local_primary.py",
     "task_dependencies.py",
     "channel_decisions.py",
     "task_lifecycle.py",

@@ -12,6 +12,8 @@ CONFIGURATION_ERRORS = frozenset(
         "CloudControlConfigurationMissing",
         "LocalChannelBindingMismatch",
         "LocalAuthorizationTaskScopeMismatch",
+        "LocalPrimaryCloudTaskHeld",
+        "LocalPrimaryAccountNotAuthorized",
     }
 )
 
@@ -20,6 +22,8 @@ def control_revision(db, job):
     """Opaque scoped digest; credentials and unrelated account state are never returned."""
     keys = [
         "cloud_control_required",
+        "execution_local_primary",
+        "local_primary_account:" + job["account_id"],
         "execution_store_id",
         "execution_channel_policy",
         "account_channel_binding:" + job["account_id"],

@@ -90,6 +90,16 @@ class PhoneReddit:
                     db.execute(statement)
         self.engine.adapters.phone_reddit = self
 
+    def task_authorized(self, task_id, account_id, *, db=None):
+        if task_id in self.config.authorized_task_ids:
+            return True
+        from .phone_rounds import round_task_authorized
+
+        if db is not None:
+            return round_task_authorized(db, task_id, account_id, self.engine.clock())
+        with self.store.connect() as connection:
+            return round_task_authorized(connection, task_id, account_id, self.engine.clock())
+
     def binding(self, account_id):
         account = self.engine.account(account_id)
         binding = self.config.bindings.get(account_id)
@@ -338,7 +348,7 @@ class PhoneReddit:
             raise BackendError("PhoneRedditSubmissionDisabled")
         item_id = claim["item_id"]
         task = self.store.one("SELECT * FROM tasks WHERE id=?", (claim["task_id"],))
-        if claim["task_id"] not in self.config.authorized_task_ids:
+        if not self.task_authorized(claim["task_id"], account["id"]):
             raise BackendError("PhoneRedditTaskOutsideDevelopmentScope")
         full_claim = {"platform": "reddit", "account": account["backend_label"], "account_id": account["id"],
                       "database": self.store.path, "operation": "execute", "execution_job": execution_job,
@@ -386,6 +396,8 @@ class PhoneReddit:
         verify_claim(json.loads(row["claim"]))
         with self.store.connect(write=True) as db:
             claim = json.loads(row["claim"])
+            if not self.task_authorized(claim["payload"]["task_id"], claim["account_id"], db=db):
+                raise Conflict("PhoneRedditTaskOutsideDevelopmentScope")
             task = db.execute("SELECT * FROM tasks WHERE id=?", (claim["payload"]["task_id"],)).fetchone()
             self.engine._integrity(db, task, "outbound")
             from .phone_rounds import submission_blocker
