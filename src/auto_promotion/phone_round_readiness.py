@@ -258,7 +258,8 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None, refresh_iden
             publish(
                 [key] if isinstance(key, dict) else
                 [m for m in scoped if id(platform_services[m["platform"]]) == key],
-                {"software_ready": False, "reason": "PhoneFleetReadinessTimeout"},
+                {"software_ready": False,
+                 "reason": "PhoneIdentityRefreshPending" if isinstance(key, dict) else "PhoneFleetReadinessTimeout"},
             )
     finally:
         # Never abandon an external submit: these futures only read capabilities.

@@ -402,7 +402,7 @@ class Statistics:
             for r in rows
         ]
 
-    def _save_report(self, db, kind, start, cutoff, now):
+    def _save_report(self, db, kind, start, cutoff, now, *, pending=None):
         day = datetime.fromtimestamp(cutoff - 1, ZONE).date()
         cumulative_start, _ = day_bounds(day)
         content = {
@@ -418,19 +418,37 @@ class Statistics:
         ).fetchone()
         if previous and previous[0] == content_hash:
             return False
+        values = (kind, cutoff, start, now, now, content_hash, canonical(content))
+        if pending is not None:
+            pending.append(values)
+        else:
+            self._write_report(db, values)
+        return True
+
+    @staticmethod
+    def _write_report(db, values):
         db.execute(
             "INSERT INTO statistical_reports VALUES(?,?,?,?,?,1,?,?) "
             "ON CONFLICT(kind,cutoff) DO UPDATE SET updated_at=excluded.updated_at,"
             "revision=statistical_reports.revision+1,content_hash=excluded.content_hash,content=excluded.content",
-            (kind, cutoff, start, now, now, content_hash, canonical(content)),
+            values,
         )
-        return True
 
     def run_due(self):
+        for attempt in range(2):
+            result = self._run_due_once()
+            if not result.get("concurrent_update"):
+                return result
+        return result
+
+    def _run_due_once(self):
         """Persist elapsed 3-hour slots, 20:00 snapshots, midnight finals and late evidence."""
         now = self.clock()
         changed = 0
-        with self.store.connect(write=True) as db:
+        pending = []
+        # Snapshot calculation must never hold the business database writer.
+        with self.store.connect() as db:
+            db.execute("BEGIN")
             state = db.execute("SELECT * FROM reporting_state WHERE id=1").fetchone()
             revision = int(
                 db.execute("SELECT value FROM meta WHERE key='statistics_revision'").fetchone()[0]
@@ -445,12 +463,12 @@ class Statistics:
                     "SELECT kind,starts_at,cutoff FROM statistical_reports"
                 ).fetchall():
                     changed += self._save_report(
-                        db, row["kind"], row["starts_at"], row["cutoff"], now
+                        db, row["kind"], row["starts_at"], row["cutoff"], now, pending=pending
                     )
             day = datetime.fromtimestamp(since, ZONE).date()
             if not state:
                 start, cutoff = day_bounds(today - timedelta(days=1))
-                changed += self._save_report(db, "daily_final", start, cutoff, now)
+                changed += self._save_report(db, "daily_final", start, cutoff, now, pending=pending)
             while day <= datetime.fromtimestamp(end, ZONE).date():
                 start, midnight = day_bounds(day)
                 windows = [
@@ -463,8 +481,17 @@ class Statistics:
                 ]
                 for kind, window_start, cutoff in sorted(windows, key=lambda w: (w[2], w[0])):
                     if since < cutoff <= end:
-                        changed += self._save_report(db, kind, window_start, cutoff, now)
+                        changed += self._save_report(db, kind, window_start, cutoff, now, pending=pending)
                 day += timedelta(days=1)
+            original_state = tuple(state) if state else None
+        with self.store.connect(write=True) as db:
+            current = db.execute("SELECT * FROM reporting_state WHERE id=1").fetchone()
+            if (tuple(current) if current else None) != original_state:
+                return {"updated_reports": 0, "concurrent_update": True,
+                        "checked_through": current["last_tick"] if current else 0,
+                        "catch_up_pending": not current or current["last_tick"] < now}
+            for values in pending:
+                self._write_report(db, values)
             db.execute(
                 "INSERT INTO reporting_state VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET "
                 "last_tick=excluded.last_tick,source_revision=excluded.source_revision",

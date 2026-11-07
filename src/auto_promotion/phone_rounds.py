@@ -683,6 +683,20 @@ class PhoneRounds:
         ):
             return
         now, chosen = self.clock(), None
+        # A completed identity observation resumes the same explicitly started
+        # member once. No item with an attempt is eligible for this continuation.
+        waiting = self.store.rows(
+            "SELECT m.round_id,m.platform,i.account_id FROM phone_round_members m "
+            "JOIN phone_rounds r ON r.id=m.round_id JOIN items i ON i.id=m.item_id "
+            "WHERE m.state='blocked' AND m.error='PhoneIdentityRefreshPending' "
+            "AND i.status='not_attempted' AND i.attempt_id IS NULL "
+            "AND r.state IN ('running','blocked') AND r.submit_deadline>?",
+            (now,))
+        for member in waiting:
+            service = getattr(self.engine.adapters, "phone_social", None)
+            if service and service.fresh(self.engine.account(member["account_id"])):
+                self.start(member["round_id"], member["platform"])
+                break
         repair = []
         # Inspect unchanged waiting rounds without holding the database writer.
         with self.store.connect() as db:
