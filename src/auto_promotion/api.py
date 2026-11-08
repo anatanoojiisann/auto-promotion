@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -26,6 +26,7 @@ from .backends.common import BackendError
 from .campaigns import Campaigns
 from .config import database_path, workspace_path
 from .connections import ConnectionInput, ConnectionManager
+from .content_queue import ContentBatch, ContentDraft, ContentQueue, publication_status
 from .core import Conflict, Engine, NotFound
 from .dispatcher import AccountBusy
 from .engagement import Engagement
@@ -166,6 +167,7 @@ def create_app(
     pools, campaigns = Pools(engine), Campaigns(engine)
     growth = Growth(engine)
     task_tools = TaskTools(engine)
+    content_queue = ContentQueue(engine)
     tiktok = TikTokManager(engine)
     meta_browser = MetaBrowser(engine)
     tiktok_browser = TikTokBrowser(engine)
@@ -786,6 +788,28 @@ def create_app(
             "ap_session", session_token, httponly=True, samesite="strict", max_age=86400
         )
         return response
+
+    @app.post("/api/content-queue", status_code=201)
+    def save_content(value: ContentDraft):
+        return content_queue.put(value)
+
+    @app.get("/api/content-queue")
+    def list_content(limit: int = Query(100, ge=1, le=500)):
+        return content_queue.list(limit)
+
+    @app.post("/api/content-queue/batches")
+    def materialize_content(value: ContentBatch):
+        return content_queue.materialize(value)
+
+    @app.get("/api/content-queue/tasks/{task_id}/status")
+    def content_task_status(task_id: str):
+        task = engine.task(task_id)
+        return {"task_id": task_id, "control_state": task["state"],
+                "items": [publication_status(i) for i in task["items"]]}
+
+    @app.get("/api/content-queue/{content_id}")
+    def read_content(content_id: str):
+        return content_queue.get(content_id)
 
     @app.get("/api/overview")
     def overview():

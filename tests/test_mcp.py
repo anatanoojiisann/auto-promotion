@@ -109,7 +109,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 75)
+        self.assertEqual(len(tools), 78)
         self.assertTrue({"acknowledge_unrelated_x_history", "authorize_deleted_x_reply_replacement", "continue_unsubmitted_x_reply_replacement"} <= tools.keys())
         # Main8a003dd adds these two local read-only tools to the prior70.
         for name in ("engagement_statistics", "engagement_history"):
@@ -328,7 +328,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
                     tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-                    self.assertEqual(len(tools), 75)
+                    self.assertEqual(len(tools), 78)
                     self.assertTrue({"acknowledge_unrelated_x_history", "authorize_deleted_x_reply_replacement", "continue_unsubmitted_x_reply_replacement"} <= tools.keys())
                     for name in ("engagement_statistics", "engagement_history"):
                         self.assertIn(name, tools)

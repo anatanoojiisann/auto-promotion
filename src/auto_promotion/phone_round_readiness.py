@@ -8,10 +8,10 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from .account_blocks import active_block
 from .cloud_control import CloudUnavailable
 from .core import Conflict, NotFound
+from .delivery_policy import late
 from .models import digest, epoch
 from .phone_protocol import capability_status
-from .phone_rounds import TOTAL_SECONDS, PREFLIGHT_SECONDS
-from .readiness import DELIVERY_GRACE_SECONDS
+from .phone_rounds import PREFLIGHT_SECONDS, TOTAL_SECONDS
 from .task_channels import control_preflight, safe_channel_code
 
 
@@ -32,7 +32,7 @@ def _member_blockers(engine, member, now, service, remote, *, refresh_identity=F
     task = store.one("SELECT * FROM tasks WHERE id=?", (member["task_id"],))
     if not task or not item or item["task_id"] != member["task_id"]:
         return ["PhoneRoundOriginalItemMissing"]
-    if now - item["due_at"] > DELIVERY_GRACE_SECONDS:
+    if late(json.loads(task["policy"]), item["due_at"], now):
         reasons.append("PhoneItemDeliveryWindowElapsed")
     account = engine.account(item["account_id"])
     if account["platform"] != member["platform"]:

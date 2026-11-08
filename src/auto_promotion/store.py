@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
-import os
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
+from .content_schema import SCHEMA as CONTENT_SCHEMA
 from .models import canonical
 
-SCHEMA = """
+SCHEMA = CONTENT_SCHEMA + """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cloud_sync_records(
  destination TEXT NOT NULL,section TEXT NOT NULL,record_id TEXT NOT NULL,

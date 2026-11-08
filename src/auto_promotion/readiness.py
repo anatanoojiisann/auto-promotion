@@ -3,6 +3,7 @@
 import json
 import math
 
+from .delivery_policy import late
 from .models import digest, epoch, telegram_target_aliases
 
 DELIVERY_GRACE_SECONDS = 900
@@ -209,7 +210,7 @@ def task_workflow(task, blockers, item_blockers, now):
         not task["manifest_hash"]
         and any(
             (
-                now - i["due_at"] > DELIVERY_GRACE_SECONDS
+                late(task["policy"], i["due_at"], now)
                 and not (
                     task["phase"] == "starting"
                     and (

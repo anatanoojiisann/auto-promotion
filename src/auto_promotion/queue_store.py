@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager
 
+from .delivery_policy import item_deadline
 from .models import canonical, digest, epoch
 from .routing import task_route
 from .temporal_tasks import QUEUE_SCHEMA as TEMPORAL_QUEUE_SCHEMA
@@ -218,9 +219,7 @@ class JobQueue:
                     route = task_route(account, payload, policy.get("execution_method"), self.engine.adapters)
                     native = payload["action"] in {"schedule_message", "schedule_file"}
                     due = epoch(policy["starts_at"]) if native else row["due_at"]
-                    expires = min(
-                        epoch(policy["ends_at"]), row["due_at"] if native else row["due_at"] + 900
-                    )
+                    expires = item_deadline(policy, row["due_at"], payload["action"])
                     added += self._put(
                         "send", row["id"], task, account, route, row["payload_hash"], due, expires
                     )

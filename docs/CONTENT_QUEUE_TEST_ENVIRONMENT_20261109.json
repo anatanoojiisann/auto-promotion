@@ -1,0 +1,11 @@
+{
+  "pydantic": "2.14.3",
+  "fastapi": "0.162.2",
+  "mcp": "1.30.0",
+  "temporalio": "1.24.0",
+  "pytest": "9.2.0",
+  "ruff": "0.17.4",
+  "phone-fleet-protocol": "0.2.0",
+  "phone-platform-contracts": "1.2.0",
+  "phone-fleet-management": "0.2.0.dev18"
+}

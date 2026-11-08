@@ -139,6 +139,7 @@ class Policy(Model):
     execution_channel_source: str = Field(default="", max_length=240)
     execution_method: Literal["inherit", "api", "browser", "phone"] = "inherit"
     execution_node_os: Literal["any", "windows", "macos"] = "any"
+    dispatch_policy: Literal["legacy", "phone_queue_v1"] = "legacy"
     outbound_dependency_mode: Literal["published", "finished"] = "published"
     outbound_dependency_deadline: str | None = None
     queries: list[str] = Field(default_factory=list, max_length=20)
@@ -171,6 +172,8 @@ class Policy(Model):
     @model_validator(mode="after")
     def window(self):
         ZoneInfo(self.timezone)
+        if self.dispatch_policy == "phone_queue_v1" and (self.execution_method != "phone" or self.execution_channel != "local"):
+            raise ValueError("DurableQueueRequiresLocalPhone")
         if self.execution_channel_source and self.execution_channel == "inherit":
             raise ValueError("明确的通道指令来源需要同时指定 cloud 或 local，不能跟随默认")
         if self.user_daily_limit == 3 and not (

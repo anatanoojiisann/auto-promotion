@@ -24,6 +24,7 @@ from .backends.common import (
     read_profile,
     x_post_weight,
 )
+from .delivery_policy import durable, late
 from .dispatcher import AccountBusy, AccountLanes
 from .execution_diagnostics import FIELDS, admission_failure_reason, safe_code
 from .models import (
@@ -40,7 +41,7 @@ from .models import (
     target_allowed,
     telegram_public_handle,
 )
-from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_blocker
+from .readiness import REASONS, task_workflow, telegram_blocker
 from .routing import route_for, task_route
 from .runtime_identity import result_runtime
 from .statistics import ZONE, Statistics, publication_time, record_publication
@@ -1023,7 +1024,7 @@ class Engine:
                     db.execute("UPDATE accounts SET disabled=1 WHERE id=?", (account_id,))
                 Store.audit(db, "account.cooldown", {"account_id": account_id, "until": until})
 
-    def create_task(self, value: TaskInput, *, interaction_claim=None):
+    def create_task(self, value: TaskInput, *, interaction_claim=None, content_claim=None):
         if len(set(value.account_ids)) != len(value.account_ids):
             raise Conflict("任务账号不能重复")
         accounts = [self.account(a) for a in value.account_ids]
@@ -1077,6 +1078,12 @@ class Engine:
         task_id = "AP-" + uuid.uuid4().hex[:14].upper()
         now = self.clock()
         with self.store.connect(write=True) as db:
+            if content_claim:
+                batch = db.execute("SELECT * FROM content_queue_batches WHERE id=?", (content_claim[0],)).fetchone()
+                if not batch or batch["request_hash"] != content_claim[1]:
+                    raise Conflict("ContentBatchClaimMismatch")
+                if batch["task_id"]:
+                    return self.task(batch["task_id"])
             if interaction_claim:
                 candidate = db.execute(
                     "SELECT * FROM hf_candidates WHERE id=?", (interaction_claim["candidate_id"],)
@@ -1113,6 +1120,9 @@ class Engine:
                     "UPDATE hf_candidates SET task_id=? WHERE id=?",
                     (task_id, interaction_claim["candidate_id"]),
                 )
+            if content_claim:
+                db.execute("UPDATE content_queue_batches SET task_id=? WHERE id=? AND task_id IS NULL",
+                           (task_id, content_claim[0]))
             Store.audit(db, "task.created", {"policy_hash": digest(envelope)}, task_id, now)
         return self.task(task_id)
 
@@ -1131,6 +1141,10 @@ class Engine:
                 "SELECT * FROM items WHERE task_id=? ORDER BY position", (task_id,)
             )
         ]
+        if durable(result["policy"]):
+            from .content_queue import publication_status
+
+            result["publication_items"] = [publication_status(i) for i in result["items"]]
         result["candidates"] = [
             decode(r, "payload", "reasons", "result")
             for r in self.store.rows(
@@ -1320,6 +1334,21 @@ class Engine:
     def _check_start_accounts(self, task, *, refresh=True):
         """Check before taking the task's write transaction or reserving any work."""
 
+        if durable(task["policy"]):
+            # Explicit start authorizes the frozen queue; fresh device evidence is
+            # obtained by the existing execution gates when work is actually due.
+            for account_id in task["account_ids"]:
+                account = self.account(account_id)
+                if account["disabled"]:
+                    raise Conflict("AccountDisabled")
+                if account["mode"] == "live" and not task_route(
+                    account, {}, "phone", self.adapters
+                ).resource:
+                    raise Conflict("PhoneAccountBindingRequired")
+            with self.store.connect(write=True) as db:
+                Store.audit(db, "task.phone_preflight_deferred",
+                            {"reason": "fresh_observation_at_execution"}, task["id"], self.clock())
+            return
         checks = []
         for account_id in task["account_ids"]:
             account = self.account(account_id)
@@ -1352,7 +1381,11 @@ class Engine:
             )
 
     def _validate_start_accounts(self, task):
-
+        if durable(json.loads(task["policy"])):
+            for account_id in json.loads(task["account_ids"]):
+                if self.account(account_id)["disabled"]:
+                    raise Conflict("AccountDisabled")
+            return
         for account_id in json.loads(task["account_ids"]):
             check = self.account_readiness(dict(task), self.account(account_id))
             if not check["ready"]:
@@ -1881,6 +1914,8 @@ class Engine:
         }:
             raise Conflict("该平台不支持此外发动作")
         policy = task["policy"]
+        if policy.get("dispatch_policy") == "phone_queue_v1" and value.action in {"schedule_message", "schedule_file"}:
+            raise Conflict("DurableQueueDoesNotChangeNativeSchedules")
         if not epoch(policy["starts_at"]) <= epoch(value.scheduled_at) < epoch(policy["ends_at"]):
             raise Conflict("计划时间超出任务执行窗口")
         if not target_allowed(account["platform"], value.target, policy["target_allowlist"]):
@@ -1930,7 +1965,11 @@ class Engine:
             from .tiktok_browser import validate_browser_item
 
             try:
-                if account.get("execution_backend") == "phone":
+                if task["policy"].get("execution_method") == "phone":
+                    from .phone_social import validate_item as validate_phone_item
+
+                    validate_phone_item(account, value.model_dump())
+                elif account.get("execution_backend") == "phone":
                     # Already validated by the narrow phone text flow above.
                     pass
                 elif account.get("execution_backend") == "desktop":
@@ -2077,7 +2116,8 @@ class Engine:
         self, db, task, *, check_membership=True, resume_frozen_x=False
     ):
         now = self.clock()
-        if now >= epoch(json.loads(task["policy"])["ends_at"]):
+        policy = json.loads(task["policy"])
+        if now >= epoch(policy["ends_at"]):
             raise Conflict("任务执行窗口已过期，请创建新任务")
         for row in db.execute(
             "SELECT * FROM items WHERE task_id=? ORDER BY position", (task["id"],)
@@ -2095,11 +2135,11 @@ class Engine:
                     or db.execute("SELECT 1 FROM attempts WHERE item_id=?", (row["id"],)).fetchone()
                 ):
                     raise Conflict("未执行项目存在尝试或回执，不能恢复")
-                if now - row["due_at"] > DELIVERY_GRACE_SECONDS:
+                if late(policy, row["due_at"], now):
                     # The normal claim boundary records this as missed; it must never send late.
                     continue
             native = payload["action"] in {"schedule_message", "schedule_file"}
-            if now - row["due_at"] > DELIVERY_GRACE_SECONDS or (native and row["due_at"] <= now):
+            if late(policy, row["due_at"], now) or (native and row["due_at"] <= now):
                 raise Conflict("清单包含已过期的计划时间，请创建新任务")
             reason = (
                 telegram_blocker(db, task, payload, row["due_at"]) if check_membership else None
@@ -2120,7 +2160,7 @@ class Engine:
         if media.get("source_url") and urlparse(media["source_url"]).scheme != "https":
             raise Conflict("媒体来源地址必须使用 HTTPS")
 
-    def set_items(self, task_id, values):
+    def set_items(self, task_id, values, *, content_claim=None):
         task = self.task(task_id)
         if not values or len(values) > 200:
             raise Conflict("每批需要 1–200 个执行项")
@@ -2205,6 +2245,16 @@ class Engine:
                 raise Conflict("清单已经冻结；变更内容请创建新任务")
             if row["campaign_id"] and any(not p.get("opportunity_id") for p in payloads):
                 raise Conflict("活动执行项必须关联已分配的共享内容")
+            if not content_claim and db.execute(
+                "SELECT 1 FROM content_queue_batches WHERE task_id=?", (task_id,)
+            ).fetchone():
+                raise Conflict("ContentTaskImmutable")
+            if content_claim:
+                batch = db.execute("SELECT * FROM content_queue_batches WHERE id=?", (content_claim[0],)).fetchone()
+                if not batch or batch["request_hash"] != content_claim[1] or batch["task_id"] != task_id:
+                    raise Conflict("ContentBatchClaimMismatch")
+                if db.execute("SELECT 1 FROM items WHERE task_id=?", (task_id,)).fetchone():
+                    return self.task(task_id)
             db.execute("UPDATE campaign_assignments SET item_id=NULL WHERE task_id=?", (task_id,))
             db.execute("DELETE FROM items WHERE task_id=?", (task_id,))
             for payload in payloads:
@@ -2613,7 +2663,7 @@ class Engine:
             if (
                 now >= epoch(policy["ends_at"])
                 or (
-                    now - row["due_at"] > DELIVERY_GRACE_SECONDS
+                    late(policy, row["due_at"], now)
                     and not (row["phase"] == "starting" and policy.get("outbound_after_task_ids"))
                 )
                 or (native and row["due_at"] <= now)
@@ -2786,7 +2836,7 @@ class Engine:
                 reason = "task_not_active"
             elif (
                 now >= epoch(policy["ends_at"])
-                or now - row["due_at"] > DELIVERY_GRACE_SECONDS
+                or late(policy, row["due_at"], now)
                 or (native and row["due_at"] <= now)
             ):
                 with self.store.connect(write=True) as db:
@@ -2873,7 +2923,7 @@ class Engine:
             native = json.loads(row["payload"])["action"] in {"schedule_message", "schedule_file"}
             if (
                 self.clock() >= epoch(policy["ends_at"])
-                or self.clock() - row["due_at"] > DELIVERY_GRACE_SECONDS
+                or late(policy, row["due_at"], self.clock())
                 or (native and row["due_at"] <= self.clock())
             ):
                 with self.store.connect(write=True) as db:

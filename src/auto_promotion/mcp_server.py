@@ -637,6 +637,29 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         return invoke(lambda: engine.candidate(task_id, CandidateInput(**candidate)))
 
     @server.tool(annotations=local)
+    def save_interaction_content(content: dict) -> dict:
+        """Save immutable target-bound content without an account, device, model call or send."""
+        from .content_queue import ContentDraft, ContentQueue
+
+        return invoke(lambda: ContentQueue(engine).put(ContentDraft(**content)))
+
+    @server.tool(annotations=read)
+    def list_interaction_content(limit: int = 100) -> dict:
+        """Read persisted content and its draft-task binding; never start execution."""
+        from .content_queue import ContentQueue
+
+        if not 1 <= limit <= 500:
+            raise ToolError("ContentLimitOutOfRange")
+        return invoke(lambda: {"items": ContentQueue(engine).list(limit)})
+
+    @server.tool(annotations=local)
+    def materialize_content_batch(batch: dict) -> dict:
+        """Bind saved content to a phone draft idempotently; explicit start_task is still required."""
+        from .content_queue import ContentBatch, ContentQueue
+
+        return invoke(lambda: ContentQueue(engine).materialize(ContentBatch(**batch)))
+
+    @server.tool(annotations=local)
     def set_task_items(task_id: str, items: list[dict]) -> dict:
         """Save drafts only. TikTok desktop comment/reply may omit target: resolve tiktok_video_id from this task/account candidate evidence; no send permission."""
         return invoke(lambda: engine.set_items(task_id, [ItemInput(**i) for i in items]))
