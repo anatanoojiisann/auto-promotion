@@ -23,9 +23,10 @@ class PromotionTask:
 
     async def call(self, name, value):
         remaining = max(0.001, self.deadline - workflow.now().timestamp())
+        preparation = name == "promotion_task_prepare"
         return await workflow.execute_activity(name, value,
-            start_to_close_timeout=timedelta(seconds=min(5, remaining)),
-            schedule_to_close_timeout=timedelta(seconds=min(15, remaining)),
+            start_to_close_timeout=timedelta(seconds=min(15 if preparation else 5, remaining)),
+            schedule_to_close_timeout=timedelta(seconds=min(35 if preparation else 15, remaining)),
             retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1)))
 
     @workflow.run
@@ -48,6 +49,8 @@ class PromotionTask:
                         continue
                     admitted = True
                 current = await self.call("promotion_task_status", value)
+                if current.get("state") == "active" and (current.get("preparation") or {}).get("items"):
+                    self.state["preparation"] = await self.call("promotion_task_prepare", value)
             except ActivityError as error:
                 if isinstance(error.cause, ApplicationError) and error.cause.non_retryable:
                     self.record("blocked", reason=error.cause.type, device_held=False)
@@ -72,11 +75,17 @@ class PromotionTask:
                 self.record("partial" if any(i["status"] == "confirmed" for i in rows) else "failed_known", device_held=False)
                 return self.state
             if current["state"] in {"paused", "cancelled"}:
-                self.record(current["state"], reason="business_task_stopped")
+                self.record(current["state"], reason="business_task_stopped", device_held=False)
+                if current["state"] == "paused" and workflow.patched("recoverable-visual-review-pause-v1"):
+                    await workflow.sleep(2)
+                    continue
                 return self.state
             pending = any(i["status"] == "unknown" for i in rows)
-            self.record("waiting_receipt" if pending else "executing",
-                        device_held=any(i.get("resource_state") in {"fenced", "busy"} for i in rows))
+            preparation = self.state.get("preparation") or {}
+            stage = ("waiting_receipt" if pending else "waiting_visual_review" if preparation.get("pending_review")
+                     else "waiting_preparation" if preparation.get("blocked") else "executing")
+            self.record(stage, review_device_held=preparation.get("device_held",False),
+                        device_held=bool(preparation.get("device_held")) or any(i.get("resource_state") in {"fenced", "busy"} for i in rows))
             await workflow.sleep(1)
         self.record("unknown" if any(i.get("submission_started") or i.get("status") == "unknown" for i in self.state.get("items", [])) else "missed",
                     reason="original_deadline_elapsed")

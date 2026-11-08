@@ -94,11 +94,16 @@ class PhoneReddit:
         if task_id in self.config.authorized_task_ids:
             return True
         from .phone_rounds import round_task_authorized
+        from .temporal_tasks import dynamically_authorized
+
+        def authorized(connection):
+            return (dynamically_authorized(self, connection, task_id, account_id)
+                    or round_task_authorized(connection, task_id, account_id, self.engine.clock()))
 
         if db is not None:
-            return round_task_authorized(db, task_id, account_id, self.engine.clock())
+            return authorized(db)
         with self.store.connect() as connection:
-            return round_task_authorized(connection, task_id, account_id, self.engine.clock())
+            return authorized(connection)
 
     def binding(self, account_id):
         account = self.engine.account(account_id)
@@ -132,9 +137,9 @@ class PhoneReddit:
             self.cached_token, self.token_until = value["access_token"], time.time() + value["expires_in"] - 30
             return self.cached_token
 
-    def request(self, method, path, body=None, key=None):
+    def request(self, method, path, body=None, key=None, *, timeout=None):
         token = self.fleet_token()
-        with httpx.Client(base_url=self.url, timeout=3 if path == "/capabilities" else 12, trust_env=False,
+        with httpx.Client(base_url=self.url, timeout=timeout if timeout is not None else (3 if path == "/capabilities" else 12), trust_env=False,
                           follow_redirects=False, transport=self.transport) as client:
             response = client.request(method, "/internal/fleet/v1" + path, json=body,
                 headers={"Authorization": "Bearer " + token,
@@ -145,14 +150,14 @@ class PhoneReddit:
             raise BackendError("PhoneRedditFleetReadOrDispatchUnavailable")
         return response.json()
 
-    def dispatch(self, request, operation_id, account_id, item_id=None):
+    def dispatch(self, request, operation_id, account_id, item_id=None, *, wait=True):
         from .execution_timing import stage
 
         with stage(self.engine, request.business_task_id, "phone_" + request.operation,
                    operation_id=operation_id, item_id=item_id):
-            return self._dispatch(request, operation_id, account_id, item_id)
+            return self._dispatch(request, operation_id, account_id, item_id, wait=wait)
 
-    def _dispatch(self, request, operation_id, account_id, item_id=None):
+    def _dispatch(self, request, operation_id, account_id, item_id=None, *, wait=True):
         """Persist intent before create; an uncertain POST is only looked up thereafter."""
         from phone_fleet_protocol import ExecutionSnapshot, fingerprint
 
@@ -204,7 +209,7 @@ class PhoneReddit:
                         db.execute(f"UPDATE {table} SET execution_id=?,result=?,phase='linked' WHERE id=?",
                                    (checked.id, encoded, operation_id))
                     last_saved = encoded
-                if checked.status in {"succeeded", "failed", "cancelled", "unknown","waiting_for_human"} or remaining() <= 0:
+                if not wait or checked.status in {"succeeded", "failed", "cancelled", "unknown","waiting_for_human"} or remaining() <= 0:
                     return snapshot
                 time.sleep(max(0, min(poll_delay, remaining())))
                 if remaining() <= 0:

@@ -22,8 +22,8 @@ class Activities:
     def __init__(self, http):
         self.http = http
 
-    async def request(self, method, path, value=None):
-        response = await self.http.request(method, path, json=value)
+    async def request(self, method, path, value=None, *, timeout=3):
+        response = await self.http.request(method, path, json=value, timeout=timeout)
         if response.status_code in {400, 401, 403, 404, 409, 410, 422}:
             raise ApplicationError("Authenticated task endpoint rejected", type="task_endpoint_rejected", non_retryable=True)
         response.raise_for_status()
@@ -33,6 +33,11 @@ class Activities:
     async def admit(self, value: dict) -> dict:
         return await self.request("POST", "/api/temporal/tasks/" + quote(value["task_id"], safe="") + "/admit",
                                   {k: value[k] for k in ("manifest_hash", "workflow_id")})
+
+    @activity.defn(name="promotion_task_prepare")
+    async def prepare(self, value: dict) -> dict:
+        return await self.request("POST", "/api/temporal/tasks/" + quote(value["task_id"], safe="") + "/prepare",
+            {k:value[k] for k in ("manifest_hash","workflow_id")}, timeout=10)
 
     @activity.defn(name="promotion_task_status")
     async def status(self, value: dict) -> dict:
@@ -61,7 +66,7 @@ async def run(config):
                                 headers={"Authorization": "Bearer " + os.environ[config["promotion_token_env"]]}) as http:
         acts = Activities(http)
         async with Worker(temporal, task_queue=config["task_queue"], workflows=[PromotionTask],
-                          activities=[acts.admit, acts.status]):
+                          activities=[acts.admit, acts.status, acts.prepare]):
             while True:
                 try:
                     response = await http.get("/api/temporal/tasks")

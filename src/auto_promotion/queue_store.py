@@ -448,13 +448,15 @@ class JobQueue:
                 "WHERE auth.identity_key=json_extract(j.route,'$.identity') "
                 "AND auth.state IN ('leased','pending') AND auth.until_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM temporal_task_links tl WHERE tl.task_id=j.task_id AND tl.state<>'enabled') "
+                "AND NOT EXISTS(SELECT 1 FROM phone_visual_preparations p WHERE p.item_id=j.reference_id AND "
+                "(p.phase<>'ready' OR p.expires_at IS NULL OR p.expires_at<=?)) "
                 "AND j.expires_at>? AND (j.kind<>'send' OR t.phase='ready') "
                 "AND NOT EXISTS(SELECT 1 FROM execution_resources r WHERE r.resource=json_extract(j.route,'$.resource') AND r.expires_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM account_task_channels ch LEFT JOIN tasks holder ON holder.id=ch.task_id "
                 "WHERE ch.account_id=j.account_id AND ch.until_at>? AND (ch.retry_at>? OR (ch.state='handoff' AND ch.task_id<>j.task_id "
                 "AND holder.state='active' AND unixepoch(json_extract(holder.policy,'$.ends_at'))>?)))"
             )
-            params = [pool, now, now, now, now, now, now, now, now, now, now, now, now]
+            params = [pool] + [now] * 13
             if reference_id is not None:
                 sql += " AND j.reference_id=?"
                 params.append(reference_id)

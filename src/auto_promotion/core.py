@@ -2245,6 +2245,9 @@ class Engine:
             if row["state"] in {"cancelled", "completed"}:
                 raise Conflict("任务已结束")
             self._freeze_manifest(db, row)
+        from .temporal_tasks import auto_register_new_phone_task
+
+        auto_register_new_phone_task(self, task_id)
         return self.task(task_id)
 
     def _freeze_manifest(self, db, row):

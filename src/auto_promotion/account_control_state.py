@@ -78,12 +78,16 @@ def account_check(engine, task, account):
     if health_reason in RESTRICTED | VERIFICATION:
         reason = reason or health_reason
     fresh = phone.fresh(account)
-    reason = reason or (None if fresh else "PhoneSocialFreshIdentityRequired")
+    from .phone_visual_preparation import trusted_ready
+
+    prepared = bool(task.get("id") and trusted_ready(phone, account["id"], task["id"]))
+    reason = reason or (None if fresh or prepared else "PhoneSocialFreshIdentityRequired")
     return {"account_id": account["id"], "label": account.get("label", account["id"]),
             "platform": account["platform"], "ready": reason is None,
-            "state": "healthy" if reason is None else "connection_check_required", "reason": reason,
-            "message": "手机身份已核验，提交前将再次核对" if reason is None else reason,
+            "state": ("healthy" if fresh else "prepared") if reason is None else "connection_check_required", "reason": reason,
+            "message": ("手机身份已核验，提交前将再次核对" if fresh else "已准备，发送前将重新核对手机身份") if reason is None else reason,
             "checked_at": account.get("checked_at"), "identity_verified": fresh,
+            "native_identity_check_pending": bool(prepared and not fresh),
             "execution_method": "phone", "pacing_until": account.get("next_at", 0)}
 
 

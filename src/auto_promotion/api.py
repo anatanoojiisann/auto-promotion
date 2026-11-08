@@ -840,6 +840,12 @@ def create_app(
 
         return admit(engine, task_id, value.get("manifest_hash"), value.get("workflow_id"))
 
+    @app.post("/api/temporal/tasks/{task_id}/prepare")
+    def temporal_prepare(task_id: str, value: dict):
+        from .phone_visual_preparation import prepare_task
+
+        return prepare_task(engine, task_id, value.get("manifest_hash"), value.get("workflow_id"))
+
     @app.get("/api/temporal/tasks/{task_id}")
     def temporal_status(task_id: str):
         from .temporal_tasks import status

@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from .backends.common import BackendError, read_profile, save_profile, verify_claim
 from .core import Conflict
-from .models import canonical, digest
+from .models import canonical, digest, epoch
 from .phone_reddit import PhoneReddit, RedditPhoneConfig
 from .phone_telegram import JOIN_SCHEMA, PhoneTelegram
 from .store import Store
@@ -64,6 +64,8 @@ class CommissionedSinglePass(BaseModel):
 
 
 class SocialPhoneConfig(RedditPhoneConfig):
+    dynamic_task_authorization_enabled: bool = False
+    async_visual_review_enabled: bool = False
     single_pass_adapters: dict[str, CommissionedSinglePass] = Field(default_factory=dict)
     single_pass_task_ids: list[str] = Field(default_factory=list)
     join_enabled: bool = False
@@ -129,6 +131,9 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 if statement.strip():
                     db.execute(statement)
         engine.adapters.phone_social = self
+        from .temporal_tasks import commission_dynamic_admission
+
+        commission_dynamic_admission(self)
 
     def single_pass_adapter(self, account_id, task_id=None):
         from .phone_single_pass import adapter
@@ -278,6 +283,11 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 raise Conflict("PhoneSocialAccountStoppedOrCoolingDown")
             if self.fresh(account):
                 return {"refreshed":False,"identity_verified":True}
+            if task_id:
+                from .phone_visual_preparation import trusted_ready
+
+                if trusted_ready(self, account_id, task_id):
+                    return {"refreshed":False,"identity_verified":False,"native_identity_check_pending":True}
             previous = self.store.one("SELECT * FROM phone_social_operations WHERE account_id=? AND kind='social_identity' ORDER BY created_at DESC LIMIT 1",(account_id,))
             if previous:
                 snapshot = json.loads(previous["result"])
@@ -464,6 +474,14 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                    "expected_adapter_sha256": adapter_sha256}
         request = self.make_request(account["id"], "social_submit", context, task_id=task["id"],
             item_id=claim["item_id"], manifest=task["manifest_hash"], channel=policy["execution_channel"])
+        if context.get("visual_review_id"):
+            from .phone_visual_preparation import trusted_ready
+
+            prepared = trusted_ready(self, account["id"], task["id"], item_id=claim["item_id"])
+            if not prepared:
+                raise BackendError("PhoneVisualPreparationRequired")
+            request = type(request).model_validate({**request.model_dump(mode="json"),
+                "deadline": min(request.deadline, prepared["expires_at"], epoch(policy["ends_at"]))})
         try:
             baseline = single_baseline or (self.observer_baseline(account["id"],binding.identity,context["target_url"]) if binding.receipt_reader=="telegram_api" else None)
             reservation = self.telegram_observer.reserve_receipt(account["id"]) if baseline is not None else None

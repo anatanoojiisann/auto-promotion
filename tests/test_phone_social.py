@@ -343,3 +343,114 @@ def test_legacy_identity_observation_is_not_fresh_after_upgrade(pilot):
     with s.store.connect(write=True) as db:
         db.execute("UPDATE phone_social_accounts SET observation=? WHERE account_id=?", (json.dumps(observation), s.account["id"]))
     assert not s.service.fresh(s.engine.account(s.account["id"]))
+
+
+def dynamic_pilot(s):
+    s.service.config = s.service.config.model_copy(update={
+        "submit_enabled": True, "dynamic_task_authorization_enabled": True,
+        "authorized_task_ids": [], "single_pass_task_ids": []})
+    from auto_promotion.temporal_tasks import commission_dynamic_admission
+
+    with s.monkeypatch.context() as patch:
+        patch.setattr(s.engine, "clock", lambda: s.task["created_at"])
+        commission_dynamic_admission(s.service)
+    s.service.prepare(s.item["id"], s.metadata)
+    if s.app == "telegram":
+        s.monkeypatch.setattr("auto_promotion.core.telegram_blocker", lambda *a, **k: None)
+    return s.service
+
+
+def test_dynamic_phone_prepare_never_authorizes_execution(pilot):
+    s = pilot
+    service = dynamic_pilot(s)
+    s.engine.prepare(s.task["id"])
+    link = s.store.one("SELECT * FROM temporal_task_links WHERE task_id=?", (s.task["id"],))
+    assert link["state"] == "registered" and link["requested_at"] is None
+    assert not service.task_authorized(s.task["id"], s.account["id"])
+    assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 0
+    assert s.store.one("SELECT COUNT(*) n FROM phone_social_authorizations")["n"] == 0
+    assert s.engine.task(s.task["id"])["state"] == "draft"
+
+
+def test_dynamic_phone_start_admits_original_queue_without_reloading(pilot):
+    from auto_promotion.temporal_tasks import admit
+
+    s = pilot
+    service = dynamic_pilot(s)
+    # Start directly, without a manual prepare, task-ID config edit or new service.
+    s.engine.start_task(s.task["id"], source="synthetic_test_explicit_start")
+    link = s.store.one("SELECT * FROM temporal_task_links WHERE task_id=?", (s.task["id"],))
+    assert link["state"] == "requested" and link["requested_at"] is not None
+    assert service is s.engine.adapters.phone_social
+    assert service.config.authorized_task_ids == [] and service.config.single_pass_task_ids == []
+    assert service.task_authorized(s.task["id"], s.account["id"])
+    assert not service.task_authorized(s.task["id"], "unbound-other-account")
+    queue = JobQueue(s.engine)
+    queue.sync(s.task["id"])
+    assert queue.claim(s.app + ".phone", "synthetic-dynamic-worker", reference_id=s.item["id"]) is None
+    result = admit(s.engine, s.task["id"], link["manifest_hash"], link["workflow_id"])
+    assert result["admitted"] is True
+    assert queue.claim(s.app + ".phone", "synthetic-dynamic-worker", reference_id=s.item["id"])
+    assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 0
+    assert s.store.one("SELECT COUNT(*) n FROM phone_social_authorizations")["n"] == 0
+
+
+def test_dynamic_phone_authorization_reads_pause_expiry_and_manifest_changes(pilot):
+    s = pilot
+    service = dynamic_pilot(s)
+    s.engine.start_task(s.task["id"], source="synthetic_test_explicit_start")
+    assert service.task_authorized(s.task["id"], s.account["id"])
+    with s.store.connect(write=True) as db:
+        db.execute("UPDATE tasks SET state='paused' WHERE id=?", (s.task["id"],))
+    assert not service.task_authorized(s.task["id"], s.account["id"])
+    with s.store.connect(write=True) as db:
+        db.execute("UPDATE tasks SET state='active' WHERE id=?", (s.task["id"],))
+        db.execute("UPDATE temporal_task_links SET manifest_hash=? WHERE task_id=?", ("f" * 64, s.task["id"]))
+    assert not service.task_authorized(s.task["id"], s.account["id"])
+
+
+def test_dynamic_phone_never_imports_or_replays_old_unknown_task(pilot):
+    from auto_promotion.temporal_tasks import auto_register_new_phone_task
+
+    s = pilot
+    s.engine.prepare(s.task["id"])
+    with s.store.connect(write=True) as db:
+        db.execute("UPDATE tasks SET state='active',phase='ready' WHERE id=?", (s.task["id"],))
+        db.execute("UPDATE items SET status='unknown' WHERE id=?", (s.item["id"],))
+    before = s.store.one("SELECT * FROM items WHERE id=?", (s.item["id"],))
+    posts = sum(r.method == "POST" for r in s.fake.requests)
+    s.service.config = s.service.config.model_copy(update={"dynamic_task_authorization_enabled": True})
+    assert auto_register_new_phone_task(s.engine, s.task["id"], freeze=True) is None
+    assert not s.service.task_authorized(s.task["id"], s.account["id"])
+    assert s.store.one("SELECT * FROM items WHERE id=?", (s.item["id"],)) == before
+    assert sum(r.method == "POST" for r in s.fake.requests) == posts
+
+
+def test_dynamic_phone_older_connected_client_still_hits_original_start_fence(pilot):
+    s=pilot
+    dynamic_pilot(s)
+    s.monkeypatch.setattr("auto_promotion.temporal_tasks.auto_register_new_phone_task",lambda *args,**kwargs:None)
+    s.engine.start_task(s.task["id"],source="synthetic_older_client_explicit_start")
+    link=s.store.one("SELECT * FROM temporal_task_links WHERE task_id=?",(s.task["id"],))
+    assert link["state"]=="requested" and link["manifest_hash"]==s.engine.task(s.task["id"])["manifest_hash"]
+    queue=JobQueue(s.engine)
+    queue.sync(s.task["id"])
+    assert queue.claim(s.app+".phone","older-client",reference_id=s.item["id"]) is None
+    assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"]==0
+
+
+def test_dynamic_phone_cold_identity_refresh_precedes_freezing_new_task(pilot):
+    s=pilot
+    dynamic_pilot(s)
+    with s.store.connect(write=True) as db:
+        db.execute("UPDATE phone_social_accounts SET observed_at=0 WHERE account_id=?",(s.account["id"],))
+    calls=[]
+    def refreshed(account_id,*,task_id=None):
+        assert s.engine.task(s.task["id"])["manifest_hash"] is None
+        calls.append(account_id)
+        with s.store.connect(write=True) as db:
+            db.execute("UPDATE phone_social_accounts SET observed_at=? WHERE account_id=?",(time.time(),account_id))
+    s.monkeypatch.setattr(s.service,"ensure_identity",refreshed)
+    s.engine.start_task(s.task["id"],source="synthetic_cold_explicit_start")
+    assert calls==[s.account["id"]]
+    assert s.store.one("SELECT state FROM temporal_task_links WHERE task_id=?",(s.task["id"],))["state"]=="requested"
