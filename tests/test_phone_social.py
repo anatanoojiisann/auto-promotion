@@ -454,3 +454,21 @@ def test_dynamic_phone_cold_identity_refresh_precedes_freezing_new_task(pilot):
     s.engine.start_task(s.task["id"],source="synthetic_cold_explicit_start")
     assert calls==[s.account["id"]]
     assert s.store.one("SELECT state FROM temporal_task_links WHERE task_id=?",(s.task["id"],))["state"]=="requested"
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_phone_start_uses_native_proof_while_unrelated_health_lane_is_busy(pilot, disabled):
+    from auto_promotion.dispatcher import AccountLanes
+    s = pilot
+    if disabled:
+        with s.store.connect(write=True) as db:
+            db.execute("UPDATE accounts SET disabled=1 WHERE id=?",(s.account["id"],))
+    before=s.store.one("SELECT status,health FROM accounts WHERE id=?",(s.account["id"],))
+    s.monkeypatch.setattr(s.engine,"check_account",lambda *a,**k:(_ for _ in ()).throw(AssertionError("duplicate desktop health probe")))
+    with AccountLanes(s.store).acquire(s.account["id"]) as existing_owner:
+        if disabled:
+            with pytest.raises(Conflict):s.engine.start_task(s.task["id"],source="synthetic_explicit_start")
+        else:
+            assert s.engine.start_task(s.task["id"],source="synthetic_explicit_start")["state"]=="active"
+        assert s.store.one("SELECT owner FROM account_lanes WHERE account_id=?",(s.account["id"],))["owner"]==existing_owner
+    assert before==s.store.one("SELECT status,health FROM accounts WHERE id=?",(s.account["id"],))

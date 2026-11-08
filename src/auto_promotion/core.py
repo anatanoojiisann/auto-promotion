@@ -1330,7 +1330,13 @@ class Engine:
             if refresh and phone is not None and account_id in phone.config.bindings and (
                     method == "phone" or route_for(account).transport == "phone"):
                 phone.ensure_identity(account_id,task_id=task["id"])
-            if account["mode"] == "live" or account["status"] == "unchecked":
+            selected_phone = bool(method == "phone" and phone is not None
+                                  and account_id in phone.config.bindings and account["mode"] == "live")
+            if selected_phone:
+                # The native proof was refreshed above. A desktop health lane
+                # does not grant or deny a place in the phone queue.
+                account = self.account(account_id)
+            elif account["mode"] == "live" or account["status"] == "unchecked":
                 # Explicit starts refresh positive observations. Failed probes
                 # retain their bounded backoff; cooldowns never trigger a probe.
                 account = (self.check_account(account_id, force=refresh, task_id=task["id"])
