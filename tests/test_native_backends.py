@@ -997,7 +997,23 @@ class TelegramTests(unittest.TestCase):
             )
         )
         self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "not_current_member")
         self.assertFalse(self.client.joined)
+
+    def test_verify_membership_reports_unrecognized_participant_without_joining(self):
+        backend = self.backend()
+        self.client.joined = True
+        with patch.object(backend, "is_member", return_value=False):
+            result = asyncio.run(
+                backend.run(
+                    "verify_join",
+                    {"target": "@public_group"},
+                    self.saved.append,
+                    lambda: self.fail("Unexpected write"),
+                )
+            )
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "membership_state_unrecognized")
 
     def test_reply_receipt_binds_parent_message(self):
         result = self.run_action(self.backend(), "reply", reply_to=12)

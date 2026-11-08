@@ -63,6 +63,7 @@ def cli(arguments, instance, *, code=None, timeout_seconds=75):
                 env=env,
                 timeout=timeout_seconds,
                 check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         value = json.loads(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -257,10 +258,14 @@ async function composerControls() {
   const dialogs = page.locator('[role="dialog"]:visible').filter({has:page.getByTestId("tweetTextarea_0")});
   const count = await dialogs.count();
   assert(count <= 1, "XReplyComposerAmbiguous");
-  const scope = count === 1 ? dialogs : page;
+  const scope = count === 1 ? dialogs : item.action === "reply"
+    ? (await targetArticle(item.target)).locator('xpath=..') : page;
   const editor = scope.getByTestId("tweetTextarea_0");
   await expect(editor).toHaveCount(1);
-  return {editor, scope, button: scope.getByTestId(count === 1 ? "tweetButton" : "tweetButtonInline")};
+  const button = item.action === "reply"
+    ? scope.getByRole("button", {name:"Reply", exact:true})
+    : scope.getByTestId(count === 1 ? "tweetButton" : "tweetButtonInline");
+  return {editor, scope, button};
 }
 """
 )
@@ -633,7 +638,7 @@ def hf_discover(settings, payload, *, checkpoint=None):
 
 
 PREPARE_JS = r"""
-await page.goto(item.action === "post" ? "https://x.com/compose/post" : item.target, {waitUntil: "domcontentloaded", timeout:45000});
+await page.goto(item.action === "post" ? "https://x.com/compose/post" : item.target, {waitUntil: "commit", timeout:45000});
 await checkIdentity();
 if (item.action === "post") await page.locator('[role="dialog"]:visible')
   .filter({has:page.getByTestId("tweetTextarea_0")}).waitFor({state:"visible",timeout:45000});
@@ -642,11 +647,16 @@ const article = await targetArticle(item.target);
 const reply = article.getByTestId("reply").first();
 await expect(reply).toBeVisible();
 await expect(reply).toBeEnabled();
+const inline = article.locator('xpath=..').getByTestId("tweetTextarea_0");
+const inlineReady = await inline.count() === 1 && await inline.isVisible() &&
+  await page.locator('[role="dialog"]:visible').count() === 0;
+if (!inlineReady) {
 await reply.click();
-// The background editor stays visible while the reply modal is mounting.
-// Wait for the modal itself; choosing a visible editor immediately races it.
+// Clicking Reply mounts a modal while the background inline editor also
+// appears. The background editor must never win that transition.
 await page.locator('[role="dialog"]:visible').filter({has:page.getByTestId("tweetTextarea_0")})
-  .waitFor({state:"visible", timeout:15000});
+  .waitFor({state:"visible",timeout:15000});
+}
 }
 const {editor, scope, button} = await composerControls();
 await editor.waitFor({state: "visible", timeout: 45000});
@@ -713,7 +723,7 @@ return {status: "unknown", verified: false, external_reference: `https://x.com/$
 """
 
 VERIFY_JS = r"""
-await page.goto(receipt.external_reference, {waitUntil: "domcontentloaded"});
+await page.goto(receipt.external_reference, {waitUntil: "commit"});
 await checkIdentity();
 const article = await targetArticle(receipt.external_reference);
 const showOriginal = article.getByRole("button", {name:"Show original", exact:true});
@@ -768,9 +778,9 @@ def reply(settings, operation, payload, checkpoint, authorize):
     if inventory.get("task", {}).get("reused"):
         raise BackendError("TabbitCheckPending")
     settled = True
+    completed_result = None
     prefix = (
-        "await page.setViewportSize({width:1440,height:1000});\n"
-        + "const expected = "
+        "const expected = "
         + json.dumps(expected)
         + "; const item = "
         + json.dumps(item)
@@ -796,7 +806,14 @@ def reply(settings, operation, payload, checkpoint, authorize):
         if not settled:
             raise BackendError("TabbitCheckPending")
         if response.get("status") != "succeeded":
-            raise BackendError("TabbitReplyUnavailable")
+            failure = BackendError("TabbitReplyUnavailable")
+            raw = response.get("result", {})
+            failure.preparation_diagnostic = {
+                "error_name": str(raw.get("errorName", ""))[:80],
+                "error_code": str(raw.get("errorCode", ""))[:80],
+                "message": str(raw.get("error", ""))[:2000],
+            }
+            raise failure
         if response.get("result", {}).get("resourceId"):
             raise BackendError("TabbitUnexpectedResource")
         return response.get("result", {}).get("value", {})
@@ -816,6 +833,9 @@ def reply(settings, operation, payload, checkpoint, authorize):
                     "verified": False,
                     "reason": "TabbitPreparationFailedBeforeSubmission",
                     "submission_started": False,
+                    "confirmed_not_submitted": True,
+                    # Private receipt only; deliberately outside RESULT_FIELDS.
+                    "preparation_diagnostic": getattr(exc, "preparation_diagnostic", {}),
                 }
             if prepared.get("prepared") is not True:
                 raise BackendError("TabbitReplyUnavailable")
@@ -834,9 +854,27 @@ def reply(settings, operation, payload, checkpoint, authorize):
         result = program("verify", "const receipt = " + json.dumps(receipt) + ";\n" + VERIFY_JS)
         result["published_at"] = observed_timestamp(result.get("published_at"))
         checkpoint(result)
+        if result.get("status") == "confirmed" and result.get("verified") is True:
+            completed_result = result
         return result
     finally:
         if settled:
-            finished = cli(["finish", "--task", task], instance)
-            if finished.get("forcedCleanup") or finished.get("ok") is False:
-                raise BackendError("TabbitFinishIncomplete")
+            # This route only creates task pages: it never acquires a user tab
+            # with --tab/--group. Close them after the independent receipt has
+            # been saved. Pending requests, drafts and unknown outcomes stay open.
+            arguments = ["finish", "--task", task]
+            if completed_result is not None:
+                arguments.append("--discard")
+            try:
+                finished = cli(arguments, instance)
+                if finished.get("forcedCleanup") or finished.get("ok") is False:
+                    raise BackendError("TabbitFinishIncomplete")
+            except BackendError:
+                if completed_result is None:
+                    raise
+                # Cleanup cannot turn an already verified publication into a
+                # failed send. Expose the incomplete cleanup for diagnostics.
+                completed_result["browser_cleanup_state"] = "incomplete"
+            else:
+                if completed_result is not None:
+                    completed_result["browser_cleanup_state"] = "closed"

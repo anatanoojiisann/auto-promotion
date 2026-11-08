@@ -57,7 +57,15 @@ class SocialBinding(BaseModel):
         return self
 
 
+class CommissionedSinglePass(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    adapter_id: str = Field(min_length=1, max_length=100)
+    adapter_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class SocialPhoneConfig(RedditPhoneConfig):
+    single_pass_adapters: dict[str, CommissionedSinglePass] = Field(default_factory=dict)
+    single_pass_task_ids: list[str] = Field(default_factory=list)
     join_enabled: bool = False
     telegram_observers: dict[str,TelegramObserverConfig] = Field(default_factory=dict)
     bindings: dict[str, SocialBinding]
@@ -121,6 +129,11 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 if statement.strip():
                     db.execute(statement)
         engine.adapters.phone_social = self
+
+    def single_pass_adapter(self, account_id, task_id=None):
+        from .phone_single_pass import adapter
+
+        return adapter(self, account_id, task_id)
 
     def worker_config(self):
         from .phone_private import write_worker_config
@@ -373,6 +386,12 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 "account_identity": identity if fresh else None,
                 "reason": "phone_social_identity_observed" if fresh else "PhoneSocialFreshIdentityRequired"}
         if operation == "preflight":
+            from .phone_single_pass import preflight
+
+            if self.single_pass_adapter(account["id"]) and preflight(self, account, payload.get("payload", {}), execution_job):
+                return {"allowed": True, "confirmed_not_submitted": True,
+                        "identity_verified": fresh, "identity_check": "native_before_submit",
+                        "reason": "PhoneTelegramSinglePassWithinClaim"}
             queue_blocker = self.telegram_queue_blocker(account["id"])
             if queue_blocker:
                 return {"allowed":False, "confirmed_not_submitted":True, "reason":queue_blocker}
@@ -415,23 +434,38 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         old = self.store.one("SELECT * FROM phone_social_authorizations WHERE item_id=?", (claim["item_id"],))
         if old:
             return self.verify(account, claim)
-        row, prepared, snapshot = self.preparation(account["id"], claim["payload"], item_id=claim["item_id"], task_id=claim["task_id"])
-        if binding.platform=="telegram" and binding.receipt_reader=="telegram_api" and (not row or row["item_id"]!=claim["item_id"] or prepared["business_task_id"]!=claim["task_id"]):
+        single_pass = self.single_pass_adapter(account["id"], claim["task_id"])
+        single_baseline = None
+        if single_pass:
+            from .account_control_state import snapshot as control_state
+            from .phone_single_pass import prepare_context
+
+            if not control_state(self.engine, account["id"], task_id=claim["task_id"])["allowed_read"]:
+                raise BackendError("PhoneSocialAccountControlNotReady")
             try:
-                row,prepared,snapshot = self.prepare_telegram_claim(account,claim)
+                social, adapter_sha256, single_baseline = prepare_context(self, account, claim)
             except BackendError as error:
-                return {"status":"failed_known","verified":False,"confirmed_not_submitted":True,"submission_started":False,"reason":error.safe_code}
-        proof = ((snapshot or {}).get("result") or {}).get("social") or {}
-        if (not row or snapshot.get("status") != "succeeded" or proof.get("receipt_capable") is not True or not proof.get("adapter_sha256")
-                or row["item_id"] != claim["item_id"] or prepared["business_task_id"] != claim["task_id"]):
-            raise BackendError("PhoneSocialReceiptCommissionedPreparationRequired")
+                return {"status":"failed_known", "verified":False, "confirmed_not_submitted":True,
+                        "submission_started":False, "reason":error.safe_code}
+        else:
+            row, prepared, snapshot = self.preparation(account["id"], claim["payload"], item_id=claim["item_id"], task_id=claim["task_id"])
+            if binding.platform=="telegram" and binding.receipt_reader=="telegram_api" and (not row or row["item_id"]!=claim["item_id"] or prepared["business_task_id"]!=claim["task_id"]):
+                try:
+                    row,prepared,snapshot = self.prepare_telegram_claim(account,claim)
+                except BackendError as error:
+                    return {"status":"failed_known","verified":False,"confirmed_not_submitted":True,"submission_started":False,"reason":error.safe_code}
+            proof = ((snapshot or {}).get("result") or {}).get("social") or {}
+            if (not row or snapshot.get("status") != "succeeded" or proof.get("receipt_capable") is not True or not proof.get("adapter_sha256")
+                    or row["item_id"] != claim["item_id"] or prepared["business_task_id"] != claim["task_id"]):
+                raise BackendError("PhoneSocialReceiptCommissionedPreparationRequired")
+            social, adapter_sha256 = prepared["social"], proof["adapter_sha256"]
         identifier = "phone-social-submit:" + uuid4().hex
-        context = {**prepared["social"], "authorization_id": identifier, "discard_after_prepare": False,
-                   "expected_adapter_sha256": proof["adapter_sha256"]}
+        context = {**social, "authorization_id": identifier, "discard_after_prepare": False,
+                   "expected_adapter_sha256": adapter_sha256}
         request = self.make_request(account["id"], "social_submit", context, task_id=task["id"],
             item_id=claim["item_id"], manifest=task["manifest_hash"], channel=policy["execution_channel"])
         try:
-            baseline = self.observer_baseline(account["id"],binding.identity,context["target_url"]) if binding.receipt_reader=="telegram_api" else None
+            baseline = single_baseline or (self.observer_baseline(account["id"],binding.identity,context["target_url"]) if binding.receipt_reader=="telegram_api" else None)
             reservation = self.telegram_observer.reserve_receipt(account["id"]) if baseline is not None else None
         except BackendError as error:
             return {"status":"failed_known","verified":False,"confirmed_not_submitted":True,"submission_started":False,"reason":error.safe_code}
@@ -538,7 +572,8 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             return {"status": "failed_known", "verified": False, "confirmed_not_submitted": True,
                     "submission_started": False, "reason": result.get("code", "PhoneSocialStoppedBeforeSubmit")}
         return {"status": "unknown", "verified": False, "submission_started": proof.submission_started if proof else None,
-                "reason": "PhoneSocialIndependentNativeReceiptRequired"}
+                "reason": "PhoneSocialIndependentNativeReceiptRequired", "receipt_pending": bool(proof and proof.submission_started),
+                "resource_state": "released" if snapshot.get("resource_released") else "fenced"}
 
     def verify(self, account, payload):
         from .execution_timing import stage

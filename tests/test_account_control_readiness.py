@@ -9,14 +9,13 @@ import pytest
 import test_task_channels as channel_cases
 from test_phone_round_preflight import services
 from test_phone_rounds import create, make_lab
+from test_phone_social import pilot as pilot
 
 from auto_promotion.cloud_control import CloudUnavailable
 from auto_promotion.local_authorization import authorization_route, validate_scope
 from auto_promotion.models import canonical
 from auto_promotion.phone_round_readiness import preflight
 from auto_promotion.task_channels import TaskChannelRouter, control_preflight
-
-pytest_plugins = ("test_phone_social",)
 
 
 @pytest.fixture

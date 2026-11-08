@@ -16,6 +16,7 @@ from .execution_diagnostics import FIELDS, browser_read_failure_reason, exceptio
 from .models import PLATFORMS, canonical
 from .runtime_identity import result_runtime
 from .store import Store
+from .text_integrity import configure_utf8_stdio, validate_outbound_payload
 
 RUNTIME = result_runtime("native_bridge")
 
@@ -111,6 +112,10 @@ def dispatch(request):
     if operation == "join" and platform != "telegram":
         raise BackendError("UnsupportedPlatformOperation")
     payload = dict(request.get("payload", {}))
+    if operation in {"execute", "preflight"}:
+        # Also protects new child processes called by a sender not yet reloaded.
+        # Read-only verify deliberately retains access to damaged old receipts.
+        validate_outbound_payload(payload.get("payload", {}))
     write = operation in {"execute", "join"}
 
     if operation == "health" and request.get("database") and request.get("account_id"):
@@ -401,11 +406,26 @@ def dispatch(request):
 
 
 def main():
+    configure_utf8_stdio()
     logging.disable(logging.CRITICAL)
     request = json.load(sys.stdin)
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = dispatch(request)
+            from .background_desktop import (
+                BackgroundDesktopUnavailable,
+                dispatch_on_background_desktop,
+                needs_background_desktop,
+            )
+
+            if needs_background_desktop(request):
+                try:
+                    result = dispatch_on_background_desktop(request)
+                except BackgroundDesktopUnavailable:
+                    # Keep read-only collection available if Windows cannot
+                    # prepare a private desktop; no child has been started.
+                    result = dispatch(request)
+            else:
+                result = dispatch(request)
     except Exception as exc:
         code = getattr(exc, "safe_code", type(exc).__name__)
         result = {

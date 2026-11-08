@@ -9,7 +9,28 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from .text_integrity import validate_outbound_text
+
 PLATFORMS = ("telegram", "reddit", "instagram", "facebook", "x", "discord", "tiktok")
+
+
+def telegram_public_handle(target: str) -> bool:
+    """Recognize only public @usernames, not case-sensitive invite links or IDs."""
+    return bool(re.fullmatch(r"@[A-Za-z0-9_]{5,32}", target, flags=re.ASCII))
+
+
+def target_allowed(platform: str, target: str, allowlist: list[str]) -> bool:
+    """Match Telegram public usernames without changing frozen target strings."""
+    if not allowlist or target in allowlist:
+        return True
+    if platform != "telegram" or not telegram_public_handle(target):
+        return False
+    return any(
+        telegram_public_handle(allowed) and target.lower() == allowed.lower()
+        for allowed in allowlist
+    )
+
+
 CAPABILITIES = {
     "telegram": {
         "discover",
@@ -236,6 +257,11 @@ class ItemInput(Model):
     tiktok_options: TikTokPostOptions | None = None
     tiktok_conversation_id: str = Field(default="", pattern=r"^[A-Za-z0-9:_-]{0,160}$")
     tiktok_message_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
+
+    @field_validator("text", "title")
+    @classmethod
+    def valid_outbound_text(cls, value):
+        return validate_outbound_text(value)
 
     @model_validator(mode="after")
     def target_or_tiktok_video(self):

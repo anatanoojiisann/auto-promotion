@@ -16,10 +16,12 @@ from .statistics import ZONE, Statistics
 from .store import Store
 from .task_tool_models import TemplateSave, TemplateTask
 from .task_tools import TaskTools
+from .text_integrity import configure_utf8_stdio
 from .workers import WorkerRun
 
 
 def main():
+    configure_utf8_stdio()
     load_environment(Path.cwd() / ".env")
     parser = argparse.ArgumentParser(description="Auto Promotion control plane")
     parser.add_argument("--db", default=str(database_path()))

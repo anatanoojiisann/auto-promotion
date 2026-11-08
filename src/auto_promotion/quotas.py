@@ -283,15 +283,16 @@ def check_claim(db, account, task, payload, due, now, item_id, *, details=None):
                      "user":user_scope if r.get("user") in equivalent_users else r.get("user")} for r in rows]
         if not proof:
             return rows
-        at = proof["due_at"] if delivery else proof["attempt_at"]
+        sources = proof.get("sources", [proof])
         return [
             {**row, "target": None, "user": None}
-            if (
-                row.get("account") == proof["account"]
-                and row.get("task") == proof["task"]
-                and row.get("at") == at
-                and row.get("target") == proof["target"]
-                and row.get("user") == proof["user"]
+            if any(
+                row.get("account") == source["account"]
+                and row.get("task") == source["task"]
+                and row.get("at") == source["due_at" if delivery else "attempt_at"]
+                and row.get("target") == source["target"]
+                and row.get("user") == source["user"]
+                for source in sources
             )
             else row
             for row in rows

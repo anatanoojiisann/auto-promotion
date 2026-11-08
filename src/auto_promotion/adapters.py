@@ -12,6 +12,7 @@ from pathlib import Path
 from .backends import BACKENDS
 from .config import PROJECTS
 from .models import CAPABILITIES
+from .text_integrity import validate_outbound_payload
 
 
 class SimulationAdapter:
@@ -142,6 +143,8 @@ class AdapterRegistry:
         )
 
     def call(self, account, operation, payload):
+        if operation in {"execute", "preflight"}:
+            validate_outbound_payload(payload.get("payload", {}))
         if account["platform"] in self.overrides:
             return self.overrides[account["platform"]].call(account, operation, payload)
         if account["mode"] == "simulation":

@@ -19,17 +19,42 @@ class OptionalBrowserDependencyTests(unittest.TestCase):
             program = textwrap.dedent(
                 """
                 import importlib.abc
+                import socket
                 import sys
+                import threading
 
                 class NoBrowserSDK(importlib.abc.MetaPathFinder):
                     def find_spec(self, fullname, path=None, target=None):
                         if fullname == 'playwright' or fullname.startswith('playwright.'):
                             raise ModuleNotFoundError('synthetic missing browser SDK', name=fullname)
 
-                def no_network(event, args):
-                    if event in {'socket.connect', 'socket.bind'}:
-                        raise AssertionError('network forbidden in optional SDK test')
+                # Windows implements socketpair with loopback TCP, which asyncio
+                # needs for its wakeup pipe. Permit only that synchronous call,
+                # on its own thread; ordinary loopback connections stay blocked.
+                stdlib_socketpair = socket.socketpair
+                socketpair_scope = threading.local()
 
+                def internal_socketpair(*args, **kwargs):
+                    previous = getattr(socketpair_scope, 'active', False)
+                    socketpair_scope.active = True
+                    try:
+                        return stdlib_socketpair(*args, **kwargs)
+                    finally:
+                        socketpair_scope.active = previous
+
+                def no_network(event, args):
+                    if event not in {'socket.connect', 'socket.bind'}:
+                        return
+                    address = args[1]
+                    if (
+                        getattr(socketpair_scope, 'active', False)
+                        and isinstance(address, tuple)
+                        and address[0] in {'127.0.0.1', '::1'}
+                    ):
+                        return
+                    raise AssertionError('network forbidden in optional SDK test')
+
+                socket.socketpair = internal_socketpair
                 sys.meta_path.insert(0, NoBrowserSDK())
                 sys.addaudithook(no_network)
                 """
@@ -57,6 +82,33 @@ class OptionalBrowserDependencyTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_network_guard_allows_socketpair_but_blocks_ordinary_connections(self):
+        self.without_sdk(
+            """
+            import unittest
+
+            check = unittest.TestCase()
+            left, right = socket.socketpair()
+            with left, right:
+                left.settimeout(1)
+                right.settimeout(1)
+                left.sendall(b'wakeup')
+                check.assertEqual(right.recv(6), b'wakeup')
+
+            for host in ('127.0.0.1', '0.0.0.0', '192.0.2.1'):
+                for operation in ('bind', 'connect'):
+                    with socket.socket() as connection:
+                        connection.settimeout(0.1)
+                        with check.assertRaisesRegex(AssertionError, 'network forbidden'):
+                            getattr(connection, operation)((host, 9))
+            # Check IPv6 restrictions without depending on host IPv6 support.
+            for operation in ('bind', 'connect'):
+                for host in ('::1', '::', '2001:db8::1'):
+                    with check.assertRaisesRegex(AssertionError, 'network forbidden'):
+                        sys.audit('socket.' + operation, None, (host, 9))
+            """
+        )
 
     def test_api_health_and_simulation_work_without_browser_sdk(self):
         self.without_sdk(

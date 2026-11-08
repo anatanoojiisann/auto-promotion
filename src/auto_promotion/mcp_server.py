@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ from .statistics import ZONE, Statistics
 from .store import Store
 from .task_tool_models import TemplateSave, TemplateTask
 from .task_tools import TaskTools
+from .text_integrity import configure_utf8_stdio
 from .tiktok import TikTokInteractionInput, TikTokManager, TikTokReadInput
 from .tiktok_browser import TikTokBrowser, TikTokBrowserConnect
 from .workers import Workers
@@ -50,6 +52,7 @@ def client_config(project_dir, python=None):
         "mcpServers": {
             "auto-promotion": {
                 "command": str(python or sys.executable),
+                "env": {"PYTHONIOENCODING": "utf-8:strict", "PYTHONUTF8": "1"},
                 "args": [
                     "-m",
                     "auto_promotion.mcp_server",
@@ -263,6 +266,16 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         """Synchronize existing Meta workflow states without starting any task."""
         return invoke(meta_browser.status)
 
+    @server.tool(annotations=local)
+    def acknowledge_unrelated_x_history(task_id: str, account_id: str, source: str) -> dict:
+        """Only on an explicit user instruction: acknowledge unrelated old X unknowns
+        for this exact frozen local task and account. Never alter old outcomes, permit
+        old targets, grant account ownership, start a task, or send a message.
+        """
+        from .x_history_ack import record_ack
+
+        return invoke(lambda: record_ack(engine, task_id, account_id, source=source))
+
     @server.tool(annotations=remote_read)
     def authorize_local_channel(
         task_id: str, account_id: str, coordinate_once: bool, source: str
@@ -285,6 +298,14 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
             raise ToolError(safe_channel_code(str(exc))) from None
         except ValueError:
             raise ToolError("ExplicitLocalCoordinationRequired") from None
+        except sqlite3.OperationalError as exc:
+            try:
+                locked = Store.locked(exc)
+            except (AttributeError, TypeError, ValueError):
+                locked = False
+            if locked:
+                raise ToolError("LocalDatabaseUnavailable") from None
+            raise ToolError("LocalAuthorizationUnavailable") from None
         except Exception:
             raise ToolError("LocalAuthorizationUnavailable") from None
 
@@ -621,6 +642,30 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         return invoke(lambda: engine.set_items(task_id, [ItemInput(**i) for i in items]))
 
     @server.tool(annotations=local)
+    def authorize_deleted_x_reply_replacement(
+        old_item_id: str, new_item_id: str, source: str, deletion_evidence: dict
+    ) -> dict:
+        """Only on explicit user instruction: authorize one corrected reply after verified deletion of the exact garbled old X reply. Preserve old attempts/outcomes; never starts a task or sends."""
+        from .deleted_reply_replacement import authorize_replacement
+
+        return invoke(
+            lambda: authorize_replacement(
+                engine, old_item_id, new_item_id, source=source, deletion_evidence=deletion_evidence
+            )
+        )
+
+    @server.tool(annotations=local)
+    def continue_unsubmitted_x_reply_replacement(
+        previous_item_id: str, new_item_id: str, source: str
+    ) -> dict:
+        """Continue an explicitly approved deleted-reply correction only with an independently validated native final receipt proving no submission. Never reset attempts, restart unknowns or send."""
+        from .deleted_reply_replacement import authorize_no_submit_retry
+
+        return invoke(
+            lambda: authorize_no_submit_retry(engine, previous_item_id, new_item_id, source=source)
+        )
+
+    @server.tool(annotations=local)
     def prepare_task(task_id: str) -> dict:
         """Optionally freeze and preview the exact manifest without starting execution."""
         return invoke(engine.prepare, task_id)
@@ -701,6 +746,7 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
 
 
 def main():
+    configure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Auto Promotion MCP (stdio)")
     parser.add_argument("--project-dir", type=Path, default=Path.cwd())
     parser.add_argument("--db", type=Path)

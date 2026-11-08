@@ -272,6 +272,58 @@ class CloudControl:
             else None
         )
 
+    def _import_blocks(self, engine, response, *, request_id=None):
+        """Apply remote blocks before allowing progress, without masking local failures."""
+        try:
+            self.import_account_blocks(engine, response)
+        except Exception as exc:
+            from .store import Store
+
+            database_error = isinstance(exc, sqlite3.Error)
+            try:
+                locked = Store.locked(exc)
+            except (AttributeError, TypeError, ValueError):
+                locked = False
+            cause = (
+                "sqlite_busy" if locked else "sqlite_error" if database_error else "import_failed"
+            )
+            previous = self.last_request_diagnostics
+            if not isinstance(previous, dict):
+                previous = {}
+            diagnostic = {
+                "schema": 1,
+                "operation": "account_block_import",
+                "outcome": "local_persistence_failed",
+                "cause": cause,
+                "remote_response_received": True,
+            }
+            request_id = _safe_diagnostic_id(request_id or previous.get("request_id"))
+            if request_id:
+                diagnostic["request_id"] = request_id
+            status = previous.get("http_status")
+            if type(status) is int and 100 <= status <= 599:
+                diagnostic["http_status"] = status
+            phase = getattr(exc, "db_phase", None)
+            if isinstance(phase, str) and phase in {"connection_setup", "write_lock"}:
+                diagnostic["db_phase"] = phase
+            wait = getattr(exc, "lock_wait_ms", None)
+            if type(wait) is int and 0 <= wait <= 1200000:
+                diagnostic["lock_wait_ms"] = wait
+            self.last_request_diagnostics = diagnostic
+            # A received response is not a healthy control observation until
+            # its account blocks have been applied locally.
+            self.last_contact_monotonic = None
+            try:
+                logging.getLogger(__name__).warning(
+                    "cloud_request %s", json.dumps(diagnostic, sort_keys=True)
+                )
+            except Exception:
+                pass
+            raise CloudUnavailable(
+                "LocalDatabaseUnavailable" if database_error else "LocalAccountBlockSyncFailed",
+                diagnostics=diagnostic,
+            ) from None
+
     def request(self, path, data=None, *, operator=False, method="POST", import_blocks=True):
         request_id = str(uuid.uuid4())
         started = time.monotonic()
@@ -397,22 +449,6 @@ class CloudControl:
         if engine is not None and import_blocks:
             self._import_blocks(engine, result, request_id=request_id)
         return result
-
-    def _import_blocks(self, engine, result, *, request_id=None):
-        try:
-            self.import_account_blocks(engine, result)
-        except sqlite3.Error as exc:
-            code = getattr(exc, "sqlite_errorcode", 0) or 0
-            diagnostic = {
-                "schema": 1,
-                "operation": "account_block_import",
-                "outcome": "local_persistence_failed",
-                "cause": "sqlite_busy" if code & 255 in {5, 6} else "sqlite_error",
-            }
-            if request_id:
-                diagnostic["request_id"] = request_id
-            self.last_request_diagnostics = diagnostic
-            raise CloudUnavailable("LocalDatabaseUnavailable", diagnostics=diagnostic) from None
 
     def claim(self, pool, expected_id):
         started = time.monotonic()
@@ -750,7 +786,21 @@ class CloudControl:
                 if len(canonical(payload).encode()) > 3_500_000:
                     raise CloudUnavailable("CloudSnapshotBatchTooLarge")
                 try:
+                    # Import once, after applying the authorized account scope.
                     result = self.request("/v1/sync", payload, operator=True, import_blocks=False)
+                    if authorization_account is not None and isinstance(
+                        result.get("account_blocks"), list
+                    ):
+                        result = {
+                            **result,
+                            "account_blocks": [
+                                r
+                                for r in result["account_blocks"]
+                                if isinstance(r, dict)
+                                and r.get("account_id") == authorization_account
+                            ],
+                        }
+                    self._import_blocks(engine, result)
                 except CloudUnavailable as error:
                     diagnostic = dict(error.diagnostics or {})
                     conflict = diagnostic.get("sync_conflict", {})
@@ -771,18 +821,6 @@ class CloudControl:
                     error.diagnostics = diagnostic
                     error.sync_revision = revision
                     raise
-                if authorization_account is not None and isinstance(
-                    result.get("account_blocks"), list
-                ):
-                    result = {
-                        **result,
-                        "account_blocks": [
-                            r
-                            for r in result["account_blocks"]
-                            if r.get("account_id") == authorization_account
-                        ],
-                    }
-                self._import_blocks(engine, result)
                 if result.get("stale"):
                     raise CloudUnavailable("CloudSnapshotStale")
                 # Commit each acknowledged slice, so failure resumes at the first
@@ -803,11 +841,13 @@ class CloudControl:
         """Mirror scoped remote stops; imported health never authorizes local recovery."""
         from .account_blocks import merge_remote_block
 
-        if not isinstance(response, dict) or not isinstance(response.get("account_blocks"), list):
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get("account_blocks"), list)
+            or not response["account_blocks"]
+        ):
             return
         records = response["account_blocks"]
-        if not records:
-            return
         # Read-only prefilter avoids taking SQLite's writer lock on every heartbeat.
         pending = []
         with engine.store.connect() as db:

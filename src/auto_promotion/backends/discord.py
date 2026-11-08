@@ -200,7 +200,7 @@ class DiscordBackend:
     def eligible(guild, member, channel):
         # Preserve this workbench's public-only policy: visible to @everyone in the server.
         everyone = {"user": {"id": "0"}, "roles": []}
-        if channel.get("nsfw") or not channel_permissions(guild, everyone, channel) & VIEW:
+        if not channel_permissions(guild, everyone, channel) & VIEW:
             raise BackendError("DiscordPublicChannelRequired")
         permissions = channel_permissions(guild, member, channel)
         required = VIEW | SEND | HISTORY

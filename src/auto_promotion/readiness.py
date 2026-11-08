@@ -8,6 +8,7 @@ from .models import digest, epoch, telegram_target_aliases
 DELIVERY_GRACE_SECONDS = 900
 
 REASONS = {
+    "outbound_text_encoding_invalid": "正文或标题存在乱码，已阻止发送；请从原始文案重新准备新任务",
     "tiktok_video_evidence_invalid": "TikTok 视频目标证据已失效或变化，请检查原候选与授权并重新准备新任务",
     "PhoneTelegramAuthoritativeQueueRequired": "手机与 Telegram 只读账号需要使用同一推广库和原账号",
     "PhoneTelegramPriorSubmissionUnresolved": "该群已有未决提交，请核对原发布回执",
@@ -188,6 +189,14 @@ def task_workflow(task, blockers, item_blockers, now):
             "执行已结束 · 回执待处理",
             "执行批次已结束；未知结果只读核验，平台排期仍需核对，人工项目保留待处理状态。",
         )
+    if task["state"] == "completed":
+        unsent = sum(i["status"] == "missed" and not i.get("attempt_id") for i in task["items"])
+        if unsent:
+            return step(
+                "completed",
+                "已结束 · 有项目未发送",
+                f"有 {unsent} 项未尝试发送；请查看逐项结果及未执行原因。",
+            )
     if task["state"] in {"cancelled", "completed"}:
         return step(
             task["state"],
@@ -433,7 +442,7 @@ def telegram_blocker(db, task, payload, at):
         keys = [digest(["telegram", variant]) for name in aliases for variant in (name, name + "/")]
         hash_slots = ",".join("?" for _ in keys)
         recent = db.execute(
-            "SELECT i.status,i.payload,i.result FROM attempts a JOIN items i ON i.id=a.item_id "
+            "SELECT i.id,i.status,i.payload,i.result FROM attempts a JOIN items i ON i.id=a.item_id "
             "JOIN tasks prior ON prior.id=i.task_id WHERE a.account_id=? AND i.task_id<>? "
             "AND (?='phone' OR json_extract(prior.policy,'$.execution_method')='phone') "
             f"AND a.target_key IN ({hash_slots})",
@@ -443,7 +452,10 @@ def telegram_blocker(db, task, payload, at):
                     and json.loads(prior["result"]).get("submission_started") is True):
                 return "PhoneTelegramPriorSubmissionUnresolved"
             if json.loads(prior["payload"]).get("text") == payload.get("text"):
-                return "PhoneTelegramOriginalAlreadyAttempted"
+                from .phone_known_unsent import authorized
+
+                if not authorized(db, task, payload, prior["id"]):
+                    return "PhoneTelegramOriginalAlreadyAttempted"
     candidate = db.execute(
         f"SELECT * FROM candidates WHERE task_id=? AND account_id=? AND lower(rtrim(target,'/')) IN ({slots}) "
         "ORDER BY CASE WHEN decision='qualified' THEN 1 ELSE 0 END,rowid DESC LIMIT 1",

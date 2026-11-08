@@ -103,7 +103,9 @@ class SyntheticTelegram:
             return SimpleNamespace(chats=getattr(self, "search_chats", [self.entity]))
         if name == "GetFullChannelRequest":
             return SimpleNamespace(
-                full_chat=SimpleNamespace(about="English public group", participants_count=99)
+                full_chat=SimpleNamespace(
+                    about=getattr(self, "about", "English public group"), participants_count=99
+                )
             )
         raise AssertionError(name)
 
@@ -273,6 +275,13 @@ class TelegramIncrementalReadTests(unittest.TestCase):
         self.assertEqual(warm, 2, "only fresh identity RPCs remain on a hot directory cache")
         self.assertLess(warm, cold)
         self.assertLessEqual(second["read_observed_at"], first["read_observed_at"])
+
+    def test_discovery_uses_explicit_group_language_without_exposing_messages(self):
+        self.client.about = "Только русский язык [RU ONLY]"
+        result = self.run_backend("discover", policy={"queries": ["public"], "max_candidates": 10})
+        self.assertEqual(result["candidates"][0]["language"], "ru")
+        self.assertGreaterEqual(result["candidates"][0]["confidence"], 0.8)
+        self.assertNotIn("messages", result["candidates"][0])
 
     def test_directory_paging_freezes_order_across_ttl_expiry_and_process_restart(self):
         from copy import copy

@@ -37,6 +37,8 @@ from .models import (
     canonical,
     digest,
     epoch,
+    target_allowed,
+    telegram_public_handle,
 )
 from .readiness import DELIVERY_GRACE_SECONDS, REASONS, task_workflow, telegram_blocker
 from .routing import route_for, task_route
@@ -45,6 +47,7 @@ from .statistics import ZONE, Statistics, publication_time, record_publication
 from .store import Store, decode
 from .task_dependencies import publication_schedule
 from .telegram_reading import read_diagnostics
+from .text_integrity import TextIntegrityError, validate_outbound_payload
 from .workers import Workers
 
 RUNTIME = result_runtime("engine")
@@ -58,6 +61,10 @@ class NotFound(Conflict):
     pass
 
 
+class InvalidOutboundText(Conflict):
+    reason = "outbound_text_encoding_invalid"
+
+
 TERMINAL = {
     "confirmed",
     "scheduled",
@@ -68,7 +75,7 @@ TERMINAL = {
     "cancelled",
 }
 RISK = re.compile(
-    r"\b(?:nsfw|porn|adult|escort|dating|casino|gambling|scam)\b|18\+|色情|赌博|博彩|约炮|诈骗",
+    r"\b(?:escort|dating|casino|gambling|scam)\b|赌博|博彩|约炮|诈骗",
     re.I,
 )
 NON_ADULT = re.compile(r"(?<![\w-])non-adult(?![\w-])", re.I)
@@ -1179,11 +1186,21 @@ class Engine:
             }
         return result
 
+    def account_readiness(self, task, account):
+        from .account_control_state import account_check
+
+        return account_check(self, dict(task), account)
+
+    def _phone_account_ready(self, task_id, account):
+        row = self.store.one("SELECT id,policy FROM tasks WHERE id=?", (task_id,))
+        if not row or json.loads(row["policy"]).get("execution_method") != "phone":
+            return False
+        return self.account_readiness(row, account)["ready"]
+
     def readiness(self, task):
         """Report every local prerequisite without checking a real account or sending."""
-        from .account_checks import summary
 
-        accounts = [summary(self.account(a), self.clock()) for a in task["account_ids"]]
+        accounts = [self.account_readiness(task, self.account(a)) for a in task["account_ids"]]
         blockers = []
         if task["state"] != "active":
             blockers.append("task_not_active")
@@ -1201,6 +1218,17 @@ class Engine:
             _, dependency_reason = publication_schedule(db, raw_task, self.clock())
             for item in task["items"]:
                 if item["status"] != "not_attempted":
+                    continue
+                try:
+                    validate_outbound_payload(item["payload"])
+                except TextIntegrityError:
+                    items.append(
+                        {
+                            "item_id": item["id"],
+                            "reason": InvalidOutboundText.reason,
+                            "message": REASONS[InvalidOutboundText.reason],
+                        }
+                    )
                     continue
                 from .interaction_intents import intent_blocker
 
@@ -1222,7 +1250,7 @@ class Engine:
                         account_reason = "account_outbound_blocked"
                     elif sender["cooldown_until"] > self.clock():
                         account_reason = "account_cooldown"
-                    elif sender["status"] != "healthy":
+                    elif sender["status"] != "healthy" and not self._phone_account_ready(task["id"], sender):
                         account_reason = "account_unhealthy"
                 reason = (
                     account_reason
@@ -1264,10 +1292,24 @@ class Engine:
             if not task["manifest"] or digest(json.loads(task["manifest"])) != expected:
                 raise Conflict("外发清单哈希不匹配")
             rows = db.execute(
-                "SELECT payload,payload_hash FROM items WHERE task_id=? ORDER BY position",
+                "SELECT id,payload,payload_hash FROM items WHERE task_id=? ORDER BY position",
                 (task["id"],),
             ).fetchall()
             payloads = [json.loads(r["payload"]) for r in rows]
+            # Old frozen tasks can predate input validation. Check before any
+            # quota/attempt claim; matching hashes do not prove readable text.
+            try:
+                for payload in payloads:
+                    validate_outbound_payload(payload)
+            except TextIntegrityError as exc:
+                raise InvalidOutboundText(str(exc)) from None
+            from .deleted_reply_replacement import validate_replacement_claim
+
+            try:
+                for row in rows:
+                    validate_replacement_claim(db, row["id"], self.clock() if self else time.time())
+            except ValueError as exc:
+                raise Conflict(str(exc)) from None
             manifest = json.loads(task["manifest"])
             if payloads != manifest["items"] or any(
                 digest(p) != r["payload_hash"] for p, r in zip(payloads, rows)
@@ -1277,7 +1319,6 @@ class Engine:
 
     def _check_start_accounts(self, task, *, refresh=True):
         """Check before taking the task's write transaction or reserving any work."""
-        from .account_checks import summary
 
         checks = []
         for account_id in task["account_ids"]:
@@ -1294,7 +1335,7 @@ class Engine:
                 # retain their bounded backoff; cooldowns never trigger a probe.
                 account = (self.check_account(account_id, force=refresh, task_id=task["id"])
                            if method == "phone" else self.check_account(account_id, force=refresh))
-            checks.append(summary(account, self.clock()))
+            checks.append(self.account_readiness(task, account))
         with self.store.connect(write=True) as db:
             Store.audit(db, "task.account_check", {"accounts": checks}, task["id"], self.clock())
         blocked = [c for c in checks if not c["ready"]]
@@ -1305,10 +1346,9 @@ class Engine:
             )
 
     def _validate_start_accounts(self, task):
-        from .account_checks import summary
 
         for account_id in json.loads(task["account_ids"]):
-            check = summary(self.account(account_id), self.clock())
+            check = self.account_readiness(dict(task), self.account(account_id))
             if not check["ready"]:
                 raise Conflict("启动前账号状态已变化：" + check["label"] + "：" + check["message"])
 
@@ -1523,7 +1563,21 @@ class Engine:
                         rows = db.execute(
                             "SELECT * FROM items WHERE task_id=? ORDER BY position", (task_id,)
                         ).fetchall()
-                        self._validate_outbound_readiness(db, task, check_membership=False)
+                        resume_frozen_x = bool(
+                            task["state"] == "paused"
+                            and task["phase"] == "ready"
+                            and task["manifest_hash"]
+                            and all(
+                                (p := json.loads(r["payload"])).get("platform") == "x"
+                                and p.get("action") == "reply"
+                                and p.get("execution_mode") == "automatic"
+                                and not p.get("media")
+                                for r in rows
+                            )
+                        )
+                        self._validate_outbound_readiness(
+                            db, task, check_membership=False, resume_frozen_x=resume_frozen_x
+                        )
                         waiting = any(
                             telegram_blocker(db, task, json.loads(r["payload"]), r["due_at"])
                             for r in rows
@@ -1557,6 +1611,9 @@ class Engine:
                         task_id,
                         self.clock(),
                     )
+            from .temporal_tasks import request_registered
+
+            request_registered(self, db, task_id)
         return self.task(task_id)
 
     def _resolve_task_schedule(self, db, task):
@@ -1740,6 +1797,10 @@ class Engine:
         return task
 
     def validate_item(self, task, value: ItemInput, *, account=None, opportunity=None):
+        try:
+            validate_outbound_payload({"text": value.text, "title": value.title})
+        except TextIntegrityError as exc:
+            raise InvalidOutboundText(str(exc)) from None
         if value.account_id not in task["account_ids"]:
             raise Conflict("账号不在该任务范围内")
         account = account or self.account(value.account_id)
@@ -1816,7 +1877,7 @@ class Engine:
         policy = task["policy"]
         if not epoch(policy["starts_at"]) <= epoch(value.scheduled_at) < epoch(policy["ends_at"]):
             raise Conflict("计划时间超出任务执行窗口")
-        if policy["target_allowlist"] and value.target not in policy["target_allowlist"]:
+        if not target_allowed(account["platform"], value.target, policy["target_allowlist"]):
             raise Conflict("目标不在任务的目标边界内")
         if RISK.search(value.target):
             raise Conflict("目标包含被禁止的类别信号")
@@ -2006,7 +2067,9 @@ class Engine:
             self.verify_media(media.model_dump())
         return account
 
-    def _validate_outbound_readiness(self, db, task, *, check_membership=True):
+    def _validate_outbound_readiness(
+        self, db, task, *, check_membership=True, resume_frozen_x=False
+    ):
         now = self.clock()
         if now >= epoch(json.loads(task["policy"])["ends_at"]):
             raise Conflict("任务执行窗口已过期，请创建新任务")
@@ -2014,6 +2077,21 @@ class Engine:
             "SELECT * FROM items WHERE task_id=? ORDER BY position", (task["id"],)
         ):
             payload = json.loads(row["payload"])
+            if resume_frozen_x:
+                if row["status"] in {"executing", "scheduled"}:
+                    raise Conflict("任务仍有执行中或平台排期项目，不能恢复")
+                if row["status"] != "not_attempted":
+                    continue
+                if (
+                    row["attempt_id"]
+                    or row["claimed_at"]
+                    or row["external_reference"]
+                    or db.execute("SELECT 1 FROM attempts WHERE item_id=?", (row["id"],)).fetchone()
+                ):
+                    raise Conflict("未执行项目存在尝试或回执，不能恢复")
+                if now - row["due_at"] > DELIVERY_GRACE_SECONDS:
+                    # The normal claim boundary records this as missed; it must never send late.
+                    continue
             native = payload["action"] in {"schedule_message", "schedule_file"}
             if now - row["due_at"] > DELIVERY_GRACE_SECONDS or (native and row["due_at"] <= now):
                 raise Conflict("清单包含已过期的计划时间，请创建新任务")
@@ -2497,7 +2575,7 @@ class Engine:
                     return self._skip(item_id, "delivery_window_elapsed", db)
             if account["disabled"]:
                 return self._skip(item_id, "account_disabled", db)
-            if account["status"] != "healthy":
+            if account["status"] != "healthy" and not self._phone_account_ready(task["id"], account):
                 return self._skip(item_id, "account_unhealthy", db)
             from .account_blocks import active_block
 
@@ -2826,7 +2904,7 @@ class Engine:
                     self._skip(row["id"], reason)
                     continue
             except Conflict as exc:
-                self._skip(row["id"], "manifest_integrity_failed")
+                self._skip(row["id"], getattr(exc, "reason", "manifest_integrity_failed"))
                 processed.append({"item_id": row["id"], "status": "blocked", "reason": str(exc)})
                 continue
             account = self.account(row["account_id"])
@@ -2864,11 +2942,11 @@ class Engine:
                     self.check_account(account["id"], force=True, task_id=row["task_id"])
                     if self._execution_method(row["task_id"]) == "phone"
                     else self.check_account(account["id"], force=True))
-            if not manual and checked[account["id"]]["connection_state"] != "healthy":
+            if not manual and checked[account["id"]]["connection_state"] != "healthy" and not self._phone_account_ready(row["task_id"], checked[account["id"]]):
                 self._skip(row["id"], "account_unhealthy")
                 continue
             account = self.account(row["account_id"])
-            if account["connection_state"] != "healthy" or account["cooldown_until"] > self.clock():
+            if (account["connection_state"] != "healthy" and not self._phone_account_ready(row["task_id"], account)) or account["cooldown_until"] > self.clock():
                 self._skip(
                     row["id"],
                     "account_cooldown"
@@ -3491,8 +3569,15 @@ class Engine:
         if value.account_id not in task["account_ids"]:
             raise Conflict("候选账号超出任务范围")
         p = task["policy"]
-        # Only the literal annotation "non-adult" is negative evidence. Titles,
-        # targets and any other adult/NSFW signals still pass through the risk gate.
+        snapshot = next(
+            (a for a in (task.get("account_snapshot") or []) if a.get("id") == value.account_id),
+            None,
+        )
+        platform = snapshot.get("platform") if snapshot else None
+        if not platform:
+            platform = self.account(value.account_id)["platform"]
+        # Keep the existing treatment of the literal "non-adult" annotation for
+        # task-specific keyword policies; the original candidate text is retained.
         content = (
             value.title + " " + NON_ADULT.sub("", value.text) + " " + value.target
         ).casefold()
@@ -3515,7 +3600,7 @@ class Engine:
             any(w in content for w in q.casefold().split()) for q in p["queries"]
         ):
             reasons.append("unrelated_topic")
-        if p["target_allowlist"] and value.target not in p["target_allowlist"]:
+        if not target_allowed(platform, value.target, p["target_allowlist"]):
             reasons.append("target_boundary")
         decision = "rejected" if reasons else "qualified"
         with (
@@ -3525,10 +3610,21 @@ class Engine:
             self._integrity(db, row, "discovery_join")
             if row["state"] in {"paused", "cancelled", "completed"}:
                 raise Conflict("任务已暂停或结束")
+            target_predicate = (
+                "lower(target)=lower(?)"
+                if platform == "telegram" and telegram_public_handle(value.target)
+                else "target=?"
+            )
             existing = db.execute(
-                "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND target=?",
+                "SELECT * FROM candidates WHERE task_id=? AND account_id=? AND "
+                + target_predicate
+                + " ORDER BY CASE WHEN state='not_attempted' THEN 1 ELSE 0 END,id LIMIT 1",
                 (task_id, value.account_id, value.target),
             ).fetchone()
+            if existing and existing["target"] != value.target:
+                # Preserve the first spelling and identity; never create another
+                # candidate or join attempt merely because Telegram changed case.
+                value = value.model_copy(update={"target": existing["target"]})
             payload = canonical(value.model_dump())
             if existing:
                 if existing["payload"] == payload:
@@ -4057,6 +4153,12 @@ class Engine:
             "joined",
             "already_joined",
         }:
+            reason = result.get("reason")
+            if not isinstance(reason, str) or reason not in {
+                "not_current_member",
+                "membership_state_unrecognized",
+            }:
+                reason = "not_conclusively_verified"
             if row["state"] in {"joined", "already_joined"}:
                 with self.store.connect(write=True) as db:
                     db.execute(
@@ -4069,8 +4171,8 @@ class Engine:
                             row["result"],
                         ),
                     )
-                return {"status": "unknown", "reason": "not_conclusively_verified"}
-            return {"status": row["state"], "reason": "not_conclusively_verified"}
+                return {"status": "unknown", "reason": reason}
+            return {"status": row["state"], "reason": reason}
         # Membership lookup may confirm joining, but never grants another attempt.
         safe = {
             k: result[k]

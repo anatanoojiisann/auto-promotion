@@ -72,6 +72,22 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(self.engine.task(task["id"])["candidates"][0]["state"], "not_attempted")
         self.assertFalse(self.store.rows("SELECT * FROM join_attempts"))
 
+    def test_readonly_nonmember_reason_preserves_unknown_join_without_retry(self):
+        task = self.task(max_joins=1, outbound_after_membership_seconds=600)
+        candidate = self.candidate(task)
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE candidates SET state='unknown' WHERE id=?", (candidate["id"],))
+        with patch.object(
+            self.engine,
+            "call",
+            return_value=dict(status="unknown", verified=False, reason="not_current_member"),
+        ) as call:
+            observed = self.engine.reconcile_join(candidate["id"])
+        self.assertEqual(observed, {"status": "unknown", "reason": "not_current_member"})
+        self.assertEqual(call.call_args.args[1], "verify_join")
+        self.assertEqual(self.engine.task(task["id"])["candidates"][0]["state"], "unknown")
+        self.assertFalse(self.store.rows("SELECT * FROM join_attempts"))
+
     def test_recovery_schedule_waits_for_cloud_and_keeps_hour_and_spacing(self):
         task = self.task(
             max_joins=1,
@@ -273,7 +289,149 @@ class ReadinessTests(unittest.TestCase):
                 (state, json.dumps(result), candidate["id"]),
             )
 
-    def test_non_adult_annotation_does_not_hide_other_risk_signals(self):
+    def test_telegram_username_case_does_not_reject_or_duplicate_candidates(self):
+        task = self.task(target_allowlist=["@examplegroup"], max_candidates=1)
+        value = CandidateInput(
+            account_id=self.account["id"],
+            target="@EXAMPLEGROUP",
+            title="AI group",
+            text="AI video",
+            language="en",
+            confidence=0.95,
+        )
+        self.assertEqual(self.engine.candidate(task["id"], value)["decision"], "qualified")
+        self.assertEqual(
+            self.engine.candidate(task["id"], value.model_copy(update={"target": "@examplegroup"}))[
+                "decision"
+            ],
+            "qualified",
+        )
+        saved = self.engine.task(task["id"])
+        self.assertEqual(len(saved["candidates"]), 1)
+        self.assertEqual(saved["candidates"][0]["target"], "@EXAMPLEGROUP")
+        self.items(task, target="@examplegroup", action="send_message", reply_to=None)
+        self.assertIsNotNone(self.engine.prepare(task["id"])["manifest_hash"])
+        with self.assertRaisesRegex(Conflict, "目标不在任务的目标边界内"):
+            self.items(task, target="@othergroup", action="send_message", reply_to=None)
+
+    def test_case_alias_cannot_create_another_candidate_after_unknown_join(self):
+        task = self.task(target_allowlist=["@examplegroup"], max_candidates=2)
+        value = CandidateInput(
+            account_id=self.account["id"],
+            target="@EXAMPLEGROUP",
+            text="AI video",
+            language="en",
+            confidence=0.95,
+        )
+        self.engine.candidate(task["id"], value)
+        candidate = self.engine.task(task["id"])["candidates"][0]
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE candidates SET state='unknown' WHERE id=?", (candidate["id"],))
+        with self.assertRaisesRegex(Conflict, "已冻结清单或已尝试入群"):
+            self.engine.candidate(
+                task["id"], value.model_copy(update={"target": "@examplegroup", "text": "AI art"})
+            )
+        saved = self.engine.task(task["id"])["candidates"]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["state"], "unknown")
+
+    def test_russian_group_case_alias_reaches_verified_simulated_send_once(self):
+        from auto_promotion.backends.telegram import telegram_language_evidence
+
+        language, confidence = telegram_language_evidence(
+            "Example AI", "Только русский язык [RU ONLY]", ""
+        )
+        task = self.task(
+            max_joins=1,
+            outbound_after_membership_seconds=600,
+            target_allowlist=["@examplegroup"],
+            languages=["ru"],
+            daily_limit=2,
+            target_daily_limit=2,
+            user_daily_limit=2,
+        )
+        result = self.engine.candidate(
+            task["id"],
+            CandidateInput(
+                account_id=self.account["id"],
+                target="@EXAMPLEGROUP",
+                text="AI video",
+                language=language,
+                confidence=confidence,
+            ),
+        )
+        self.assertEqual(result["decision"], "qualified")
+        self.items(
+            task,
+            target="@examplegroup",
+            action="send_message",
+            reply_to=None,
+            scheduled_at=iso(self.now + 600),
+        )
+        self.assertEqual(self.engine.start_task(task["id"])["phase"], "starting")
+        self.assertEqual(self.engine.run_joins(task["id"])["processed"][0]["status"], "joined")
+        self.engine.start_task(task["id"], source="scheduler")
+        self.now += 600
+        self.assertEqual(self.engine.run_once(task["id"])["processed"][0]["status"], "confirmed")
+        self.assertEqual(self.engine.run_once(task["id"])["processed"], [])
+        self.assertEqual(len(self.store.rows("SELECT * FROM join_attempts")), 1)
+        self.assertEqual(len(self.store.rows("SELECT * FROM attempts")), 1)
+
+    def test_expired_join_only_task_reports_unsent_items_without_starting_them(self):
+        from auto_promotion.queue_store import JobQueue
+
+        task = self.discovery(self.task())
+        self.items(task)
+        self.now += 7201
+        JobQueue(self.engine).sync(task["id"])
+        done = self.engine.task(task["id"])
+        self.assertEqual(done["state"], "completed")
+        self.assertEqual(done["items"][0]["status"], "missed")
+        self.assertIsNone(done["items"][0]["attempt_id"])
+        self.assertEqual(done["readiness"]["workflow"]["label"], "已结束 · 有项目未发送")
+        self.assertIn("未尝试发送", done["readiness"]["workflow"]["message"])
+
+    def test_nsfw_candidates_and_targets_are_not_automatically_rejected(self):
+        cases = [
+            ("@nsfw", "NSFW AI art", "adult AI video, 18+"),
+            ("@adult", "AI 色情图片", "porn and NSFW AI art"),
+        ]
+        for target, title, text in cases:
+            with self.subTest(target=target):
+                task = self.task()
+                decision = self.engine.candidate(
+                    task["id"],
+                    CandidateInput(
+                        account_id=self.account["id"],
+                        target=target,
+                        title=title,
+                        text=text,
+                        language="en",
+                        confidence=0.95,
+                    ),
+                )
+                self.assertEqual(decision["decision"], "qualified")
+                items = self.items(task, target=target, action="send_message", reply_to=None)
+                self.assertEqual(items["items"][0]["payload"]["target"], target)
+
+    def test_other_risk_categories_still_block_nsfw_candidates_and_targets(self):
+        task = self.task()
+        decision = self.engine.candidate(
+            task["id"],
+            CandidateInput(
+                account_id=self.account["id"],
+                target="@ai_group",
+                text="NSFW AI and casino promotions",
+                language="en",
+                confidence=0.95,
+            ),
+        )
+        self.assertEqual(decision["decision"], "rejected")
+        self.assertIn("blocked_category", decision["reasons"])
+        with self.assertRaisesRegex(Conflict, "目标包含被禁止的类别信号"):
+            self.items(task, target="@casino", action="send_message", reply_to=None)
+
+    def test_non_adult_annotation_does_not_hide_configured_keywords(self):
         cases = [
             ({"text": "Current non-adult AI video question"}, "qualified"),
             ({"text": "NON-ADULT AI video question"}, "qualified"),

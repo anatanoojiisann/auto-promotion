@@ -336,7 +336,33 @@ def event_id(platform, payload):
 
 def explicit_unsent_retry_source(db, account, task, payload, item_id):
     """Return only the exact audited no-submit attempt underlying this retry."""
+    from .deleted_reply_replacement import replacement_proof
     from .models import digest
+
+    correction = replacement_proof(db, item_id)
+    if correction and correction.get("prior_no_submit_items"):
+        sources = []
+        for previous in correction["prior_no_submit_items"]:
+            attempt = db.execute(
+                "SELECT * FROM attempts WHERE id=? AND item_id=?",
+                (previous["attempt_id"], previous["item_id"]),
+            ).fetchone()
+            old = db.execute(
+                "SELECT due_at FROM items WHERE id=?", (previous["item_id"],)
+            ).fetchone()
+            if not attempt or not old or attempt["account_id"] != account["id"]:
+                return None
+            sources.append(
+                {
+                    "account": account["id"],
+                    "task": attempt["task_id"],
+                    "attempt_at": attempt["started_at"],
+                    "due_at": old["due_at"],
+                    "target": attempt["target_key"],
+                    "user": attempt["user_key"],
+                }
+            )
+        return {"sources": sources}
 
     marker = db.execute(
         "SELECT details FROM audit WHERE task_id=? AND kind='interaction.explicit_unsent_retry_authorized' AND json_extract(details,'$.new_item_id')=? ORDER BY id DESC LIMIT 1",
@@ -421,12 +447,20 @@ def intent_blocker(db, account, task, payload, item_id):
             "blocked_by_task_id": owner[0] if owner else None,
         }
     # Include receipts created before this additive migration, and unresolved manual evidence.
+    from .deleted_reply_replacement import replacement_proof
+
+    correction = replacement_proof(db, item_id)
     for old in db.execute(
         "SELECT i.id,i.task_id,i.account_id,i.status,i.attempt_id,i.external_reference,i.result,i.payload,t.policy FROM items i JOIN tasks t ON t.id=i.task_id "
         "JOIN accounts a ON a.id=i.account_id WHERE a.platform=? AND i.id<>? AND "
         "(i.attempt_id IS NOT NULL OR i.status IN ('confirmed','executing','unknown','scheduled'))",
         (account["platform"], item_id),
     ):
+        if correction and old["id"] in {
+            correction["old_item_id"],
+            *(p["item_id"] for p in correction.get("prior_no_submit_items", [])),
+        }:
+            continue  # Exact user-authorized correction with a confirmed deletion receipt.
         previous = json.loads(old["result"])
         if (
             old["status"] == "manual_attention"

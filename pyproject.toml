@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115,<1", "pydantic>=2.10,<3", "uvicorn>=0.34,<1", "tzdata>=2025.1"]
 
 [project.optional-dependencies]
+temporal = ["temporalio==1.24.0"]
 dev = ["ruff>=0.12,<1", "build>=1.2,<2", "httpx>=0.28,<1"]
 phone = ["phone-fleet-management==0.2.0.dev18", "phone-fleet-protocol==0.2.0"]
 telegram = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3"]

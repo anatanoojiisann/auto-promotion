@@ -22,6 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import PROJECTS, load_environment
+from .text_integrity import configure_utf8_stdio, validate_outbound_payload
 
 
 def http(url, method="GET", body=None, headers=None):
@@ -598,7 +599,10 @@ def instagram(operation, account, payload, root):
 
 
 def main():
+    configure_utf8_stdio()
     request = json.load(sys.stdin)
+    if request["operation"] in {"execute", "preflight"}:
+        validate_outbound_payload(request.get("payload", {}).get("payload", {}))
     p = request["platform"]
     workspace = Path(os.environ["AUTO_PROMOTION_WORKSPACE"])
     root = workspace / PROJECTS[p]
@@ -624,4 +628,4 @@ if __name__ == "__main__":
             result = main()
     except Exception as exc:
         result = {"bridge_error": safe_error_code(exc)}
-    sys.stdout.write(json.dumps(result, ensure_ascii=False))
+    sys.stdout.write(json.dumps(result, ensure_ascii=True))
