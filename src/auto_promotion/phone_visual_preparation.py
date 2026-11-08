@@ -257,6 +257,23 @@ def prepare_task(engine, task_id, manifest_hash, workflow_id):
         if not permission["allowed_read"]:
             waits.append({"account_id": account_id, "reason": permission["reason"]})
             continue
+        # Only a baseline read with no persisted native intent may wait/recover.
+        # A busy observer is a per-account queue condition, never a failed submit.
+        if (row["phase"] == "blocked" and row["reason"] == "AccountBusy"
+                and not row["request"] and not row["native_execution_id"]):
+            _update(service, item["id"], phase="waiting_account", reason="AccountBusy")
+            row = service.store.one("SELECT * FROM phone_visual_preparations WHERE item_id=?", (item["id"],))
+        if not row["request"]:
+            if row["phase"] == "waiting_account" and engine.clock() - row["updated_at"] >= 120:
+                _update(service, item["id"], phase="blocked", reason="account_read_wait_timeout")
+                continue
+            lane = service.store.one("SELECT 1 occupied FROM account_lanes WHERE account_id=? AND expires_at>?",
+                                     (account_id, engine.clock()))
+            if lane:
+                _update(service, item["id"], phase="waiting_account", reason="AccountBusy")
+                waits.append({"account_id":account_id,"reason":"AccountBusy"})
+                retry_at = min(retry_at or engine.clock()+2, engine.clock()+2)
+                continue
         due = item.get("due_at") or engine.clock()
         if due > engine.clock() + 30 and not row["request"]:
             retry_at = min(retry_at or due, due - 30)
@@ -264,7 +281,12 @@ def prepare_task(engine, task_id, manifest_hash, workflow_id):
         try:
             dispatched = _step_item(service, task, item, row)
         except BackendError as error:
-            _update(service, item["id"], phase="blocked", reason=error.safe_code)
+            if error.safe_code == "AccountBusy" and not row["request"] and not row["native_execution_id"]:
+                _update(service, item["id"], phase="waiting_account", reason="AccountBusy")
+                waits.append({"account_id":account_id,"reason":"AccountBusy"})
+                retry_at = min(retry_at or engine.clock()+2, engine.clock()+2)
+            else:
+                _update(service, item["id"], phase="blocked", reason=error.safe_code)
             dispatched = False
         except (ValueError, TypeError, KeyError) as error:
             _update(service, item["id"], phase="blocked", reason="visual_preparation_invalid_" + type(error).__name__)

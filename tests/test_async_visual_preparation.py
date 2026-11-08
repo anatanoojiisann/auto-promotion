@@ -129,3 +129,25 @@ def test_old_identity_cache_is_not_refreshed_by_approval_and_account_stops_still
     assert not account_check(s.engine,s.engine.task(s.task["id"]),s.engine.account(s.account["id"]))["ready"]
     queue=JobQueue(s.engine);queue.sync(s.task["id"])
     assert queue.claim("telegram.phone","synthetic-worker",reference_id=s.item["id"]) is None
+
+
+@pytest.mark.parametrize("pilot",["telegram"],indirect=True)
+@pytest.mark.parametrize("expire",[False,True])
+def test_observer_lane_wait_does_not_dispatch_or_fail_and_is_bounded(async_pilot,expire):
+    from auto_promotion.dispatcher import AccountLanes
+    s=async_pilot
+    before=len(s.fake.requests)
+    with AccountLanes(s.store).acquire(s.account["id"]):
+        value=step(s)
+        assert value["items"][0]["phase"]=="waiting_account" and value["account_waits"]
+        first=s.store.one("SELECT * FROM phone_visual_preparations WHERE item_id=?",(s.item["id"],))
+        assert not first["request"] and not first["native_execution_id"]
+        step(s)
+        assert s.store.one("SELECT updated_at FROM phone_visual_preparations WHERE item_id=?",(s.item["id"],))["updated_at"]==first["updated_at"]
+        assert len(s.fake.requests)==before
+        if expire:
+            s.monkeypatch.setattr(s.engine,"clock",lambda:first["updated_at"]+121)
+            assert step(s)["items"][0]["reason"]=="account_read_wait_timeout"
+    if not expire:assert step(s)["pending_review"]
+    assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"]==0
+    assert s.store.one("SELECT COUNT(*) n FROM phone_social_authorizations")["n"]==0
