@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-promotion"
-version = "0.1.1.dev2"
+version = "0.1.1.dev3"
 description = "Local account, task and API control plane for six social platforms"
 readme = "README.md"
 requires-python = ">=3.11"

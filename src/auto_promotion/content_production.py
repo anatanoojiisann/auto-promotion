@@ -10,7 +10,7 @@ from .content_queue import ContentDraft, ContentQueue
 from .core import Conflict, NotFound
 from .drafts import DraftService
 from .models import AccountProfile, ItemInput, Model, canonical, digest
-from .planner import render_template
+from .planner import content_key, render_template
 from .store import Store
 
 
@@ -102,6 +102,7 @@ class ContentProduction:
                             canonical(
                                 {
                                     "source": source,
+                                    "content_key": row["content_key"],
                                     "revision": row["revision"],
                                     "observed_at": row["updated_at"],
                                 }
@@ -165,7 +166,12 @@ class ContentProduction:
                     for k in ItemInput.model_fields
                     if k in source and k not in {"account_id", "scheduled_at"}
                 }
-                payload.update(text=text, title=title, opportunity_id=row["source_id"])
+                payload.update(
+                    text=text,
+                    title=title,
+                    opportunity_id=row["source_id"],
+                    content_key=snapshot.get("content_key") or content_key(source),
+                )
                 with self.store.connect(write=True) as db:
                     current = db.execute(
                         "SELECT * FROM content_production_items WHERE run_id=? AND position=?",

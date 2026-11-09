@@ -19,6 +19,7 @@ PACKAGES = {
 AP_TESTS = (
     "tests/test_publication_receipt_integration.py",
     "tests/test_content_production.py",
+    "tests/test_content_phone_pipeline.py",
     "tests/test_content_queue.py",
     "tests/test_hf_content_queue.py",
     "tests/test_campaign_api.py",
