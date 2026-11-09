@@ -99,9 +99,21 @@ async function scenario(name, options = {}) {
     release = gate();
   let starts = 0,
     authorizations = 0,
+    reconciliations = 0,
     holdRead = false,
     heldRead = false;
   let current = task();
+  if (options.reconcileReason)
+    current.candidates = [
+      {
+        id: "candidate-fixture",
+        target: "@examplegroup",
+        decision: "qualified",
+        reasons: [],
+        state: "unknown",
+        result: {},
+      },
+    ];
   if (options.accountBlockDisplay || options.desktopDisplay) {
     current.readiness.workflow = {
       ...current.readiness.workflow,
@@ -229,6 +241,12 @@ async function scenario(name, options = {}) {
       }
       return route.fulfill({ json: response });
     }
+    if (url.pathname === "/api/candidates/candidate-fixture/reconcile") {
+      reconciliations++;
+      return route.fulfill({
+        json: { status: "unknown", reason: options.reconcileReason },
+      });
+    }
     if (url.pathname.startsWith("/api/tasks/")) {
       const id = url.pathname.split("/").at(-1);
       const snapshot = structuredClone(id === current.id ? current : task(id));
@@ -261,7 +279,21 @@ async function scenario(name, options = {}) {
   try {
     await page.goto("http://task-race.test/#tasks/task-fixture");
     await page.locator("#run-task").waitFor();
-    if (options.localAuthorization) {
+    if (options.reconcileReason) {
+      await page.locator('[data-join-reconcile="candidate-fixture"]').click();
+      await page.waitForFunction(
+        () => document.querySelector("#notice").textContent.length > 0,
+      );
+      const notice = await page.locator("#notice").textContent();
+      assert.match(
+        notice,
+        options.reconcileReason === "not_current_member"
+          ? /当前显示账号不是群成员.*不会重复申请/
+          : /未识别的成员状态.*不会重复申请/,
+      );
+      assert.equal(reconciliations, 1);
+      assert.equal(starts, 0);
+    } else if (options.localAuthorization) {
       const selector = "#local-channel-authorization-form";
       await page
         .locator(selector)
@@ -492,6 +524,14 @@ async function scenario(name, options = {}) {
   });
   const failures = [];
   for (const [name, options] of [
+    [
+      "telegram-current-nonmember-reason",
+      { reconcileReason: "not_current_member" },
+    ],
+    [
+      "telegram-unrecognized-membership-reason",
+      { reconcileReason: "membership_state_unrecognized" },
+    ],
     [
       "local-authorization-explicit-once-across-poll",
       { localAuthorization: true },

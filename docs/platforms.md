@@ -80,7 +80,7 @@ Reddit 仍采用人工清单。X 默认采用人工清单；单独启用 `automa
 
 ## Discord（官方 Bot）
 
-第一版支持 Bot 已获授权服务器中的普通文字频道和公告频道：文字、最多 10 个文件/图片、普通文字频道内的消息回复、本机定时发送和只读回执核对。频道必须对该服务器的 `@everyone` 角色可见；私密频道、NSFW、私信、论坛和 Thread 暂不支持。此处的公开指服务器成员可见，不代表服务器本身可被全网搜索。不会搜索或自动加入其他服务器。
+支持 Bot 已获授权服务器中的普通文字频道和公告频道：文字、最多 10 个文件/图片、普通文字频道内的消息回复、本机定时发送和只读回执核对。频道必须对该服务器的 `@everyone` 角色可见；不会仅因频道被标记为 NSFW 而排除，平台自身的限制和 Bot 权限仍然适用。私密频道、私信、论坛和 Thread 暂不支持。此处的公开指服务器成员可见，不代表服务器本身可被全网搜索。不会搜索或自动加入其他服务器。
 
 1. 在 [Discord 开发者后台](https://discord.com/developers/applications) 创建应用，从 Bot 页面生成 Bot Token。
 2. 在 Installation 配置 `Guild Install` 和 `bot` scope，由拥有服务器管理权限的人使用安装链接添加 Bot。需要 `View Channels`、`Send Messages`、`Read Message History`；文件/图片还需 `Attach Files`。当前版本不使用 Slash Commands、Gateway 或 Message Content intent。

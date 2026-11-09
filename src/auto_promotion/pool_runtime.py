@@ -24,7 +24,8 @@ from .execution_channels import (
     read_state,
     use_cloud,
 )
-from .local_primary import configured as local_primary_configured, eligible as local_primary_eligible
+from .local_primary import configured as local_primary_configured
+from .local_primary import eligible as local_primary_eligible
 from .models import canonical
 from .queue_store import JobQueue, executor_task_ids, job_scope
 from .routing import POOLS

@@ -15,9 +15,9 @@ temporal = ["temporalio==1.24.0"]
 dev = ["ruff>=0.12,<1", "build>=1.2,<2", "httpx>=0.28,<1"]
 phone = ["phone-fleet-management==0.2.0.dev18", "phone-fleet-protocol==0.2.0"]
 telegram = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3"]
-browser = ["playwright>=1.55,<2"]
+browser = ["playwright>=1.55,<2", "pywin32>=306,<400; sys_platform == 'win32'"]
 mcp = ["mcp>=1.30,<2"]
-all = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3", "playwright>=1.55,<2", "mcp>=1.30,<2"]
+all = ["telethon>=1.42,<2", "python-socks[asyncio]>=2.7,<3", "playwright>=1.55,<2", "mcp>=1.30,<2", "pywin32>=306,<400; sys_platform == 'win32'"]
 
 [project.scripts]
 auto-promotion = "auto_promotion.cli:main"

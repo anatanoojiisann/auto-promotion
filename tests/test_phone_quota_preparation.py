@@ -1,10 +1,12 @@
 """Synthetic pre-submission proof and quota counters, without device actions."""
 import json
+
 import pytest
-from tests.test_phone_rounds import make_lab, create, finish
+
 from auto_promotion.models import canonical, digest
 from auto_promotion.queue_store import JobQueue
 from auto_promotion.quotas import check_claim
+from tests.test_phone_rounds import create, finish, make_lab
 
 
 @pytest.mark.parametrize("uncertain", [False, True])

@@ -1,6 +1,8 @@
 import json
 from unittest.mock import patch
 
+from test_x_history_ack import XHistoryAcknowledgementTests
+
 from auto_promotion.cloud_control import CloudUnavailable
 from auto_promotion.execution_channels import binding
 from auto_promotion.local_authorization import activate_local_task_handoff
@@ -8,7 +10,6 @@ from auto_promotion.models import canonical, digest
 from auto_promotion.queue_store import JobQueue, job_scope
 from auto_promotion.task_channels import TaskChannelRouter, channel_binding, save_binding
 from auto_promotion.x_history_ack import record_self_unknown_exclusion
-from test_x_history_ack import XHistoryAcknowledgementTests
 
 
 class SelfUnknownTests(XHistoryAcknowledgementTests):

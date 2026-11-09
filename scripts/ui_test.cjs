@@ -674,24 +674,21 @@ async function cleanup() {
       headers: { "X-AP-Client": "local-ui" },
     }).then((r) => r.json()),
   );
-  await page.getByRole("link", { name: "互动统计", exact: true }).click();
+  await page.getByRole("link", { name: "互动效果", exact: true }).click();
+  await page.getByRole("heading", { name: "互动效果", exact: true }).waitFor();
+  await page.locator("#effects-workspace[aria-busy=false]").waitFor();
+  assert.deepEqual(
+    await page.locator(".effect-summary .effect-stat strong").allTextContents(),
+    ["0", "不可获取", "不可获取", "不可获取"],
+    "simulation publications do not create live engagement metrics",
+  );
+  await page.getByRole("link", { name: "发布与定时报告", exact: true }).click();
   await page.getByRole("heading", { name: "互动统计", exact: true }).waitFor();
   const publicationStats = page.locator("#main > .stats");
-  const engagementStats = page.locator("#engagement-metrics .stats");
-  // Exercise both regions after the asynchronous engagement render completes.
-  await engagementStats.waitFor({ state: "visible" });
+  await publicationStats.waitFor({ state: "visible" });
   assert.equal(await publicationStats.count(), 1);
-  assert.equal(await engagementStats.count(), 1);
-  assert.equal(await page.locator("#main .stats").count(), 2);
+  assert.equal(await page.locator("#main .stats").count(), 1);
   assert.ok((await publicationStats.innerText()).includes("不可统计"));
-  const engagementText = await engagementStats.innerText();
-  for (const label of ["已观察观看", "已观察点赞", "已观察回复"])
-    assert.ok(engagementText.includes(label));
-  assert.deepEqual(
-    await engagementStats.locator(".stat strong").allTextContents(),
-    ["不可获取", "不可获取", "不可获取"],
-    "simulation publications do not create observed live engagement metrics",
-  );
   const statistics = await page.evaluate(() =>
     fetch("/api/statistics").then((r) => r.json()),
   );

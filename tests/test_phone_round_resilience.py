@@ -51,7 +51,7 @@ def test_health_survives_phone_round_error_and_reports_recovery(tmp_path):
 
 
 def test_known_failed_member_is_visible_and_other_apps_continue(tmp_path):
-    from tests.test_phone_rounds import make_lab, create, finish
+    from tests.test_phone_rounds import create, finish, make_lab
     lab = make_lab(tmp_path)
     round_ = create(lab)
     lab.rounds.start(round_["id"])
@@ -73,7 +73,7 @@ def test_known_failed_member_is_visible_and_other_apps_continue(tmp_path):
 
 
 def test_unknown_outcome_ends_round_without_becoming_success_or_requeued(tmp_path):
-    from tests.test_phone_rounds import make_lab, create, finish
+    from tests.test_phone_rounds import create, finish, make_lab
     lab = make_lab(tmp_path)
     round_ = create(lab)
     lab.rounds.start(round_["id"])
@@ -94,8 +94,10 @@ def test_unknown_outcome_ends_round_without_becoming_success_or_requeued(tmp_pat
 def test_busy_coordinator_writer_returns_control_within_one_short_wait(tmp_path):
     import sqlite3
     import time
+
     import pytest
-    from tests.test_phone_rounds import make_lab, create
+
+    from tests.test_phone_rounds import create, make_lab
     lab = make_lab(tmp_path)
     round_ = create(lab)
     lab.rounds.start(round_["id"])
@@ -112,6 +114,7 @@ def test_busy_coordinator_writer_returns_control_within_one_short_wait(tmp_path)
 
 def test_phone_health_uses_original_phone_task_and_its_own_cache(tmp_path):
     from types import SimpleNamespace
+
     from tests.test_phone_rounds import make_lab
     lab = make_lab(tmp_path)
     account = lab.store.one("SELECT a.id FROM accounts a WHERE a.platform='telegram'")
@@ -130,7 +133,8 @@ def test_phone_health_uses_original_phone_task_and_its_own_cache(tmp_path):
 
 def test_completed_identity_refresh_resumes_only_untouched_original_member(tmp_path):
     from types import SimpleNamespace
-    from tests.test_phone_rounds import make_lab, create
+
+    from tests.test_phone_rounds import create, make_lab
     lab = make_lab(tmp_path)
     identifier = create(lab)["id"]
     lab.rounds.start(identifier)
@@ -152,6 +156,7 @@ def test_completed_identity_refresh_resumes_only_untouched_original_member(tmp_p
 
 def test_health_operation_dispatches_through_phone_task_route(tmp_path):
     from types import SimpleNamespace
+
     from tests.test_phone_rounds import make_lab
     lab = make_lab(tmp_path)
     account = lab.engine.account(lab.store.one("SELECT id FROM accounts WHERE platform='telegram'")["id"])
@@ -167,8 +172,8 @@ def test_health_operation_dispatches_through_phone_task_route(tmp_path):
 
 
 def test_explicit_recheck_recovers_only_start_rejected_while_task_still_draft(tmp_path):
-    from tests.test_phone_rounds import make_lab, create
     from auto_promotion.core import Conflict
+    from tests.test_phone_rounds import create, make_lab
     lab = make_lab(tmp_path)
     rid = create(lab)["id"]
     lab.rounds.start(rid)
@@ -186,9 +191,10 @@ def test_explicit_recheck_recovers_only_start_rejected_while_task_still_draft(tm
 
 def test_shared_telegram_health_preserves_numeric_identity_through_phone_route(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from tests.test_phone_rounds import make_lab
+
     from auto_promotion.models import digest
     from auto_promotion.phone_social import PhoneSocial
+    from tests.test_phone_rounds import make_lab
     lab = make_lab(tmp_path)
     aid = lab.store.one("SELECT id FROM accounts WHERE platform='telegram'")["id"]
     original = digest(["telegram", "123456"])
@@ -200,7 +206,7 @@ def test_shared_telegram_health_preserves_numeric_identity_through_phone_route(t
         binding=lambda account_id: (lab.engine.account(account_id), binding),
         fresh=lambda account: True,
         shared_account_binding=lambda account: binding,
-        config=SimpleNamespace(join_enabled=False))
+        config=SimpleNamespace(join_enabled=False, bindings={aid: binding}))
     monkeypatch.setattr("auto_promotion.phone_social.read_profile",
                         lambda *args: {"identity": "123456"})
     lab.engine.adapters.phone_social = service

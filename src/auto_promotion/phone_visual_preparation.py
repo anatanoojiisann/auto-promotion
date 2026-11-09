@@ -3,7 +3,6 @@
 import json
 
 import httpx
-
 from phone_fleet_protocol import ExecutionRequest, ExecutionSnapshot, fingerprint
 from phone_fleet_protocol.visual_review import context_sha256, pending_visual_review_result
 

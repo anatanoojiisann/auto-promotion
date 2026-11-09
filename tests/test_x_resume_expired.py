@@ -1,6 +1,7 @@
 import unittest
 
 import test_engine as fixtures
+
 from auto_promotion.core import Conflict
 from auto_promotion.readiness import DELIVERY_GRACE_SECONDS
 
