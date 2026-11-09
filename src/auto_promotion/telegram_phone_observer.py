@@ -2,6 +2,7 @@
 import asyncio
 import re
 import time
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -9,6 +10,19 @@ from .backends.common import BackendError, account_lock, profile_path, read_prof
 from .backends.telegram import TelegramBackend
 from .backends.telegram_reads import TelegramReads
 from .telegram_receipt_budget import reserve_receipt_reads, validate_receipt_reads
+
+
+# Platform message dates have one-second resolution and a separate clock.
+TELEGRAM_CLOCK_TOLERANCE = 2.0
+RECEIPT_CREATION_WINDOW = 120.0
+
+
+def bound_telegram_receipt(receipt, context, submitted_at):
+    from phone_fleet_protocol.social import receipt_matches
+
+    return bool(receipt and receipt.source == "telegram_api" and submitted_at
+                and receipt.created_at <= submitted_at + RECEIPT_CREATION_WINDOW
+                and receipt_matches(receipt, context, submitted_at - TELEGRAM_CLOCK_TOLERANCE))
 
 
 class TelegramObserverConfig(BaseModel):
@@ -161,20 +175,38 @@ class TelegramPhoneObserver:
                     if (peer_id!=baseline["peer_id"] or str(me.id)!=baseline["api_user_id"]
                             or baseline["identity_sha256"]!=fingerprint({"account":identity})):
                         raise BackendError("PhoneTelegramObserverPeerChanged")
-                    found = []
-                    for delay in (0,.5,1,2):
+                    lower = since - TELEGRAM_CLOCK_TOLERANCE
+                    upper = min(since + RECEIPT_CREATION_WINDOW, time.time() + 2)
+                    # Telegram's history offset is exclusive, with whole-second timestamps.
+                    cutoff = datetime.fromtimestamp(int(upper) + 1, timezone.utc)
+
+                    def matches(message):
+                        return (message and getattr(message, "out", False)
+                                and getattr(message, "sender_id", None) == me.id
+                                and message.id > baseline["last_message_id"]
+                                and (getattr(message, "message", "") or "") == context.text
+                                and not getattr(message, "media", None)
+                                and not getattr(message, "reply_to_msg_id", None)
+                                and not getattr(message, "fwd_from", None)
+                                and not getattr(message, "edit_date", None)
+                                and getattr(message, "date", None)
+                                and lower <= message.date.timestamp() <= upper)
+
+                    for delay in (0, .5, 1, 2):
                         if delay:
                             await asyncio.sleep(delay)
-                        messages = await client.get_messages(entity,limit=64,min_id=baseline["last_message_id"])
-                        found = [m for m in messages if getattr(m,"out",False) and getattr(m,"sender_id",None)==me.id
-                            and m.id>baseline["last_message_id"] and (getattr(m,"message","") or "")==context.text
-                            and not getattr(m,"media",None) and not getattr(m,"reply_to_msg_id",None) and not getattr(m,"fwd_from",None)
-                            and getattr(m,"date",None) and since<=m.date.timestamp()<=time.time()+2]
+                        messages = await client.get_messages(entity, limit=65, min_id=baseline["last_message_id"], offset_date=cutoff)
+                        if len(messages) >= 65:
+                            return None  # The bounded page cannot prove uniqueness.
+                        found = [m for m in messages if matches(m)]
                         if found:
                             break
-                    if len(found)!=1:
+                    if len(found) != 1:
                         return None
-                    message = found[0]
+                    reread = await client.get_messages(entity, ids=[found[0].id])
+                    if len(reread) != 1 or not matches(reread[0]) or reread[0].id != found[0].id or reread[0].date != found[0].date:
+                        return None
+                    message = reread[0]
                     return SocialReceipt(platform="telegram",action="send_message",native_id=str(message.id),target_id=context.target_id,
                         author=identity,text_sha256=fingerprint({"text":context.text}),permalink=f"https://t.me/{entity.username}/{message.id}",
                         created_at=message.date.timestamp(),observed_at=time.time(),source="telegram_api")

@@ -3110,6 +3110,8 @@ class Engine:
                 "external_reference",
                 "published_at",
                 "scheduled_message_ids",
+                "reconciliation_source",
+                "original_runtime_status",
                 "publish_id",
                 "post_ids",
                 "comment_id",

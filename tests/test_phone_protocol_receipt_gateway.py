@@ -93,6 +93,33 @@ def test_original_phone_claim_protocol_receipt_is_cached_and_readable_after_stop
     assert first["receipt"]["native_id"]=="98765" and first["signature"]
     assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"]==1
 
+    # An expired native callback stays fenced. A verified original execution can
+    # read its historical receipt, without creating an operation or another grant.
+    from phone_fleet_protocol import ExecutionRequest
+    from auto_promotion.core import Conflict
+    old_used = time.time() - 3600
+    operation = s.store.one("SELECT * FROM phone_social_operations WHERE id=?", (auth["id"],))
+    request = ExecutionRequest.model_validate_json(operation["request"])
+    old_receipt = dict(first["receipt"], created_at=old_used-1.574, observed_at=time.time())
+    with s.store.connect(write=True) as db:
+        db.execute("UPDATE phone_social_authorizations SET used_at=? WHERE id=?", (old_used,auth["id"]))
+        db.execute("UPDATE phone_telegram_observer_receipts SET receipt=NULL WHERE authorization_id=?", (auth["id"],))
+    with pytest.raises(Conflict, match="CorrelationMismatch"):
+        s.service.telegram_receipt(body, s.config["runtime_token"])
+    historical_reads = []
+    def historic_reader(account_id, context, baseline, since, *, consume=None):
+        assert consume is None and since == old_used
+        historical_reads.append(account_id)
+        return SocialReceipt.model_validate(old_receipt)
+    s.service.telegram_observer.receipt = historic_reader
+    snapshot = {"id": auth["execution_id"], "status": "unknown", "resource_released": True,
+                "result": {"simulated": False, "social": {"submission_started": True, "submitted_at": old_used}}}
+    assert s.service.reconcile_protocol_receipt(request, dict(snapshot, id="different")) is None
+    assert s.service.reconcile_protocol_receipt(request, snapshot)["message_id"] == "98765"
+    assert s.service.reconcile_protocol_receipt(request, snapshot)["original_runtime_status"] == "unknown"
+    assert historical_reads == [s.account["id"]]
+    assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 1
+
 
 @pytest.mark.parametrize("pilot",["telegram"],indirect=True)
 def test_exhausted_shared_receipt_budget_blocks_before_submit_dispatch(pilot):

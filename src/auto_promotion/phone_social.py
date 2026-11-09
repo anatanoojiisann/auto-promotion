@@ -584,7 +584,8 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             receipt = proof.receipt
             return {"status": "confirmed", "verified": True, "external_reference": receipt.permalink,
                 "native_id": receipt.native_id, "message_id": receipt.native_id if context.platform == "telegram" else None,
-                "native_comment_id": receipt.native_id, "published_at": receipt.created_at, "submission_started": True}
+                "native_comment_id": receipt.native_id, **({"comment_id": receipt.native_id} if context.platform == "instagram" else {}),
+                "published_at": receipt.created_at, "submission_started": True}
         if (snapshot.get("status") == "failed" and result.get("external_effect") == "none"
                 and result.get("quiescent") is True and not (proof and proof.submission_started)):
             return {"status": "failed_known", "verified": False, "confirmed_not_submitted": True,

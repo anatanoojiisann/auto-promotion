@@ -51,6 +51,11 @@ class Client:
         self.calls.append("history")
         if self.attack:
             await self._call(None,type(self.attack,(),{})())
+        if "ids" in kwargs:
+            self.calls.append(("exact_ids", kwargs["ids"]))
+            if getattr(self, "changed_reread", False):
+                return []
+            return [m for m in self.messages if m.id in kwargs["ids"]]
         return self.messages
 
 
@@ -101,7 +106,7 @@ def test_phone_number_and_handle_identity_must_match_same_api_account():
     assert not same_native_account(me,"@different")
 
 
-@pytest.mark.parametrize("change",("valid","wrong_user","duplicate","old_message","api_write","api_join"))
+@pytest.mark.parametrize("change",("valid","real_clock_delta","too_early","old_message","wrong_user","duplicate","changed_reread","incomplete_page","api_write","api_join"))
 @pytest.mark.asyncio
 async def test_only_new_unique_own_native_message_can_be_receipt(tmp_path,monkeypatch,change):
     reader,clients=setup_reader(tmp_path,monkeypatch)
@@ -114,6 +119,13 @@ async def test_only_new_unique_own_native_message_can_be_receipt(tmp_path,monkey
         client=original(*args)
         message=SimpleNamespace(id=11,out=True,sender_id=44,message="hi",date=datetime.fromtimestamp(now,timezone.utc),media=None,reply_to_msg_id=None,fwd_from=None)
         client.messages=[message]
+        if change in {"real_clock_delta", "too_early"}:
+            delta = 1.574 if change == "real_clock_delta" else 3
+            message.date = datetime.fromtimestamp(now-1-delta, timezone.utc)
+        if change == "changed_reread":
+            client.changed_reread = True
+        if change == "incomplete_page":
+            client.messages.extend(SimpleNamespace(**{**vars(message), "id": i, "message": "other"}) for i in range(12, 76))
         if change=="wrong_user":
             client.me.id=45
         if change=="duplicate":
@@ -134,7 +146,8 @@ async def test_only_new_unique_own_native_message_can_be_receipt(tmp_path,monkey
             await reader.query("phone",context.identity,context.target_url,baseline=baseline,context=context,since=now-1)
     else:
         receipt=await reader.query("phone",context.identity,context.target_url,baseline=baseline,context=context,since=now-1)
-        if change=="valid":
+        if change in {"valid", "real_clock_delta"}:
+            assert ("exact_ids", [11]) in clients[0].calls
             assert receipt.native_id=="11" and receipt.source=="telegram_api" and receipt.author==context.identity
         else:
             assert receipt is None

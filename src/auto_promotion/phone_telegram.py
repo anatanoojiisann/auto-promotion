@@ -7,6 +7,7 @@ from .backends.common import BackendError, verify_claim
 from .core import Conflict
 from .models import canonical, digest
 from .store import Store
+from .telegram_phone_observer import bound_telegram_receipt
 
 JOIN_SCHEMA = """
 CREATE TABLE IF NOT EXISTS phone_telegram_join_authorizations(
@@ -131,11 +132,14 @@ class PhoneTelegram:
                 raise BackendError("PhoneTelegramReceiptBudgetUnavailable")
 
     def telegram_receipt(self,body,bearer):
+        return self._read_telegram_receipt(body, bearer, historical=False)
+
+    def _read_telegram_receipt(self, body, bearer, *, historical):
         import hashlib
         import hmac
 
         from phone_fleet_protocol import fingerprint
-        from phone_fleet_protocol.social import SocialInteraction, receipt_matches
+        from phone_fleet_protocol.social import SocialInteraction
 
         if not hmac.compare_digest(bearer,self.config.runtime_token.get_secret_value()):
             raise Conflict("PhoneSocialRuntimeAuthenticationRequired")
@@ -143,7 +147,7 @@ class PhoneTelegram:
         stored = self.store.one("SELECT * FROM phone_telegram_observer_receipts WHERE authorization_id=?",(body["authorization_id"],))
         if (not row or not stored or row["used_at"] is None or row["request_hash"]!=body["request_sha256"]
                 or row["native_id"]!=body["native_command_id"] or row["execution_id"]!=body["execution_id"]
-                or row["device_id"]!=body["device_id"] or time.time()-row["used_at"]>600):
+                or row["device_id"]!=body["device_id"] or (not historical and time.time()-row["used_at"]>600)):
             raise Conflict("PhoneTelegramReceiptCorrelationMismatch")
         context = SocialInteraction.model_validate_json(row["context"])
         if context.platform!="telegram" or context.receipt_reader!="telegram_api":
@@ -153,15 +157,15 @@ class PhoneTelegram:
         receipt = json.loads(stored["receipt"]) if stored["receipt"] else None
         if receipt is None:
             reservation = self.store.one("SELECT * FROM phone_telegram_receipt_budgets WHERE authorization_id=?",(row["id"],))
-            if reservation:
+            if reservation and not historical:
                 def consume(reads,count):
                     self.consume_receipt_budget(row["id"],stored["account_id"],stored["observer_sha256"],reads,count)
-                observed = self.telegram_observer.receipt(stored["account_id"],context,json.loads(stored["baseline"]),float(int(row["used_at"])),consume=consume)
+                observed = self.telegram_observer.receipt(stored["account_id"],context,json.loads(stored["baseline"]),row["used_at"],consume=consume)
             else:
                 # Historical, already-consumed authorizations remain read-only recoverable.
-                observed = self.telegram_observer.receipt(stored["account_id"],context,json.loads(stored["baseline"]),float(int(row["used_at"])))
+                observed = self.telegram_observer.receipt(stored["account_id"],context,json.loads(stored["baseline"]),row["used_at"])
             if observed:
-                if (observed.source!="telegram_api" or not receipt_matches(observed,context,float(int(row["used_at"])))
+                if (observed.source!="telegram_api" or not bound_telegram_receipt(observed,context,row["used_at"])
                         or int(observed.native_id)<=json.loads(stored["baseline"])["last_message_id"]):
                     raise Conflict("PhoneTelegramObserverReceiptMismatch")
                 receipt = observed.model_dump(mode="json")
@@ -175,19 +179,23 @@ class PhoneTelegram:
 
     def reconcile_protocol_receipt(self,request,snapshot):
         """Read the original authorization only; an API receipt never rewrites B's unknown result."""
-        from phone_fleet_protocol.social import SocialReceipt, receipt_matches
+        from phone_fleet_protocol import fingerprint
+        from phone_fleet_protocol.social import SocialReceipt
 
         context=request.social
         raw=((snapshot.get("result") or {}).get("social") or {})
         if context.platform!="telegram" or context.receipt_reader!="telegram_api" or snapshot.get("status")!="unknown" or not raw.get("submission_started"):
             return None
         auth=self.store.one("SELECT * FROM phone_social_authorizations WHERE id=?",(context.authorization_id,))
-        if not auth or auth["used_at"] is None or not auth["native_id"] or auth["execution_id"]!=snapshot.get("id"):
+        if (not auth or auth["used_at"] is None or not auth["native_id"]
+                or auth["execution_id"] != snapshot.get("id") or auth["item_id"] != request.task_item_id
+                or auth["request_hash"] != fingerprint(request) or auth["device_id"] != request.device_id
+                or (snapshot.get("result") or {}).get("simulated") is not False):
             return None
-        value=self.telegram_receipt({"authorization_id":auth["id"],"request_sha256":auth["request_hash"],"native_command_id":auth["native_id"],
-            "execution_id":auth["execution_id"],"device_id":auth["device_id"]},self.config.runtime_token.get_secret_value())
+        value=self._read_telegram_receipt({"authorization_id":auth["id"],"request_sha256":auth["request_hash"],"native_command_id":auth["native_id"],
+            "execution_id":auth["execution_id"],"device_id":auth["device_id"]}, self.config.runtime_token.get_secret_value(), historical=time.time()-auth["used_at"]>600)
         receipt=SocialReceipt.model_validate(value["receipt"]) if value.get("receipt") else None
-        if not receipt_matches(receipt,context,raw.get("submitted_at") or float(int(auth["used_at"]))):
+        if not bound_telegram_receipt(receipt,context,raw.get("submitted_at") or auth["used_at"]):
             return None
         return {"status":"confirmed","verified":True,"external_reference":receipt.permalink,"native_id":receipt.native_id,
             "message_id":receipt.native_id,"published_at":receipt.created_at,"submission_started":True,
