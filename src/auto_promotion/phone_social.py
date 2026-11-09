@@ -440,7 +440,17 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         validate_item(account, claim["payload"])
         full_claim = {"platform": account["platform"], "account": account["backend_label"], "account_id": account["id"],
             "database": self.store.path, "operation": "execute", "execution_job": execution_job, "payload": claim}
-        verify_claim(full_claim)
+        try:
+            verify_claim(full_claim)
+        except BackendError as error:
+            # This local guard precedes grant creation and all native dispatches.
+            # Existing intent always requires reconciliation of its original execution.
+            prior = self.store.one("SELECT id FROM phone_social_authorizations WHERE item_id=?", (claim["item_id"],))
+            dispatched = self.store.one("SELECT id FROM phone_social_operations WHERE item_id=? AND kind='social_submit'", (claim["item_id"],))
+            if error.safe_code != "ExecutionWindowElapsed" or prior or dispatched:
+                raise
+            return {"status": "failed_known", "verified": False, "confirmed_not_submitted": True,
+                    "submission_started": False, "reason": error.safe_code}
         old = self.store.one("SELECT * FROM phone_social_authorizations WHERE item_id=?", (claim["item_id"],))
         if old:
             return self.verify(account, claim)

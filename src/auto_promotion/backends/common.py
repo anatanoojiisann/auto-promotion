@@ -439,8 +439,11 @@ def verify_claim(request):
             if item["action"].startswith("schedule_"):
                 if due <= now:
                     raise BackendError("ExecutionWindowElapsed")
-            elif not due <= now <= due + 900:
-                raise BackendError("ExecutionWindowElapsed")
+            else:
+                from ..delivery_policy import late
+
+                if now < due or late(policy, due, now):
+                    raise BackendError("ExecutionWindowElapsed")
             for media in item["media"]:
                 actual = hashlib.sha256(Path(media["path"]).read_bytes()).hexdigest()
                 if actual != media["sha256"]:

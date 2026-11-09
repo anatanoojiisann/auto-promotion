@@ -3262,7 +3262,8 @@ class Engine:
                     k: result[k]
                     for k in (
                         "publish_id",
-                        "reply_id",                        "post_ids",
+                        "reply_id",
+                        "post_ids",
                         "comment_id",
                         "tiktok_receipt_binding",
                         "platform_status",

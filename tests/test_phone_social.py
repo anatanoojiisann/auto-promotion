@@ -748,3 +748,45 @@ def test_explicit_phone_route_uses_only_the_verified_shared_x_account(monkeypatc
     result = registry.call_phone({"id": "test-x", "platform": "x"}, "health", {})
     assert result["healthy"] is bound
     assert result["reason"] == ("verified_phone_binding" if bound else "PhoneFleetPreparationOnly")
+
+@pytest.mark.parametrize("pilot", ["x"], indirect=True)
+def test_durable_phone_reply_remains_valid_after_legacy_fifteen_minutes(pilot):
+    s = pilot
+    now = time.time()
+    def iso(value):
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+    s.task = s.engine.create_task(TaskInput(name="Durable late phone reply", account_ids=[s.account["id"]],
+        policy={"execution_channel":"local", "execution_method":"phone", "dispatch_policy":"phone_queue_v1",
+                "starts_at":iso(now-1200), "ends_at":iso(now+1800), "min_interval":120, "max_joins":0}))
+    s.engine.set_items(s.task["id"], [ItemInput(account_id=s.account["id"], action="reply", target=URLS["x"],
+                                             text=TEXT, scheduled_at=iso(now-960))])
+    s.task = s.engine.task(s.task["id"])
+    s.item = s.task["items"][0]
+    claim, context = claim_original(s)
+    s.fake.authorize = lambda body: s.service.authorize(body, "synthetic-runtime-token-of-sufficient-length")
+    result = s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    assert result["status"] == "confirmed" and result["reply_id"] == "98765"
+    assert s.store.one("SELECT count(*) n FROM phone_social_authorizations WHERE used_at IS NOT NULL")["n"] == 1
+
+
+@pytest.mark.parametrize("pilot", ["x"], indirect=True)
+@pytest.mark.parametrize("prior_intent", [False, True])
+def test_local_window_denial_before_any_grant_is_known_unsent(pilot, prior_intent):
+    s = pilot
+    claim, context = claim_original(s)
+    if prior_intent:
+        s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+    def expired(_):
+        raise BackendError("ExecutionWindowElapsed")
+    s.monkeypatch.setattr("auto_promotion.phone_social.verify_claim", expired)
+    if prior_intent:
+        with pytest.raises(BackendError, match="ExecutionWindowElapsed"):
+            s.service.execute(s.engine.account(s.account["id"]), claim, context)
+        assert len([r for r in s.fake.requests if r.method == "POST"]) == before
+        return
+    result = s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    assert result == {"status":"failed_known", "verified":False, "confirmed_not_submitted":True,
+                      "submission_started":False, "reason":"ExecutionWindowElapsed"}
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before
+    assert s.store.one("SELECT count(*) n FROM phone_social_authorizations")["n"] == 0
