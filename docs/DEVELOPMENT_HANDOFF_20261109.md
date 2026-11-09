@@ -130,3 +130,8 @@ $env:PYTHONPATH='D:\Projects\pap-r9\control-system\src;D:\Projects\pap-r9\contro
 - [MCP SDK architecture](https://modelcontextprotocol.io/docs/learn/architecture)
 - [GitHub checkout and cross-repository access](https://github.com/actions/checkout)
 - [GitHub setup-python](https://github.com/actions/setup-python)
+
+
+## 后续内容解耦修复
+
+AP `0.1.1.dev4` 的来源作者分离、候选执行关联及按版本回执回流，见 [两处修复交接](CONTENT_ORIGIN_LINKS_20261109.md)。本文件前述数字是前一轮结果，新增验证以该交接为准；群控配对版本保持不变。

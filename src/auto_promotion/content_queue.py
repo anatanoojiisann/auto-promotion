@@ -234,6 +234,10 @@ class ContentQueue:
             for actual, expected in zip(task["items"], items)
         ):
             raise Conflict("ContentTaskPayloadChanged")
+        from .content_origins import sync_content_origins
+
+        with self.store.connect(write=True) as db:
+            sync_content_origins(db, self.engine.clock(), task_id=task["id"])
         return {
             "batch_id": batch_id,
             "task_id": task["id"],

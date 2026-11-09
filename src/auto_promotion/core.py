@@ -2689,7 +2689,7 @@ class Engine:
                 return self._skip(item_id, "earlier_item_pending", db)
             target_key = digest([account["platform"], payload["target"].casefold()])
             user_key = digest(
-                [account["platform"], payload["recipient_id"] or payload["target"].casefold()]
+                [account["platform"], quotas.user_identifier(payload)]
             )
             day = now - now % 86400
             mode = account["mode"]
@@ -3225,6 +3225,9 @@ class Engine:
                     claim["task_id"],
                     now,
                 )
+            from .content_origins import sync_content_origins
+
+            sync_content_origins(db, now, item_id=claim["item_id"])
             self._mark_completed(db, claim["task_id"])
         return safe
 

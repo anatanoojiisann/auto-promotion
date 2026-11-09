@@ -101,6 +101,12 @@ class Interactions(InteractionSchedule, JointInteractions):
             "SELECT id,version,kind,state,provider,provider_job_id,source,real_product_output,started_at,finished_at,estimated_cost,actual_cost FROM hf_generation WHERE candidate_id=? ORDER BY started_at",
             (candidate_id,),
         )
+        from .content_origins import content_origin_history
+
+        with self.store.connect() as db:
+            history = content_origin_history(db, candidate_id)
+        if history:
+            candidate["content_executions"] = history
         return candidate
 
     def list(self):
@@ -2372,7 +2378,12 @@ class Interactions(InteractionSchedule, JointInteractions):
 
             with self.store.connect(write=True) as db:
                 self.queue.guard(db, job)
-                enqueue_hf(self.engine, db, candidate, candidate["draft"])
+                if candidate["task_id"] or candidate["item_id"]:
+                    from .content_origins import sync_content_origins
+
+                    sync_content_origins(db, self.clock(), item_id=candidate["item_id"])
+                else:
+                    enqueue_hf(self.engine, db, candidate, candidate["draft"])
             return
         with self.store.connect(write=True) as db:
             self.queue.guard(db, job)
@@ -2622,11 +2633,16 @@ class Interactions(InteractionSchedule, JointInteractions):
         # The existing sender/pools own submission; this worker never invokes an execute adapter.
 
     def sync_results(self):
+        from .content_origins import sync_content_origins
+
         now = self.clock()
         with self.store.connect(write=True) as db:
+            sync_content_origins(db, now)
             for row in db.execute(
-                "SELECT c.*,i.status item_status,i.external_reference item_reference,i.result item_result,i.claimed_at,i.attempt_id FROM hf_candidates c JOIN items i ON i.id=c.item_id WHERE c.state NOT IN ('PUBLISHED','SIMULATED','CLOSED')"
+                "SELECT c.*,p.config origin_config,i.status item_status,i.external_reference item_reference,i.result item_result,i.claimed_at,i.attempt_id FROM hf_candidates c JOIN hf_policies p ON p.id=c.policy_id JOIN items i ON i.id=c.item_id WHERE c.state NOT IN ('PUBLISHED','SIMULATED','CLOSED')"
             ).fetchall():
+                if json.loads(row["origin_config"]).get("content_queue_only"):
+                    continue  # Content batches never enter the legacy automatic retry path.
                 state = row["item_status"]
                 if state == "not_attempted":
                     reason = json.loads(row["item_result"]).get("reason")

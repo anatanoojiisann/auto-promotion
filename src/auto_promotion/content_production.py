@@ -170,6 +170,7 @@ class ContentProduction:
                     text=text,
                     title=title,
                     opportunity_id=row["source_id"],
+                    source_author_id=source["author_id"],
                     content_key=snapshot.get("content_key") or content_key(source),
                 )
                 with self.store.connect(write=True) as db:
@@ -232,7 +233,7 @@ def enqueue_hf(engine, db, candidate, text):
     if candidate.get("task_id") or candidate.get("item_id"):
         raise Conflict("ExistingInteractionMustKeepOriginalSender")
     source = candidate["source"]
-    revision = digest([candidate["version"], candidate["source_hash"], text])
+    revision = digest(["hf-content/2", candidate["version"], candidate["source_hash"], text])
     entry = ContentProduction(engine).enqueue(
         "hf_candidate",
         candidate["id"],
@@ -242,11 +243,12 @@ def enqueue_hf(engine, db, candidate, text):
             "action": "reply",
             "target": source["url"],
             "text": text,
-            "recipient_id": source.get("author_id", ""),
+            "source_author_id": source.get("author_id", ""),
             "content_key": digest(["x", candidate["source_event_id"]]),
         },
         {
             "policy_id": candidate["policy_id"],
+            "candidate_version": candidate["version"],
             "source_hash": candidate["source_hash"],
             "source_event_id": candidate["source_event_id"],
             "source_observed_at": candidate["source_event_at"],

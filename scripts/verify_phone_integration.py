@@ -20,6 +20,8 @@ AP_TESTS = (
     "tests/test_publication_receipt_integration.py",
     "tests/test_content_production.py",
     "tests/test_content_phone_pipeline.py",
+    "tests/test_content_origin_links.py",
+    "tests/test_automatic_content_phone.py",
     "tests/test_content_queue.py",
     "tests/test_hf_content_queue.py",
     "tests/test_campaign_api.py",
@@ -29,6 +31,10 @@ AP_TESTS = (
     "tests/test_phone_protocol_upgrade.py",
     "tests/test_phone_platform_independence.py",
     "tests/test_phone_known_unsent.py",
+    "tests/test_engine.py",
+    "tests/test_execution_channels.py",
+    "tests/test_task_channels.py",
+    "tests/test_outbound_text_integrity.py",
 )
 LEGACY_MODULES = ("test_campaigns", "test_interactions", "test_interaction_joint")
 LEGACY_BOUNDARIES = (

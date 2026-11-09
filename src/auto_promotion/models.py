@@ -7,7 +7,15 @@ from datetime import datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from .text_integrity import validate_outbound_text
 
@@ -70,12 +78,26 @@ def canonical(value) -> str:
 def telegram_target_aliases(target):
     """Equivalent public group spellings, without equating invites, posts or forum topics."""
     value = target.casefold().rstrip("/")
-    match = re.fullmatch(r"(?:@|(?:https?://)?(?:t\.me|telegram\.me)/)([a-z][a-z0-9_]{3,31})", value)
+    match = re.fullmatch(
+        r"(?:@|(?:https?://)?(?:t\.me|telegram\.me)/)([a-z][a-z0-9_]{3,31})", value
+    )
     if not match:
         return (value,)
     name = match[1]
-    return ("@" + name, *(p + name for p in ("https://t.me/", "http://t.me/", "t.me/",
-                                               "https://telegram.me/", "http://telegram.me/", "telegram.me/")))
+    return (
+        "@" + name,
+        *(
+            p + name
+            for p in (
+                "https://t.me/",
+                "http://t.me/",
+                "t.me/",
+                "https://telegram.me/",
+                "http://telegram.me/",
+                "telegram.me/",
+            )
+        ),
+    )
 
 
 def digest(value) -> str:
@@ -172,7 +194,9 @@ class Policy(Model):
     @model_validator(mode="after")
     def window(self):
         ZoneInfo(self.timezone)
-        if self.dispatch_policy == "phone_queue_v1" and (self.execution_method != "phone" or self.execution_channel != "local"):
+        if self.dispatch_policy == "phone_queue_v1" and (
+            self.execution_method != "phone" or self.execution_channel != "local"
+        ):
             raise ValueError("DurableQueueRequiresLocalPhone")
         if self.execution_channel_source and self.execution_channel == "inherit":
             raise ValueError("明确的通道指令来源需要同时指定 cloud 或 local，不能跟随默认")
@@ -249,6 +273,7 @@ class ItemInput(Model):
     reply_to: int | None = Field(default=None, gt=0)
     discord_reply_to: str = Field(default="", pattern=r"^(?:|[1-9][0-9]{0,19})$")
     recipient_id: str = Field(default="", max_length=160)
+    source_author_id: str = Field(default="", max_length=160)
     target_owned: bool = False
     execution_mode: Literal["automatic", "manual"] = "automatic"
     opportunity_id: str = ""
@@ -260,6 +285,13 @@ class ItemInput(Model):
     tiktok_options: TikTokPostOptions | None = None
     tiktok_conversation_id: str = Field(default="", pattern=r"^[A-Za-z0-9:_-]{0,160}$")
     tiktok_message_id: str = Field(default="", pattern=r"^(?:|[0-9]{1,30})$")
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_payload(self, handler):
+        value = handler(self)
+        if not self.source_author_id:
+            value.pop("source_author_id", None)
+        return value
 
     @field_validator("text", "title")
     @classmethod

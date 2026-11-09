@@ -37,6 +37,12 @@
 
 活动仅在既有 `dispatch_policy=phone_queue_v1` 时接入。生成草稿即入内容队列；materialize 绑定原活动任务与 assignment ID，不另建任务。崩溃后再次 materialize 恢复原空草稿；已冻结、已尝试或有未知结果的任务不得重新收编。旧 dispatch_policy 仍走原路径。
 
+## 来源作者和执行结果回流
+
+AP `0.1.1.dev4` 将手机路径的来源作者保存为可选 `source_author_id`，与实际收件人 `recipient_id` 分开；未提供新字段的旧序列化和指纹不变，按用户限额兼容旧记录。队列 materialize 后补齐候选原任务/执行项关联，结果按内容版本回流，并在候选详情保留 `content_executions` 历史。未知结果只查原执行；内容模式不进入旧自动重发流程。
+
+绑定后由内容执行任务管理发送账号、排期和权限，生产策略停用控制后续生产，不替代已绑定任务的暂停/停止。执行时的真实账号、原生许可、设备独占、全局停止和回执校验继续生效。详见 [两处修复与验证交接](CONTENT_ORIGIN_LINKS_20261109.md)。
+
 ## 配对集成检查
 
 `docs/integrations/phone-pair.json` 固定群控仓库提交及协议/Fleet 包版本。Python 3.12 执行：
