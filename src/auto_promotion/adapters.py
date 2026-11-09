@@ -132,7 +132,7 @@ class AdapterRegistry:
         key = "phone_reddit" if account["platform"] == "reddit" else "phone_social"
         service = getattr(self, key, None)
         if service and route_for(account).transport != "phone" and (
-                account["platform"] != "telegram" or not service.shared_telegram_binding(account)):
+                key != "phone_social" or not service.shared_account_binding(account)):
             service = None
         return PhoneBackend(service=service, execution_job=getattr(self.context, "job", None)).call(account, operation, payload)
 

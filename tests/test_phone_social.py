@@ -734,3 +734,17 @@ def test_phone_start_uses_native_proof_while_unrelated_health_lane_is_busy(pilot
     assert before == s.store.one(
         "SELECT status,health FROM accounts WHERE id=?", (s.account["id"],)
     )
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_explicit_phone_route_uses_only_the_verified_shared_x_account(monkeypatch, tmp_path, bound):
+    from types import SimpleNamespace
+    from auto_promotion.adapters import AdapterRegistry
+    from auto_promotion import routing
+
+    registry = AdapterRegistry(tmp_path)
+    monkeypatch.setattr(routing, "route_for", lambda account: SimpleNamespace(transport="edge"))
+    registry.phone_social = SimpleNamespace(shared_account_binding=lambda account: bound,
+        backend=lambda account, operation, payload, job: {"healthy": True, "reason": "verified_phone_binding"})
+    result = registry.call_phone({"id": "test-x", "platform": "x"}, "health", {})
+    assert result["healthy"] is bound
+    assert result["reason"] == ("verified_phone_binding" if bound else "PhoneFleetPreparationOnly")

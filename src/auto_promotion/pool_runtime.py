@@ -12,6 +12,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .cloud_control import CloudControl, CloudJobClosed, CloudJournal, CloudUnavailable
+from .config import service_project_directory
 from .execution_channels import (
     activate_local,
     check_standby,
@@ -193,7 +194,7 @@ class PoolScheduler:
                         continue
                 child = self.popen(
                     argv,
-                    cwd=Path(__file__).resolve().parents[2],
+                    cwd=service_project_directory(),
                     stdout=handles[0],
                     stderr=handles[1],
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
