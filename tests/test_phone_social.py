@@ -407,6 +407,14 @@ def test_original_queue_single_permission_and_native_receipt_finish_once(pilot):
     creates = len([r for r in s.fake.requests if r.method == "POST"])
     assert s.service.verify(s.engine.account(s.account["id"]), claim)["verified"]
     assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
+    if s.app == "instagram":
+        # A previous sender stored only the verified link. Read its original native receipt once.
+        with s.store.connect(write=True) as db:
+            db.execute("UPDATE items SET result=json_remove(result,'$.comment_id') WHERE id=?", (s.item["id"],))
+        assert s.engine.reconcile(s.item["id"])["comment_id"] == result["comment_id"]
+        assert s.engine.reconcile(s.item["id"])["comment_id"] == result["comment_id"]
+        assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 1
+        assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
 
 
 def test_global_stop_blocks_final_permission_and_retains_unused_grant(pilot):

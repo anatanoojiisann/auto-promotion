@@ -594,6 +594,30 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 "reason": "PhoneSocialIndependentNativeReceiptRequired", "receipt_pending": bool(proof and proof.submission_started),
                 "resource_state": "released" if snapshot.get("resource_released") else "fenced"}
 
+    def read_confirmed_comment_id(self, item):
+        """Recover the validated native ID for older confirmed phone receipts without another attempt."""
+        account = self.engine.account(item["account_id"])
+        result = self.engine.call(account, "verify", {"item_id": item["id"], "payload": json.loads(item["payload"])}, item["task_id"])
+        comment_id = result.get("comment_id")
+        if (not result.get("verified") or not isinstance(comment_id, str) or not comment_id.isascii()
+                or not comment_id.isdigit() or not item["external_reference"]
+                or result.get("external_reference") != item["external_reference"]):
+            raise Conflict("PhoneInstagramOriginalReceiptMismatch")
+        with self.store.connect(write=True) as db:
+            original = db.execute("SELECT result FROM items WHERE id=? AND status='confirmed' AND attempt_id=? AND external_reference=?",
+                                  (item["id"], item["attempt_id"], item["external_reference"])).fetchone()
+            if not original:
+                raise Conflict("PhoneInstagramOriginalReceiptMismatch")
+            recorded = json.loads(original["result"])
+            if recorded.get("comment_id") not in (None, comment_id):
+                raise Conflict("PhoneInstagramOriginalReceiptMismatch")
+            if not recorded.get("comment_id"):
+                recorded["comment_id"] = comment_id
+                db.execute("UPDATE items SET result=? WHERE id=?", (canonical(recorded), item["id"]))
+                Store.audit(db, "phone_social.comment_id_read_back", {"item_id": item["id"], "comment_id": comment_id},
+                            item["task_id"], self.engine.clock())
+        return recorded
+
     def verify(self, account, payload):
         from .execution_timing import stage
 

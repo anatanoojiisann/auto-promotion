@@ -3227,6 +3227,10 @@ class Engine:
         row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
         if not row:
             raise NotFound("执行项不存在")
+        if row["status"] == "confirmed" and self._execution_method(row["task_id"]) == "phone":
+            service = getattr(self.adapters, "phone_social", None)
+            if service and self.account(row["account_id"])["platform"] == "instagram":
+                return service.read_confirmed_comment_id(row)
         if row["status"] not in {"unknown", "scheduled"}:
             raise Conflict("只有未知结果或平台排期需要核对")
         payload = {
