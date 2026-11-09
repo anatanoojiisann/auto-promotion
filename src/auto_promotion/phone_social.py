@@ -585,6 +585,7 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             return {"status": "confirmed", "verified": True, "external_reference": receipt.permalink,
                 "native_id": receipt.native_id, "message_id": receipt.native_id if context.platform == "telegram" else None,
                 "native_comment_id": receipt.native_id, **({"comment_id": receipt.native_id} if context.platform == "instagram" else {}),
+                **({"publish_id": receipt.native_id, "reply_id": receipt.native_id} if context.platform == "x" else {}),
                 "published_at": receipt.created_at, "submission_started": True}
         if (snapshot.get("status") == "failed" and result.get("external_effect") == "none"
                 and result.get("quiescent") is True and not (proof and proof.submission_started)):
@@ -598,23 +599,25 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         """Recover the validated native ID for older confirmed phone receipts without another attempt."""
         account = self.engine.account(item["account_id"])
         result = self.engine.call(account, "verify", {"item_id": item["id"], "payload": json.loads(item["payload"])}, item["task_id"])
-        comment_id = result.get("comment_id")
-        if (not result.get("verified") or not isinstance(comment_id, str) or not comment_id.isascii()
-                or not comment_id.isdigit() or not item["external_reference"]
+        fields = ("reply_id", "publish_id") if account["platform"] == "x" else ("comment_id",)
+        mismatch = "PhoneXOriginalReceiptMismatch" if account["platform"] == "x" else "PhoneInstagramOriginalReceiptMismatch"
+        native_id = result.get(fields[0])
+        if (not result.get("verified") or not isinstance(native_id, str) or not native_id.isascii()
+                or not native_id.isdigit() or not item["external_reference"]
                 or result.get("external_reference") != item["external_reference"]):
-            raise Conflict("PhoneInstagramOriginalReceiptMismatch")
+            raise Conflict(mismatch)
         with self.store.connect(write=True) as db:
             original = db.execute("SELECT result FROM items WHERE id=? AND status='confirmed' AND attempt_id=? AND external_reference=?",
                                   (item["id"], item["attempt_id"], item["external_reference"])).fetchone()
             if not original:
-                raise Conflict("PhoneInstagramOriginalReceiptMismatch")
+                raise Conflict(mismatch)
             recorded = json.loads(original["result"])
-            if recorded.get("comment_id") not in (None, comment_id):
-                raise Conflict("PhoneInstagramOriginalReceiptMismatch")
-            if not recorded.get("comment_id"):
-                recorded["comment_id"] = comment_id
+            if any(recorded.get(field) not in (None, native_id) for field in fields):
+                raise Conflict(mismatch)
+            if any(not recorded.get(field) for field in fields):
+                recorded.update(dict.fromkeys(fields, native_id))
                 db.execute("UPDATE items SET result=? WHERE id=?", (canonical(recorded), item["id"]))
-                Store.audit(db, "phone_social.comment_id_read_back", {"item_id": item["id"], "comment_id": comment_id},
+                Store.audit(db, "phone_social." + fields[0] + "_read_back", {"item_id": item["id"], fields[0]: native_id},
                             item["task_id"], self.engine.clock())
         return recorded
 

@@ -407,12 +407,13 @@ def test_original_queue_single_permission_and_native_receipt_finish_once(pilot):
     creates = len([r for r in s.fake.requests if r.method == "POST"])
     assert s.service.verify(s.engine.account(s.account["id"]), claim)["verified"]
     assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
-    if s.app == "instagram":
+    if s.app in {"instagram", "x"}:
+        field = "reply_id" if s.app == "x" else "comment_id"
         # A previous sender stored only the verified link. Read its original native receipt once.
         with s.store.connect(write=True) as db:
-            db.execute("UPDATE items SET result=json_remove(result,'$.comment_id') WHERE id=?", (s.item["id"],))
-        assert s.engine.reconcile(s.item["id"])["comment_id"] == result["comment_id"]
-        assert s.engine.reconcile(s.item["id"])["comment_id"] == result["comment_id"]
+            db.execute("UPDATE items SET result=json_remove(result,?,'$.publish_id') WHERE id=?", ("$." + field, s.item["id"]))
+        assert s.engine.reconcile(s.item["id"])[field] == result[field]
+        assert s.engine.reconcile(s.item["id"])[field] == result[field]
         assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 1
         assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
 
