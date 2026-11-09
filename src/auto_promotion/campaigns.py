@@ -537,6 +537,17 @@ class Campaigns:
             ):
                 raise Conflict("生成期间活动或账号资料发生变化，草稿未保存，请重新规划")
             db.executemany("UPDATE campaign_assignments SET payload=? WHERE id=?", changes)
+            if campaign["config"]["policy"].get("dispatch_policy") == "phone_queue_v1":
+                from .campaign_content_queue import save_assignment
+
+                for _, identifier in changes:
+                    assignment = dict(
+                        db.execute(
+                            "SELECT ca.*,o.payload source FROM campaign_assignments ca JOIN opportunities o ON o.id=ca.opportunity_id WHERE ca.id=?",
+                            (identifier,),
+                        ).fetchone()
+                    )
+                    save_assignment(self.engine, assignment, db=db)
             db.execute(
                 "UPDATE campaigns SET revision=revision+1,updated_at=? WHERE id=?",
                 (self.clock(), campaign_id),
@@ -590,6 +601,14 @@ class Campaigns:
     def materialize(self, campaign_id):
         campaign = self.raw(campaign_id)
         if campaign["state"] in {"materialized", "paused", "completed"}:
+            if (
+                campaign["state"] == "materialized"
+                and campaign["config"]["policy"].get("dispatch_policy") == "phone_queue_v1"
+            ):
+                for task in self.store.rows(
+                    "SELECT id FROM tasks WHERE campaign_id=? AND state='draft'", (campaign_id,)
+                ):
+                    self.populate(task["id"])
             return self.get(campaign_id)
         if campaign["state"] != "planned":
             raise Conflict("请先生成分配预览")
@@ -741,6 +760,10 @@ class Campaigns:
             [ItemInput(**json.loads(a["payload"])) for a in assignments],
             key=lambda v: v.scheduled_at,
         )
+        if task["policy"].get("dispatch_policy") == "phone_queue_v1":
+            from .campaign_content_queue import populate
+
+            return populate(self.engine, task, assignments)
         return self.engine.set_items(task_id, values)
 
     def change_state(self, campaign_id, state):

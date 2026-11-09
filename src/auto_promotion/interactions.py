@@ -129,6 +129,12 @@ class Interactions(InteractionSchedule, JointInteractions):
             row = db.execute("SELECT * FROM hf_policies WHERE id=?", (policy_id,)).fetchone()
             if value.expected_version != (row["version"] if row else 0):
                 raise Conflict("配置已改变，请刷新后保存")
+            if (
+                row
+                and bool(json.loads(row["config"]).get("content_queue_only"))
+                != config.content_queue_only
+            ):
+                raise Conflict("ContentQueueModeImmutableCreateNewPolicy")
             version = row["version"] + 1 if row else 1
             epoch = row["count_epoch"] if row else 1
             reset = False
@@ -369,7 +375,9 @@ class Interactions(InteractionSchedule, JointInteractions):
             "worker": worker,
             "model_connectivity": "unverified" if not synthetic else "simulation",
             "simulation": synthetic,
-            "publishing": "requires_target_eligibility",
+            "publishing": "content_queue_batch_start_required"
+            if config.content_queue_only
+            else "requires_target_eligibility",
             "accounts": choices,
             "retry_at": retry_at if retry_at > self.clock() else None,
         }
@@ -765,9 +773,11 @@ class Interactions(InteractionSchedule, JointInteractions):
                 )
             # Definitively blocked work stays dormant; a fresh scan/config/manual choice may wake it.
             for row in db.execute(
-                "SELECT id,version,state FROM hf_candidates WHERE state IN ('READY','PUBLISHING','VERIFYING')"
+                "SELECT c.id,c.version,c.state,p.config FROM hf_candidates c JOIN hf_policies p ON p.id=c.policy_id WHERE c.state IN ('READY','PUBLISHING','VERIFYING')"
             ).fetchall():
-                if row["state"] == "READY":
+                if row["state"] == "READY" and not json.loads(row["config"]).get(
+                    "content_queue_only", False
+                ):
                     self.queue.put(db, "publish", row["id"] + "|" + str(row["version"]))
             for row in db.execute(
                 "SELECT candidate_id,offset_seconds,due_at FROM hf_observations WHERE state='pending'"
@@ -1321,7 +1331,7 @@ class Interactions(InteractionSchedule, JointInteractions):
             elif classification.priority in {"P0", "P1"}:
                 db.execute("DELETE FROM hf_batch_members WHERE candidate_id=?", (candidate_id,))
                 db.execute("UPDATE hf_candidates SET batch_id=NULL WHERE id=?", (candidate_id,))
-            if state == "QUEUED" and config.joint:
+            if state == "QUEUED" and config.joint and not config.content_queue_only:
                 self._create_processing(db, candidate_id, config, classification)
             elif state == "QUEUED":
                 self.queue.put(
@@ -1814,7 +1824,13 @@ class Interactions(InteractionSchedule, JointInteractions):
                             candidate_id,
                         ),
                     )
-                    if cfg.joint:
+                    if cfg.content_queue_only and (cfg.joint or value.action == "adopt"):
+                        self.queue.put(
+                            db,
+                            "generate",
+                            candidate_id + "|" + str(new_version) + "|" + str(policy["version"]),
+                        )
+                    elif cfg.joint:
                         execution = value.account_id or row["execution_account_id"]
                         db.execute(
                             "UPDATE hf_candidates SET execution_account_id=?,owner_account_id=? WHERE id=?",
@@ -1870,7 +1886,7 @@ class Interactions(InteractionSchedule, JointInteractions):
         self.sync_processing()
         return [self.candidate(r["id"]) for r in rows]
 
-    def _eligible(self, candidate, config, account):
+    def _eligible(self, candidate, config, account, *, production_only=False):
         if not config.enabled:
             return {"status": "ineligible", "reasons": ["strategy_disabled"], "evidence": []}
         if self.store.one("SELECT value FROM meta WHERE key='global_stop'")["value"] != "0":
@@ -1883,11 +1899,14 @@ class Interactions(InteractionSchedule, JointInteractions):
             and candidate["source"]["url"] not in profile["allowed_targets"]
         ):
             return {"status": "ineligible", "reasons": ["account_profile_mismatch"], "evidence": []}
-        if (
-            account["id"] not in self._execution_ids(config, candidate.get("primary_product_id"))
-            or account["disabled"]
-            or account["status"] != "healthy"
-            or account["cooldown_until"] > self.clock()
+        if account["disabled"] or (
+            not production_only
+            and (
+                account["id"]
+                not in self._execution_ids(config, candidate.get("primary_product_id"))
+                or account["status"] != "healthy"
+                or account["cooldown_until"] > self.clock()
+            )
         ):
             return {"status": "ineligible", "reasons": ["account_unavailable"], "evidence": []}
         try:
@@ -1905,7 +1924,11 @@ class Interactions(InteractionSchedule, JointInteractions):
             return {"status": "ineligible", "reasons": [quality], "evidence": []}
         if config.joint and not candidate["classification"].get("verified_fact_ids"):
             return {"status": "unknown", "reasons": ["answer_facts_missing"], "evidence": []}
-        return self.io.eligibility(candidate, config, account)
+        return (
+            {"status": "eligible", "reasons": [], "evidence": []}
+            if production_only
+            else self.io.eligibility(candidate, config, account)
+        )
 
     def _block(self, job, candidate, eligibility):
         with self.store.connect(write=True) as db:
@@ -1940,12 +1963,14 @@ class Interactions(InteractionSchedule, JointInteractions):
             return
         if candidate["expires_at"] <= self.clock():
             return
-        if config.joint and not candidate["execution_account_id"]:
+        if config.joint and not candidate["execution_account_id"] and not config.content_queue_only:
             return
         account = self.engine.account(
             candidate["execution_account_id"] or candidate["owner_account_id"]
         )
-        eligible = self._eligible(candidate, config, account)
+        eligible = self._eligible(
+            candidate, config, account, production_only=config.content_queue_only
+        )
         if eligible["status"] != "eligible":
             self._block(job, candidate, eligible)
             return self.clock() + 60 if config.joint else None
@@ -1988,8 +2013,14 @@ class Interactions(InteractionSchedule, JointInteractions):
             "assets": [],
             "real_product_output": False,
         }
-        media_requested = plan["recommended"] in {"image", "video", "reuse_existing"}
-        available = self.io.media_status().get("configured") is True
+        media_requested = not config.content_queue_only and plan["recommended"] in {
+            "image",
+            "video",
+            "reuse_existing",
+        }
+        available = (
+            not config.content_queue_only and self.io.media_status().get("configured") is True
+        )
         if media_requested and not available:
             plan["reason"] = "factory_media_connector_unavailable_text_only"
         with self.store.connect(write=True) as db:
@@ -2036,6 +2067,11 @@ class Interactions(InteractionSchedule, JointInteractions):
                     canonical({"candidate_id": candidate_id}),
                 ),
             )
+            if config.content_queue_only:
+                from .content_production import enqueue_hf
+
+                enqueue_hf(self.engine, db, candidate, text)
+                return
             self.queue.put(
                 db,
                 "media"
@@ -2048,7 +2084,7 @@ class Interactions(InteractionSchedule, JointInteractions):
         candidate_id, version = job["reference_id"].split("|", 1)
         candidate = self.candidate(candidate_id)
         config = InteractionConfig.model_validate(self.policy(candidate["policy_id"])["config"])
-        if config.run_mode == "discovery_only":
+        if config.content_queue_only or config.run_mode == "discovery_only":
             return
         existing = self.store.one(
             "SELECT * FROM hf_generation WHERE candidate_id=? AND version=? AND kind<>'text'",
@@ -2330,6 +2366,13 @@ class Interactions(InteractionSchedule, JointInteractions):
         if config.run_mode == "discovery_only":
             return
         if candidate["version"] != int(version) or candidate["state"] != "READY":
+            return
+        if config.content_queue_only:
+            from .content_production import enqueue_hf
+
+            with self.store.connect(write=True) as db:
+                self.queue.guard(db, job)
+                enqueue_hf(self.engine, db, candidate, candidate["draft"])
             return
         with self.store.connect(write=True) as db:
             self.queue.guard(db, job)

@@ -67,7 +67,9 @@ def client_config(project_dir, python=None):
 PhonePlatform = Literal["telegram", "reddit", "instagram", "facebook", "x", "tiktok"]
 
 
-def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_config=None, phone_reddit_config=None):
+def create_server(
+    engine=None, *, phone_rounds_enabled=False, phone_social_config=None, phone_reddit_config=None
+):
     from .runtime_identity import capture_runtime
 
     runtime = capture_runtime("mcp")
@@ -78,9 +80,11 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
     )
     if phone_social_config is not None:
         from .phone_social import PhoneSocial
+
         PhoneSocial(engine, phone_social_config)
     if phone_reddit_config is not None:
         from .phone_reddit import PhoneReddit
+
         PhoneReddit(engine, phone_reddit_config)
     server = FastMCP(
         "Auto Promotion",
@@ -636,6 +640,20 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         """Apply deterministic task qualification rules to a candidate."""
         return invoke(lambda: engine.candidate(task_id, CandidateInput(**candidate)))
 
+    @server.tool(annotations=remote_read)
+    def produce_interaction_content(production: dict) -> dict:
+        """Generate into durable content using stored sources and an independent profile. Model mode calls the configured draft provider; no phone, task start or send occurs."""
+        from .content_production import ContentProduction, ProductionInput
+
+        return invoke(lambda: ContentProduction(engine).produce(ProductionInput(**production)))
+
+    @server.tool(annotations=read)
+    def get_content_production(run_id: str) -> dict:
+        """Read saved production progress without regenerating or publishing."""
+        from .content_production import ContentProduction
+
+        return invoke(lambda: ContentProduction(engine).get(run_id))
+
     @server.tool(annotations=local)
     def save_interaction_content(content: dict) -> dict:
         """Save immutable target-bound content without an account, device, model call or send."""
@@ -753,7 +771,11 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         @server.tool(annotations=remote_read)
         def check_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
             """Check the selected platform or round without starting an interaction."""
-            return invoke(lambda: phone_preflight(rounds, round_id, platforms={platform} if platform else None))
+            return invoke(
+                lambda: phone_preflight(
+                    rounds, round_id, platforms={platform} if platform else None
+                )
+            )
 
         @server.tool(annotations=outbound)
         def start_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
@@ -763,7 +785,11 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         @server.tool(annotations=local)
         def stop_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
             """Fence future submissions for one platform or the whole round. Keep original uncertain results."""
-            return invoke(rounds.stop_platform, round_id, platform) if platform else invoke(rounds.stop, round_id)
+            return (
+                invoke(rounds.stop_platform, round_id, platform)
+                if platform
+                else invoke(rounds.stop, round_id)
+            )
 
     return server
 
@@ -793,9 +819,13 @@ def main():
     if not args.no_env:
         load_environment(database_path().parent / "cloud-node.env")
     from .phone_readiness import load_bindings
+
     social, reddit = load_bindings(args.phone_social_config, args.phone_reddit_config, parser)
-    create_server(phone_rounds_enabled=args.phone_rounds, phone_social_config=social,
-                  phone_reddit_config=reddit).run(transport="stdio")
+    create_server(
+        phone_rounds_enabled=args.phone_rounds,
+        phone_social_config=social,
+        phone_reddit_config=reddit,
+    ).run(transport="stdio")
 
 
 if __name__ == "__main__":
