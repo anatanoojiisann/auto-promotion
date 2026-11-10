@@ -1,4 +1,4 @@
-"""Build paired wheels and run offline integration on Python 3.12; never start services."""
+"""Build paired wheels and run offline integration on Python 3.12; no live task execution."""
 
 import argparse
 import hashlib
@@ -37,6 +37,12 @@ AP_TESTS = (
     "tests/test_engine.py",
     "tests/test_execution_channels.py",
     "tests/test_task_channels.py",
+    "tests/test_interaction_readiness.py",
+    "tests/test_persistent_pools.py",
+    "tests/test_background_desktop.py",
+    "tests/test_cloud_transport_diagnostics.py",
+    "tests/test_cloud_workflow.py",
+    "tests/test_phone_runtime_identity.py",
     "tests/test_outbound_text_integrity.py",
 )
 LEGACY_MODULES = ("test_campaigns", "test_interactions", "test_interaction_joint")
@@ -107,6 +113,9 @@ def main():
     parser.add_argument(
         "--full-legacy", action="store_true", help="Also run all legacy campaign and HF tests"
     )
+    parser.add_argument(
+        "--all-tests", action="store_true", help="Run the complete offline AP pytest suite"
+    )
     args = parser.parse_args()
     if sys.version_info[:2] != (3, 12):
         parser.error("Use Python 3.12 for the paired phone packages")
@@ -171,7 +180,7 @@ def main():
         "-c",
         root / "requirements-phone-test.txt",
         *built,
-        "auto-promotion[dev,mcp,telegram,temporal,phone-test]",
+        "auto-promotion[dev,mcp,telegram,temporal,browser,phone-test]",
     )
     run(python, "-m", "pip", "check")
     run(
@@ -197,14 +206,19 @@ def main():
     manifest = work / "manifest.json"
     manifest.write_text(json.dumps(report, indent=2))
     ap_tests = (
-        *AP_TESTS,
-        *(
-            [f"tests/{name}.py" for name in LEGACY_MODULES]
-            if args.full_legacy
-            else LEGACY_BOUNDARIES
-        ),
+        ("tests",)
+        if args.all_tests
+        else (
+            *AP_TESTS,
+            *(
+                [f"tests/{name}.py" for name in LEGACY_MODULES]
+                if args.full_legacy
+                else LEGACY_BOUNDARIES
+            ),
+        )
     )
     report["full_legacy"] = args.full_legacy
+    report["all_tests"] = args.all_tests
     suites = (
         (phone / "packages/phone-fleet-protocol", ["tests"], "protocol"),
         (

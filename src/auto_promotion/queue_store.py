@@ -448,19 +448,19 @@ class JobQueue:
                 "AND a.disabled=0 AND a.cooldown_until<=? AND a.next_at<=? "
                 "AND NOT EXISTS(SELECT 1 FROM account_blocks b WHERE b.account_id=a.id "
                 "AND b.state='active' AND (b.until_at IS NULL OR b.until_at>?)) "
-                "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' "
+                "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' AND busy.kind IN ('send','join') "
                 "AND busy.lease_until>? AND (busy.account_id=j.account_id OR "
-                "(json_extract(j.route,'$.identity') IS NOT NULL AND json_extract(busy.route,'$.identity')=json_extract(j.route,'$.identity')))) "
+                "(json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.identity') IS NOT NULL AND json_extract(CASE WHEN busy.kind IN ('send','join') THEN busy.route ELSE '{}' END,'$.identity')=json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.identity')))) "
                 "AND NOT EXISTS(SELECT 1 FROM account_lanes lane "
                 "WHERE lane.account_id=j.account_id AND lane.expires_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM channel_authorization_requests auth "
-                "WHERE auth.identity_key=json_extract(j.route,'$.identity') "
+                "WHERE auth.identity_key=json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.identity') "
                 "AND auth.state IN ('leased','pending') AND auth.until_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM temporal_task_links tl WHERE tl.task_id=j.task_id AND tl.state<>'enabled') "
                 "AND NOT EXISTS(SELECT 1 FROM phone_visual_preparations p WHERE p.item_id=j.reference_id AND "
                 "(p.phase<>'ready' OR p.expires_at IS NULL OR p.expires_at<=?)) "
                 "AND j.expires_at>? AND (j.kind<>'send' OR t.phase='ready') "
-                "AND NOT EXISTS(SELECT 1 FROM execution_resources r WHERE r.resource=json_extract(j.route,'$.resource') AND r.expires_at>?) "
+                "AND NOT EXISTS(SELECT 1 FROM execution_resources r WHERE r.resource=json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.resource') AND r.expires_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM account_task_channels ch LEFT JOIN tasks holder ON holder.id=ch.task_id "
                 "WHERE ch.account_id=j.account_id AND ch.until_at>? AND (ch.retry_at>? OR (ch.state='handoff' AND ch.task_id<>j.task_id "
                 "AND holder.state='active' AND unixepoch(json_extract(holder.policy,'$.ends_at'))>?)))"
@@ -576,7 +576,7 @@ class JobQueue:
                 if (
                     resource
                     and db.execute(
-                        "SELECT 1 FROM execution_jobs WHERE state='leased' AND lease_until>? AND json_extract(route,'$.resource')=?",
+                        "SELECT 1 FROM execution_jobs WHERE state='leased' AND kind IN ('send','join') AND lease_until>? AND json_extract(CASE WHEN kind IN ('send','join') THEN route ELSE '{}' END,'$.resource')=?",
                         (now, resource),
                     ).fetchone()
                 ):
