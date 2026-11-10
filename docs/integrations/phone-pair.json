@@ -1,6 +1,6 @@
 {
   "repository": "anatanoojiisann/phone-agent-platform",
-  "commit": "7b5c124b9f872b28d41f4ad432c395710b4d1346",
+  "commit": "7f0a58ee09acc69d7e6536aa403305dafb6c47a1",
   "packages": {
     "phone-platform-contracts": "1.2.0",
     "phone-fleet-protocol": "0.2.2",
