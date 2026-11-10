@@ -27,3 +27,5 @@ The private paired gate supports --all-tests and runs the complete AP pytest sui
 Final immutable phone source: `7f0a58ee09acc69d7e6536aa403305dafb6c47a1`.
 
 GitHub follow-up: delay initial rendering until every deferred page module is loaded; the effects regression deliberately delays its script on reload and passed. Legacy discovery retains all 1563 unittest cases, including indirect subclasses, without importing pure-function phone fixtures. Existing valid local leases on this node remain usable during another account's offline scope; node/store/generation/expiry/task mismatches do not grant retained authority. The related channel/local-authorization regression passed 57 cases and 17 subtests.
+
+The legacy discovery filter also excludes pytest helper-class modules. A fresh process blocked pytest and phone SDK imports and still discovered all 1563 unittest cases without loader errors. Import failures now stop before the long suite runs. This follow-up changes only the legacy test runner/documentation; installed application code and the full private paired pytest input remain the same as 74d659de60fa854f0712809c305f8bbcf5844057.
