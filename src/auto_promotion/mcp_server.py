@@ -692,7 +692,7 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
 
     @server.tool(annotations=local)
     async def prepare_task(task_id: str, phone_comment_target: dict[str, str] | None = None) -> dict:
-        """Freeze the manifest. For a single Instagram phone comment or X phone reply, optionally verify the original post and draft with target_id, target_author and target_text; never submits."""
+        """Freeze the manifest. For a single Instagram or Facebook phone comment or X phone reply, optionally verify the original post and draft with target_id, target_author and target_text; never submits."""
         def prepare():
             if phone_comment_target is None:
                 return engine.prepare(task_id)
@@ -702,7 +702,7 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
                 raise Conflict("PhoneCommentPreparationScopeMismatch")
             item = task["items"][0]
             payload = item["payload"]
-            if (payload["platform"], payload["action"]) not in {("instagram", "comment"), ("x", "reply")} or item["status"] != "not_attempted":
+            if (payload["platform"], payload["action"]) not in {("instagram", "comment"), ("facebook", "comment"), ("x", "reply")} or item["status"] != "not_attempted":
                 raise Conflict("PhoneCommentPreparationScopeMismatch")
             service = getattr(engine.adapters, "phone_social", None)
             if service is None:

@@ -3230,7 +3230,7 @@ class Engine:
             raise NotFound("执行项不存在")
         if row["status"] == "confirmed" and self._execution_method(row["task_id"]) == "phone":
             service = getattr(self.adapters, "phone_social", None)
-            if service and self.account(row["account_id"])["platform"] in {"instagram", "x"}:
+            if service and self.account(row["account_id"])["platform"] in {"instagram", "facebook", "x"}:
                 return service.read_confirmed_comment_id(row)
         if row["status"] not in {"unknown", "scheduled"}:
             raise Conflict("只有未知结果或平台排期需要核对")

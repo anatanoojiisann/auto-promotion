@@ -594,7 +594,7 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             receipt = proof.receipt
             return {"status": "confirmed", "verified": True, "external_reference": receipt.permalink,
                 "native_id": receipt.native_id, "message_id": receipt.native_id if context.platform == "telegram" else None,
-                "native_comment_id": receipt.native_id, **({"comment_id": receipt.native_id} if context.platform == "instagram" else {}),
+                "native_comment_id": receipt.native_id, **({"comment_id": receipt.native_id} if context.platform in {"instagram", "facebook"} else {}),
                 **({"publish_id": receipt.native_id, "reply_id": receipt.native_id} if context.platform == "x" else {}),
                 "published_at": receipt.created_at, "submission_started": True}
         if (snapshot.get("status") == "failed" and result.get("external_effect") == "none"
@@ -610,7 +610,8 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         account = self.engine.account(item["account_id"])
         result = self.engine.call(account, "verify", {"item_id": item["id"], "payload": json.loads(item["payload"])}, item["task_id"])
         fields = ("reply_id", "publish_id") if account["platform"] == "x" else ("comment_id",)
-        mismatch = "PhoneXOriginalReceiptMismatch" if account["platform"] == "x" else "PhoneInstagramOriginalReceiptMismatch"
+        mismatch = {"x": "PhoneXOriginalReceiptMismatch", "instagram": "PhoneInstagramOriginalReceiptMismatch",
+                    "facebook": "PhoneFacebookOriginalReceiptMismatch"}[account["platform"]]
         native_id = result.get(fields[0])
         if (not result.get("verified") or not isinstance(native_id, str) or not native_id.isascii()
                 or not native_id.isdigit() or not item["external_reference"]

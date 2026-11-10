@@ -407,7 +407,7 @@ def test_original_queue_single_permission_and_native_receipt_finish_once(pilot):
     creates = len([r for r in s.fake.requests if r.method == "POST"])
     assert s.service.verify(s.engine.account(s.account["id"]), claim)["verified"]
     assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
-    if s.app in {"instagram", "x"}:
+    if s.app in {"instagram", "facebook", "x"}:
         field = "reply_id" if s.app == "x" else "comment_id"
         # A previous sender stored only the verified link. Read its original native receipt once.
         with s.store.connect(write=True) as db:
@@ -790,3 +790,25 @@ def test_local_window_denial_before_any_grant_is_known_unsent(pilot, prior_inten
                       "submission_started":False, "reason":"ExecutionWindowElapsed"}
     assert len([r for r in s.fake.requests if r.method == "POST"]) == before
     assert s.store.one("SELECT count(*) n FROM phone_social_authorizations")["n"] == 0
+
+
+@pytest.mark.parametrize("pilot", ["facebook"], indirect=True)
+def test_mcp_prepares_one_facebook_phone_comment_without_sending(pilot):
+    import asyncio
+    from auto_promotion.mcp_server import create_server
+
+    s = pilot
+    s.engine.adapters.phone_social = s.service
+    server = create_server(s.engine)
+    result = asyncio.run(server.call_tool("prepare_task", {
+        "task_id": s.task["id"], "phone_comment_target": s.metadata,
+    }))
+    if isinstance(result, tuple):
+        result = result[1]
+    elif not isinstance(result, dict):
+        result = json.loads(result[0].text)
+    proof = result["phone_preparation"]
+    assert proof["status"] == "succeeded" and proof["discarded"] is True
+    assert proof["submission_started"] is False
+    assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 0
+    assert s.store.one("SELECT COUNT(*) n FROM phone_social_authorizations")["n"] == 0
