@@ -13,17 +13,14 @@ from pathlib import Path
 def modules(root):
     for path in sorted((root / "tests").glob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        pytest_import = any(
-            (isinstance(node, ast.Import) and any(alias.name == "pytest" for alias in node.names))
-            or (isinstance(node, ast.ImportFrom) and node.module == "pytest")
+        has_class = any(isinstance(node, ast.ClassDef) for node in tree.body)
+        custom_loader = any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "load_tests"
             for node in tree.body
         )
-        unittest_class = any(
-            isinstance(node, ast.ClassDef)
-            and any("TestCase" in ast.unparse(base) for base in node.bases)
-            for node in tree.body
-        )
-        if pytest_import and not unittest_class:
+        # Pure function suites may import pytest fixtures indirectly. They have
+        # no unittest cases and belong to the complete paired pytest job.
+        if not has_class and not custom_loader:
             continue
         yield path.stem
 

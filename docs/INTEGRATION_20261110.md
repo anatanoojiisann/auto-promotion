@@ -25,3 +25,5 @@ Full regression also exposed plain-text internal stage routes being read as JSON
 The private paired gate supports --all-tests and runs the complete AP pytest suite against installed wheels. The source-suite diagnostic run was superseded after the bridge/queue fixes; its partial failures are retained separately and are not presented as a passing final suite.
 
 Final immutable phone source: `7b5c124b9f872b28d41f4ad432c395710b4d1346`.
+
+GitHub follow-up: delay initial rendering until every deferred page module is loaded; the effects regression deliberately delays its script on reload and passed. Legacy discovery retains all 1563 unittest cases, including indirect subclasses, without importing pure-function phone fixtures. Existing valid local leases on this node remain usable during another account's offline scope; node/store/generation/expiry/task mismatches do not grant retained authority. The related channel/local-authorization regression passed 57 cases and 17 subtests.

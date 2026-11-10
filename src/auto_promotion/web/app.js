@@ -2079,7 +2079,8 @@ window.addEventListener("hashchange", () => {
   ++panelGeneration;
   render().catch((e) => toast(e.message, true));
 });
-(async () => {
+// All deferred page modules must be initialized before the first route renders.
+window.addEventListener("DOMContentLoaded", async () => {
   try {
     await api("/session", "POST");
     if (
@@ -2102,4 +2103,4 @@ window.addEventListener("hashchange", () => {
     );
     $("#retry-start").onclick = () => location.reload();
   }
-})();
+});

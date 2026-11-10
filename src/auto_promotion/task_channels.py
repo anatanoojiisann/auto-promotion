@@ -459,6 +459,23 @@ def control_plan(engine, task_id, account_id, policy, *, authorization_only=Fals
         primary = configured(db)
         grant = valid(db, account_id) if primary else None
         bound = channel_binding(db, account_id)
+        stored = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
+        store_id = stored[0] if stored else None
+        local_node = os.getenv("AP_NODE_ID", socket.gethostname())
+        prior = db.execute(
+            "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
+        ).fetchone()
+        retained_local = bool(
+            channel == "local"
+            and offline_only(engine.store)
+            and store_id is not None
+            and prior
+            and prior["state"] == "ready"
+            and prior["channel"] == "local"
+            and prior["until_at"] >= until
+            and binding_matches(prior, bound, local_node, store_id)
+            and original_fence_valid(db, bound, engine.clock(), task_id)
+        )
     if primary:
         if authorization_only:
             raise CloudUnavailable("LocalPrimaryTaskAuthorizationNotRequired")
@@ -484,7 +501,9 @@ def control_plan(engine, task_id, account_id, policy, *, authorization_only=Fals
     # A new task cannot borrow it or renew it implicitly through the cloud.
     coordinated_local = channel == "local" and bool(bound.get("coordination_task_id"))
     scoped_offline = offline_only(engine.store, account_id)
-    no_cloud = (scoped_offline or coordinated_local) and not authorization_only
+    # Another account's offline instruction must not force this node's still
+    # valid local lease to contact the cloud or expand/renew its authority.
+    no_cloud = (scoped_offline or coordinated_local or retained_local) and not authorization_only
     if no_cloud and channel == "cloud":
         raise CloudUnavailable("LocalOfflineModeActive")
     cloud = None if no_cloud else CloudControl.configured()
@@ -492,7 +511,6 @@ def control_plan(engine, task_id, account_id, policy, *, authorization_only=Fals
     node_id = (state.get("node_id") if no_cloud and scoped_offline else None) or (
         cloud.node_id if cloud else os.getenv("AP_NODE_ID", socket.gethostname())
     )
-    stored = engine.store.one("SELECT value FROM meta WHERE key='execution_store_id'")
     return dict(
         task_id=task_id,
         account_id=account_id,
@@ -502,7 +520,7 @@ def control_plan(engine, task_id, account_id, policy, *, authorization_only=Fals
         cloud=cloud,
         local_state=state,
         node_id=node_id,
-        store_id=stored["value"] if stored else None,
+        store_id=store_id,
         authorization_only=authorization_only,
     )
 
