@@ -199,17 +199,23 @@ class StatisticsTests(unittest.TestCase):
     def test_report_calculation_allows_other_business_writers(self):
         original = self.stats._snapshot
         observed = []
+
         def snapshot(db, start, cutoff):
             with self.store.connect(write=True) as writer:
-                writer.execute("INSERT OR REPLACE INTO meta VALUES('report_concurrency_probe','ok')")
+                writer.execute(
+                    "INSERT OR REPLACE INTO meta VALUES('report_concurrency_probe','ok')"
+                )
             observed.append(True)
             return original(db, start, cutoff)
+
         self.stats._snapshot = snapshot
         result = self.stats.run_due()
         self.assertTrue(observed)
         self.assertGreater(result["updated_reports"], 0)
-        self.assertEqual(self.store.one(
-            "SELECT value FROM meta WHERE key='report_concurrency_probe'")["value"], "ok")
+        self.assertEqual(
+            self.store.one("SELECT value FROM meta WHERE key='report_concurrency_probe'")["value"],
+            "ok",
+        )
 
     def test_default_database_selects_business_store_from_parent_workspace(self):
         root = Path(self.tmp.name) / "workspace"

@@ -78,24 +78,47 @@ def register(engine, task_id, instruction):
             raise Conflict("TemporalTaskNotFound")
         policy = json.loads(task["policy"])
         items = db.execute("SELECT * FROM items WHERE task_id=?", (task_id,)).fetchall()
-        if (task["state"] != "draft" or not task["manifest_hash"] or not items
-                or policy.get("execution_method") != "phone" or policy.get("execution_channel") != "local"
-                or epoch(policy["ends_at"]) <= engine.clock()
-                or any(i["status"] != "not_attempted" or i["attempt_id"] or i["external_reference"] for i in items)
-                or db.execute("SELECT 1 FROM attempts WHERE task_id=?", (task_id,)).fetchone()):
+        if (
+            task["state"] != "draft"
+            or not task["manifest_hash"]
+            or not items
+            or policy.get("execution_method") != "phone"
+            or policy.get("execution_channel") != "local"
+            or epoch(policy["ends_at"]) <= engine.clock()
+            or any(
+                i["status"] != "not_attempted" or i["attempt_id"] or i["external_reference"]
+                for i in items
+            )
+            or db.execute("SELECT 1 FROM attempts WHERE task_id=?", (task_id,)).fetchone()
+        ):
             raise Conflict("TemporalRequiresNewFrozenUnattemptedLocalPhoneTask")
         store_id = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
-        identifier = "promotion-" + digest([store_id[0] if store_id else "local", task_id, task["manifest_hash"]])
+        identifier = "promotion-" + digest(
+            [store_id[0] if store_id else "local", task_id, task["manifest_hash"]]
+        )
         old = db.execute("SELECT * FROM temporal_task_links WHERE task_id=?", (task_id,)).fetchone()
         if old:
             if old["manifest_hash"] != task["manifest_hash"]:
                 raise Conflict("TemporalManifestChanged")
             return dict(old)
-        db.execute("INSERT INTO temporal_task_links VALUES(?,?,?,'registered',?,NULL,NULL,?)",
-                   (task_id, task["manifest_hash"], identifier, engine.clock(), instruction))
-        Store.audit(db, "temporal.task_registered", {"workflow_id": identifier,
-                    "manifest_hash": task["manifest_hash"], "instruction": instruction}, task_id, engine.clock())
-        return dict(db.execute("SELECT * FROM temporal_task_links WHERE task_id=?", (task_id,)).fetchone())
+        db.execute(
+            "INSERT INTO temporal_task_links VALUES(?,?,?,'registered',?,NULL,NULL,?)",
+            (task_id, task["manifest_hash"], identifier, engine.clock(), instruction),
+        )
+        Store.audit(
+            db,
+            "temporal.task_registered",
+            {
+                "workflow_id": identifier,
+                "manifest_hash": task["manifest_hash"],
+                "instruction": instruction,
+            },
+            task_id,
+            engine.clock(),
+        )
+        return dict(
+            db.execute("SELECT * FROM temporal_task_links WHERE task_id=?", (task_id,)).fetchone()
+        )
 
 
 def request_registered(engine, db, task_id):
@@ -112,14 +135,18 @@ def request_registered(engine, db, task_id):
 
         raise Conflict("TemporalManifestChanged")
     if task["state"] == "active" and task["phase"] == "ready" and row["state"] == "registered":
-        db.execute("UPDATE temporal_task_links SET state='requested',requested_at=? WHERE task_id=?",
-                   (engine.clock(), task_id))
+        db.execute(
+            "UPDATE temporal_task_links SET state='requested',requested_at=? WHERE task_id=?",
+            (engine.clock(), task_id),
+        )
 
 
 def pending(engine):
-    return engine.store.rows("SELECT l.task_id,l.manifest_hash,l.workflow_id,t.policy FROM temporal_task_links l "
-                             "JOIN tasks t ON t.id=l.task_id WHERE l.state='requested' AND t.state='active' "
-                             "ORDER BY l.requested_at LIMIT 20")
+    return engine.store.rows(
+        "SELECT l.task_id,l.manifest_hash,l.workflow_id,t.policy FROM temporal_task_links l "
+        "JOIN tasks t ON t.id=l.task_id WHERE l.state='requested' AND t.state='active' "
+        "ORDER BY l.requested_at LIMIT 20"
+    )
 
 
 def admit(engine, task_id, manifest_hash, workflow_id):
@@ -136,8 +163,12 @@ def admit(engine, task_id, manifest_hash, workflow_id):
     has_preparations = bool(preparation_rows(engine, task_id))
     dynamic = link["instruction"] == AUTO_ENROLL_INSTRUCTION
     if link["state"] == "enabled":
-        return {"admitted": True, "task_id": task_id, "manifest_hash": manifest_hash,
-                "preparation_required": has_preparations}
+        return {
+            "admitted": True,
+            "task_id": task_id,
+            "manifest_hash": manifest_hash,
+            "preparation_required": has_preparations,
+        }
     if task["state"] != "active" or task["phase"] != "ready" or link["state"] != "requested":
         return {"admitted": False, "waiting_for": "explicit_start_or_ready_phase"}
     if task["manifest_hash"] != manifest_hash or engine.clock() >= epoch(task["policy"]["ends_at"]):
@@ -159,17 +190,30 @@ def admit(engine, task_id, manifest_hash, workflow_id):
             return {"admitted": False, "waiting_for": "global_stop"}
         accounts = json.loads(current["account_ids"])
         for identifier in accounts:
-            row = db.execute("SELECT disabled,cooldown_until FROM accounts WHERE id=?", (identifier,)).fetchone()
+            row = db.execute(
+                "SELECT disabled,cooldown_until FROM accounts WHERE id=?", (identifier,)
+            ).fetchone()
             if not dynamic and (row["disabled"] or row["cooldown_until"] > engine.clock()):
                 return {"admitted": False, "waiting_for": "account_stopped_or_cooling_down"}
-        changed = db.execute("UPDATE temporal_task_links SET state='enabled',admitted_at=? "
-                             "WHERE task_id=? AND state='requested' AND manifest_hash=?",
-                             (engine.clock(), task_id, manifest_hash)).rowcount
+        changed = db.execute(
+            "UPDATE temporal_task_links SET state='enabled',admitted_at=? "
+            "WHERE task_id=? AND state='requested' AND manifest_hash=?",
+            (engine.clock(), task_id, manifest_hash),
+        ).rowcount
         if changed:
-            Store.audit(db, "temporal.task_admitted", {"workflow_id": workflow_id,
-                        "manifest_hash": manifest_hash}, task_id, engine.clock())
-    return {"admitted": True, "task_id": task_id, "manifest_hash": manifest_hash,
-            "preparation_required": has_preparations}
+            Store.audit(
+                db,
+                "temporal.task_admitted",
+                {"workflow_id": workflow_id, "manifest_hash": manifest_hash},
+                task_id,
+                engine.clock(),
+            )
+    return {
+        "admitted": True,
+        "task_id": task_id,
+        "manifest_hash": manifest_hash,
+        "preparation_required": has_preparations,
+    }
 
 
 def status(engine, task_id):
@@ -177,8 +221,11 @@ def status(engine, task_id):
 
     task = engine.task(task_id)
     value = task_state(task)
-    value["registration"] = engine.store.one("SELECT task_id,manifest_hash,workflow_id,state,admitted_at "
-                                             "FROM temporal_task_links WHERE task_id=?", (task_id,))
+    value["registration"] = engine.store.one(
+        "SELECT task_id,manifest_hash,workflow_id,state,admitted_at "
+        "FROM temporal_task_links WHERE task_id=?",
+        (task_id,),
+    )
     value["deadline"] = epoch(task["policy"]["ends_at"])
     from .phone_visual_preparation import summary
 
@@ -195,20 +242,35 @@ def dynamically_authorized(service, db, task_id, account_id):
     if not getattr(service.config, "dynamic_task_authorization_enabled", False):
         return False
     binding = service.config.bindings.get(account_id)
-    if not binding or not db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='temporal_task_links'").fetchone():
+    if (
+        not binding
+        or not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='temporal_task_links'"
+        ).fetchone()
+    ):
         return False
     row = db.execute(
         "SELECT t.*,l.manifest_hash AS registered_manifest,l.state AS coordination_state,l.requested_at "
-        "FROM tasks t JOIN temporal_task_links l ON l.task_id=t.id WHERE t.id=?", (task_id,)).fetchone()
-    if (not row or row["state"] != "active" or row["phase"] != "ready"
-            or not row["manifest_hash"] or row["manifest_hash"] != row["registered_manifest"]
-            or row["coordination_state"] not in {"requested", "preparing", "enabled"}
-            or row["requested_at"] is None or account_id not in json.loads(row["account_ids"])):
+        "FROM tasks t JOIN temporal_task_links l ON l.task_id=t.id WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+    if (
+        not row
+        or row["state"] != "active"
+        or row["phase"] != "ready"
+        or not row["manifest_hash"]
+        or row["manifest_hash"] != row["registered_manifest"]
+        or row["coordination_state"] not in {"requested", "preparing", "enabled"}
+        or row["requested_at"] is None
+        or account_id not in json.loads(row["account_ids"])
+    ):
         return False
     policy = json.loads(row["policy"])
-    return (policy.get("execution_method") == "phone" and policy.get("execution_channel") == "local"
-            and service.engine.clock() < epoch(policy["ends_at"]))
+    return (
+        policy.get("execution_method") == "phone"
+        and policy.get("execution_channel") == "local"
+        and service.engine.clock() < epoch(policy["ends_at"])
+    )
 
 
 def auto_register_new_phone_task(engine, task_id, *, freeze=False):
@@ -222,12 +284,19 @@ def auto_register_new_phone_task(engine, task_id, *, freeze=False):
         return None
     task = engine.task(task_id)
     policy = task["policy"]
-    if (task["state"] != "draft" or not task["items"]
-            or policy.get("execution_method") != "phone" or policy.get("execution_channel") != "local"
-            or epoch(policy["ends_at"]) <= engine.clock()
-            or not task["account_ids"] or any(a not in service.config.bindings for a in task["account_ids"])
-            or any(i["status"] != "not_attempted" or i.get("attempt_id") or i.get("external_reference")
-                   for i in task["items"])):
+    if (
+        task["state"] != "draft"
+        or not task["items"]
+        or policy.get("execution_method") != "phone"
+        or policy.get("execution_channel") != "local"
+        or epoch(policy["ends_at"]) <= engine.clock()
+        or not task["account_ids"]
+        or any(a not in service.config.bindings for a in task["account_ids"])
+        or any(
+            i["status"] != "not_attempted" or i.get("attempt_id") or i.get("external_reference")
+            for i in task["items"]
+        )
+    ):
         return None
     cutover = engine.store.one("SELECT value FROM meta WHERE key='phone_dynamic_admission_cutover'")
     if not cutover or task["created_at"] < float(cutover["value"]):
@@ -252,14 +321,29 @@ def commission_dynamic_admission(service):
 
     JobQueue(service.engine)
     with service.store.connect(write=True) as db:
-        db.execute("INSERT OR IGNORE INTO meta VALUES('phone_dynamic_admission_cutover',?)",
-                   (str(service.engine.clock()),))
-        db.execute("INSERT INTO meta VALUES('phone_dynamic_admission_enabled','1') "
-                   "ON CONFLICT(key) DO UPDATE SET value='1'")
+        db.execute(
+            "INSERT OR IGNORE INTO meta VALUES('phone_dynamic_admission_cutover',?)",
+            (str(service.engine.clock()),),
+        )
+        db.execute(
+            "INSERT INTO meta VALUES('phone_dynamic_admission_enabled','1') "
+            "ON CONFLICT(key) DO UPDATE SET value='1'"
+        )
         db.execute("DELETE FROM phone_dynamic_bindings")
-        db.executemany("INSERT INTO phone_dynamic_bindings VALUES(?,?,?,?)",
-                       [(identifier,binding.platform,binding.device_id,int(
-                           getattr(service.config,"async_visual_review_enabled",False)
-                           and binding.platform=="telegram" and binding.receipt_reader=="telegram_api"
-                           and identifier in service.config.single_pass_adapters))
-                        for identifier,binding in service.config.bindings.items()])
+        db.executemany(
+            "INSERT INTO phone_dynamic_bindings VALUES(?,?,?,?)",
+            [
+                (
+                    identifier,
+                    binding.platform,
+                    binding.device_id,
+                    int(
+                        getattr(service.config, "async_visual_review_enabled", False)
+                        and binding.platform == "telegram"
+                        and binding.receipt_reader == "telegram_api"
+                        and identifier in service.config.single_pass_adapters
+                    ),
+                )
+                for identifier, binding in service.config.bindings.items()
+            ],
+        )

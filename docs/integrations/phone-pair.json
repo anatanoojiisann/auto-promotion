@@ -3,7 +3,7 @@
   "commit": "08d372fb0f0ce4ae1b03b132b72502ff22d7ce5c",
   "packages": {
     "phone-platform-contracts": "1.2.0",
-    "phone-fleet-protocol": "0.2.1",
-    "phone-fleet-management": "0.2.0.dev19"
+    "phone-fleet-protocol": "0.2.2",
+    "phone-fleet-management": "0.2.0.dev20"
   }
 }

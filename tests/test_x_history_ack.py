@@ -180,8 +180,14 @@ class XHistoryAcknowledgementTests(unittest.TestCase):
             )
             db.execute(
                 "INSERT INTO account_task_channels VALUES(?,?,?,?,?,'ready','cloud_acknowledged',?,NULL,0)",
-                (self.account["id"], "local", "test-generation", self.engine.clock() + 600,
-                 self.new["id"], self.engine.clock()),
+                (
+                    self.account["id"],
+                    "local",
+                    "test-generation",
+                    self.engine.clock() + 600,
+                    self.new["id"],
+                    self.engine.clock(),
+                ),
             )
             db.execute(
                 "INSERT INTO task_channel_claims VALUES(?,?,?,?)",
@@ -194,9 +200,16 @@ class XHistoryAcknowledgementTests(unittest.TestCase):
             db.execute(
                 "INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    "new-attempt", self.item["id"], self.account["id"], self.new["id"],
-                    "target", "user", "live", self.engine.clock() - 2,
-                    self.engine.clock() - 1, "failed_known",
+                    "new-attempt",
+                    self.item["id"],
+                    self.account["id"],
+                    self.new["id"],
+                    "target",
+                    "user",
+                    "live",
+                    self.engine.clock() - 2,
+                    self.engine.clock() - 1,
+                    "failed_known",
                 ),
             )
             db.execute(

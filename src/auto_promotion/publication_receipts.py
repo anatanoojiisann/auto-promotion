@@ -57,5 +57,6 @@ def outcome_v2(snapshot, context, proof):
         "receipt_reader": receipt.reader,
         "receipt_evidence_sha256": receipt.evidence_sha256,
         **({"message_id": identifier} if receipt.platform == "telegram" else {}),
-        **({"comment_id": identifier} if receipt.platform == "reddit" else {}),
+        **({"comment_id": identifier} if receipt.platform in {"reddit", "instagram"} else {}),
+        **({"publish_id": identifier, "reply_id": identifier} if receipt.platform == "x" else {}),
     }

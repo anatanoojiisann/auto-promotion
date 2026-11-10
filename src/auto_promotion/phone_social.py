@@ -674,7 +674,27 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             "execution_job": execution_job,
             "payload": claim,
         }
-        verify_claim(full_claim)
+        try:
+            verify_claim(full_claim)
+        except BackendError as error:
+            # This local guard precedes grant creation and all native dispatches.
+            # Existing intent always requires reconciliation of its original execution.
+            prior = self.store.one(
+                "SELECT id FROM phone_social_authorizations WHERE item_id=?", (claim["item_id"],)
+            )
+            dispatched = self.store.one(
+                "SELECT id FROM phone_social_operations WHERE item_id=? AND kind='social_submit'",
+                (claim["item_id"],),
+            )
+            if error.safe_code != "ExecutionWindowElapsed" or prior or dispatched:
+                raise
+            return {
+                "status": "failed_known",
+                "verified": False,
+                "confirmed_not_submitted": True,
+                "submission_started": False,
+                "reason": error.safe_code,
+            }
         old = self.store.one(
             "SELECT * FROM phone_social_authorizations WHERE item_id=?", (claim["item_id"],)
         )
@@ -990,6 +1010,12 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 "native_id": receipt.native_id,
                 "message_id": receipt.native_id if context.platform == "telegram" else None,
                 "native_comment_id": receipt.native_id,
+                **({"comment_id": receipt.native_id} if context.platform == "instagram" else {}),
+                **(
+                    {"publish_id": receipt.native_id, "reply_id": receipt.native_id}
+                    if context.platform == "x"
+                    else {}
+                ),
                 "published_at": receipt.created_at,
                 "submission_started": True,
             }
@@ -1014,6 +1040,55 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             "receipt_pending": bool(proof and proof.submission_started),
             "resource_state": "released" if snapshot.get("resource_released") else "fenced",
         }
+
+    def read_confirmed_comment_id(self, item):
+        """Recover the validated native ID for older confirmed phone receipts without another attempt."""
+        account = self.engine.account(item["account_id"])
+        result = self.engine.call(
+            account,
+            "verify",
+            {"item_id": item["id"], "payload": json.loads(item["payload"])},
+            item["task_id"],
+        )
+        fields = ("reply_id", "publish_id") if account["platform"] == "x" else ("comment_id",)
+        mismatch = (
+            "PhoneXOriginalReceiptMismatch"
+            if account["platform"] == "x"
+            else "PhoneInstagramOriginalReceiptMismatch"
+        )
+        native_id = result.get(fields[0])
+        if (
+            not result.get("verified")
+            or not isinstance(native_id, str)
+            or not native_id.isascii()
+            or not native_id.isdigit()
+            or not item["external_reference"]
+            or result.get("external_reference") != item["external_reference"]
+        ):
+            raise Conflict(mismatch)
+        with self.store.connect(write=True) as db:
+            original = db.execute(
+                "SELECT result FROM items WHERE id=? AND status='confirmed' AND attempt_id=? AND external_reference=?",
+                (item["id"], item["attempt_id"], item["external_reference"]),
+            ).fetchone()
+            if not original:
+                raise Conflict(mismatch)
+            recorded = json.loads(original["result"])
+            if any(recorded.get(field) not in (None, native_id) for field in fields):
+                raise Conflict(mismatch)
+            if any(not recorded.get(field) for field in fields):
+                recorded.update(dict.fromkeys(fields, native_id))
+                db.execute(
+                    "UPDATE items SET result=? WHERE id=?", (canonical(recorded), item["id"])
+                )
+                Store.audit(
+                    db,
+                    "phone_social." + fields[0] + "_read_back",
+                    {"item_id": item["id"], fields[0]: native_id},
+                    item["task_id"],
+                    self.engine.clock(),
+                )
+        return recorded
 
     def verify(self, account, payload):
         from .execution_timing import stage
@@ -1050,8 +1125,12 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         request = ExecutionRequest.model_validate_json(row["request"])
         # dispatch on an existing durable record only GETs its original execution.
         snapshot = self.dispatch(request, row["id"], account["id"], row["item_id"])
-        return self.reconcile_protocol_receipt(request, snapshot) or self.outcome(
-            snapshot, request.social
+        from .phone_receipt_readback import reconcile_x_receipt
+
+        return (
+            self.reconcile_protocol_receipt(request, snapshot)
+            or reconcile_x_receipt(self, request, snapshot)
+            or self.outcome(snapshot, request.social)
         )
 
 

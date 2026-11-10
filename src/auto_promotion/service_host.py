@@ -18,7 +18,7 @@ import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from .config import load_environment
+from .config import load_environment, service_project_directory
 from .runtime_identity import capture_runtime
 from .store import Store
 from .workers import Workers
@@ -154,7 +154,7 @@ class ServiceHost:
             env = {**os.environ, "AUTO_PROMOTION_LIVE_WRITES": "0"}
         return subprocess.Popen(
             argv,
-            cwd=Path(__file__).resolve().parents[2],
+            cwd=service_project_directory(),
             stdout=self.log_handles[0],
             stderr=self.log_handles[1],
             env=env,
@@ -259,7 +259,7 @@ def main():
         parser.error("The reporting service cannot enable phone execution")
     if os.name != "nt":
         parser.error("This service host is installed through Windows Task Scheduler")
-    repo = Path(__file__).resolve().parents[2]
+    repo = service_project_directory()
     os.chdir(repo)
     load_environment(repo / ".env")
     if args.reports_only:

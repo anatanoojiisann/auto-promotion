@@ -32,6 +32,17 @@ PROJECTS = {
 }
 
 
+def service_project_directory():
+    """Keep the existing business working directory when code runs from a release bundle."""
+    configured = os.getenv("AP_SERVICE_PROJECT_DIR")
+    if not configured:
+        return Path(__file__).resolve().parents[2]
+    path = Path(configured)
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError("Existing absolute service project directory required")
+    return path
+
+
 def workspace_path():
     return Path(os.getenv("AUTO_PROMOTION_WORKSPACE", Path.cwd().parent)).resolve()
 

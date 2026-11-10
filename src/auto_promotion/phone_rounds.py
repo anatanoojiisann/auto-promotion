@@ -40,7 +40,9 @@ def round_task_authorized(db, task_id, account_id, now):
 
     if not configured(db) or not valid(db, account_id):
         return False
-    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_round_members'").fetchone():
+    if not db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_round_members'"
+    ).fetchone():
         return False
     row = db.execute(
         "SELECT r.id round_id,r.state round_state,r.manifest_hash round_manifest,r.submit_deadline,"
@@ -50,15 +52,25 @@ def round_task_authorized(db, task_id, account_id, now):
         "FROM phone_round_members m JOIN phone_rounds r ON r.id=m.round_id "
         "JOIN phone_round_preflights p ON p.id=m.check_id AND p.round_id=r.id "
         "JOIN tasks t ON t.id=m.task_id JOIN items i ON i.id=m.item_id "
-        "JOIN accounts a ON a.id=i.account_id WHERE m.task_id=?", (task_id,)
+        "JOIN accounts a ON a.id=i.account_id WHERE m.task_id=?",
+        (task_id,),
     ).fetchone()
-    if not row or row["round_state"] not in {"checking", "running"} or row["member_state"] not in {"checking", "pending", "starting", "queued"}:
+    if (
+        not row
+        or row["round_state"] not in {"checking", "running"}
+        or row["member_state"] not in {"checking", "pending", "starting", "queued"}
+    ):
         return False
-    if (not row["submit_deadline"] or now >= row["submit_deadline"] or row["account_id"] != account_id
-            or row["item_task"] != task_id or row["platform"] != row["account_platform"]
-            or row["task_state"] not in {"draft", "active"}
-            or row["payload_hash"] != row["current_payload"]
-            or row["manifest_hash"] != row["current_manifest"]):
+    if (
+        not row["submit_deadline"]
+        or now >= row["submit_deadline"]
+        or row["account_id"] != account_id
+        or row["item_task"] != task_id
+        or row["platform"] != row["account_platform"]
+        or row["task_state"] not in {"draft", "active"}
+        or row["payload_hash"] != row["current_payload"]
+        or row["manifest_hash"] != row["current_manifest"]
+    ):
         return False
     try:
         policy = json.loads(row["policy"])
@@ -66,9 +78,14 @@ def round_task_authorized(db, task_id, account_id, now):
         return False
     if policy.get("execution_channel") != "local" or policy.get("execution_method") != "phone":
         return False
-    members = db.execute("SELECT task_id,platform FROM phone_round_members WHERE round_id=?", (row["round_id"],)).fetchall()
-    return bool(members and len({m["platform"] for m in members}) == len(members)
-                and digest(sorted(m["task_id"] for m in members)) == row["round_manifest"])
+    members = db.execute(
+        "SELECT task_id,platform FROM phone_round_members WHERE round_id=?", (row["round_id"],)
+    ).fetchall()
+    return bool(
+        members
+        and len({m["platform"] for m in members}) == len(members)
+        and digest(sorted(m["task_id"] for m in members)) == row["round_manifest"]
+    )
 
 
 def submission_blocker(db, task_id, now):
@@ -297,13 +314,21 @@ class PhoneRounds:
                 "AND t.state='draft' AND i.status='not_attempted' AND i.attempt_id IS NULL "
                 "AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.item_id=m.item_id) "
                 "AND NOT EXISTS (SELECT 1 FROM execution_jobs j WHERE j.reference_id=m.item_id)",
-                (round_id, platform, platform)).fetchall()
+                (round_id, platform, platform),
+            ).fetchall()
             for member in untouched:
-                Store.audit(db, "phone_round.start_recheck_requested",
-                            {"previous_start_requested_at": member["start_requested_at"]},
-                            member["task_id"], now)
-                db.execute("UPDATE phone_round_members SET start_requested_at=NULL,start_lease_until=NULL "
-                           "WHERE round_id=? AND task_id=?", (round_id, member["task_id"]))
+                Store.audit(
+                    db,
+                    "phone_round.start_recheck_requested",
+                    {"previous_start_requested_at": member["start_requested_at"]},
+                    member["task_id"],
+                    now,
+                )
+                db.execute(
+                    "UPDATE phone_round_members SET start_requested_at=NULL,start_lease_until=NULL "
+                    "WHERE round_id=? AND task_id=?",
+                    (round_id, member["task_id"]),
+                )
             scope = {
                 m[0]
                 for m in db.execute(
@@ -368,8 +393,9 @@ class PhoneRounds:
                         final=False,
                     )
 
-                snapshot = checker(self, round_id, platforms=scope, on_members=completed,
-                                   refresh_identity=True)
+                snapshot = checker(
+                    self, round_id, platforms=scope, on_members=completed, refresh_identity=True
+                )
             else:
                 snapshot = (
                     checker(self, round_id)
@@ -617,7 +643,8 @@ class PhoneRounds:
                     "external_reference": m["external_reference"] if verified else None,
                     "reason": m["error"]
                     or (control_wait or {}).get("reason")
-                    or result.get("reason") or result.get("skip_reason"),
+                    or result.get("reason")
+                    or result.get("skip_reason"),
                     "control_wait": public_wait,
                     "quota_wait": quota_wait,
                     "start_requested_at": m["start_requested_at"],
@@ -712,7 +739,8 @@ class PhoneRounds:
             "WHERE m.state='blocked' AND m.error='PhoneIdentityRefreshPending' "
             "AND i.status='not_attempted' AND i.attempt_id IS NULL "
             "AND r.state IN ('running','blocked') AND r.submit_deadline>?",
-            (now,))
+            (now,),
+        )
         for member in waiting:
             service = getattr(self.engine.adapters, "phone_social", None)
             if service and service.fresh(self.engine.account(member["account_id"])):
@@ -727,12 +755,15 @@ class PhoneRounds:
             due = []
             for row in candidates:
                 members = self._members(db, row, now)
-                terminal = all(m["stage"] in {"confirmed", "failed_known", "unknown", "cancelled", "missed"}
-                               for m in members)
+                terminal = all(
+                    m["stage"] in {"confirmed", "failed_known", "unknown", "cancelled", "missed"}
+                    for m in members
+                )
                 pending = db.execute(
                     "SELECT 1 FROM phone_round_members WHERE round_id=? AND "
                     "(state='pending' OR (state='starting' AND start_lease_until<=?)) LIMIT 1",
-                    (row["id"], now)).fetchone()
+                    (row["id"], now),
+                ).fetchone()
                 if terminal or now >= row["deadline"] or pending:
                     due.append(row["id"])
         if not due:
@@ -748,9 +779,17 @@ class PhoneRounds:
                     continue
                 members = self._members(db, row, now)
                 for member in members:
-                    if member["stage"] in {"confirmed", "failed_known", "unknown", "cancelled", "missed"}:
-                        db.execute("UPDATE phone_round_members SET state=? WHERE round_id=? AND item_id=?",
-                                   (member["stage"], row["id"], member["item_id"]))
+                    if member["stage"] in {
+                        "confirmed",
+                        "failed_known",
+                        "unknown",
+                        "cancelled",
+                        "missed",
+                    }:
+                        db.execute(
+                            "UPDATE phone_round_members SET state=? WHERE round_id=? AND item_id=?",
+                            (member["stage"], row["id"], member["item_id"]),
+                        )
                         member["admission_state"] = member["stage"]
                 complete = self._scope_intact(row, members) and all(m["verified"] for m in members)
                 finished = self._scope_intact(row, members) and all(
@@ -763,7 +802,9 @@ class PhoneRounds:
                         (
                             "completed"
                             if complete and all(m["within_budget"] for m in members)
-                            else "finished" if finished else "expired",
+                            else "finished"
+                            if finished
+                            else "expired",
                             min(now, row["deadline"]),
                             canonical(members),
                             row["id"],

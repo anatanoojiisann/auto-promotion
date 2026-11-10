@@ -131,10 +131,15 @@ class AdapterRegistry:
 
         key = "phone_reddit" if account["platform"] == "reddit" else "phone_social"
         service = getattr(self, key, None)
-        if service and route_for(account).transport != "phone" and (
-                account["platform"] != "telegram" or not service.shared_telegram_binding(account)):
+        if (
+            service
+            and route_for(account).transport != "phone"
+            and (key != "phone_social" or not service.shared_account_binding(account))
+        ):
             service = None
-        return PhoneBackend(service=service, execution_job=getattr(self.context, "job", None)).call(account, operation, payload)
+        return PhoneBackend(service=service, execution_job=getattr(self.context, "job", None)).call(
+            account, operation, payload
+        )
 
     def commissioned(self, account):
         return account["mode"] == "simulation" or (
@@ -150,6 +155,7 @@ class AdapterRegistry:
         if account["mode"] == "simulation":
             return self.simulation.call(account, operation, payload)
         from .routing import route_for
+
         if route_for(account).transport == "phone":
             # Explicit native services reuse the original claimed send job.
             # Unconfigured phone routes remain preparation-only.

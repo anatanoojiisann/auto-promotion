@@ -407,34 +407,41 @@ def dispatch(request):
 
 def main():
     configure_utf8_stdio()
-    logging.disable(logging.CRITICAL)
-    request = json.load(sys.stdin)
+    previous_log_limit = logging.root.manager.disable
     try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            from .background_desktop import (
-                BackgroundDesktopUnavailable,
-                dispatch_on_background_desktop,
-                needs_background_desktop,
-            )
+        logging.disable(logging.CRITICAL)
+        request = json.load(sys.stdin)
+        try:
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                from .background_desktop import (
+                    BackgroundDesktopUnavailable,
+                    dispatch_on_background_desktop,
+                    needs_background_desktop,
+                )
 
-            if needs_background_desktop(request):
-                try:
-                    result = dispatch_on_background_desktop(request)
-                except BackgroundDesktopUnavailable:
-                    # Keep read-only collection available if Windows cannot
-                    # prepare a private desktop; no child has been started.
+                if needs_background_desktop(request):
+                    try:
+                        result = dispatch_on_background_desktop(request)
+                    except BackgroundDesktopUnavailable:
+                        # Keep read-only collection available if Windows cannot
+                        # prepare a private desktop; no child has been started.
+                        result = dispatch(request)
+                else:
                     result = dispatch(request)
-            else:
-                result = dispatch(request)
-    except Exception as exc:
-        code = getattr(exc, "safe_code", type(exc).__name__)
-        result = {
-            "bridge_error": code
-            if isinstance(code, str) and code.isidentifier()
-            else "BackendError",
-            **exception_details(exc),
-        }
-    print(json.dumps(result, ensure_ascii=True))
+        except Exception as exc:
+            code = getattr(exc, "safe_code", type(exc).__name__)
+            result = {
+                "bridge_error": code
+                if isinstance(code, str) and code.isidentifier()
+                else "BackendError",
+                **exception_details(exc),
+            }
+        print(json.dumps(result, ensure_ascii=True))
+    finally:
+        logging.disable(previous_log_limit)
 
 
 if __name__ == "__main__":

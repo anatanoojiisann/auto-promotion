@@ -130,13 +130,21 @@ def reddit_phone_enabled(account, action):
     except BackendError:
         return False
     binding = profile.get("phone_fleet", {})
-    return bool(profile.get("connection_type") == "phone_fleet" and binding.get("device_id")
-                and binding.get("reddit_comments_enabled") is True)
+    return bool(
+        profile.get("connection_type") == "phone_fleet"
+        and binding.get("device_id")
+        and binding.get("reddit_comments_enabled") is True
+    )
 
 
 def social_phone_actions(account):
-    actions = {"telegram": "send_message", "x": "reply", "instagram": "comment",
-               "facebook": "comment", "tiktok": "comment"}
+    actions = {
+        "telegram": "send_message",
+        "x": "reply",
+        "instagram": "comment",
+        "facebook": "comment",
+        "tiktok": "comment",
+    }
     if account.get("mode") != "live" or account.get("platform") not in actions:
         return []
     try:
@@ -145,8 +153,15 @@ def social_phone_actions(account):
         return []
     binding = profile.get("phone_fleet", {})
     expected = actions[account["platform"]]
-    return [expected] if (profile.get("connection_type") == "phone_fleet"
-        and binding.get("device_id") and binding.get("social_actions") == [expected]) else []
+    return (
+        [expected]
+        if (
+            profile.get("connection_type") == "phone_fleet"
+            and binding.get("device_id")
+            and binding.get("social_actions") == [expected]
+        )
+        else []
+    )
 
 
 def automatic_action_allowed(account, action, policy):
@@ -401,10 +416,16 @@ def verify_claim(request):
                 current_profile = read_profile(account["platform"], account["backend_label"])
             except BackendError:
                 current_profile = {}
-            if (current_profile.get("connection_type") == "phone_fleet" and account["platform"] != "reddit"
-                    and item["action"] not in social_phone_actions(current_account)):
+            if (
+                current_profile.get("connection_type") == "phone_fleet"
+                and account["platform"] != "reddit"
+                and item["action"] not in social_phone_actions(current_account)
+            ):
                 raise BackendError("PhoneSocialActionNotCommissioned")
-            if (account["platform"] == "reddit" and not reddit_phone_enabled(current_account, item["action"])) or (
+            if (
+                account["platform"] == "reddit"
+                and not reddit_phone_enabled(current_account, item["action"])
+            ) or (
                 account["platform"] == "x"
                 and not automatic_action_allowed(current_account, item["action"], policy)
             ):
@@ -439,8 +460,11 @@ def verify_claim(request):
             if item["action"].startswith("schedule_"):
                 if due <= now:
                     raise BackendError("ExecutionWindowElapsed")
-            elif not due <= now <= due + 900:
-                raise BackendError("ExecutionWindowElapsed")
+            else:
+                from ..delivery_policy import late
+
+                if now < due or late(policy, due, now):
+                    raise BackendError("ExecutionWindowElapsed")
             for media in item["media"]:
                 actual = hashlib.sha256(Path(media["path"]).read_bytes()).hexdigest()
                 if actual != media["sha256"]:

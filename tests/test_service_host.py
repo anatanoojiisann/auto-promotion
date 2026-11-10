@@ -40,6 +40,22 @@ class ServiceHostTests(unittest.TestCase):
             process=self.process,
         )
 
+    def test_release_launch_uses_the_existing_business_working_directory(self):
+        runtime = Path(self.temp.name)
+        with patch.dict("os.environ", {"AP_SERVICE_PROJECT_DIR": str(runtime)}):
+            with patch("auto_promotion.service_host.subprocess.Popen") as launch:
+                self.host._launch()
+                self.assertEqual(launch.call_args.kwargs["cwd"], runtime)
+        for handle in self.host.log_handles:
+            handle.close()
+
+    def test_relative_service_working_directory_is_rejected(self):
+        from auto_promotion.config import service_project_directory
+
+        with patch.dict("os.environ", {"AP_SERVICE_PROJECT_DIR": "relative"}):
+            with self.assertRaises(ValueError):
+                service_project_directory()
+
     def test_starts_sender_once_when_absent(self):
         self.assertEqual(self.host.step()["state"], "starting")
         self.assertEqual(self.host.step()["state"], "starting_or_needs_attention")

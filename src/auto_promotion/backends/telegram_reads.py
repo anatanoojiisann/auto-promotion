@@ -71,7 +71,9 @@ class TelegramReads:
         self.identity = digest(["telegram-read-identity-v1", str(identity)])
         self.scope = digest(["telegram-read-cache-v1", self.identity, str(revision)])
         # All labels for the SAME real identity on this machine share one ledger.
-        self.path = (profile_path("telegram", label).parent if ledger_root is None else Path(ledger_root)) / "read-state.sqlite3"
+        self.path = (
+            profile_path("telegram", label).parent if ledger_root is None else Path(ledger_root)
+        ) / "read-state.sqlite3"
         self.scan_used, self.denied, self.cache_hits, self.cache_misses = 0, 0, 0, 0
         self.cache_observed_at = None
         self.budget_used, self.budget_end = None, None

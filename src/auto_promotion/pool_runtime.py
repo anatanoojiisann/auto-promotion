@@ -12,6 +12,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .cloud_control import CloudControl, CloudJobClosed, CloudJournal, CloudUnavailable
+from .config import service_project_directory
 from .execution_channels import (
     activate_local,
     check_standby,
@@ -176,24 +177,35 @@ class PoolScheduler:
                 phone_env = {}
                 if pool.endswith(".phone"):
                     # A broken phone configuration must not hold other platform pools.
-                    phone_env = {k: v for k, v in os.environ.items()
-                                 if k not in {"AP_PHONE_REDDIT_CONFIG", "AP_PHONE_SOCIAL_CONFIG"}}
-                    service = getattr(self.engine.adapters,
-                        "phone_reddit" if pool == "reddit.phone" else "phone_social", None)
+                    phone_env = {
+                        k: v
+                        for k, v in os.environ.items()
+                        if k not in {"AP_PHONE_REDDIT_CONFIG", "AP_PHONE_SOCIAL_CONFIG"}
+                    }
+                    service = getattr(
+                        self.engine.adapters,
+                        "phone_reddit" if pool == "reddit.phone" else "phone_social",
+                        None,
+                    )
                     try:
                         if service is None:
                             raise RuntimeError("Phone worker service unavailable")
-                        phone_env["AP_PHONE_REDDIT_CONFIG" if pool == "reddit.phone" else "AP_PHONE_SOCIAL_CONFIG"] = service.worker_config()
+                        phone_env[
+                            "AP_PHONE_REDDIT_CONFIG"
+                            if pool == "reddit.phone"
+                            else "AP_PHONE_SOCIAL_CONFIG"
+                        ] = service.worker_config()
                     except Exception as exc:
                         for handle in handles:
                             handle.close()
                         self.engine.store.audit_best_effort(
-                            "pool.phone_config_unavailable", {"pool": pool, "error_type": type(exc).__name__}
+                            "pool.phone_config_unavailable",
+                            {"pool": pool, "error_type": type(exc).__name__},
                         )
                         continue
                 child = self.popen(
                     argv,
-                    cwd=Path(__file__).resolve().parents[2],
+                    cwd=service_project_directory(),
                     stdout=handles[0],
                     stderr=handles[1],
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -351,7 +363,11 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
         from .phone_reddit import attach_worker
 
         attach_worker(engine)
-    if pool.endswith(".phone") and pool != "reddit.phone" and not getattr(engine.adapters, "phone_social", None):
+    if (
+        pool.endswith(".phone")
+        and pool != "reddit.phone"
+        and not getattr(engine.adapters, "phone_social", None)
+    ):
         from .phone_social import attach_worker as attach_social_worker
 
         attach_social_worker(engine)
@@ -395,8 +411,10 @@ def run_pool(engine, pool, node_id, *, idle_exit=30, max_jobs=None):
                             (time.time(), owner),
                         )
                     next_heartbeat = time.monotonic() + 10
-                local = primary or independent_active(engine) or (
-                    local_active(engine, cloud) if cloud else False
+                local = (
+                    primary
+                    or independent_active(engine)
+                    or (local_active(engine, cloud) if cloud else False)
                 )
                 channel_state = read_state(engine.store)
                 pending = engine.store.one("SELECT value FROM meta WHERE key='cloud_retry_after'")

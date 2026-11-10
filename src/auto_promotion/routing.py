@@ -60,9 +60,15 @@ def task_route(account, payload, method, registry):
     # Keep explicit phone work in the native pool even when a binding is missing.
     service = getattr(registry, "phone_social", None)
     binding = service.shared_account_binding(account) if service else None
-    return ExecutionRoute(account["platform"], "phone", account["platform"] + ".phone", default.identity,
-                          "phone:" + digest(binding.device_id) if binding else None,
-                          "phone", binding.node_os if binding else "any")
+    return ExecutionRoute(
+        account["platform"],
+        "phone",
+        account["platform"] + ".phone",
+        default.identity,
+        "phone:" + digest(binding.device_id) if binding else None,
+        "phone",
+        binding.node_os if binding else "any",
+    )
 
 
 def route_for(account, payload=None, *, profile=None):
@@ -80,10 +86,21 @@ def route_for(account, payload=None, *, profile=None):
             profile = {}
     if profile.get("connection_type") == "phone_fleet":
         binding = profile.get("phone_fleet", {})
-        if not binding.get("device_id") or binding.get("node_os", "any") not in {"any", "windows", "macos"}:
+        if not binding.get("device_id") or binding.get("node_os", "any") not in {
+            "any",
+            "windows",
+            "macos",
+        }:
             raise BackendError("PhoneFleetBindingInvalid")
-        return ExecutionRoute(platform, "phone", platform + ".phone", identity,
-            "phone:" + digest(binding["device_id"]), "phone", binding.get("node_os", "any"))
+        return ExecutionRoute(
+            platform,
+            "phone",
+            platform + ".phone",
+            identity,
+            "phone:" + digest(binding["device_id"]),
+            "phone",
+            binding.get("node_os", "any"),
+        )
     transport = TRANSPORTS[platform]
     resource = None
     if platform in {"facebook", "instagram", "tiktok"}:

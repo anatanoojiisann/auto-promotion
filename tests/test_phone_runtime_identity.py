@@ -23,6 +23,7 @@ PHONE_RUNTIME_FILES = {
     "phone_social_api.py",
     "phone_software_check.py",
     "phone_telegram.py",
+    "phone_receipt_readback.py",
     "telegram_phone_observer.py",
     "telegram_receipt_budget.py",
 }

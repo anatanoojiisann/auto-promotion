@@ -107,6 +107,24 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         task = self.engine.prepare(task["id"])
         return self.engine.start_task(task["id"])
 
+    async def test_sync_receipt_reader_and_phone_preparation_use_worker_thread(self):
+        import asyncio
+        from unittest.mock import patch
+
+        async def read_id():
+            return {"message_id": "42583"}
+
+        with patch.object(self.engine, "reconcile", side_effect=lambda _: asyncio.run(read_id())):
+            self.assertEqual(
+                (await self.call("verify_task_item", item_id="original"))["message_id"], "42583"
+            )
+        task = self.approved_task()
+        with self.assertRaises(Exception) as rejected:
+            await self.call(
+                "prepare_task", task_id=task["id"], phone_comment_target={"target_id": "wrong"}
+            )
+        self.assertTrue(str(rejected.exception))
+
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
         self.assertEqual(len(tools), 80)

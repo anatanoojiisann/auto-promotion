@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -23,6 +24,38 @@ class BackgroundDesktopTests(unittest.TestCase):
             "payload": {"read_only": True},
         }
 
+    def test_bridge_logging_suppression_ends_with_the_call(self):
+        previous = logging.root.manager.disable
+        output = io.StringIO()
+
+        def dispatched(request):
+            self.assertEqual(logging.root.manager.disable, logging.CRITICAL)
+            return {"verified": True}
+
+        try:
+            logging.disable(logging.WARNING)
+            with (
+                patch("sys.stdin", io.StringIO(json.dumps(self.request))),
+                patch("sys.stdout", output),
+                patch.object(background_desktop, "needs_background_desktop", return_value=False),
+                patch.object(native_bridge, "dispatch", side_effect=dispatched),
+            ):
+                native_bridge.main()
+            self.assertEqual(logging.root.manager.disable, logging.WARNING)
+            self.assertEqual(json.loads(output.getvalue()), {"verified": True})
+        finally:
+            logging.disable(previous)
+
+    def test_invalid_bridge_input_restores_logging(self):
+        previous = logging.root.manager.disable
+        try:
+            logging.disable(logging.NOTSET)
+            with patch("sys.stdin", io.StringIO("{")), self.assertRaises(json.JSONDecodeError):
+                native_bridge.main()
+            self.assertEqual(logging.root.manager.disable, logging.NOTSET)
+        finally:
+            logging.disable(previous)
+
     def test_only_headed_read_only_browser_metrics_use_private_desktop(self):
         with (
             patch.object(background_desktop.sys, "platform", "win32"),
@@ -40,7 +73,11 @@ class BackgroundDesktopTests(unittest.TestCase):
                 self.assertFalse(background_desktop.needs_background_desktop(self.request))
             read_profile.return_value = {"browser_channel": "msedge", "browser_headless": False}
             for operation, read_only in (("execute", True), ("engagement", False)):
-                request = {**self.request, "operation": operation, "payload": {"read_only": read_only}}
+                request = {
+                    **self.request,
+                    "operation": operation,
+                    "payload": {"read_only": read_only},
+                }
                 self.assertFalse(background_desktop.needs_background_desktop(request))
             with patch.dict(os.environ, {background_desktop._CHILD_ENV: "1"}):
                 self.assertFalse(background_desktop.needs_background_desktop(self.request))
@@ -101,7 +138,10 @@ class BackgroundDesktopTests(unittest.TestCase):
                     "payload": {"read_only": True, "external_reference": "invalid"},
                 }
                 output = io.StringIO()
-                with patch("sys.stdin", io.StringIO(json.dumps(request))), patch("sys.stdout", output):
+                with (
+                    patch("sys.stdin", io.StringIO(json.dumps(request))),
+                    patch("sys.stdout", output),
+                ):
                     native_bridge.main()
                 result = json.loads(output.getvalue())
                 self.assertFalse(result["verified"])

@@ -283,19 +283,24 @@ def test_platform_with_ready_prerequisites_continues_while_others_remain_blocked
 
 def test_explicit_start_refreshes_only_stale_account_and_preserves_readonly_checks(lab):
     from auto_promotion.phone_round_readiness import preflight
+
     services(lab)
     service = lab.engine.adapters.phone_social
     stale = {"value": True}
     refreshed = []
     service.fresh = lambda account: account["platform"] != "telegram" or not stale["value"]
+
     def ensure(account_id, **kwargs):
         refreshed.append(account_id)
         stale["value"] = False
+
     service.ensure_identity = ensure
     identifier = create(lab)["id"]
     snapshot = preflight(lab.rounds, identifier)
     assert not refreshed
-    assert next(m for m in snapshot["members"] if m["platform"] == "telegram")["blockers"] == ["FreshPhoneIdentityRequired"]
+    assert next(m for m in snapshot["members"] if m["platform"] == "telegram")["blockers"] == [
+        "FreshPhoneIdentityRequired"
+    ]
     lab.rounds.preflight_check = None
     snapshot = lab.rounds.start(identifier)
     assert len(refreshed) == 1

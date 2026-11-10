@@ -447,10 +447,13 @@ def telegram_blocker(db, task, payload, at):
             "JOIN tasks prior ON prior.id=i.task_id WHERE a.account_id=? AND i.task_id<>? "
             "AND (?='phone' OR json_extract(prior.policy,'$.execution_method')='phone') "
             f"AND a.target_key IN ({hash_slots})",
-            (payload["account_id"], task["id"], policy.get("execution_method"), *keys))
+            (payload["account_id"], task["id"], policy.get("execution_method"), *keys),
+        )
         for prior in recent:
-            if prior["status"] in {"unknown","executing"} or (prior["status"]=="cancelled"
-                    and json.loads(prior["result"]).get("submission_started") is True):
+            if prior["status"] in {"unknown", "executing"} or (
+                prior["status"] == "cancelled"
+                and json.loads(prior["result"]).get("submission_started") is True
+            ):
                 return "PhoneTelegramPriorSubmissionUnresolved"
             if json.loads(prior["payload"]).get("text") == payload.get("text"):
                 from .phone_known_unsent import authorized

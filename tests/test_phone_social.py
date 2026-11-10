@@ -67,6 +67,8 @@ class SyntheticFleet:
                     },
                 },
             )
+        if request.url.path.endswith("/receipt-readback"):
+            return httpx.Response(404, json={"code": "not_found"})
         if request.method == "POST":
             body = json.loads(request.content)
             typed = ExecutionRequest.model_validate(body)
@@ -407,6 +409,18 @@ def test_original_queue_single_permission_and_native_receipt_finish_once(pilot):
     creates = len([r for r in s.fake.requests if r.method == "POST"])
     assert s.service.verify(s.engine.account(s.account["id"]), claim)["verified"]
     assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
+    if s.app in {"instagram", "x"}:
+        field = "reply_id" if s.app == "x" else "comment_id"
+        # A previous sender stored only the verified link. Read its original native receipt once.
+        with s.store.connect(write=True) as db:
+            db.execute(
+                "UPDATE items SET result=json_remove(result,?,'$.publish_id') WHERE id=?",
+                ("$." + field, s.item["id"]),
+            )
+        assert s.engine.reconcile(s.item["id"])[field] == result[field]
+        assert s.engine.reconcile(s.item["id"])[field] == result[field]
+        assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 1
+        assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
 
 
 def test_global_stop_blocks_final_permission_and_retains_unused_grant(pilot):
@@ -725,3 +739,105 @@ def test_phone_start_uses_native_proof_while_unrelated_health_lane_is_busy(pilot
     assert before == s.store.one(
         "SELECT status,health FROM accounts WHERE id=?", (s.account["id"],)
     )
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_explicit_phone_route_uses_only_the_verified_shared_x_account(monkeypatch, tmp_path, bound):
+    from types import SimpleNamespace
+
+    from auto_promotion import routing
+    from auto_promotion.adapters import AdapterRegistry
+
+    registry = AdapterRegistry(tmp_path)
+    monkeypatch.setattr(routing, "route_for", lambda account: SimpleNamespace(transport="edge"))
+    registry.phone_social = SimpleNamespace(
+        shared_account_binding=lambda account: bound,
+        backend=lambda account, operation, payload, job: {
+            "healthy": True,
+            "reason": "verified_phone_binding",
+        },
+    )
+    result = registry.call_phone({"id": "test-x", "platform": "x"}, "health", {})
+    assert result["healthy"] is bound
+    assert result["reason"] == ("verified_phone_binding" if bound else "PhoneFleetPreparationOnly")
+
+
+@pytest.mark.parametrize("pilot", ["x"], indirect=True)
+def test_durable_phone_reply_remains_valid_after_legacy_fifteen_minutes(pilot):
+    s = pilot
+    now = time.time()
+
+    def iso(value):
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+    s.task = s.engine.create_task(
+        TaskInput(
+            name="Durable late phone reply",
+            account_ids=[s.account["id"]],
+            policy={
+                "execution_channel": "local",
+                "execution_method": "phone",
+                "dispatch_policy": "phone_queue_v1",
+                "starts_at": iso(now - 1200),
+                "ends_at": iso(now + 1800),
+                "min_interval": 120,
+                "max_joins": 0,
+            },
+        )
+    )
+    s.engine.set_items(
+        s.task["id"],
+        [
+            ItemInput(
+                account_id=s.account["id"],
+                action="reply",
+                target=URLS["x"],
+                text=TEXT,
+                scheduled_at=iso(now - 960),
+            )
+        ],
+    )
+    s.task = s.engine.task(s.task["id"])
+    s.item = s.task["items"][0]
+    claim, context = claim_original(s)
+    s.fake.authorize = lambda body: s.service.authorize(
+        body, "synthetic-runtime-token-of-sufficient-length"
+    )
+    result = s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    assert result["status"] == "confirmed" and result["reply_id"] == "98765"
+    assert (
+        s.store.one("SELECT count(*) n FROM phone_social_authorizations WHERE used_at IS NOT NULL")[
+            "n"
+        ]
+        == 1
+    )
+
+
+@pytest.mark.parametrize("pilot", ["x"], indirect=True)
+@pytest.mark.parametrize("prior_intent", [False, True])
+def test_local_window_denial_before_any_grant_is_known_unsent(pilot, prior_intent):
+    s = pilot
+    claim, context = claim_original(s)
+    if prior_intent:
+        s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+
+    def expired(_):
+        raise BackendError("ExecutionWindowElapsed")
+
+    s.monkeypatch.setattr("auto_promotion.phone_social.verify_claim", expired)
+    if prior_intent:
+        with pytest.raises(BackendError, match="ExecutionWindowElapsed"):
+            s.service.execute(s.engine.account(s.account["id"]), claim, context)
+        assert len([r for r in s.fake.requests if r.method == "POST"]) == before
+        return
+    result = s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    assert result == {
+        "status": "failed_known",
+        "verified": False,
+        "confirmed_not_submitted": True,
+        "submission_started": False,
+        "reason": "ExecutionWindowElapsed",
+    }
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before
+    assert s.store.one("SELECT count(*) n FROM phone_social_authorizations")["n"] == 0

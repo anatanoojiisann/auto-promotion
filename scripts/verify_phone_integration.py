@@ -26,6 +26,9 @@ AP_TESTS = (
     "tests/test_hf_content_queue.py",
     "tests/test_campaign_api.py",
     "tests/test_phone_social.py",
+    "tests/test_phone_receipt_readback.py",
+    "tests/test_phone_protocol_receipt_gateway.py",
+    "tests/test_telegram_phone_observer.py",
     "tests/test_phone_reddit.py",
     "tests/test_mcp.py",
     "tests/test_phone_protocol_upgrade.py",
@@ -97,6 +100,9 @@ def isolated_environment(work):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phone-source", type=Path, required=True)
+    parser.add_argument(
+        "--phone-commit", help="Exact phone revision supplied by the private repository CI"
+    )
     parser.add_argument("--work-root", type=Path, default=Path(".local/phone-integration"))
     parser.add_argument(
         "--full-legacy", action="store_true", help="Also run all legacy campaign and HF tests"
@@ -107,6 +113,10 @@ def main():
     root = Path(__file__).resolve().parents[1]
     phone = args.phone_source.resolve(strict=True)
     pair = json.loads((root / "docs/integrations/phone-pair.json").read_text())
+    if args.phone_commit:
+        if not re.fullmatch(r"[a-f0-9]{40}", args.phone_commit):
+            parser.error("An exact phone commit SHA is required")
+        pair = {**pair, "commit": args.phone_commit}
     revision = subprocess.check_output(
         ["git", "-C", str(phone), "rev-parse", "HEAD"], text=True
     ).strip()

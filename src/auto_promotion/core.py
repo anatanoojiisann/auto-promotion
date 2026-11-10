@@ -226,6 +226,7 @@ class Engine:
             except BackendError:
                 value["owned_target_id"] = ""
         from .backends.common import social_phone_actions
+
         phone_actions = social_phone_actions(value)
         if phone_actions:
             value["execution_backend"] = "phone"
@@ -336,20 +337,30 @@ class Engine:
     def _execution_method(self, task_id):
         if not task_id:
             return None
-        row = self.store.one("SELECT json_extract(policy,'$.execution_method') AS method FROM tasks WHERE id=?", (task_id,))
+        row = self.store.one(
+            "SELECT json_extract(policy,'$.execution_method') AS method FROM tasks WHERE id=?",
+            (task_id,),
+        )
         return row["method"] if row else None
 
     def call(self, account, operation, payload=None, task_id=None):
         from .target_checks import TargetChecks
 
         account = self.account(account["id"])
-        method = self._execution_method(task_id) if operation in {"health","preflight","execute","join","verify","verify_join"} else None
+        method = (
+            self._execution_method(task_id)
+            if operation in {"health", "preflight", "execute", "join", "verify", "verify_join"}
+            else None
+        )
         route = task_route(account, (payload or {}).get("payload", {}), method, self.adapters)
         with self.lanes.acquire(account["id"], resource=route.resource):
             # Another caller can record a FloodWait/disable while this caller is
             # acquiring its lane. Never authorize a read with a stale account.
             account = self.account(account["id"])
-            if task_route(account, (payload or {}).get("payload", {}), method, self.adapters) != route:
+            if (
+                task_route(account, (payload or {}).get("payload", {}), method, self.adapters)
+                != route
+            ):
                 raise Conflict("账号连接已变化，请重新核验")
             if account["platform"] == "x":
                 from .read_cooldowns import x_read_until
@@ -682,10 +693,11 @@ class Engine:
             }
         if account["disabled"] or account["cooldown_until"] > self.clock():
             return account
-        if not recovery and cached(
-            account, self.clock(), probe_key(account, self.store.path), force=force
-        ) and account["health"].get("execution_method", "inherit") == (
-            self._execution_method(task_id) if task_id else "inherit"
+        if (
+            not recovery
+            and cached(account, self.clock(), probe_key(account, self.store.path), force=force)
+            and account["health"].get("execution_method", "inherit")
+            == (self._execution_method(task_id) if task_id else "inherit")
         ):
             return {**account, "health": {**account["health"], "probe_cached": True}}
         try:
@@ -693,7 +705,9 @@ class Engine:
             route = task_route(account, {}, method, self.adapters)
             with self.lanes.acquire(account_id, resource=route.resource):
                 if task_id:
-                    return self._check_account_locked(account_id, force=force, recovery=recovery, task_id=task_id)
+                    return self._check_account_locked(
+                        account_id, force=force, recovery=recovery, task_id=task_id
+                    )
                 return self._check_account_locked(account_id, force=force, recovery=recovery)
         except AccountBusy:
             current = self.account(account_id)
@@ -726,8 +740,11 @@ class Engine:
         original_key = key
         previous = account["health"]
         method = self._execution_method(task_id) if task_id else "inherit"
-        if (not recovery and cached(account, now, key, force=force)
-                and account["health"].get("execution_method", "inherit") == method):
+        if (
+            not recovery
+            and cached(account, now, key, force=force)
+            and account["health"].get("execution_method", "inherit") == method
+        ):
             return {**account, "health": {**previous, "probe_cached": True}}
         try:
             payload = None
@@ -736,8 +753,11 @@ class Engine:
                     "account_block_recovery_generation": account["outbound_block"]["generation"]
                 }
             result = (
-                self.call(account, "health", payload, task_id=task_id) if task_id else
-                self.call(account, "health", payload) if payload else self.call(account, "health")
+                self.call(account, "health", payload, task_id=task_id)
+                if task_id
+                else self.call(account, "health", payload)
+                if payload
+                else self.call(account, "health")
             )
         except AccountBusy:
             return {**account, "writable": False, "connection_state": "busy"}
@@ -1079,7 +1099,9 @@ class Engine:
         now = self.clock()
         with self.store.connect(write=True) as db:
             if content_claim:
-                batch = db.execute("SELECT * FROM content_queue_batches WHERE id=?", (content_claim[0],)).fetchone()
+                batch = db.execute(
+                    "SELECT * FROM content_queue_batches WHERE id=?", (content_claim[0],)
+                ).fetchone()
                 if not batch or batch["request_hash"] != content_claim[1]:
                     raise Conflict("ContentBatchClaimMismatch")
                 if batch["task_id"]:
@@ -1121,8 +1143,10 @@ class Engine:
                     (task_id, interaction_claim["candidate_id"]),
                 )
             if content_claim:
-                db.execute("UPDATE content_queue_batches SET task_id=? WHERE id=? AND task_id IS NULL",
-                           (task_id, content_claim[0]))
+                db.execute(
+                    "UPDATE content_queue_batches SET task_id=? WHERE id=? AND task_id IS NULL",
+                    (task_id, content_claim[0]),
+                )
             Store.audit(db, "task.created", {"policy_hash": digest(envelope)}, task_id, now)
         return self.task(task_id)
 
@@ -1264,7 +1288,9 @@ class Engine:
                         account_reason = "account_outbound_blocked"
                     elif sender["cooldown_until"] > self.clock():
                         account_reason = "account_cooldown"
-                    elif sender["status"] != "healthy" and not self._phone_account_ready(task["id"], sender):
+                    elif sender["status"] != "healthy" and not self._phone_account_ready(
+                        task["id"], sender
+                    ):
                         account_reason = "account_unhealthy"
                 reason = (
                     account_reason
@@ -1341,26 +1367,44 @@ class Engine:
                 account = self.account(account_id)
                 if account["disabled"]:
                     raise Conflict("AccountDisabled")
-                if account["mode"] == "live" and not task_route(
-                    account, {}, "phone", self.adapters
-                ).resource:
+                if (
+                    account["mode"] == "live"
+                    and not task_route(account, {}, "phone", self.adapters).resource
+                ):
                     raise Conflict("PhoneAccountBindingRequired")
             with self.store.connect(write=True) as db:
-                Store.audit(db, "task.phone_preflight_deferred",
-                            {"reason": "fresh_observation_at_execution"}, task["id"], self.clock())
+                Store.audit(
+                    db,
+                    "task.phone_preflight_deferred",
+                    {"reason": "fresh_observation_at_execution"},
+                    task["id"],
+                    self.clock(),
+                )
             return
         checks = []
         for account_id in task["account_ids"]:
             account = self.account(account_id)
-            phone = getattr(self.adapters,"phone_social",None)
+            phone = getattr(self.adapters, "phone_social", None)
             method = task["policy"].get("execution_method")
-            if method == "phone" and account["mode"] == "live" and not task_route(account, {}, method, self.adapters).resource:
+            if (
+                method == "phone"
+                and account["mode"] == "live"
+                and not task_route(account, {}, method, self.adapters).resource
+            ):
                 raise Conflict("PhoneAccountBindingRequired")
-            if refresh and phone is not None and account_id in phone.config.bindings and (
-                    method == "phone" or route_for(account).transport == "phone"):
-                phone.ensure_identity(account_id,task_id=task["id"])
-            selected_phone = bool(method == "phone" and phone is not None
-                                  and account_id in phone.config.bindings and account["mode"] == "live")
+            if (
+                refresh
+                and phone is not None
+                and account_id in phone.config.bindings
+                and (method == "phone" or route_for(account).transport == "phone")
+            ):
+                phone.ensure_identity(account_id, task_id=task["id"])
+            selected_phone = bool(
+                method == "phone"
+                and phone is not None
+                and account_id in phone.config.bindings
+                and account["mode"] == "live"
+            )
             if selected_phone:
                 # The native proof was refreshed above. A desktop health lane
                 # does not grant or deny a place in the phone queue.
@@ -1368,8 +1412,11 @@ class Engine:
             elif account["mode"] == "live" or account["status"] == "unchecked":
                 # Explicit starts refresh positive observations. Failed probes
                 # retain their bounded backoff; cooldowns never trigger a probe.
-                account = (self.check_account(account_id, force=refresh, task_id=task["id"])
-                           if method == "phone" else self.check_account(account_id, force=refresh))
+                account = (
+                    self.check_account(account_id, force=refresh, task_id=task["id"])
+                    if method == "phone"
+                    else self.check_account(account_id, force=refresh)
+                )
             checks.append(self.account_readiness(task, account))
         with self.store.connect(write=True) as db:
             Store.audit(db, "task.account_check", {"accounts": checks}, task["id"], self.clock())
@@ -1494,11 +1541,15 @@ class Engine:
             reason = submission_blocker(db, task_id, self.clock())
             if reason:
                 raise Conflict(reason)
-            round_start = source == "phone_round" and db.execute(
-                "SELECT 1 FROM sqlite_master WHERE name='phone_round_members'"
-            ).fetchone() and db.execute(
-                "SELECT 1 FROM phone_round_members WHERE task_id=?", (task_id,)
-            ).fetchone()
+            round_start = (
+                source == "phone_round"
+                and db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='phone_round_members'"
+                ).fetchone()
+                and db.execute(
+                    "SELECT 1 FROM phone_round_members WHERE task_id=?", (task_id,)
+                ).fetchone()
+            )
         if task["state"] in {"cancelled", "completed"}:
             raise Conflict("任务已结束")
         if self.clock() >= epoch(task["policy"]["ends_at"]):
@@ -1843,9 +1894,14 @@ class Engine:
         if value.account_id not in task["account_ids"]:
             raise Conflict("账号不在该任务范围内")
         account = account or self.account(value.account_id)
-        if account["mode"] == "live" and account["platform"] != "reddit" and (
-                account.get("execution_backend") == "phone" or task["policy"].get("execution_method") == "phone"):
-
+        if (
+            account["mode"] == "live"
+            and account["platform"] != "reddit"
+            and (
+                account.get("execution_backend") == "phone"
+                or task["policy"].get("execution_method") == "phone"
+            )
+        ):
             from .phone_social import validate_item as validate_phone_item
 
             try:
@@ -1855,7 +1911,10 @@ class Engine:
         if (
             account["mode"] == "live"
             and (
-                (account["platform"] == "reddit" and not automatic_action_allowed(account, value.action, task["policy"]))
+                (
+                    account["platform"] == "reddit"
+                    and not automatic_action_allowed(account, value.action, task["policy"])
+                )
                 or (
                     account["platform"] == "x"
                     and not automatic_action_allowed(account, value.action, task["policy"])
@@ -1914,7 +1973,10 @@ class Engine:
         }:
             raise Conflict("该平台不支持此外发动作")
         policy = task["policy"]
-        if policy.get("dispatch_policy") == "phone_queue_v1" and value.action in {"schedule_message", "schedule_file"}:
+        if policy.get("dispatch_policy") == "phone_queue_v1" and value.action in {
+            "schedule_message",
+            "schedule_file",
+        }:
             raise Conflict("DurableQueueDoesNotChangeNativeSchedules")
         if not epoch(policy["starts_at"]) <= epoch(value.scheduled_at) < epoch(policy["ends_at"]):
             raise Conflict("计划时间超出任务执行窗口")
@@ -2245,13 +2307,22 @@ class Engine:
                 raise Conflict("清单已经冻结；变更内容请创建新任务")
             if row["campaign_id"] and any(not p.get("opportunity_id") for p in payloads):
                 raise Conflict("活动执行项必须关联已分配的共享内容")
-            if not content_claim and db.execute(
-                "SELECT 1 FROM content_queue_batches WHERE task_id=?", (task_id,)
-            ).fetchone():
+            if (
+                not content_claim
+                and db.execute(
+                    "SELECT 1 FROM content_queue_batches WHERE task_id=?", (task_id,)
+                ).fetchone()
+            ):
                 raise Conflict("ContentTaskImmutable")
             if content_claim:
-                batch = db.execute("SELECT * FROM content_queue_batches WHERE id=?", (content_claim[0],)).fetchone()
-                if not batch or batch["request_hash"] != content_claim[1] or batch["task_id"] != task_id:
+                batch = db.execute(
+                    "SELECT * FROM content_queue_batches WHERE id=?", (content_claim[0],)
+                ).fetchone()
+                if (
+                    not batch
+                    or batch["request_hash"] != content_claim[1]
+                    or batch["task_id"] != task_id
+                ):
                     raise Conflict("ContentBatchClaimMismatch")
                 if db.execute("SELECT 1 FROM items WHERE task_id=?", (task_id,)).fetchone():
                     return self.task(task_id)
@@ -2605,7 +2676,10 @@ class Engine:
             if (
                 account["mode"] == "live"
                 and (
-                    (account["platform"] == "reddit" and not automatic_action_allowed(account, payload["action"], policy))
+                    (
+                        account["platform"] == "reddit"
+                        and not automatic_action_allowed(account, payload["action"], policy)
+                    )
                     or (
                         account["platform"] == "x"
                         and not automatic_action_allowed(account, payload["action"], policy)
@@ -2636,7 +2710,9 @@ class Engine:
                     return self._skip(item_id, "delivery_window_elapsed", db)
             if account["disabled"]:
                 return self._skip(item_id, "account_disabled", db)
-            if account["status"] != "healthy" and not self._phone_account_ready(task["id"], account):
+            if account["status"] != "healthy" and not self._phone_account_ready(
+                task["id"], account
+            ):
                 return self._skip(item_id, "account_unhealthy", db)
             from .account_blocks import active_block
 
@@ -2688,9 +2764,7 @@ class Engine:
             if any(r["status"] not in TERMINAL for r in earlier):
                 return self._skip(item_id, "earlier_item_pending", db)
             target_key = digest([account["platform"], payload["target"].casefold()])
-            user_key = digest(
-                [account["platform"], quotas.user_identifier(payload)]
-            )
+            user_key = digest([account["platform"], quotas.user_identifier(payload)])
             day = now - now % 86400
             mode = account["mode"]
             if backend_gate and "daily_remaining" in backend_gate:
@@ -2887,7 +2961,12 @@ class Engine:
             return []
         try:
             account = self.account(rows[0]["account_id"])
-            route = task_route(account, json.loads(rows[0]["payload"]), self._execution_method(rows[0]["task_id"]), self.adapters)
+            route = task_route(
+                account,
+                json.loads(rows[0]["payload"]),
+                self._execution_method(rows[0]["task_id"]),
+                self.adapters,
+            )
             with self.lanes.acquire(rows[0]["account_id"], limits, resource=route.resource):
                 return self._run_account_rows(rows, stopped)["processed"]
         except AccountBusy:
@@ -2995,19 +3074,33 @@ class Engine:
                 continue
             if not manual and account["id"] not in checked:
                 # A fresh read-only health check before a live claim; simulation needs one too.
-                phone = getattr(self.adapters,"phone_social",None)
-                if phone is not None and account["id"] in phone.config.bindings and (
-                        self._execution_method(row["task_id"]) == "phone" or route_for(account).transport == "phone"):
-                    phone.ensure_identity(account["id"],task_id=row["task_id"])
+                phone = getattr(self.adapters, "phone_social", None)
+                if (
+                    phone is not None
+                    and account["id"] in phone.config.bindings
+                    and (
+                        self._execution_method(row["task_id"]) == "phone"
+                        or route_for(account).transport == "phone"
+                    )
+                ):
+                    phone.ensure_identity(account["id"], task_id=row["task_id"])
                 checked[account["id"]] = (
                     self.check_account(account["id"], force=True, task_id=row["task_id"])
                     if self._execution_method(row["task_id"]) == "phone"
-                    else self.check_account(account["id"], force=True))
-            if not manual and checked[account["id"]]["connection_state"] != "healthy" and not self._phone_account_ready(row["task_id"], checked[account["id"]]):
+                    else self.check_account(account["id"], force=True)
+                )
+            if (
+                not manual
+                and checked[account["id"]]["connection_state"] != "healthy"
+                and not self._phone_account_ready(row["task_id"], checked[account["id"]])
+            ):
                 self._skip(row["id"], "account_unhealthy")
                 continue
             account = self.account(row["account_id"])
-            if (account["connection_state"] != "healthy" and not self._phone_account_ready(row["task_id"], account)) or account["cooldown_until"] > self.clock():
+            if (
+                account["connection_state"] != "healthy"
+                and not self._phone_account_ready(row["task_id"], account)
+            ) or account["cooldown_until"] > self.clock():
                 self._skip(
                     row["id"],
                     "account_cooldown"
@@ -3112,7 +3205,10 @@ class Engine:
                 "external_reference",
                 "published_at",
                 "scheduled_message_ids",
+                "reconciliation_source",
+                "original_runtime_status",
                 "publish_id",
+                "reply_id",
                 "post_ids",
                 "comment_id",
                 "native_id",
@@ -3235,6 +3331,10 @@ class Engine:
         row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
         if not row:
             raise NotFound("执行项不存在")
+        if row["status"] == "confirmed" and self._execution_method(row["task_id"]) == "phone":
+            service = getattr(self.adapters, "phone_social", None)
+            if service and self.account(row["account_id"])["platform"] in {"instagram", "x"}:
+                return service.read_confirmed_comment_id(row)
         if row["status"] not in {"unknown", "scheduled"}:
             raise Conflict("只有未知结果或平台排期需要核对")
         payload = {
@@ -3265,6 +3365,7 @@ class Engine:
                     k: result[k]
                     for k in (
                         "publish_id",
+                        "reply_id",
                         "post_ids",
                         "comment_id",
                         "tiktok_receipt_binding",
@@ -4016,9 +4117,9 @@ class Engine:
                     candidate=True,
                 )
                 continue
-            phone = getattr(self.adapters,"phone_social",None)
+            phone = getattr(self.adapters, "phone_social", None)
             if phone is not None and account["id"] in phone.config.bindings:
-                phone.ensure_identity(account["id"],task_id=task_id)
+                phone.ensure_identity(account["id"], task_id=task_id)
             probe = self.check_account(account["id"], force=True)
             if probe["connection_state"] != "healthy":
                 self._skip(candidate["id"], "account_unhealthy", candidate=True)

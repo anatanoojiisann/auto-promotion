@@ -121,6 +121,10 @@ def test_real_wire_models_feed_original_business_result_and_six_state_projection
     result = consume(snapshot, context, kind)
     assert result["verified"] is True
     assert result["native_id"] == case["native_id"]
+    if case["platform"] == "x":
+        assert result["publish_id"] == result["reply_id"] == case["native_id"]
+    if case["platform"] == "instagram":
+        assert result["comment_id"] == case["native_id"]
     assert result["receipt_contract"] == "publication.receipt/2"
     assert (
         publication_status(

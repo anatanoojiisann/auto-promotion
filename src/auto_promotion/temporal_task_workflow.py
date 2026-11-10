@@ -24,32 +24,44 @@ class PromotionTask:
     async def call(self, name, value):
         remaining = max(0.001, self.deadline - workflow.now().timestamp())
         preparation = name == "promotion_task_prepare"
-        return await workflow.execute_activity(name, value,
+        return await workflow.execute_activity(
+            name,
+            value,
             start_to_close_timeout=timedelta(seconds=min(15 if preparation else 5, remaining)),
             schedule_to_close_timeout=timedelta(seconds=min(35 if preparation else 15, remaining)),
-            retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1)))
+            retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1)),
+        )
 
     @workflow.run
     async def run(self, value: dict) -> dict:
         if set(value) != {"task_id", "manifest_hash", "workflow_id", "deadline"}:
             raise ApplicationError("Frozen task correlation required", non_retryable=True)
         if workflow.info().workflow_id != value["workflow_id"]:
-            raise ApplicationError("Workflow identity does not match original registration", non_retryable=True)
+            raise ApplicationError(
+                "Workflow identity does not match original registration", non_retryable=True
+            )
         self.deadline = value["deadline"]
-        self.state.update(task_id=value["task_id"], manifest_hash=value["manifest_hash"],
-                          started_at=workflow.now().timestamp())
+        self.state.update(
+            task_id=value["task_id"],
+            manifest_hash=value["manifest_hash"],
+            started_at=workflow.now().timestamp(),
+        )
         admitted = False
         while workflow.now().timestamp() < self.deadline:
             try:
                 if not admitted:
                     reply = await self.call("promotion_task_admit", value)
                     if not reply.get("admitted"):
-                        self.record("waiting_control", reason=reply.get("waiting_for"), device_held=False)
+                        self.record(
+                            "waiting_control", reason=reply.get("waiting_for"), device_held=False
+                        )
                         await workflow.sleep(1)
                         continue
                     admitted = True
                 current = await self.call("promotion_task_status", value)
-                if current.get("state") == "active" and (current.get("preparation") or {}).get("items"):
+                if current.get("state") == "active" and (current.get("preparation") or {}).get(
+                    "items"
+                ):
                     self.state["preparation"] = await self.call("promotion_task_prepare", value)
             except ActivityError as error:
                 if isinstance(error.cause, ApplicationError) and error.cause.non_retryable:
@@ -63,30 +75,67 @@ class PromotionTask:
                 return self.state
             self.state["items"] = current["items"]
             rows = current["items"]
-            if rows and all(i["status"] == "confirmed" and i.get("external_reference")
-                            and i.get("verified") is True and i.get("native_id") for i in rows):
+            if rows and all(
+                i["status"] == "confirmed"
+                and i.get("external_reference")
+                and i.get("verified") is True
+                and i.get("native_id")
+                for i in rows
+            ):
                 self.record("confirmed", device_held=False)
-                self.state["elapsed_seconds"] = workflow.now().timestamp() - self.state["started_at"]
+                self.state["elapsed_seconds"] = (
+                    workflow.now().timestamp() - self.state["started_at"]
+                )
                 return self.state
             terminal = {"failed_known", "cancelled", "missed"}
-            if rows and all(i["status"] in terminal or (
-                    i["status"] == "confirmed" and i.get("external_reference")
-                    and i.get("verified") is True and i.get("native_id")) for i in rows):
-                self.record("partial" if any(i["status"] == "confirmed" for i in rows) else "failed_known", device_held=False)
+            if rows and all(
+                i["status"] in terminal
+                or (
+                    i["status"] == "confirmed"
+                    and i.get("external_reference")
+                    and i.get("verified") is True
+                    and i.get("native_id")
+                )
+                for i in rows
+            ):
+                self.record(
+                    "partial" if any(i["status"] == "confirmed" for i in rows) else "failed_known",
+                    device_held=False,
+                )
                 return self.state
             if current["state"] in {"paused", "cancelled"}:
                 self.record(current["state"], reason="business_task_stopped", device_held=False)
-                if current["state"] == "paused" and workflow.patched("recoverable-visual-review-pause-v1"):
+                if current["state"] == "paused" and workflow.patched(
+                    "recoverable-visual-review-pause-v1"
+                ):
                     await workflow.sleep(2)
                     continue
                 return self.state
             pending = any(i["status"] == "unknown" for i in rows)
             preparation = self.state.get("preparation") or {}
-            stage = ("waiting_receipt" if pending else "waiting_visual_review" if preparation.get("pending_review")
-                     else "waiting_preparation" if preparation.get("blocked") else "executing")
-            self.record(stage, review_device_held=preparation.get("device_held",False),
-                        device_held=bool(preparation.get("device_held")) or any(i.get("resource_state") in {"fenced", "busy"} for i in rows))
+            stage = (
+                "waiting_receipt"
+                if pending
+                else "waiting_visual_review"
+                if preparation.get("pending_review")
+                else "waiting_preparation"
+                if preparation.get("blocked")
+                else "executing"
+            )
+            self.record(
+                stage,
+                review_device_held=preparation.get("device_held", False),
+                device_held=bool(preparation.get("device_held"))
+                or any(i.get("resource_state") in {"fenced", "busy"} for i in rows),
+            )
             await workflow.sleep(1)
-        self.record("unknown" if any(i.get("submission_started") or i.get("status") == "unknown" for i in self.state.get("items", [])) else "missed",
-                    reason="original_deadline_elapsed")
+        self.record(
+            "unknown"
+            if any(
+                i.get("submission_started") or i.get("status") == "unknown"
+                for i in self.state.get("items", [])
+            )
+            else "missed",
+            reason="original_deadline_elapsed",
+        )
         return self.state

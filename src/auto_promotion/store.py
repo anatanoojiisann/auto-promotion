@@ -13,7 +13,9 @@ from pathlib import Path
 from .content_schema import SCHEMA as CONTENT_SCHEMA
 from .models import canonical
 
-SCHEMA = CONTENT_SCHEMA + """
+SCHEMA = (
+    CONTENT_SCHEMA
+    + """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cloud_sync_records(
  destination TEXT NOT NULL,section TEXT NOT NULL,record_id TEXT NOT NULL,
@@ -257,6 +259,7 @@ CREATE TABLE IF NOT EXISTS task_templates(
  created_at REAL NOT NULL
 );
 """
+)
 
 
 class Store:
@@ -469,14 +472,25 @@ class Store:
             waited = (acquired or ended) - started
             held = ended - acquired if acquired is not None else 0
             if write and (waited >= 0.1 or held >= 0.25):
-                callers = [f for f in traceback.extract_stack(limit=12)
-                           if "auto_promotion" in f.filename and f.name != "connect"]
+                callers = [
+                    f
+                    for f in traceback.extract_stack(limit=12)
+                    if "auto_promotion" in f.filename and f.name != "connect"
+                ]
                 caller = callers[-1] if callers else None
-                logging.getLogger(__name__).warning("database_transaction %s", json.dumps({
-                    "pid": os.getpid(), "wait_seconds": round(waited, 3),
-                    "hold_seconds": round(held, 3), "acquired": acquired is not None,
-                    "operation": caller.name if caller else "unknown",
-                    "module": Path(caller.filename).name if caller else "unknown"}))
+                logging.getLogger(__name__).warning(
+                    "database_transaction %s",
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "wait_seconds": round(waited, 3),
+                            "hold_seconds": round(held, 3),
+                            "acquired": acquired is not None,
+                            "operation": caller.name if caller else "unknown",
+                            "module": Path(caller.filename).name if caller else "unknown",
+                        }
+                    ),
+                )
 
     def rows(self, sql, params=()):
         with self.connect() as db:
