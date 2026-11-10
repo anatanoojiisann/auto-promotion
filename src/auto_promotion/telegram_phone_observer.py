@@ -11,7 +11,6 @@ from .backends.telegram import TelegramBackend
 from .backends.telegram_reads import TelegramReads
 from .telegram_receipt_budget import reserve_receipt_reads, validate_receipt_reads
 
-
 # Platform message dates have one-second resolution and a separate clock.
 TELEGRAM_CLOCK_TOLERANCE = 2.0
 RECEIPT_CREATION_WINDOW = 120.0
@@ -22,7 +21,7 @@ def bound_telegram_receipt(receipt, context, submitted_at):
 
     return bool(receipt and receipt.source == "telegram_api" and submitted_at
                 and receipt.created_at <= submitted_at + RECEIPT_CREATION_WINDOW
-                and receipt_matches(receipt, context, submitted_at - TELEGRAM_CLOCK_TOLERANCE))
+                and receipt_matches(receipt, context, submitted_at))
 
 
 class TelegramObserverConfig(BaseModel):

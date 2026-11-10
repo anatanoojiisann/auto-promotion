@@ -653,7 +653,10 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         request = ExecutionRequest.model_validate_json(row["request"])
         # dispatch on an existing durable record only GETs its original execution.
         snapshot=self.dispatch(request,row["id"],account["id"],row["item_id"])
-        return self.reconcile_protocol_receipt(request,snapshot) or self.outcome(snapshot,request.social)
+        from .phone_receipt_readback import reconcile_x_receipt
+
+        return (self.reconcile_protocol_receipt(request, snapshot)
+                or reconcile_x_receipt(self, request, snapshot) or self.outcome(snapshot, request.social))
 
 
 def attach_worker(engine):

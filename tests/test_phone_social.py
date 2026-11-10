@@ -67,6 +67,8 @@ class SyntheticFleet:
                     },
                 },
             )
+        if request.url.path.endswith("/receipt-readback"):
+            return httpx.Response(404, json={"code": "not_found"})
         if request.method == "POST":
             body = json.loads(request.content)
             typed = ExecutionRequest.model_validate(body)
@@ -738,8 +740,9 @@ def test_phone_start_uses_native_proof_while_unrelated_health_lane_is_busy(pilot
 @pytest.mark.parametrize("bound", [False, True])
 def test_explicit_phone_route_uses_only_the_verified_shared_x_account(monkeypatch, tmp_path, bound):
     from types import SimpleNamespace
-    from auto_promotion.adapters import AdapterRegistry
+
     from auto_promotion import routing
+    from auto_promotion.adapters import AdapterRegistry
 
     registry = AdapterRegistry(tmp_path)
     monkeypatch.setattr(routing, "route_for", lambda account: SimpleNamespace(transport="edge"))
