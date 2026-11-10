@@ -507,7 +507,41 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                     (identifier,account["id"],canonical(baseline),observer_sha256))
                 db.execute("INSERT INTO phone_telegram_receipt_budgets(authorization_id,account_id,observer_sha256,read_identity,window_end,reserved) VALUES(?,?,?,?,?,?)",
                     (identifier,account["id"],observer_sha256,reservation["read_identity"],reservation["window_end"],reservation["reserved"]))
-        return self.outcome(self.dispatch(request, identifier, account["id"], claim["item_id"]), request.social)
+        try:
+            snapshot = self.dispatch(request, identifier, account["id"], claim["item_id"])
+        except BackendError as error:
+            # The capabilities gate runs before any operation intent is recorded
+            # or request is sent. Classify only that proven boundary as unsubmitted.
+            # Once an intent or native use exists, retain the unknown outcome.
+            if error.safe_code != "PhoneFleetDeviceNotReady":
+                raise
+            safe = False
+            with self.store.connect(write=True) as db:
+                row = db.execute(
+                    "SELECT used_at,native_id,execution_id FROM phone_social_authorizations WHERE id=?",
+                    (identifier,),
+                ).fetchone()
+                intent = db.execute(
+                    "SELECT 1 FROM phone_social_operations WHERE item_id=? AND kind='social_submit'",
+                    (claim["item_id"],),
+                ).fetchone()
+                if row and not intent and all(row[key] is None for key in
+                                             ("used_at", "native_id", "execution_id")):
+                    now = time.time()
+                    db.execute(
+                        "UPDATE phone_social_authorizations SET expires_at=MIN(expires_at,?) WHERE id=?",
+                        (now, identifier),
+                    )
+                    Store.audit(db, "phone_social.dispatch_not_started",
+                                {"item_id": claim["item_id"], "reason": error.safe_code},
+                                task["id"], now)
+                    safe = True
+            if not safe:
+                raise
+            return {"status": "failed_known", "verified": False,
+                    "confirmed_not_submitted": True, "submission_started": False,
+                    "reason": error.safe_code}
+        return self.outcome(snapshot, request.social)
 
     def authorize(self, body, bearer):
         if not hmac.compare_digest(bearer, self.config.runtime_token.get_secret_value()):
