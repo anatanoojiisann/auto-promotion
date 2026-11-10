@@ -107,10 +107,36 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         task = self.engine.prepare(task["id"])
         return self.engine.start_task(task["id"])
 
+    async def test_sync_receipt_reader_and_phone_preparation_use_worker_thread(self):
+        import asyncio
+        from unittest.mock import patch
+
+        async def read_id():
+            return {"message_id": "42583"}
+
+        with patch.object(self.engine, "reconcile", side_effect=lambda _: asyncio.run(read_id())):
+            self.assertEqual(
+                (await self.call("verify_task_item", item_id="original"))["message_id"], "42583"
+            )
+        task = self.approved_task()
+        with self.assertRaises(Exception) as rejected:
+            await self.call(
+                "prepare_task", task_id=task["id"], phone_comment_target={"target_id": "wrong"}
+            )
+        self.assertTrue(str(rejected.exception))
+
     async def test_catalog_and_accounts_cover_all_six_platforms(self):
         tools = {t.name: t for t in await self.server.list_tools()}
-        self.assertEqual(len(tools), 78)
-        self.assertTrue({"acknowledge_unrelated_x_history", "authorize_deleted_x_reply_replacement", "continue_unsubmitted_x_reply_replacement"} <= tools.keys())
+        self.assertEqual(len(tools), 80)
+        self.assertTrue({"produce_interaction_content", "get_content_production"} <= tools.keys())
+        self.assertTrue(
+            {
+                "acknowledge_unrelated_x_history",
+                "authorize_deleted_x_reply_replacement",
+                "continue_unsubmitted_x_reply_replacement",
+            }
+            <= tools.keys()
+        )
         # Main8a003dd adds these two local read-only tools to the prior70.
         for name in ("engagement_statistics", "engagement_history"):
             self.assertIn(name, tools)
@@ -328,8 +354,18 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     initialized = await client.initialize()
                     self.assertEqual(initialized.serverInfo.name, "Auto Promotion")
                     tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-                    self.assertEqual(len(tools), 78)
-                    self.assertTrue({"acknowledge_unrelated_x_history", "authorize_deleted_x_reply_replacement", "continue_unsubmitted_x_reply_replacement"} <= tools.keys())
+                    self.assertEqual(len(tools), 80)
+                    self.assertTrue(
+                        {"produce_interaction_content", "get_content_production"} <= tools.keys()
+                    )
+                    self.assertTrue(
+                        {
+                            "acknowledge_unrelated_x_history",
+                            "authorize_deleted_x_reply_replacement",
+                            "continue_unsubmitted_x_reply_replacement",
+                        }
+                        <= tools.keys()
+                    )
                     for name in ("engagement_statistics", "engagement_history"):
                         self.assertIn(name, tools)
                         self.assertTrue(tools[name].annotations.readOnlyHint)

@@ -66,7 +66,9 @@ def _self_unknown_proof(db, item, now):
         or jobs[0]["state"] != "unknown"
         or jobs[0]["owner"] is not None
         or jobs[0]["lease_until"] > now
-        or db.execute("SELECT 1 FROM cloud_receipt_outbox WHERE job_id=?", (jobs[0]["id"],)).fetchone()
+        or db.execute(
+            "SELECT 1 FROM cloud_receipt_outbox WHERE job_id=?", (jobs[0]["id"],)
+        ).fetchone()
     ):
         raise ValueError("XHistoryAcknowledgementSelfUnknownUnsafe")
     return {
@@ -148,9 +150,17 @@ def _scope(db, task_id, account_id, now, *, creating=False, self_unknown_ids=())
             if (
                 (old["task_id"] == task_id and not self_unknown)
                 or digest(payload) != old["payload_hash"]
-                or (not self_unknown and old["task_state"] not in {"paused", "cancelled", "completed"})
+                or (
+                    not self_unknown
+                    and old["task_state"] not in {"paused", "cancelled", "completed"}
+                )
                 or old["task_created"] > task["created_at"]
-                or (action == "reply" and (not source or (not self_unknown and source in {t["event"] for t in targets})))
+                or (
+                    action == "reply"
+                    and (
+                        not source or (not self_unknown and source in {t["event"] for t in targets})
+                    )
+                )
                 or action not in {"reply", "post"}
             ):
                 raise ValueError("XHistoryAcknowledgementHistoryUnsafe")
@@ -196,20 +206,39 @@ def record_self_unknown_exclusion(engine, task_id, account_id, item_id, *, sourc
             raise ValueError("XHistoryAcknowledgementRequired")
         prior = json.loads(saved[0])
         if prior.get("version") == 2:
-            if {p["item_id"] for p in prior.get("self_unknowns", [])} == {item_id} and allowed_unknown_ids(db, task_id, account_id, now) is not None:
-                return {"task_id": task_id, "account_id": account_id, "item_id": item_id, "unchanged": True}
+            if {p["item_id"] for p in prior.get("self_unknowns", [])} == {
+                item_id
+            } and allowed_unknown_ids(db, task_id, account_id, now) is not None:
+                return {
+                    "task_id": task_id,
+                    "account_id": account_id,
+                    "item_id": item_id,
+                    "unchanged": True,
+                }
             raise ValueError("XHistoryAcknowledgementChanged")
-        if prior.get("version") != 1 or not isinstance(prior.get("source"), str) or not prior["source"].strip():
+        if (
+            prior.get("version") != 1
+            or not isinstance(prior.get("source"), str)
+            or not prior["source"].strip()
+        ):
             raise ValueError("XHistoryAcknowledgementChanged")
         current = _scope(db, task_id, account_id, now, self_unknown_ids={item_id})
-        for field in ("task_id", "account_id", "identity_hash", "manifest_hash", "until", "targets"):
+        for field in (
+            "task_id",
+            "account_id",
+            "identity_hash",
+            "manifest_hash",
+            "until",
+            "targets",
+        ):
             if prior.get(field) != current[field]:
                 raise ValueError("XHistoryAcknowledgementChanged")
         previous_history = {p["item_id"]: p for p in prior["history"]}
         new_history = [p for p in current["history"] if p["item_id"] == item_id]
         if len(new_history) != 1 or any(
             previous_history.get(p["item_id"]) != p
-            for p in current["history"] if p["item_id"] != item_id
+            for p in current["history"]
+            if p["item_id"] != item_id
         ):
             raise ValueError("XHistoryAcknowledgementChanged")
         value = {
@@ -221,15 +250,21 @@ def record_self_unknown_exclusion(engine, task_id, account_id, item_id, *, sourc
             "prior_acknowledged_at": prior.get("acknowledged_at"),
         }
         db.execute("UPDATE meta SET value=? WHERE key=?", (canonical(value), key))
-        Store.audit(db, "x.self_unknown_excluded", {
-            "account_id": account_id,
-            "item_id": item_id,
-            "manifest_hash": current["manifest_hash"],
-            "attempt_id": current["self_unknowns"][0]["attempt_id"],
-            "source": source.strip(),
-            "old_outcomes_changed": False,
-            "old_targets_retry_allowed": False,
-        }, task_id, now)
+        Store.audit(
+            db,
+            "x.self_unknown_excluded",
+            {
+                "account_id": account_id,
+                "item_id": item_id,
+                "manifest_hash": current["manifest_hash"],
+                "attempt_id": current["self_unknowns"][0]["attempt_id"],
+                "source": source.strip(),
+                "old_outcomes_changed": False,
+                "old_targets_retry_allowed": False,
+            },
+            task_id,
+            now,
+        )
     return {"task_id": task_id, "account_id": account_id, "item_id": item_id, "unchanged": False}
 
 
@@ -289,8 +324,9 @@ def allowed_unknown_ids(db, task_id, account_id, now):
     try:
         value = json.loads(saved[0])
         self_unknowns = value.get("self_unknowns", []) if value.get("version") == 2 else []
-        current = _scope(db, task_id, account_id, now,
-                         self_unknown_ids={p["item_id"] for p in self_unknowns})
+        current = _scope(
+            db, task_id, account_id, now, self_unknown_ids={p["item_id"] for p in self_unknowns}
+        )
         if not isinstance(value.get("source"), str) or not value["source"].strip():
             return None
         for key in (

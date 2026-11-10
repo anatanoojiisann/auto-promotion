@@ -14,3 +14,21 @@ CREATE TABLE IF NOT EXISTS content_queue_members(
  UNIQUE(batch_id,position)
 );
 """
+
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS content_producer_links(
+ source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision TEXT NOT NULL,
+ content_id TEXT NOT NULL REFERENCES content_queue_entries(id),
+ PRIMARY KEY(source_kind,source_id,source_revision)
+);
+CREATE TABLE IF NOT EXISTS content_production_runs(
+ id TEXT PRIMARY KEY,request_hash TEXT NOT NULL,request TEXT NOT NULL,
+ profile_snapshot TEXT NOT NULL,created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS content_production_items(
+ run_id TEXT NOT NULL REFERENCES content_production_runs(id),position INTEGER NOT NULL,
+ source_id TEXT NOT NULL,source_snapshot TEXT NOT NULL,state TEXT NOT NULL,
+ owner TEXT,lease_until REAL NOT NULL DEFAULT 0,content_id TEXT REFERENCES content_queue_entries(id),reason TEXT,
+ PRIMARY KEY(run_id,position)
+);
+"""

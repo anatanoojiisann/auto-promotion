@@ -42,8 +42,10 @@ async def _check(root):
         Store(root / "ap.db"), AdapterRegistry(root), clock=time.time, live_enabled=False
     )
     tasks = []
+
     def iso(value):
         return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
     for platform in PLATFORMS:
         account = engine.add_account(
             AccountInput(

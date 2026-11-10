@@ -197,15 +197,30 @@ class PhonePreparations:
 
         row = self.view(job_id)
         from .phone_protocol import is_legacy, legacy_result, require_capabilities
+
         if is_legacy(row["request"]):
             from urllib.parse import quote, urlencode
-            path = "/executions/" + quote(row["execution_id"], safe="") if row["execution_id"] else "/executions/lookup?" + urlencode({
-                k: row["request"][k] for k in ("business_task_id", "task_item_id", "operation")})
-            result = legacy_result(await self.client.request("GET", path), row["request"], row["execution_id"])
+
+            path = (
+                "/executions/" + quote(row["execution_id"], safe="")
+                if row["execution_id"]
+                else "/executions/lookup?"
+                + urlencode(
+                    {
+                        k: row["request"][k]
+                        for k in ("business_task_id", "task_item_id", "operation")
+                    }
+                )
+            )
+            result = legacy_result(
+                await self.client.request("GET", path), row["request"], row["execution_id"]
+            )
             return {**row, "result": result, "legacy_read_only": True}
         request = ExecutionRequest.model_validate(row["request"])
         if row["dispatch"] == "ready":
-            require_capabilities(await self.client.request("GET", "/capabilities"), request.operation)
+            require_capabilities(
+                await self.client.request("GET", "/capabilities"), request.operation
+            )
             with self.store.connect(write=True) as db:
                 self.validate(db, request.business_task_id, request.task_item_id)
                 changed = db.execute(

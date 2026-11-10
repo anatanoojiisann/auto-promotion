@@ -94,7 +94,9 @@ class FrozenXResumeTests(unittest.TestCase):
     def test_manifest_tamper_still_rejected(self):
         task = self.paused_task()
         with self.store.connect(write=True) as db:
-            db.execute("UPDATE items SET payload_hash='tampered' WHERE id=?", (task["items"][0]["id"],))
+            db.execute(
+                "UPDATE items SET payload_hash='tampered' WHERE id=?", (task["items"][0]["id"],)
+            )
         self.advance_past_first()
         with self.assertRaises(Conflict):
             self.engine.start_task(task["id"])

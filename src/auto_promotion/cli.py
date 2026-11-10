@@ -29,9 +29,21 @@ def main():
     serve = sub.add_parser("serve")
     serve.add_argument("--port", type=int, default=8780)
     serve.add_argument("--no-worker", action="store_true")
-    serve.add_argument("--phone-social-config", type=Path, help="Path to the protected phone social account bindings")
-    serve.add_argument("--phone-reddit-config", type=Path, help="Path to the protected Reddit phone account bindings")
-    serve.add_argument("--phone-rounds", action="store_true", help="Enable timed rounds for selected phone platforms on the existing pooled sender")
+    serve.add_argument(
+        "--phone-social-config",
+        type=Path,
+        help="Path to the protected phone social account bindings",
+    )
+    serve.add_argument(
+        "--phone-reddit-config",
+        type=Path,
+        help="Path to the protected Reddit phone account bindings",
+    )
+    serve.add_argument(
+        "--phone-rounds",
+        action="store_true",
+        help="Enable timed rounds for selected phone platforms on the existing pooled sender",
+    )
     serve.add_argument(
         "--execution-mode",
         choices=("legacy", "pooled"),

@@ -227,6 +227,11 @@ async function cleanup() {
     await page.screenshot({ path: path.join(output, "detail-desktop.png") });
   await page.getByRole("button", { name: "关闭详情", exact: true }).click();
   assert.equal(page.url(), beforeDetail);
+  // A cached app/session response must not start routing before deferred modules.
+  await page.route("**/assets/effects.js", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await route.continue();
+  });
   await page.reload();
   await ready();
   assert.equal(await page.locator("#effects-range").inputValue(), "all");

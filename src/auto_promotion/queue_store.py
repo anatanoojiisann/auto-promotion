@@ -36,7 +36,6 @@ def bind_connection(db):
     db.create_function("ap_pool_owner", 0, lambda: getattr(_CURRENT_JOB, "owner", None))
 
 
-
 QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS channel_authorization_requests(
  account_id TEXT PRIMARY KEY,id TEXT NOT NULL UNIQUE,identity_key TEXT NOT NULL UNIQUE,
@@ -216,7 +215,9 @@ class JobQueue:
                 for row in rows:
                     payload = json.loads(row["payload"])
                     account = self.engine.account(row["account_id"])
-                    route = task_route(account, payload, policy.get("execution_method"), self.engine.adapters)
+                    route = task_route(
+                        account, payload, policy.get("execution_method"), self.engine.adapters
+                    )
                     native = payload["action"] in {"schedule_message", "schedule_file"}
                     due = epoch(policy["starts_at"]) if native else row["due_at"]
                     expires = item_deadline(policy, row["due_at"], payload["action"])
@@ -236,7 +237,9 @@ class JobQueue:
                         row["id"],
                         task,
                         account,
-                        task_route(account, {}, policy.get("execution_method"), self.engine.adapters),
+                        task_route(
+                            account, {}, policy.get("execution_method"), self.engine.adapters
+                        ),
                         digest(json.loads(row["payload"])),
                         epoch(policy["starts_at"]),
                         epoch(policy["ends_at"]),
@@ -275,16 +278,22 @@ class JobQueue:
         from .execution_waits import refresh_control_waits
 
         now = self.clock()
-        if self.store.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_round_members'"):
-            cutoff_sql = ("SELECT j.id,r.submit_deadline FROM execution_jobs j "
-                          "JOIN phone_round_members m ON m.task_id=j.task_id "
-                          "JOIN phone_rounds r ON r.id=m.round_id WHERE j.kind='send' "
-                          "AND j.state='pending' AND r.submit_deadline<j.expires_at")
+        if self.store.one(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='phone_round_members'"
+        ):
+            cutoff_sql = (
+                "SELECT j.id,r.submit_deadline FROM execution_jobs j "
+                "JOIN phone_round_members m ON m.task_id=j.task_id "
+                "JOIN phone_rounds r ON r.id=m.round_id WHERE j.kind='send' "
+                "AND j.state='pending' AND r.submit_deadline<j.expires_at"
+            )
             if self.store.one(cutoff_sql + " LIMIT 1"):
                 with self.store.connect(write=True) as db:
                     for row in db.execute(cutoff_sql).fetchall():
-                        db.execute("UPDATE execution_jobs SET expires_at=? WHERE id=? AND state='pending' AND expires_at>?",
-                                   (row["submit_deadline"], row["id"], row["submit_deadline"]))
+                        db.execute(
+                            "UPDATE execution_jobs SET expires_at=? WHERE id=? AND state='pending' AND expires_at>?",
+                            (row["submit_deadline"], row["id"], row["submit_deadline"]),
+                        )
         refresh_control_waits(self)
         terminal = ",".join("?" for _ in WRITE_TERMINAL)
         query = (
@@ -376,8 +385,9 @@ class JobQueue:
         from .local_primary import uncertain_duplicate
 
         payload = json.loads(item["payload"])
-        return (uncertain_duplicate(db, account, payload, job["reference_id"])
-                or intent_blocker(db, account, task, payload, job["reference_id"]))
+        return uncertain_duplicate(db, account, payload, job["reference_id"]) or intent_blocker(
+            db, account, task, payload, job["reference_id"]
+        )
 
     def _wait_for_intent(self, db, job, blocked, now):
         previous = json.loads(job["result"])
@@ -438,19 +448,19 @@ class JobQueue:
                 "AND a.disabled=0 AND a.cooldown_until<=? AND a.next_at<=? "
                 "AND NOT EXISTS(SELECT 1 FROM account_blocks b WHERE b.account_id=a.id "
                 "AND b.state='active' AND (b.until_at IS NULL OR b.until_at>?)) "
-                "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' "
+                "AND NOT EXISTS(SELECT 1 FROM execution_jobs busy WHERE busy.state='leased' AND busy.kind IN ('send','join') "
                 "AND busy.lease_until>? AND (busy.account_id=j.account_id OR "
-                "(json_extract(j.route,'$.identity') IS NOT NULL AND json_extract(busy.route,'$.identity')=json_extract(j.route,'$.identity')))) "
+                "(json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.identity') IS NOT NULL AND json_extract(CASE WHEN busy.kind IN ('send','join') THEN busy.route ELSE '{}' END,'$.identity')=json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.identity')))) "
                 "AND NOT EXISTS(SELECT 1 FROM account_lanes lane "
                 "WHERE lane.account_id=j.account_id AND lane.expires_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM channel_authorization_requests auth "
-                "WHERE auth.identity_key=json_extract(j.route,'$.identity') "
+                "WHERE auth.identity_key=json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.identity') "
                 "AND auth.state IN ('leased','pending') AND auth.until_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM temporal_task_links tl WHERE tl.task_id=j.task_id AND tl.state<>'enabled') "
                 "AND NOT EXISTS(SELECT 1 FROM phone_visual_preparations p WHERE p.item_id=j.reference_id AND "
                 "(p.phase<>'ready' OR p.expires_at IS NULL OR p.expires_at<=?)) "
                 "AND j.expires_at>? AND (j.kind<>'send' OR t.phase='ready') "
-                "AND NOT EXISTS(SELECT 1 FROM execution_resources r WHERE r.resource=json_extract(j.route,'$.resource') AND r.expires_at>?) "
+                "AND NOT EXISTS(SELECT 1 FROM execution_resources r WHERE r.resource=json_extract(CASE WHEN j.kind IN ('send','join') THEN j.route ELSE '{}' END,'$.resource') AND r.expires_at>?) "
                 "AND NOT EXISTS(SELECT 1 FROM account_task_channels ch LEFT JOIN tasks holder ON holder.id=ch.task_id "
                 "WHERE ch.account_id=j.account_id AND ch.until_at>? AND (ch.retry_at>? OR (ch.state='handoff' AND ch.task_id<>j.task_id "
                 "AND holder.state='active' AND unixepoch(json_extract(holder.policy,'$.ends_at'))>?)))"
@@ -467,7 +477,9 @@ class JobQueue:
             if primary:
                 permitted = eligible(db)
                 sql += " AND j.account_id IN (" + (",".join("?" for _ in permitted) or "NULL") + ")"
-                sql += " AND COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')<>'cloud'"
+                sql += (
+                    " AND COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')<>'cloud'"
+                )
                 params.extend(permitted)
             if accounts is not None:
                 sql += " AND (COALESCE(json_extract(t.policy,'$.execution_channel'),'inherit')<>'inherit' "
@@ -495,6 +507,7 @@ class JobQueue:
 
                 if primary:
                     from .channel_decisions import saved
+
                     decision = saved(db, row["task_id"])
                     if decision and decision.get("resolved", {}).get(row["account_id"]) == "cloud":
                         continue
@@ -506,11 +519,25 @@ class JobQueue:
                 prior_expired = False
                 if primary and channel:
                     from .local_primary import valid
+
                     grant = valid(db, row["account_id"])
-                    old = db.execute("SELECT generation,until_at FROM account_task_channels WHERE account_id=?", (row["account_id"],)).fetchone()
-                    prior_expired = bool(grant and old and old["until_at"] <= now and grant.get("prior_generation") == old["generation"])
-                if channel and not prior_expired and (
-                    channel["retry_at"] > now or handoff_blocks(db, channel, row["task_id"], now)
+                    old = db.execute(
+                        "SELECT generation,until_at FROM account_task_channels WHERE account_id=?",
+                        (row["account_id"],),
+                    ).fetchone()
+                    prior_expired = bool(
+                        grant
+                        and old
+                        and old["until_at"] <= now
+                        and grant.get("prior_generation") == old["generation"]
+                    )
+                if (
+                    channel
+                    and not prior_expired
+                    and (
+                        channel["retry_at"] > now
+                        or handoff_blocks(db, channel, row["task_id"], now)
+                    )
                 ):
                     continue
                 source = self._source(db, row)
@@ -549,7 +576,7 @@ class JobQueue:
                 if (
                     resource
                     and db.execute(
-                        "SELECT 1 FROM execution_jobs WHERE state='leased' AND lease_until>? AND json_extract(route,'$.resource')=?",
+                        "SELECT 1 FROM execution_jobs WHERE state='leased' AND kind IN ('send','join') AND lease_until>? AND json_extract(CASE WHEN kind IN ('send','join') THEN route ELSE '{}' END,'$.resource')=?",
                         (now, resource),
                     ).fetchone()
                 ):
@@ -707,16 +734,31 @@ class JobQueue:
                     item = db.execute(
                         "SELECT payload FROM items WHERE id=?", (job["reference_id"],)
                     ).fetchone()
-                    full_item = db.execute("SELECT * FROM items WHERE id=?", (job["reference_id"],)).fetchone()
+                    full_item = db.execute(
+                        "SELECT * FROM items WHERE id=?", (job["reference_id"],)
+                    ).fetchone()
                     skipped = json.loads(full_item["result"] or "{}").get("skip_reason")
                     if skipped in {"activity_limit", "delivery_limit"}:
                         from .quotas import check_claim
-                        task = dict(db.execute("SELECT * FROM tasks WHERE id=?", (job["task_id"],)).fetchone())
+
+                        task = dict(
+                            db.execute(
+                                "SELECT * FROM tasks WHERE id=?", (job["task_id"],)
+                            ).fetchone()
+                        )
                         detail = {}
-                        reason = check_claim(db, dict(account), task, json.loads(full_item["payload"]),
-                                             full_item["due_at"], now, full_item["id"], details=detail)
+                        reason = check_claim(
+                            db,
+                            dict(account),
+                            task,
+                            json.loads(full_item["payload"]),
+                            full_item["due_at"],
+                            now,
+                            full_item["id"],
+                            details=detail,
+                        )
                         if reason and detail.get("retry_at", 0) > now:
-                            quota_wait = {"reason":reason, **detail}
+                            quota_wait = {"reason": reason, **detail}
                             delay = max(delay, detail["retry_at"])
                     deferred = TargetChecks(
                         self.engine,
@@ -785,7 +827,9 @@ class JobQueue:
                 "json_extract(result,'$.control_wait.first_failed_at') first_failed_at,"
                 "json_extract(result,'$.control_wait.retry_at') retry_at "
                 "FROM execution_jobs WHERE state='pending' AND json_type(result,'$.control_wait')='object'"
-                + (" AND task_id=?" if task_id else ""), (task_id,) if task_id else ()),
+                + (" AND task_id=?" if task_id else ""),
+                (task_id,) if task_id else (),
+            ),
             "account_channels": self.store.rows(
                 "SELECT account_id,channel,state,until_at,task_id,error,retry_at FROM account_task_channels"
             ),
@@ -847,6 +891,8 @@ def verify_job_claim(db, request):
         or row["account_id"] != request["account_id"]
     ):
         raise ValueError("PersistentJobClaimExpired")
-    task = db.execute("SELECT json_extract(policy,'$.execution_method') FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+    task = db.execute(
+        "SELECT json_extract(policy,'$.execution_method') FROM tasks WHERE id=?", (row["task_id"],)
+    ).fetchone()
     if task and task[0] == "phone" and row["pool"] != request.get("platform", "") + ".phone":
         raise ValueError("PhoneOriginalPoolClaimRequired")

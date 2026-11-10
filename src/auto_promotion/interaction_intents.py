@@ -557,6 +557,10 @@ def candidate_guard(db, item_id, now):
     from .interaction_models import InteractionConfig
 
     model = InteractionConfig.model_validate_json(row["config"])
+    if model.content_queue_only:
+        # Production ownership is provenance, not execution authorization.
+        # The frozen content task owns its sender, timing and submit checks.
+        return None
     config = model.model_dump()
     if not config["enabled"] or config["run_mode"] != "live":
         return "strategy_paused_or_dry_run"

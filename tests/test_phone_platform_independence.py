@@ -71,10 +71,16 @@ def test_aliases_share_unknown_history_and_delivery_limits_on_the_original_accou
         assert (
             telegram_blocker(db, task, payload, 10000) == "PhoneTelegramPriorSubmissionUnresolved"
         )
-        assert quotas.check_claim(db, acct, task, payload, 10000, 10000, "other-item") == "activity_limit"
+        assert (
+            quotas.check_claim(db, acct, task, payload, 10000, 10000, "other-item")
+            == "activity_limit"
+        )
         # When the historical attempt was made earlier, its delivery reservation still counts.
         db.execute("UPDATE attempts SET started_at=started_at-90000 WHERE item_id='item-telegram'")
-        assert quotas.check_claim(db, acct, task, payload, 10000, 10000, "other-item") == "delivery_limit"
+        assert (
+            quotas.check_claim(db, acct, task, payload, 10000, 10000, "other-item")
+            == "delivery_limit"
+        )
         payload["target"] = "https://t.me/different_group"
         assert telegram_blocker(db, task, payload, 10000) is None
         assert quotas.check_claim(db, acct, task, payload, 10000, 10000, "other-item") is None

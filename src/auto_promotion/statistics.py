@@ -481,15 +481,20 @@ class Statistics:
                 ]
                 for kind, window_start, cutoff in sorted(windows, key=lambda w: (w[2], w[0])):
                     if since < cutoff <= end:
-                        changed += self._save_report(db, kind, window_start, cutoff, now, pending=pending)
+                        changed += self._save_report(
+                            db, kind, window_start, cutoff, now, pending=pending
+                        )
                 day += timedelta(days=1)
             original_state = tuple(state) if state else None
         with self.store.connect(write=True) as db:
             current = db.execute("SELECT * FROM reporting_state WHERE id=1").fetchone()
             if (tuple(current) if current else None) != original_state:
-                return {"updated_reports": 0, "concurrent_update": True,
-                        "checked_through": current["last_tick"] if current else 0,
-                        "catch_up_pending": not current or current["last_tick"] < now}
+                return {
+                    "updated_reports": 0,
+                    "concurrent_update": True,
+                    "checked_through": current["last_tick"] if current else 0,
+                    "catch_up_pending": not current or current["last_tick"] < now,
+                }
             for values in pending:
                 self._write_report(db, values)
             db.execute(

@@ -67,17 +67,25 @@ def _member_blockers(engine, member, now, service, remote, *, refresh_identity=F
             reasons.append("PhoneFleetSubmissionUnsupported")
         if not service.config.submit_enabled:
             reasons.append("PhoneSubmissionDisabled")
-        authorized = (service.task_authorized(task["id"], account["id"])
-                      if hasattr(service, "task_authorized") else task["id"] in service.config.authorized_task_ids)
+        authorized = (
+            service.task_authorized(task["id"], account["id"])
+            if hasattr(service, "task_authorized")
+            else task["id"] in service.config.authorized_task_ids
+        )
         if not authorized:
             reasons.append("PhoneTaskOutsideAuthorizedScope")
         try:
-            if (refresh_identity and not reasons and not service.fresh(account)
-                    and callable(getattr(service, "ensure_identity", None))):
+            if (
+                refresh_identity
+                and not reasons
+                and not service.fresh(account)
+                and callable(getattr(service, "ensure_identity", None))
+            ):
                 from .execution_timing import stage
+
                 with stage(engine, task["id"], "phone_identity_refresh", account_id=account["id"]):
                     service.ensure_identity(account["id"], task_id=task["id"])
-            if (refresh_identity and not reasons and account["status"] != "healthy"):
+            if refresh_identity and not reasons and account["status"] != "healthy":
                 account = engine.check_account(account["id"], force=True, task_id=task["id"])
                 if account["status"] != "healthy":
                     reasons.append("AccountNotHealthy")
@@ -179,8 +187,11 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None, refresh_iden
                 elif common:
                     reasons = []
                 else:
-                    reasons = (member_reasons if member_reasons is not None else
-                               _member_blockers(engine, member, rounds.clock(), service, remote))
+                    reasons = (
+                        member_reasons
+                        if member_reasons is not None
+                        else _member_blockers(engine, member, rounds.clock(), service, remote)
+                    )
             except Exception:
                 reasons = ["PhoneMemberReadinessUnavailable"]
             value = {
@@ -218,11 +229,16 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None, refresh_iden
             pool.submit(_fleet_capabilities, service): key for key, service in sources.items()
         }
         fleet_deadline = time.monotonic() + FLEET_CHECK_SECONDS
-        deadline = time.monotonic() + (PREFLIGHT_SECONDS - 1 if refresh_identity else FLEET_CHECK_SECONDS)
+        deadline = time.monotonic() + (
+            PREFLIGHT_SECONDS - 1 if refresh_identity else FLEET_CHECK_SECONDS
+        )
         pending = set(futures)
         while pending:
-            until = min(deadline, fleet_deadline) if any(
-                not isinstance(futures[f], dict) for f in pending) else deadline
+            until = (
+                min(deadline, fleet_deadline)
+                if any(not isinstance(futures[f], dict) for f in pending)
+                else deadline
+            )
             done, pending = wait(
                 pending, timeout=max(0, until - time.monotonic()), return_when=FIRST_COMPLETED
             )
@@ -239,9 +255,15 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None, refresh_iden
                 remote = future.result()
                 if refresh_identity:
                     for member in selected:
-                        job = pool.submit(_member_blockers, engine, member, rounds.clock(),
-                                          platform_services[member["platform"]], remote,
-                                          refresh_identity=True)
+                        job = pool.submit(
+                            _member_blockers,
+                            engine,
+                            member,
+                            rounds.clock(),
+                            platform_services[member["platform"]],
+                            remote,
+                            refresh_identity=True,
+                        )
                         futures[job] = member
                         pending.add(job)
                 else:
@@ -253,17 +275,24 @@ def preflight(rounds, round_id, *, platforms=None, on_members=None, refresh_iden
                         continue
                     pending.remove(future)
                     future.cancel()
-                    publish([m for m in scoped if id(platform_services[m["platform"]]) == key],
-                            {"reason": "PhoneFleetReadinessTimeout"})
+                    publish(
+                        [m for m in scoped if id(platform_services[m["platform"]]) == key],
+                        {"reason": "PhoneFleetReadinessTimeout"},
+                    )
             if not done and time.monotonic() >= deadline:
                 break
         for future in pending:
             key = futures[future]
             publish(
-                [key] if isinstance(key, dict) else
-                [m for m in scoped if id(platform_services[m["platform"]]) == key],
-                {"software_ready": False,
-                 "reason": "PhoneIdentityRefreshPending" if isinstance(key, dict) else "PhoneFleetReadinessTimeout"},
+                [key]
+                if isinstance(key, dict)
+                else [m for m in scoped if id(platform_services[m["platform"]]) == key],
+                {
+                    "software_ready": False,
+                    "reason": "PhoneIdentityRefreshPending"
+                    if isinstance(key, dict)
+                    else "PhoneFleetReadinessTimeout",
+                },
             )
     finally:
         # Never abandon an external submit: these futures only read capabilities.

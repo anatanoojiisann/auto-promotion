@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sqlite3
@@ -46,19 +47,37 @@ from .workers import Workers
 Platform = Literal["telegram", "reddit", "instagram", "facebook", "x", "discord", "tiktok"]
 
 
-def client_config(project_dir, python=None):
+def client_config(
+    project_dir,
+    python=None,
+    *,
+    db=None,
+    phone_social_config=None,
+    phone_reddit_config=None,
+    phone_rounds=False,
+):
     """Return a credential-free configuration for stdio MCP clients."""
+    arguments = [
+        "-m",
+        "auto_promotion.mcp_server",
+        "--project-dir",
+        str(Path(project_dir).resolve()),
+    ]
+    for flag, path in (
+        ("--db", db),
+        ("--phone-social-config", phone_social_config),
+        ("--phone-reddit-config", phone_reddit_config),
+    ):
+        if path is not None:
+            arguments.extend((flag, str(Path(path).resolve())))
+    if phone_rounds:
+        arguments.append("--phone-rounds")
     return {
         "mcpServers": {
             "auto-promotion": {
                 "command": str(python or sys.executable),
                 "env": {"PYTHONIOENCODING": "utf-8:strict", "PYTHONUTF8": "1"},
-                "args": [
-                    "-m",
-                    "auto_promotion.mcp_server",
-                    "--project-dir",
-                    str(Path(project_dir).resolve()),
-                ],
+                "args": arguments,
             }
         }
     }
@@ -67,7 +86,9 @@ def client_config(project_dir, python=None):
 PhonePlatform = Literal["telegram", "reddit", "instagram", "facebook", "x", "tiktok"]
 
 
-def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_config=None, phone_reddit_config=None):
+def create_server(
+    engine=None, *, phone_rounds_enabled=False, phone_social_config=None, phone_reddit_config=None
+):
     from .runtime_identity import capture_runtime
 
     runtime = capture_runtime("mcp")
@@ -78,9 +99,11 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
     )
     if phone_social_config is not None:
         from .phone_social import PhoneSocial
+
         PhoneSocial(engine, phone_social_config)
     if phone_reddit_config is not None:
         from .phone_reddit import PhoneReddit
+
         PhoneReddit(engine, phone_reddit_config)
     server = FastMCP(
         "Auto Promotion",
@@ -636,6 +659,20 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         """Apply deterministic task qualification rules to a candidate."""
         return invoke(lambda: engine.candidate(task_id, CandidateInput(**candidate)))
 
+    @server.tool(annotations=remote_read)
+    def produce_interaction_content(production: dict) -> dict:
+        """Generate into durable content using stored sources and an independent profile. Model mode calls the configured draft provider; no phone, task start or send occurs."""
+        from .content_production import ContentProduction, ProductionInput
+
+        return invoke(lambda: ContentProduction(engine).produce(ProductionInput(**production)))
+
+    @server.tool(annotations=read)
+    def get_content_production(run_id: str) -> dict:
+        """Read saved production progress without regenerating or publishing."""
+        from .content_production import ContentProduction
+
+        return invoke(lambda: ContentProduction(engine).get(run_id))
+
     @server.tool(annotations=local)
     def save_interaction_content(content: dict) -> dict:
         """Save immutable target-bound content without an account, device, model call or send."""
@@ -660,9 +697,11 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         return invoke(lambda: ContentQueue(engine).materialize(ContentBatch(**batch)))
 
     @server.tool(annotations=local)
-    def set_task_items(task_id: str, items: list[dict]) -> dict:
+    async def set_task_items(task_id: str, items: list[dict]) -> dict:
         """Save drafts only. TikTok desktop comment/reply may omit target: resolve tiktok_video_id from this task/account candidate evidence; no send permission."""
-        return invoke(lambda: engine.set_items(task_id, [ItemInput(**i) for i in items]))
+        return await asyncio.to_thread(
+            invoke, lambda: engine.set_items(task_id, [ItemInput(**i) for i in items])
+        )
 
     @server.tool(annotations=local)
     def authorize_deleted_x_reply_replacement(
@@ -689,9 +728,54 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         )
 
     @server.tool(annotations=local)
-    def prepare_task(task_id: str) -> dict:
-        """Optionally freeze and preview the exact manifest without starting execution."""
-        return invoke(engine.prepare, task_id)
+    async def prepare_task(
+        task_id: str, phone_comment_target: dict[str, str] | None = None
+    ) -> dict:
+        """Freeze the manifest. For a single Instagram phone comment or X phone reply, optionally verify the original post and draft with target_id, target_author and target_text; never submits."""
+
+        def prepare():
+            if phone_comment_target is None:
+                return engine.prepare(task_id)
+            task = engine.task(task_id)
+            if (
+                task["state"] != "draft"
+                or task["policy"].get("execution_method") != "phone"
+                or len(task["items"]) != 1
+                or set(phone_comment_target) != {"target_id", "target_author", "target_text"}
+            ):
+                raise Conflict("PhoneCommentPreparationScopeMismatch")
+            item = task["items"][0]
+            payload = item["payload"]
+            if (payload["platform"], payload["action"]) not in {
+                ("instagram", "comment"),
+                ("x", "reply"),
+            } or item["status"] != "not_attempted":
+                raise Conflict("PhoneCommentPreparationScopeMismatch")
+            service = getattr(engine.adapters, "phone_social", None)
+            if service is None:
+                raise Conflict("PhoneSocialMCPBindingRequired")
+            task = engine.prepare(task_id)
+            snapshot = service.prepare(item["id"], phone_comment_target, discard=True)
+            raw = snapshot.get("result") or {}
+            proof = raw.get("social") or {}
+            task["phone_preparation"] = {
+                "execution_id": snapshot.get("id"),
+                "status": snapshot.get("status"),
+                "code": raw.get("code"),
+                "simulated": raw.get("simulated"),
+                **{
+                    k: proof.get(k)
+                    for k in (
+                        "editor_verified",
+                        "discarded",
+                        "receipt_capable",
+                        "submission_started",
+                    )
+                },
+            }
+            return task
+
+        return await asyncio.to_thread(invoke, prepare)
 
     @server.tool(annotations=outbound)
     def start_joins(task_id: str) -> dict:
@@ -704,19 +788,21 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         return invoke(run)
 
     @server.tool(annotations=outbound)
-    def start_task(task_id: str) -> dict:
+    async def start_task(task_id: str) -> dict:
         """On an explicit user instruction, start sending/interacting with this task now.
 
         Automatically load campaign items and freeze the exact manifest. No approval
         phrases are needed. Honor global stops, account cooldowns, quotas and schedules.
         Never call merely because the user asked to draft, analyze, plan or preview.
         """
-        return invoke(lambda: engine.start_and_run(task_id, source="codex"))
+        return await asyncio.to_thread(
+            invoke, lambda: engine.start_and_run(task_id, source="codex")
+        )
 
     @server.tool(annotations=remote_read)
-    def verify_task_item(item_id: str) -> dict:
+    async def verify_task_item(item_id: str) -> dict:
         """Read platform receipts for unknown or scheduled results; never resend an item."""
-        return invoke(engine.reconcile, item_id)
+        return await asyncio.to_thread(invoke, engine.reconcile, item_id)
 
     @server.tool(annotations=remote_read)
     def verify_telegram_membership(candidate_id: str) -> dict:
@@ -753,7 +839,11 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         @server.tool(annotations=remote_read)
         def check_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
             """Check the selected platform or round without starting an interaction."""
-            return invoke(lambda: phone_preflight(rounds, round_id, platforms={platform} if platform else None))
+            return invoke(
+                lambda: phone_preflight(
+                    rounds, round_id, platforms={platform} if platform else None
+                )
+            )
 
         @server.tool(annotations=outbound)
         def start_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
@@ -763,7 +853,11 @@ def create_server(engine=None, *, phone_rounds_enabled=False, phone_social_confi
         @server.tool(annotations=local)
         def stop_phone_round(round_id: str, platform: PhonePlatform | None = None) -> dict:
             """Fence future submissions for one platform or the whole round. Keep original uncertain results."""
-            return invoke(rounds.stop_platform, round_id, platform) if platform else invoke(rounds.stop, round_id)
+            return (
+                invoke(rounds.stop_platform, round_id, platform)
+                if platform
+                else invoke(rounds.stop, round_id)
+            )
 
     return server
 
@@ -783,7 +877,19 @@ def main():
     if not project.is_dir():
         parser.error("Project directory does not exist")
     if args.print_config:
-        print(json.dumps(client_config(project), ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                client_config(
+                    project,
+                    db=args.db,
+                    phone_social_config=args.phone_social_config,
+                    phone_reddit_config=args.phone_reddit_config,
+                    phone_rounds=args.phone_rounds,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
     os.chdir(project)
     if not args.no_env:
@@ -793,9 +899,13 @@ def main():
     if not args.no_env:
         load_environment(database_path().parent / "cloud-node.env")
     from .phone_readiness import load_bindings
+
     social, reddit = load_bindings(args.phone_social_config, args.phone_reddit_config, parser)
-    create_server(phone_rounds_enabled=args.phone_rounds, phone_social_config=social,
-                  phone_reddit_config=reddit).run(transport="stdio")
+    create_server(
+        phone_rounds_enabled=args.phone_rounds,
+        phone_social_config=social,
+        phone_reddit_config=reddit,
+    ).run(transport="stdio")
 
 
 if __name__ == "__main__":

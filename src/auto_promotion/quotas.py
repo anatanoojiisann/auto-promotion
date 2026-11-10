@@ -16,6 +16,15 @@ UNSUBMITTED_MANUAL = (
 )
 
 
+def user_identifier(payload):
+    """Actual recipients take precedence; public target authors share legacy user quotas."""
+    return (
+        payload.get("recipient_id")
+        or payload.get("source_author_id")
+        or payload["target"].casefold()
+    )
+
+
 def settings(db):
     row = db.execute("SELECT value FROM meta WHERE key='execution_settings'").fetchone()
     return ExecutionSettings.model_validate_json(row[0]).model_dump()
@@ -62,7 +71,7 @@ def scopes(db, account, task, payload, *, include_local_override=True):
         ),
         (
             "user",
-            digest([platform, payload.get("recipient_id") or payload["target"].casefold()]),
+            digest([platform, user_identifier(payload)]),
             {"daily": policy["user_daily_limit"], "hourly": 100000},
         ),
     ]
@@ -110,9 +119,7 @@ def event(account, task, payload, at, *, pool_id=None):
         "campaign": dict(task).get("campaign_id"),
         "pool": pool_id,
         "target": digest([account["platform"], payload["target"].casefold()]),
-        "user": digest(
-            [account["platform"], payload.get("recipient_id") or payload["target"].casefold()]
-        ),
+        "user": digest([account["platform"], user_identifier(payload)]),
     }
 
 
@@ -244,18 +251,22 @@ def check_claim(db, account, task, payload, due, now, item_id, *, details=None):
     equivalent = set()
     if account["platform"] == "telegram":
         aliases = telegram_target_aliases(payload["target"])
-        equivalent = {digest(["telegram", spelling]) for a in aliases for spelling in (a, a+"/")}
+        equivalent = {digest(["telegram", spelling]) for a in aliases for spelling in (a, a + "/")}
     target_scope = digest([account["platform"], payload["target"].casefold()])
 
-    user_key = payload.get("recipient_id") or payload["target"].casefold()
+    user_key = user_identifier(payload)
     user_scope = digest([account["platform"], user_key])
     equivalent_users = equivalent if user_scope in equivalent else set()
 
     unsent = []
-    if (account["platform"] == "telegram"
-            and json.loads(task["policy"]).get("execution_method") == "phone"
-            and db.execute("SELECT 1 FROM sqlite_master WHERE name='phone_social_authorizations'").fetchone()
-            and db.execute("SELECT 1 FROM sqlite_master WHERE name='execution_jobs'").fetchone()):
+    if (
+        account["platform"] == "telegram"
+        and json.loads(task["policy"]).get("execution_method") == "phone"
+        and db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='phone_social_authorizations'"
+        ).fetchone()
+        and db.execute("SELECT 1 FROM sqlite_master WHERE name='execution_jobs'").fetchone()
+    ):
         unsent = db.execute(
             "SELECT a.account_id,a.task_id,a.started_at,a.target_key,a.user_key,i.due_at "
             "FROM attempts a JOIN items i ON i.id=a.item_id AND i.attempt_id=a.id "
@@ -267,20 +278,39 @@ def check_claim(db, account, task, payload, due, now, item_id, *, details=None):
             "AND json_extract(t.policy,'$.execution_method')='phone' "
             "AND j.state='failed_known' AND j.owner IS NULL AND j.lease_until<=? "
             "AND NOT EXISTS(SELECT 1 FROM phone_social_authorizations x WHERE x.item_id=i.id)",
-            (account["id"],now)).fetchall()
+            (account["id"], now),
+        ).fetchall()
 
     def records(*, delivery):
         rows = events(db, account["mode"], delivery=delivery, exclude_item=item_id)
         # Retain operation/account/global usage. A proven pre-submission phone
         # failure did not contact its target or recipient.
-        excluded = {(r["account_id"],r["task_id"],r["due_at"] if delivery else r["started_at"],
-                     r["target_key"],r["user_key"]) for r in unsent}
-        rows = [{**r,"target":None,"user":None}
-                if (r.get("account"),r.get("task"),r.get("at"),r.get("target"),r.get("user")) in excluded
-                else r for r in rows]
+        excluded = {
+            (
+                r["account_id"],
+                r["task_id"],
+                r["due_at"] if delivery else r["started_at"],
+                r["target_key"],
+                r["user_key"],
+            )
+            for r in unsent
+        }
+        rows = [
+            {**r, "target": None, "user": None}
+            if (r.get("account"), r.get("task"), r.get("at"), r.get("target"), r.get("user"))
+            in excluded
+            else r
+            for r in rows
+        ]
         if equivalent:
-            rows = [{**r, "target":target_scope if r.get("target") in equivalent else r.get("target"),
-                     "user":user_scope if r.get("user") in equivalent_users else r.get("user")} for r in rows]
+            rows = [
+                {
+                    **r,
+                    "target": target_scope if r.get("target") in equivalent else r.get("target"),
+                    "user": user_scope if r.get("user") in equivalent_users else r.get("user"),
+                }
+                for r in rows
+            ]
         if not proof:
             return rows
         sources = proof.get("sources", [proof])

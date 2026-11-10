@@ -8,7 +8,13 @@ from auto_promotion.execution_channels import binding, configure_independent, re
 from auto_promotion.models import AccountInput, epoch
 from auto_promotion.pool_runtime import PoolScheduler, run_pool
 from auto_promotion.queue_store import JobQueue
-from auto_promotion.task_channels import TaskChannelRouter, guard_context, save_binding
+from auto_promotion.task_channels import (
+    TaskChannelRouter,
+    channel_binding,
+    control_plan,
+    guard_context,
+    save_binding,
+)
 
 
 class OfflineResumeTests(unittest.TestCase):
@@ -153,6 +159,38 @@ class OfflineResumeTests(unittest.TestCase):
             guard_context(self.engine, context)
         self.assertEqual(context["channel"], "local")
         self.assertIsNone(cloud)
+        self.assertEqual(self.store.one("SELECT count(*) n FROM attempts")["n"], 0)
+
+        with self.store.connect() as db:
+            original = channel_binding(db, other["id"])
+        for field, value in (
+            ("node_id", "another-node"),
+            ("store_id", "another-store"),
+            ("generation", "stale-generation"),
+            ("until_at", self.now - 1),
+            ("coordination_task_id", "another-task"),
+        ):
+            with self.subTest(field=field):
+                with self.store.connect(write=True) as db:
+                    save_binding(db, {**original, field: value})
+                with patch.object(CloudControl, "configured", return_value=None) as configured:
+                    plan = control_plan(
+                        self.engine, other_task["id"], other["id"], other_task["policy"]
+                    )
+                if field == "coordination_task_id":
+                    # Explicit coordination stays local but the later scope
+                    # guard must reject an unrelated task before any attempt.
+                    with patch.object(CloudControl, "configured", return_value=None):
+                        with self.assertRaisesRegex(
+                            CloudUnavailable, "LocalAuthorizationTaskScopeMismatch"
+                        ):
+                            TaskChannelRouter(self.engine).prepare(job)
+                else:
+                    self.assertFalse(plan["no_cloud"])
+                    configured.assert_called_once_with()
+        with self.store.connect(write=True) as db:
+            save_binding(db, original)
+        self.assertEqual(self.store.one("SELECT count(*) n FROM attempts")["n"], 0)
 
 
 if __name__ == "__main__":

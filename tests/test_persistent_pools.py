@@ -140,12 +140,31 @@ class PersistentPoolTests(unittest.TestCase):
                 "UPDATE tasks SET policy=json_set(policy,'$.execution_method','phone') WHERE id=?",
                 (task["id"],),
             )
-            sql = ("INSERT OR IGNORE INTO execution_jobs(id,kind,reference_id,task_id,account_id,"
-                   "pool,route,version,available_at,expires_at,created_at,updated_at) "
-                   "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            sql = (
+                "INSERT OR IGNORE INTO execution_jobs(id,kind,reference_id,task_id,account_id,"
+                "pool,route,version,available_at,expires_at,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+            )
+
             def put(key, pool):
-                db.execute(sql, (key, "send", key, task["id"], account["id"], pool, "{}", "1",
-                                 now, now + 60, now, now))
+                db.execute(
+                    sql,
+                    (
+                        key,
+                        "send",
+                        key,
+                        task["id"],
+                        account["id"],
+                        pool,
+                        "{}",
+                        "1",
+                        now,
+                        now + 60,
+                        now,
+                        now,
+                    ),
+                )
+
             put("wrong-phone-route", "x.playwright")
             put("correct-phone-route", "x.phone")
             db.execute(
@@ -153,9 +172,12 @@ class PersistentPoolTests(unittest.TestCase):
                 (task["id"],),
             )
             put("ordinary-desktop-route", "x.playwright")
-            found = {r[0] for r in db.execute(
-                "SELECT id FROM execution_jobs WHERE id IN ('wrong-phone-route','correct-phone-route','ordinary-desktop-route')"
-            )}
+            found = {
+                r[0]
+                for r in db.execute(
+                    "SELECT id FROM execution_jobs WHERE id IN ('wrong-phone-route','correct-phone-route','ordinary-desktop-route')"
+                )
+            }
         self.assertEqual(found, {"correct-phone-route", "ordinary-desktop-route"})
 
     def test_phone_configuration_failure_does_not_block_another_pool(self):
@@ -171,8 +193,20 @@ class PersistentPoolTests(unittest.TestCase):
         with self.store.connect(write=True) as db:
             db.execute(
                 "INSERT INTO execution_jobs(id,kind,reference_id,task_id,account_id,pool,route,version,available_at,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("phone-probe", "send", "phone-item", task["id"], account["id"],
-                 "telegram.phone", "{}", "1", now - 1, now + 60, now, now),
+                (
+                    "phone-probe",
+                    "send",
+                    "phone-item",
+                    task["id"],
+                    account["id"],
+                    "telegram.phone",
+                    "{}",
+                    "1",
+                    now - 1,
+                    now + 60,
+                    now,
+                    now,
+                ),
             )
         self.engine.adapters.phone_social = SimpleNamespace(
             worker_config=Mock(side_effect=RuntimeError("secret must not be logged"))
@@ -180,11 +214,13 @@ class PersistentPoolTests(unittest.TestCase):
         child = Mock(pid=1234)
         child.poll.return_value = None
         popen = Mock(return_value=child)
-        with patch("auto_promotion.pool_runtime.independent_active", return_value=True), \
-             patch("auto_promotion.pool_runtime.local_account_scope", return_value=None), \
-             patch("auto_promotion.pool_runtime.executor_task_ids", return_value=None), \
-             patch.dict(os.environ, {"AP_EXECUTOR_POOLS": "telegram.phone,simulation.x"}), \
-             patch.object(self.engine, "recover"):
+        with (
+            patch("auto_promotion.pool_runtime.independent_active", return_value=True),
+            patch("auto_promotion.pool_runtime.local_account_scope", return_value=None),
+            patch("auto_promotion.pool_runtime.executor_task_ids", return_value=None),
+            patch.dict(os.environ, {"AP_EXECUTOR_POOLS": "telegram.phone,simulation.x"}),
+            patch.object(self.engine, "recover"),
+        ):
             scheduler = PoolScheduler(self.engine, popen=popen)
             scheduler.queue.sync = Mock()
             try:
@@ -192,7 +228,9 @@ class PersistentPoolTests(unittest.TestCase):
                 self.assertEqual(popen.call_count, 1)
                 argv = popen.call_args.args[0]
                 self.assertEqual(argv[argv.index("--pool") + 1], "simulation.x")
-                audit = self.store.one("SELECT details FROM audit WHERE kind='pool.phone_config_unavailable'")
+                audit = self.store.one(
+                    "SELECT details FROM audit WHERE kind='pool.phone_config_unavailable'"
+                )
                 self.assertNotIn("secret", audit["details"])
             finally:
                 for handles in scheduler.handles.values():
