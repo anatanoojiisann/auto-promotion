@@ -3,7 +3,7 @@
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
 from .models import Model
 
@@ -195,6 +195,7 @@ class ProductSettings(Model):
 
 
 class InteractionConfig(Model):
+    content_queue_only: bool = False
     schema_version: Literal[1, 2] = 1
     strategy_profile: Literal["legacy", "joint_p0_p1"] = "legacy"
     dedupe_scope_id: str | None = Field(default=None, pattern=r"^[\w-]{1,80}$")
@@ -227,6 +228,13 @@ class InteractionConfig(Model):
     scan_hours: tuple[int, int] = (0, 0)
     publish_hours: tuple[int, int] = (0, 0)
     observation_offsets_seconds: list[int] = Field(default_factory=lambda: [86400, 259200])
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_config(self, handler):
+        value = handler(self)
+        if not self.content_queue_only:
+            value.pop("content_queue_only", None)
+        return value
 
     @model_validator(mode="after")
     def validate_scope(self):

@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .core import RISK, Conflict
 from .models import CAPABILITIES, ItemInput, digest, epoch, target_allowed
-from .quotas import Calendar, event, events, scopes, settings
+from .quotas import Calendar, event, events, scopes, settings, user_identifier
 
 
 def content_key(value):
@@ -267,7 +267,12 @@ def build_plan(engine, campaign, pool, opportunities, profiles):
                 tiktok_video_id=value.get("tiktok_video_id", ""),
                 tiktok_comment_id=value.get("tiktok_comment_id", ""),
                 tiktok_options=value.get("tiktok_options"),
-                recipient_id=value["author_id"],
+                recipient_id=""
+                if policy.get("execution_method") == "phone"
+                else value["author_id"],
+                source_author_id=value["author_id"]
+                if policy.get("execution_method") == "phone"
+                else "",
                 target_owned=value["target_owned"],
                 execution_mode=execution,
                 opportunity_id=opportunity["id"],
@@ -291,7 +296,7 @@ def build_plan(engine, campaign, pool, opportunities, profiles):
                     key = digest(
                         [
                             account["platform"],
-                            payload["recipient_id"] or payload["target"].casefold(),
+                            user_identifier(payload),
                         ]
                     )
                 limits.append((scope, key, quota))

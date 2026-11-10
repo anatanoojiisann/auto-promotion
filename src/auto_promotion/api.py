@@ -26,6 +26,7 @@ from .backends.common import BackendError
 from .campaigns import Campaigns
 from .config import database_path, workspace_path
 from .connections import ConnectionInput, ConnectionManager
+from .content_production import ContentProduction, ProductionInput
 from .content_queue import ContentBatch, ContentDraft, ContentQueue, publication_status
 from .core import Conflict, Engine, NotFound
 from .dispatcher import AccountBusy
@@ -159,7 +160,9 @@ def create_app(
         store,
         registry,
         clock=clock,
-        live_enabled=not statistics_only and not disable_live_writes and os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
+        live_enabled=not statistics_only
+        and not disable_live_writes
+        and os.getenv("AUTO_PROMOTION_LIVE_WRITES") == "1",
     )
     connections = ConnectionManager(engine)
     statistics = Statistics(store, clock=clock)
@@ -174,6 +177,7 @@ def create_app(
     phone_preparations = None
     if phone_fleet_config is not None:
         from .phone_fleet import configured
+
         phone_preparations = configured(engine, phone_fleet_config)
     phone_reddit = None
     if phone_reddit_config is not None:
@@ -377,18 +381,29 @@ def create_app(
     async def phone_readiness(platform: str | None = None):
         from .phone_protocol import capability_status
         from .phone_readiness import readiness
+
         result = await asyncio.to_thread(readiness, engine, platform=platform)
         sender_job = background_tasks.get("sender")
         result["sender_running"] = sender_job is not None and not sender_job.done()
         if phone_preparations is not None and platform is None:
             try:
-                status = capability_status(await phone_preparations.client.request("GET", "/capabilities"))
+                status = capability_status(
+                    await phone_preparations.client.request("GET", "/capabilities")
+                )
             except Exception:
-                status = {"state": "service_unavailable", "software_ready": False, "device_ready": False,
-                          "reason": "PhoneFleetReadinessUnavailable"}
+                status = {
+                    "state": "service_unavailable",
+                    "software_ready": False,
+                    "device_ready": False,
+                    "reason": "PhoneFleetReadinessUnavailable",
+                }
             result["services"].append(status)
             result["configured"] = True
-            result["state"] = "software_ready" if all(s["software_ready"] for s in result["services"]) else "setup_required"
+            result["state"] = (
+                "software_ready"
+                if all(s["software_ready"] for s in result["services"])
+                else "setup_required"
+            )
         return result
 
     if phone_rounds is not None:
@@ -804,8 +819,11 @@ def create_app(
     @app.get("/api/content-queue/tasks/{task_id}/status")
     def content_task_status(task_id: str):
         task = engine.task(task_id)
-        return {"task_id": task_id, "control_state": task["state"],
-                "items": [publication_status(i) for i in task["items"]]}
+        return {
+            "task_id": task_id,
+            "control_state": task["state"],
+            "items": [publication_status(i) for i in task["items"]],
+        }
 
     @app.get("/api/content-queue/{content_id}")
     def read_content(content_id: str):
@@ -844,7 +862,9 @@ def create_app(
     def phone_known_unsent_retry(value: dict):
         from .phone_known_unsent import register
 
-        return register(engine, value.get("old_item_id"), value.get("new_item_id"), value.get("instruction"))
+        return register(
+            engine, value.get("old_item_id"), value.get("new_item_id"), value.get("instruction")
+        )
 
     @app.post("/api/temporal/tasks/{task_id}/register")
     def temporal_register(task_id: str, value: dict):
@@ -905,6 +925,14 @@ def create_app(
     @app.get("/api/opportunities")
     def opportunity_list(offset: int = 0, limit: int = 100, platform: str | None = None):
         return campaigns.content(offset=offset, limit=limit, platform=platform)
+
+    @app.post("/api/content-production")
+    def produce_content(value: ProductionInput):
+        return ContentProduction(engine).produce(value)
+
+    @app.get("/api/content-production/{run_id}")
+    def content_production_status(run_id: str):
+        return ContentProduction(engine).get(run_id)
 
     @app.post("/api/opportunities/import")
     def import_opportunities(value: OpportunityImport):

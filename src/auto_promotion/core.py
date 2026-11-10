@@ -2270,7 +2270,9 @@ class Engine:
                         epoch(payload["scheduled_at"]),
                     ),
                 )
-                if payload.get("opportunity_id"):
+                # A validated standalone content batch owns its binding; campaign
+                # tasks still require the original assignment, including queued drafts.
+                if payload.get("opportunity_id") and (row["campaign_id"] or not content_claim):
                     assignment = db.execute(
                         "SELECT id,account_id FROM campaign_assignments WHERE task_id=? AND opportunity_id=?",
                         (task_id, payload["opportunity_id"]),
@@ -2687,7 +2689,7 @@ class Engine:
                 return self._skip(item_id, "earlier_item_pending", db)
             target_key = digest([account["platform"], payload["target"].casefold()])
             user_key = digest(
-                [account["platform"], payload["recipient_id"] or payload["target"].casefold()]
+                [account["platform"], quotas.user_identifier(payload)]
             )
             day = now - now % 86400
             mode = account["mode"]
@@ -3113,6 +3115,11 @@ class Engine:
                 "publish_id",
                 "post_ids",
                 "comment_id",
+                "native_id",
+                "native_comment_id",
+                "receipt_contract",
+                "receipt_reader",
+                "receipt_evidence_sha256",
                 "message_id",
                 "conversation_id",
                 "recipient_id",
@@ -3218,6 +3225,9 @@ class Engine:
                     claim["task_id"],
                     now,
                 )
+            from .content_origins import sync_content_origins
+
+            sync_content_origins(db, now, item_id=claim["item_id"])
             self._mark_completed(db, claim["task_id"])
         return safe
 

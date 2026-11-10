@@ -1,0 +1,46 @@
+name: Paired phone and content integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  phone-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: promotion
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read exact paired revision
+        id: pair
+        working-directory: promotion
+        run: |
+          python -c 'import json,os; p=json.load(open("docs/integrations/phone-pair.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); print("repository="+p["repository"],file=f); print("commit="+p["commit"],file=f)'
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pair.outputs.repository }}
+          ref: ${{ steps.pair.outputs.commit }}
+          path: phone
+          token: ${{ secrets.PHONE_PLATFORM_READ_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Build independent wheels and run synthetic integration
+        working-directory: promotion
+        run: python scripts/verify_phone_integration.py --phone-source ../phone
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-phone-integration
+          path: promotion/.local/phone-integration/**/manifest.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-phone-junit
+          path: promotion/.local/phone-integration/**/*.xml
