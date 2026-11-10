@@ -23,3 +23,5 @@ The private CI can provide --phone-commit with the exact 40-character SHA of its
 Full regression also exposed plain-text internal stage routes being read as JSON by external-job ownership checks. Stage jobs now remain outside send/join ownership, with guarded JSON evaluation. The existing attempted-orphan recovery case verifies one original attempt and preserves unknown after expiry. Persistent-pool and phone-independence checks cover the original execution locks.
 
 The private paired gate supports --all-tests and runs the complete AP pytest suite against installed wheels. The source-suite diagnostic run was superseded after the bridge/queue fixes; its partial failures are retained separately and are not presented as a passing final suite.
+
+Final immutable phone source: `7b5c124b9f872b28d41f4ad432c395710b4d1346`.
