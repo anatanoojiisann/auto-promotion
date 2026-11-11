@@ -2344,6 +2344,12 @@ class Engine:
         )
 
     def change_state(self, task_id, state):
+        if state in {"paused", "cancelled"}:
+            service = getattr(self.adapters, "phone_social", None)
+            pause_receipts = getattr(service, "pause_receipts", None)
+            stopped = pause_receipts(task_id) if callable(pause_receipts) else 0
+            if state == "paused" and stopped and self.store.one("SELECT state FROM tasks WHERE id=?", (task_id,))["state"] == "completed":
+                return self.task(task_id)
         # A local cancel can close receipt follow-up without retracting a native schedule.
         if state == "cancelled":
             with self.store.connect(write=True) as db:
@@ -2411,6 +2417,10 @@ class Engine:
                 "UPDATE meta SET value=? WHERE key='global_stop'", ("1" if stopped else "0",)
             )
             Store.audit(db, "global_stop", {"stopped": stopped})
+        if stopped:
+            pause_receipts = getattr(getattr(self.adapters, "phone_social", None), "pause_receipts", None)
+            if callable(pause_receipts):
+                pause_receipts()
         from .cloud_control import queue_settings
 
         queue_settings(self, {"global_stop": stopped})
@@ -3224,7 +3234,7 @@ class Engine:
             self._mark_completed(db, claim["task_id"])
         return safe
 
-    def reconcile(self, item_id, *, read_scan_rpc_limit=None):
+    def reconcile(self, item_id, *, read_scan_rpc_limit=None, phone_receipt_lookup=False, resume_phone_receipt=False):
         row = self.store.one("SELECT * FROM items WHERE id=?", (item_id,))
         if not row:
             raise NotFound("执行项不存在")
@@ -3249,6 +3259,15 @@ class Engine:
             and account["cooldown_until"] > self.clock()
         ):
             raise Conflict("账号仍在冷却，请稍后核对")
+        if resume_phone_receipt:
+            if not phone_receipt_lookup:
+                raise Conflict("ExplicitPhoneReceiptReadRequired")
+            service=getattr(self.adapters,"phone_social",None)
+            if service and self._execution_method(row["task_id"])=="phone":
+                from .phone_receipt_recovery import resume
+                resume(service,item_id)
+        if phone_receipt_lookup:
+            payload["allow_receipt_lookup"] = True
         if read_scan_rpc_limit is not None:
             payload["read_scan_rpc_limit"] = read_scan_rpc_limit
         result = self.call(account, "verify", payload, row["task_id"])

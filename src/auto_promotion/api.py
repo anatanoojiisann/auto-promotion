@@ -322,6 +322,8 @@ def create_app(
                     (interactions.schedule, "hf_schedule"),
                     (meta_browser.sync, "meta_browser_sync"),
                 ]
+                if phone_social is not None:
+                    callbacks.append((phone_social.reconcile_receipts_due, "phone_receipts"))
                 callbacks.extend(
                     (lambda stage=stage: interactions.run_stage(stage, max_jobs=3), "hf_" + stage)
                     for stage in interactions.stages
@@ -846,6 +848,16 @@ def create_app(
 
         return register(engine, value.get("old_item_id"), value.get("new_item_id"), value.get("instruction"))
 
+    @app.post("/api/temporal/worker-heartbeat")
+    def workflow_worker_heartbeat(value: dict):
+        from .workflow_health import heartbeat
+        return heartbeat(engine, value)
+
+    @app.get("/api/temporal/worker-health")
+    def workflow_worker_health():
+        from .workflow_health import status
+        return status(engine)
+
     @app.post("/api/temporal/tasks/{task_id}/register")
     def temporal_register(task_id: str, value: dict):
         from .temporal_tasks import register
@@ -1314,8 +1326,8 @@ def create_app(
         return engine.reconcile_join(candidate_id)
 
     @app.post("/api/items/{item_id}/reconcile")
-    def reconcile(item_id: str):
-        return engine.reconcile(item_id)
+    def reconcile(item_id: str, resume_receipt: bool = False):
+        return engine.reconcile(item_id, phone_receipt_lookup=True, resume_phone_receipt=resume_receipt)
 
     @app.post("/api/items/{item_id}/manual-outcome")
     def manual(item_id: str, value: ManualOutcome):

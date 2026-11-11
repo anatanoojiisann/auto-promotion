@@ -64,6 +64,8 @@ class CommissionedSinglePass(BaseModel):
 
 
 class SocialPhoneConfig(RedditPhoneConfig):
+    require_workflow_heartbeat: bool = False
+    receipt_followup_enabled: bool = False
     dynamic_task_authorization_enabled: bool = False
     async_visual_review_enabled: bool = False
     single_pass_adapters: dict[str, CommissionedSinglePass] = Field(default_factory=dict)
@@ -127,9 +129,14 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             if not self.config.oauth_client_id or not self.config.oauth_client_secret:
                 raise Conflict("PhoneSocialOAuthClientRequired")
         with self.store.connect(write=True) as db:
-            for statement in (SCHEMA+JOIN_SCHEMA).split(";"):
+            from .phone_receipt_recovery import SCHEMA as RECEIPT_SCHEMA
+            for statement in (SCHEMA+JOIN_SCHEMA+RECEIPT_SCHEMA).split(";"):
                 if statement.strip():
                     db.execute(statement)
+        with self.store.connect(write=True) as db:
+            columns={row[1] for row in db.execute("PRAGMA table_info(phone_social_receipt_jobs)")}
+            if "generation" not in columns:
+                db.execute("ALTER TABLE phone_social_receipt_jobs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
         engine.adapters.phone_social = self
         from .temporal_tasks import commission_dynamic_admission
 
@@ -319,6 +326,16 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         task = self.store.one("SELECT * FROM tasks WHERE id=?", (item["task_id"],))
         policy = json.loads(task["policy"])
         self.check_method(policy, binding)
+        if self.config.require_workflow_heartbeat:
+            from .workflow_health import status as worker_status
+            if not worker_status(self.engine)["coordinator_loop_alive"]:
+                raise Conflict("WorkflowWorkerHeartbeatMissing")
+        if binding.platform in {"facebook", "instagram"}:
+            from .meta_browser import claim_blocker
+            with self.store.connect() as db:
+                reason = claim_blocker(db, account, payload, item_id, time.time())
+            if reason:
+                raise Conflict("PhoneSocialPreparationBlocked:" + reason)
         if binding.platform == "telegram" and binding.receipt_reader == "telegram_api":
             self.observer_baseline(account["id"], binding.identity, payload["target"])
         identifier = "phone-social-prepare:" + uuid4().hex
@@ -541,7 +558,14 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             return {"status": "failed_known", "verified": False,
                     "confirmed_not_submitted": True, "submission_started": False,
                     "reason": error.safe_code}
-        return self.outcome(snapshot, request.social)
+        outcome = self.outcome(snapshot, request.social)
+        if self.config.receipt_followup_enabled and outcome.get("status") == "unknown":
+            from .phone_receipt_recovery import followup
+            try:
+                return followup(self, request, snapshot) or outcome
+            except BackendError:
+                return outcome
+        return outcome
 
     def authorize(self, body, bearer):
         if not hmac.compare_digest(bearer, self.config.runtime_token.get_secret_value()):
@@ -688,7 +712,17 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         request = ExecutionRequest.model_validate_json(row["request"])
         # dispatch on an existing durable record only GETs its original execution.
         snapshot=self.dispatch(request,row["id"],account["id"],row["item_id"])
-        return self.reconcile_protocol_receipt(request,snapshot) or self.outcome(snapshot,request.social)
+        from .phone_receipt_recovery import followup
+        recovered = followup(self, request, snapshot) if payload.get("allow_receipt_lookup") is True else None
+        return self.reconcile_protocol_receipt(request,snapshot) or recovered or self.outcome(snapshot,request.social)
+
+    def pause_receipts(self, task_id=None):
+        from .phone_receipt_recovery import pause
+        return pause(self, task_id)
+
+    def reconcile_receipts_due(self):
+        from .phone_receipt_recovery import run_due
+        return run_due(self)
 
 
 def attach_worker(engine):

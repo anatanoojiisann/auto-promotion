@@ -180,6 +180,10 @@ def status(engine, task_id):
     value["registration"] = engine.store.one("SELECT task_id,manifest_hash,workflow_id,state,admitted_at "
                                              "FROM temporal_task_links WHERE task_id=?", (task_id,))
     value["deadline"] = epoch(task["policy"]["ends_at"])
+    from .workflow_health import status as worker_status
+    value["workflow_worker"] = worker_status(engine)
+    if value["registration"] and value["registration"]["state"] == "requested" and not value["workflow_worker"]["coordinator_loop_alive"]:
+        value["waiting_for"] = "WorkflowWorkerHeartbeatMissing"
     from .phone_visual_preparation import summary
 
     value["preparation"] = summary(engine, task_id)

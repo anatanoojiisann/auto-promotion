@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import os
+import time
+from uuid import uuid4
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -67,8 +69,14 @@ async def run(config):
         acts = Activities(http)
         async with Worker(temporal, task_queue=config["task_queue"], workflows=[PromotionTask],
                           activities=[acts.admit, acts.status, acts.prepare]):
+            worker_id = "coordinator-" + uuid4().hex
+            next_heartbeat = 0
             while True:
                 try:
+                    if time.monotonic() >= next_heartbeat:
+                        reply = await http.post("/api/temporal/worker-heartbeat", json={"worker_id": worker_id, "task_queue": config["task_queue"]})
+                        # Older API versions can still admit tasks without this additive health route.
+                        next_heartbeat = time.monotonic() + 5
                     response = await http.get("/api/temporal/tasks")
                     response.raise_for_status()
                     for row in response.json()["data"]:
