@@ -114,10 +114,13 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         async def read_id():
             return {"message_id": "42583"}
 
-        with patch.object(self.engine, "reconcile", side_effect=lambda _: asyncio.run(read_id())):
+        with patch.object(
+            self.engine, "reconcile", side_effect=lambda _, **kwargs: asyncio.run(read_id())
+        ) as verify:
             self.assertEqual(
                 (await self.call("verify_task_item", item_id="original"))["message_id"], "42583"
             )
+            verify.assert_called_once_with("original", phone_receipt_lookup=True)
         task = self.approved_task()
         with self.assertRaises(Exception) as rejected:
             await self.call(

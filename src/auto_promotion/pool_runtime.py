@@ -114,7 +114,7 @@ class PoolScheduler:
         task_ids = executor_task_ids()
         sql = (
             "SELECT pool,MIN(available_at) oldest FROM execution_jobs "
-            "WHERE state='pending' AND available_at<=? AND expires_at>?"
+            "WHERE state='pending' AND COALESCE(json_extract(result,'$.waiting_for'),'')<>'local_state_change' AND available_at<=? AND expires_at>?"
         )
         params = [now + 2, now]
         with self.engine.store.connect() as db:

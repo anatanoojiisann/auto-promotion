@@ -203,7 +203,21 @@ class PhoneReddit:
         if not self.store.one(f"SELECT id FROM {table} WHERE id=?", (operation_id,)):
             if time.time() >= request.deadline:
                 raise Conflict("PhoneExecutionDeadlineElapsed")
-            require_capabilities(self.request("GET", "/capabilities"), request.operation)
+            # A just-finished identity observation can leave the device briefly
+            # unavailable while its lease is released. Only repeat this read-only
+            # capability query; never repeat an external submission.
+            for attempt in range(5):
+                try:
+                    require_capabilities(self.request("GET", "/capabilities"), request.operation)
+                    break
+                except BackendError as error:
+                    if (
+                        error.safe_code != "PhoneFleetDeviceNotReady"
+                        or attempt == 4
+                        or time.time() + 0.5 >= request.deadline
+                    ):
+                        raise
+                    time.sleep(0.5)
         with self.store.connect(write=True) as db:
             old = db.execute(f"SELECT * FROM {table} WHERE id=?", (operation_id,)).fetchone()
             if old and json.loads(old["request"]) != value:

@@ -71,6 +71,8 @@ class CommissionedSinglePass(BaseModel):
 
 
 class SocialPhoneConfig(RedditPhoneConfig):
+    require_workflow_heartbeat: bool = False
+    receipt_followup_enabled: bool = False
     dynamic_task_authorization_enabled: bool = False
     async_visual_review_enabled: bool = False
     single_pass_adapters: dict[str, CommissionedSinglePass] = Field(default_factory=dict)
@@ -148,9 +150,17 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             if not self.config.oauth_client_id or not self.config.oauth_client_secret:
                 raise Conflict("PhoneSocialOAuthClientRequired")
         with self.store.connect(write=True) as db:
-            for statement in (SCHEMA + JOIN_SCHEMA).split(";"):
+            from .phone_receipt_recovery import SCHEMA as RECEIPT_SCHEMA
+
+            for statement in (SCHEMA + JOIN_SCHEMA + RECEIPT_SCHEMA).split(";"):
                 if statement.strip():
                     db.execute(statement)
+        with self.store.connect(write=True) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(phone_social_receipt_jobs)")}
+            if "generation" not in columns:
+                db.execute(
+                    "ALTER TABLE phone_social_receipt_jobs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+                )
         engine.adapters.phone_social = self
         from .temporal_tasks import commission_dynamic_admission
 
@@ -458,6 +468,18 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         task = self.store.one("SELECT * FROM tasks WHERE id=?", (item["task_id"],))
         policy = json.loads(task["policy"])
         self.check_method(policy, binding)
+        if self.config.require_workflow_heartbeat:
+            from .workflow_health import status as worker_status
+
+            if not worker_status(self.engine)["coordinator_loop_alive"]:
+                raise Conflict("WorkflowWorkerHeartbeatMissing")
+        if binding.platform in {"facebook", "instagram"}:
+            from .meta_browser import claim_blocker
+
+            with self.store.connect() as db:
+                reason = claim_blocker(db, account, payload, item_id, time.time())
+            if reason:
+                raise Conflict("PhoneSocialPreparationBlocked:" + reason)
         if binding.platform == "telegram" and binding.receipt_reader == "telegram_api":
             self.observer_baseline(account["id"], binding.identity, payload["target"])
         identifier = "phone-social-prepare:" + uuid4().hex
@@ -835,9 +857,60 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                         reservation["reserved"],
                     ),
                 )
-        return self.outcome(
-            self.dispatch(request, identifier, account["id"], claim["item_id"]), request.social
-        )
+        try:
+            snapshot = self.dispatch(request, identifier, account["id"], claim["item_id"])
+        except BackendError as error:
+            # The capabilities gate runs before any operation intent is recorded
+            # or request is sent. Classify only that proven boundary as unsubmitted.
+            # Once an intent or native use exists, retain the unknown outcome.
+            if error.safe_code != "PhoneFleetDeviceNotReady":
+                raise
+            safe = False
+            with self.store.connect(write=True) as db:
+                row = db.execute(
+                    "SELECT used_at,native_id,execution_id FROM phone_social_authorizations WHERE id=?",
+                    (identifier,),
+                ).fetchone()
+                intent = db.execute(
+                    "SELECT 1 FROM phone_social_operations WHERE item_id=? AND kind='social_submit'",
+                    (claim["item_id"],),
+                ).fetchone()
+                if (
+                    row
+                    and not intent
+                    and all(row[key] is None for key in ("used_at", "native_id", "execution_id"))
+                ):
+                    now = time.time()
+                    db.execute(
+                        "UPDATE phone_social_authorizations SET expires_at=MIN(expires_at,?) WHERE id=?",
+                        (now, identifier),
+                    )
+                    Store.audit(
+                        db,
+                        "phone_social.dispatch_not_started",
+                        {"item_id": claim["item_id"], "reason": error.safe_code},
+                        task["id"],
+                        now,
+                    )
+                    safe = True
+            if not safe:
+                raise
+            return {
+                "status": "failed_known",
+                "verified": False,
+                "confirmed_not_submitted": True,
+                "submission_started": False,
+                "reason": error.safe_code,
+            }
+        outcome = self.outcome(snapshot, request.social)
+        if self.config.receipt_followup_enabled and outcome.get("status") == "unknown":
+            from .phone_receipt_recovery import followup
+
+            try:
+                return followup(self, request, snapshot) or outcome
+            except BackendError:
+                return outcome
+        return outcome
 
     def authorize(self, body, bearer):
         if not hmac.compare_digest(bearer, self.config.runtime_token.get_secret_value()):
@@ -1010,7 +1083,11 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
                 "native_id": receipt.native_id,
                 "message_id": receipt.native_id if context.platform == "telegram" else None,
                 "native_comment_id": receipt.native_id,
-                **({"comment_id": receipt.native_id} if context.platform == "instagram" else {}),
+                **(
+                    {"comment_id": receipt.native_id}
+                    if context.platform in {"instagram", "facebook"}
+                    else {}
+                ),
                 **(
                     {"publish_id": receipt.native_id, "reply_id": receipt.native_id}
                     if context.platform == "x"
@@ -1051,11 +1128,11 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
             item["task_id"],
         )
         fields = ("reply_id", "publish_id") if account["platform"] == "x" else ("comment_id",)
-        mismatch = (
-            "PhoneXOriginalReceiptMismatch"
-            if account["platform"] == "x"
-            else "PhoneInstagramOriginalReceiptMismatch"
-        )
+        mismatch = {
+            "x": "PhoneXOriginalReceiptMismatch",
+            "instagram": "PhoneInstagramOriginalReceiptMismatch",
+            "facebook": "PhoneFacebookOriginalReceiptMismatch",
+        }[account["platform"]]
         native_id = result.get(fields[0])
         if (
             not result.get("verified")
@@ -1126,12 +1203,30 @@ class PhoneSocial(PhoneTelegram, PhoneReddit):
         # dispatch on an existing durable record only GETs its original execution.
         snapshot = self.dispatch(request, row["id"], account["id"], row["item_id"])
         from .phone_receipt_readback import reconcile_x_receipt
+        from .phone_receipt_recovery import followup
 
-        return (
-            self.reconcile_protocol_receipt(request, snapshot)
-            or reconcile_x_receipt(self, request, snapshot)
-            or self.outcome(snapshot, request.social)
+        confirmed = self.reconcile_protocol_receipt(request, snapshot)
+        if confirmed:
+            return confirmed
+        x_receipt = reconcile_x_receipt(self, request, snapshot)
+        if x_receipt:
+            return x_receipt
+        recovered = (
+            followup(self, request, snapshot)
+            if payload.get("allow_receipt_lookup") is True
+            else None
         )
+        return recovered or self.outcome(snapshot, request.social)
+
+    def pause_receipts(self, task_id=None):
+        from .phone_receipt_recovery import pause
+
+        return pause(self, task_id)
+
+    def reconcile_receipts_due(self):
+        from .phone_receipt_recovery import run_due
+
+        return run_due(self)
 
 
 def attach_worker(engine):

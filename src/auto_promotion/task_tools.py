@@ -424,6 +424,9 @@ class TaskTools:
             coverage = rows(
                 "SELECT f.* FROM feedback_checks f JOIN items i ON i.id=f.item_id WHERE i.task_id=?"
             )
+            from .phone_receipt_diagnostics import chain
+
+            phone_chain = chain(db, items)
         from .account_blocks import active_block
 
         with self.store.connect() as db:
@@ -449,6 +452,7 @@ class TaskTools:
             "feedback_events": feedback,
             "feedback_checks": coverage,
             "account_blocks": account_blocks,
+            "phone_execution_chain": phone_chain,
             "execution_read_observations": [
                 {
                     "account_id": row["account_id"],
