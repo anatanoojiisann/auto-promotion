@@ -409,7 +409,7 @@ def test_original_queue_single_permission_and_native_receipt_finish_once(pilot):
     creates = len([r for r in s.fake.requests if r.method == "POST"])
     assert s.service.verify(s.engine.account(s.account["id"]), claim)["verified"]
     assert len([r for r in s.fake.requests if r.method == "POST"]) == creates
-    if s.app in {"instagram", "x"}:
+    if s.app in {"instagram", "facebook", "x"}:
         field = "reply_id" if s.app == "x" else "comment_id"
         # A previous sender stored only the verified link. Read its original native receipt once.
         with s.store.connect(write=True) as db:
@@ -841,3 +841,118 @@ def test_local_window_denial_before_any_grant_is_known_unsent(pilot, prior_inten
     }
     assert len([r for r in s.fake.requests if r.method == "POST"]) == before
     assert s.store.one("SELECT count(*) n FROM phone_social_authorizations")["n"] == 0
+
+
+@pytest.mark.parametrize("pilot", ["facebook"], indirect=True)
+def test_mcp_prepares_one_facebook_phone_comment_without_sending(pilot):
+    import asyncio
+
+    from auto_promotion.mcp_server import create_server
+
+    s = pilot
+    s.engine.adapters.phone_social = s.service
+    server = create_server(s.engine)
+    result = asyncio.run(
+        server.call_tool(
+            "prepare_task",
+            {
+                "task_id": s.task["id"],
+                "phone_comment_target": s.metadata,
+            },
+        )
+    )
+    if isinstance(result, tuple):
+        result = result[1]
+    elif not isinstance(result, dict):
+        result = json.loads(result[0].text)
+    proof = result["phone_preparation"]
+    assert proof["status"] == "succeeded" and proof["discarded"] is True
+    assert proof["submission_started"] is False
+    assert s.store.one("SELECT COUNT(*) n FROM attempts")["n"] == 0
+    assert s.store.one("SELECT COUNT(*) n FROM phone_social_authorizations")["n"] == 0
+
+
+def test_unavailable_device_before_dispatch_is_known_unsubmitted_and_revokes_grant(pilot):
+    s = pilot
+    claim, context = claim_original(s)
+    original_request = s.service.request
+    capability_reads = []
+
+    def unavailable(method, path, *args, **kwargs):
+        result = original_request(method, path, *args, **kwargs)
+        if path == "/capabilities":
+            capability_reads.append(path)
+            result["operations"]["social_submit"] = "unsupported"
+        return result
+
+    s.monkeypatch.setattr(s.service, "request", unavailable)
+    s.monkeypatch.setattr("auto_promotion.phone_reddit.time.sleep", lambda _: None)
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+    result = s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    assert result == {
+        "status": "failed_known",
+        "verified": False,
+        "confirmed_not_submitted": True,
+        "submission_started": False,
+        "reason": "PhoneFleetDeviceNotReady",
+    }
+    assert len(capability_reads) == 5
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before
+    assert (
+        s.store.one("SELECT COUNT(*) n FROM phone_social_operations WHERE kind='social_submit'")[
+            "n"
+        ]
+        == 0
+    )
+    grant = s.store.one(
+        "SELECT * FROM phone_social_authorizations WHERE item_id=?", (s.item["id"],)
+    )
+    assert grant["used_at"] is None and grant["native_id"] is None and grant["execution_id"] is None
+    assert grant["expires_at"] <= time.time()
+    assert (
+        s.store.one("SELECT COUNT(*) n FROM audit WHERE kind='phone_social.dispatch_not_started'")[
+            "n"
+        ]
+        == 1
+    )
+
+
+def test_transient_device_readiness_only_retries_capability_query(pilot):
+    s = pilot
+    claim, context = claim_original(s)
+    original_request = s.service.request
+    reads = []
+
+    def transient(method, path, *args, **kwargs):
+        result = original_request(method, path, *args, **kwargs)
+        if path == "/capabilities":
+            reads.append(path)
+            if len(reads) < 3:
+                result["operations"]["social_submit"] = "unsupported"
+        return result
+
+    s.monkeypatch.setattr(s.service, "request", transient)
+    s.monkeypatch.setattr("auto_promotion.phone_reddit.time.sleep", lambda _: None)
+    s.fake.authorize = lambda body: s.service.authorize(
+        body, "synthetic-runtime-token-of-sufficient-length"
+    )
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+    result = s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    assert result["verified"] is True and result["external_reference"]
+    assert len(reads) == 3
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before + 1
+
+
+def test_lost_submit_response_remains_unknown_and_is_not_resent(pilot):
+    s = pilot
+    claim, context = claim_original(s)
+    s.fake.lose_next = True
+    before = len([r for r in s.fake.requests if r.method == "POST"])
+    result = s.service.execute(s.engine.account(s.account["id"]), claim, context)
+    assert result["status"] == "unknown"
+    operation = s.store.one(
+        "SELECT * FROM phone_social_operations WHERE item_id=? AND kind='social_submit'",
+        (s.item["id"],),
+    )
+    assert operation["phase"] == "uncertain" and not operation["execution_id"]
+    assert len([r for r in s.fake.requests if r.method == "POST"]) == before + 1

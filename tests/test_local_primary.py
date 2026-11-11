@@ -3,12 +3,13 @@
 import json
 from unittest.mock import patch
 
+import pytest
 import test_persistent_pools as pool_fixtures
 import test_phone_rounds as round_fixtures
 
 from auto_promotion.cloud_control import CloudControl
 from auto_promotion.execution_channels import binding
-from auto_promotion.local_primary import enable, uncertain_duplicate, valid
+from auto_promotion.local_primary import enable, extend_account, uncertain_duplicate, valid
 from auto_promotion.models import AccountInput, canonical
 from auto_promotion.phone_rounds import round_task_authorized
 from auto_promotion.pool_runtime import run_pool
@@ -259,3 +260,122 @@ def test_cutover_grants_only_accounts_with_verified_expired_owner(tmp_path):
             db.execute("UPDATE accounts SET identity_hash='different' WHERE id=?", (telegram,))
         with lab.store.connect() as db:
             assert not valid(db, telegram)
+
+
+def extension_lab(tmp_path):
+    lab = round_fixtures.make_lab(tmp_path)
+    existing = lab.store.one("SELECT id FROM accounts WHERE platform='telegram'")["id"]
+    target = lab.store.one("SELECT id FROM accounts WHERE platform='facebook'")["id"]
+    with lab.store.connect(write=True) as db:
+        db.execute("UPDATE accounts SET identity_hash='synthetic-' || id,status='healthy'")
+    grant(lab.engine, [existing])
+    with lab.store.connect() as db:
+        mode = json.loads(
+            db.execute("SELECT value FROM meta WHERE key='execution_local_primary'").fetchone()[0]
+        )
+        account = dict(db.execute("SELECT * FROM accounts WHERE id=?", (target,)).fetchone())
+    proof = {
+        "exclusive_local": True,
+        "observed_at": lab.now[0],
+        "account_id": target,
+        "identity_hash": account["identity_hash"],
+        "node_id": "test-node",
+        "store_id": mode["store_id"],
+        "mode_generation": mode["generation"],
+        "prior_generation": None,
+        "prior_until": None,
+        "evidence_ref": "synthetic-owner-evidence",
+    }
+    return lab, existing, target, mode, proof
+
+
+def test_extend_existing_local_mode_grants_only_verified_account(tmp_path):
+    with patch.dict("os.environ", {"AP_NODE_ID": "test-node"}):
+        lab, existing, target, mode, proof = extension_lab(tmp_path)
+        with lab.store.connect() as db:
+            before = dict(valid(db, existing))
+        result = extend_account(lab.engine, target, proof, source="explicit synthetic request")
+        assert not result["already_authorized"]
+        with lab.store.connect() as db:
+            assert valid(db, existing) == before
+            assert valid(db, target)["mode_generation"] == mode["generation"]
+            assert (
+                json.loads(
+                    db.execute(
+                        "SELECT value FROM meta WHERE key='execution_local_primary'"
+                    ).fetchone()[0]
+                )
+                == mode
+            )
+            assert db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+            assert (
+                db.execute("SELECT status FROM items WHERE id='item-facebook'").fetchone()[0]
+                == "not_attempted"
+            )
+        assert extend_account(lab.engine, target, proof, source="explicit synthetic request")[
+            "already_authorized"
+        ]
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ("stale", "PriorOwnershipEvidenceRequired"),
+        ("nonfinite", "PriorOwnershipEvidenceRequired"),
+        ("missing_reference", "PriorOwnershipEvidenceRequired"),
+        ("identity", "PriorOwnershipEvidenceMismatch"),
+        ("node", "PriorOwnershipEvidenceMismatch"),
+        ("mode", "PriorOwnershipEvidenceMismatch"),
+        ("outcome", "LocalPrimaryOutcomeUnresolved"),
+        ("prior_owner", "PriorOwnershipStillActive"),
+        ("blocked", "LocalPrimaryAccountBlocked"),
+        ("old_grant", "LocalPrimaryPriorGrantChanged"),
+    ],
+)
+def test_extension_rejects_changed_or_unresolved_ownership(tmp_path, change, reason):
+    with patch.dict("os.environ", {"AP_NODE_ID": "test-node"}):
+        lab, existing, target, mode, proof = extension_lab(tmp_path)
+        if change == "stale":
+            proof["observed_at"] -= 121
+        if change == "nonfinite":
+            proof["observed_at"] = float("nan")
+        if change == "missing_reference":
+            proof["evidence_ref"] = ""
+        if change == "identity":
+            proof["identity_hash"] = "different"
+        if change == "node":
+            proof["node_id"] = "different"
+        if change == "mode":
+            proof["mode_generation"] = "different"
+        with lab.store.connect(write=True) as db:
+            if change == "outcome":
+                db.execute("UPDATE items SET status='unknown' WHERE id='item-facebook'")
+            if change == "prior_owner":
+                db.execute(
+                    "INSERT INTO account_task_channels VALUES(?,?,?,?,?,'ready','cloud_acknowledged',?,NULL,0)",
+                    (target, "cloud", "prior", lab.now[0] + 100, "old", lab.now[0]),
+                )
+                proof.update(prior_generation="prior", prior_until=lab.now[0] + 100)
+            if change == "blocked":
+                db.execute(
+                    "INSERT INTO account_blocks(account_id,state,reason,since,generation,details,updated_at) VALUES(?,'active','synthetic',?,1,'{}',?)",
+                    (target, lab.now[0], lab.now[0]),
+                )
+            if change == "old_grant":
+                db.execute(
+                    "INSERT INTO meta VALUES(?,?)",
+                    ("local_primary_account:" + target, canonical({"generation": "old"})),
+                )
+        with pytest.raises(ValueError, match=reason):
+            extend_account(lab.engine, target, proof, source="explicit synthetic request")
+        with lab.store.connect() as db:
+            assert valid(db, existing)
+            assert valid(db, target) is None
+            assert (
+                json.loads(
+                    db.execute(
+                        "SELECT value FROM meta WHERE key='execution_local_primary'"
+                    ).fetchone()[0]
+                )
+                == mode
+            )

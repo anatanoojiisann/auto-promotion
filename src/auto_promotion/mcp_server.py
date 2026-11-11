@@ -428,9 +428,11 @@ def create_server(
     def system_status() -> dict:
         """Read MCP/platform readiness and execution switches without contacting platforms."""
         from .queue_store import JobQueue
+        from .workflow_health import status as workflow_worker_status
 
         return invoke(
             lambda: {
+                "workflow_worker": workflow_worker_status(engine),
                 "mcp_server": "auto-promotion",
                 "transport": "stdio",
                 "runtime": runtime,
@@ -731,7 +733,7 @@ def create_server(
     async def prepare_task(
         task_id: str, phone_comment_target: dict[str, str] | None = None
     ) -> dict:
-        """Freeze the manifest. For a single Instagram phone comment or X phone reply, optionally verify the original post and draft with target_id, target_author and target_text; never submits."""
+        """Freeze the manifest. For a single Instagram or Facebook phone comment or X phone reply, optionally verify the original post and draft with target_id, target_author and target_text; never submits."""
 
         def prepare():
             if phone_comment_target is None:
@@ -748,6 +750,7 @@ def create_server(
             payload = item["payload"]
             if (payload["platform"], payload["action"]) not in {
                 ("instagram", "comment"),
+                ("facebook", "comment"),
                 ("x", "reply"),
             } or item["status"] != "not_attempted":
                 raise Conflict("PhoneCommentPreparationScopeMismatch")
@@ -800,9 +803,16 @@ def create_server(
         )
 
     @server.tool(annotations=remote_read)
-    async def verify_task_item(item_id: str) -> dict:
+    async def verify_task_item(item_id: str, resume_receipt: bool = False) -> dict:
         """Read platform receipts for unknown or scheduled results; never resend an item."""
-        return await asyncio.to_thread(invoke, engine.reconcile, item_id)
+        return await asyncio.to_thread(
+            invoke,
+            lambda: engine.reconcile(
+                item_id,
+                phone_receipt_lookup=True,
+                **({"resume_phone_receipt": True} if resume_receipt else {}),
+            ),
+        )
 
     @server.tool(annotations=remote_read)
     def verify_telegram_membership(candidate_id: str) -> dict:

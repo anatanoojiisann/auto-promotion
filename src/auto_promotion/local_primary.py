@@ -1,6 +1,7 @@
 """Explicit single-store local authority; never silently fall back to a remote owner."""
 
 import json
+import math
 import os
 import socket
 import uuid
@@ -154,6 +155,149 @@ def enable(engine, evidence):
             now=now,
         )
     return {"accepted": accepted, "rejected": rejected, "generation": generation}
+
+
+def extend_account(engine, account_id, proof, *, source):
+    """Grant one account under the existing local mode after verified ownership.
+
+    This local administrative operation accepts evidence from the trusted cutover
+    operator, never from a public request. It does not start or modify a task.
+    """
+    if not isinstance(source, str) or not source.strip() or len(source) > 500:
+        raise ValueError("ExplicitLocalAccountInstructionRequired")
+    if not isinstance(proof, dict) or proof.get("exclusive_local") is not True:
+        raise ValueError("PriorOwnershipEvidenceRequired")
+    observed_at = proof.get("observed_at")
+    now = engine.clock()
+    if (
+        type(observed_at) not in (int, float)
+        or not math.isfinite(observed_at)
+        or not 0 <= now - observed_at <= 120
+        or not isinstance(proof.get("evidence_ref"), str)
+        or not proof["evidence_ref"].strip()
+    ):
+        raise ValueError("PriorOwnershipEvidenceRequired")
+    node = os.getenv("AP_NODE_ID", socket.gethostname())
+    with engine.store.connect(write=True) as db:
+        mode = state(db)
+        store = db.execute("SELECT value FROM meta WHERE key='execution_store_id'").fetchone()
+        if (
+            mode.get("enabled") is not True
+            or not mode.get("generation")
+            or not store
+            or not store[0]
+            or mode.get("store_id") != store[0]
+            or mode.get("node_id") != node
+        ):
+            raise ValueError("LocalPrimaryModeBindingInvalid")
+        account = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if (
+            not account
+            or account["mode"] != "live"
+            or not account["identity_hash"]
+            or account["status"] != "healthy"
+            or account["disabled"]
+            or account["cooldown_until"] > now
+        ):
+            raise ValueError("AccountIdentityUnavailable")
+        expected = {
+            "account_id": account_id,
+            "identity_hash": account["identity_hash"],
+            "node_id": node,
+            "store_id": store[0],
+            "mode_generation": mode["generation"],
+        }
+        if any(proof.get(key) != value for key, value in expected.items()):
+            raise ValueError("PriorOwnershipEvidenceMismatch")
+        if db.execute(
+            "SELECT 1 FROM accounts WHERE platform=? AND identity_hash=? AND id<>?",
+            (account["platform"], account["identity_hash"], account_id),
+        ).fetchone():
+            raise ValueError("LocalPrimaryIdentityAliasRequiresReconciliation")
+        prior = db.execute(
+            "SELECT * FROM account_task_channels WHERE account_id=?", (account_id,)
+        ).fetchone()
+        if proof.get("prior_generation") != (prior["generation"] if prior else None) or proof.get(
+            "prior_until"
+        ) != (prior["until_at"] if prior else None):
+            raise ValueError("PriorOwnershipEvidenceMismatch")
+        if prior and (prior["until_at"] > now or prior["state"] != "ready"):
+            raise ValueError("PriorOwnershipStillActive")
+        existing = db.execute(
+            "SELECT 1 FROM meta WHERE key=?", ("local_primary_account:" + account_id,)
+        ).fetchone()
+        if existing:
+            grant = valid(db, account_id)
+            if grant:
+                return {
+                    "account_id": account_id,
+                    "already_authorized": True,
+                    "generation": grant["generation"],
+                }
+            raise ValueError("LocalPrimaryPriorGrantChanged")
+        if db.execute(
+            "SELECT 1 FROM account_blocks WHERE account_id=? AND state='active' "
+            "AND (until_at IS NULL OR until_at>?)",
+            (account_id, now),
+        ).fetchone():
+            raise ValueError("LocalPrimaryAccountBlocked")
+        if db.execute(
+            "SELECT 1 FROM attempts WHERE account_id=? AND finished_at IS NULL", (account_id,)
+        ).fetchone():
+            raise ValueError("AttemptStillRunning")
+        if db.execute(
+            "SELECT 1 FROM items WHERE account_id=? AND status IN "
+            "('executing','unknown','scheduled')",
+            (account_id,),
+        ).fetchone():
+            raise ValueError("LocalPrimaryOutcomeUnresolved")
+        if (
+            db.execute(
+                "SELECT 1 FROM execution_jobs WHERE account_id=? AND state='leased' "
+                "AND lease_until>?",
+                (account_id, now),
+            ).fetchone()
+            or db.execute(
+                "SELECT 1 FROM account_lanes WHERE account_id=? AND expires_at>?", (account_id, now)
+            ).fetchone()
+        ):
+            raise ValueError("LocalPrimaryAccountBusy")
+        if db.execute(
+            "SELECT 1 FROM cloud_receipt_outbox r LEFT JOIN execution_jobs j ON j.id=r.job_id "
+            "WHERE json_extract(r.lease,'$.account_id')=? OR j.account_id=? LIMIT 1",
+            (account_id, account_id),
+        ).fetchone():
+            raise ValueError("PriorReceiptPending")
+        grant = {
+            key: account[key]
+            for key in ("id", "platform", "mode", "backend_label", "identity_hash")
+        }
+        grant.update(
+            node_id=node,
+            store_id=store[0],
+            generation=uuid.uuid4().hex,
+            mode_generation=mode["generation"],
+            granted_at=now,
+            prior_generation=prior["generation"] if prior else None,
+            prior_until=prior["until_at"] if prior else None,
+            ownership_observed_at=observed_at,
+            ownership_evidence_ref=proof["evidence_ref"],
+        )
+        db.execute(
+            "INSERT INTO meta VALUES(?,?)",
+            ("local_primary_account:" + account_id, canonical(grant)),
+        )
+        Store.audit(
+            db,
+            "execution.local_primary_account_granted",
+            {**grant, "source": source.strip(), "extended_existing_mode": True},
+            now=now,
+        )
+    return {
+        "account_id": account_id,
+        "already_authorized": False,
+        "generation": grant["generation"],
+    }
 
 
 def _target(value):

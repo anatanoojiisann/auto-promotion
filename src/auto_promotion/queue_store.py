@@ -275,6 +275,10 @@ class JobQueue:
             return int(db.total_changes != before)
 
     def recover(self):
+        from .phone_local_gate import refresh_waits
+
+        with self.store.connect(write=True) as db:
+            refresh_waits(db, self.clock())
         from .execution_waits import refresh_control_waits
 
         now = self.clock()
@@ -551,6 +555,19 @@ class JobQueue:
                 blocked = self._intent_block(db, row)
                 if blocked:
                     self._wait_for_intent(db, row, blocked, now)
+                    continue
+                from .phone_local_gate import blocker
+
+                reason = blocker(db, {**dict(row), "checked_at": now})
+                if reason:
+                    self.engine._skip(row["reference_id"], reason, db)
+                    db.execute(
+                        "UPDATE execution_jobs SET result=? WHERE id=?",
+                        (
+                            canonical({"reason": reason, "waiting_for": "local_state_change"}),
+                            row["id"],
+                        ),
+                    )
                     continue
                 route = json.loads(row["route"])
                 account = db.execute(

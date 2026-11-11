@@ -169,9 +169,12 @@ def claim_blocker(db, account, payload, item_id, now):
         "WHERE i.account_id=? AND i.status IN ('unknown','executing','scheduled') AND i.id<>?",
         (account["id"], item_id),
     ).fetchall()
+    from .phone_predispatch_continuation import allowed as phone_predispatch_allowed
+
     if any(
         row["id"] not in acknowledged_legacy_items
         and not verified_pending_moderation(row, account, connection, now)
+        and not phone_predispatch_allowed(db, row["id"], item_id, account["id"], payload, now)
         for row in unsettled
     ):
         return "meta_outcome_unknown"
